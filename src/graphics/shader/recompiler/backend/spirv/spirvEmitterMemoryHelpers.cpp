@@ -501,6 +501,24 @@ uint32_t EncodeFormattedStoreComponent(EmitterState& state, const Format::Buffer
 		    state, EmitBitCastF32U32(state, data), ConstantF32Value(state, 0.0f));
 		return EmitPackHalf2x16(state, pair);
 	}
+	if ((bits == 11u || bits == 10u) && info.type == Format::ComponentType::Float) {
+		// Unsigned 11/10-bit floats share the half-float exponent: drop the sign and the low
+		// mantissa bits of the f16 encoding, clamping negatives to zero and keeping NaN a NaN.
+		const auto value = EmitBitCastF32U32(state, data);
+		const auto pair  = EmitCompositeConstructF32x2(state, value, ConstantF32Value(state, 0.0f));
+		const auto half  = EmitPackHalf2x16(state, pair);
+		const auto shift = ConstantU32(state, bits == 11u ? 4u : 5u);
+		const auto packed_small = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+		                                 EmitAndConstant(state, half, 0x7fffu), shift);
+		const auto nan      = Binary(state, spv::OpUGreaterThan, TypeBool(state),
+		                             EmitAndConstant(state, half, 0x7fffu), ConstantU32(state, 0x7c00u));
+		const auto negative = Binary(state, spv::OpINotEqual, TypeBool(state),
+		                             EmitAndConstant(state, half, 0x8000u), ConstantU32(state, 0u));
+		const auto finite =
+		    Select(state, TypeU32(state), negative, ConstantU32(state, 0u), packed_small);
+		return Select(state, TypeU32(state), nan, ConstantU32(state, bits == 11u ? 0x7ffu : 0x3ffu),
+		              finite);
+	}
 	return data;
 }
 
