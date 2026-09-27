@@ -20197,6 +20197,29 @@ TestCase Vop1SdwaFfblCapturedHighWordSource() {
   return test;
 }
 
+TestCase Vop1SdwaBfrevCapturedLowWordSource() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendBufferLoadDword(&code, 2, 30);
+  code.push_back(0x7e2070f9u);
+  code.push_back(0x00040602u); // v_bfrev_b32 v16, v2.word0 (GTA V PPSA04263)
+  AppendStoreVgpr(&code, 16, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop1SdwaBfrevCapturedLowWordSource";
+  test.code = std::move(code);
+  test.initial = {0x12340001u};
+  test.expected = {0x80000000u};
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_BFREV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.decoded_counts = {{"V_BFREV_B32 v16, v2.sdwa(sel=4,sext=0)", 1}};
+  test.ir_counts = {{" = BitFieldUExtract ", 1}, {" = BitReverse32 ", 1}};
+  test.required_spirv = {"OpBitFieldUExtract", "OpBitReverse"};
+  return test;
+}
+
 TestCase Vop1SdwaNotCapturedByte0Source() {
   using O = ShaderOpcode;
 
@@ -31707,6 +31730,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorFfbhI32NativeAndVop3OnGpu);
   AddCase(Vop1SdwaFfbhCapturedScalarLowWordSource);
   AddCase(Vop1SdwaFfblCapturedHighWordSource);
+  AddCase(Vop1SdwaBfrevCapturedLowWordSource);
   AddCase(Vop1SdwaNotCapturedByte0Source);
   AddCase(Vop1SdwaNotPreservesHighWordDestination);
   AddCase(Vop1SdwaNotPartialSourcesAndDestinations);
@@ -37076,6 +37100,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, Vop1SdwaFfbhCapturedScalarLowWordSource());
     RunCase(&vulkan, VectorFfbhI32NativeAndVop3OnGpu());
     RunCase(&vulkan, Vop1SdwaFfblCapturedHighWordSource());
+    RunCase(&vulkan, Vop1SdwaBfrevCapturedLowWordSource());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cubeid-omod-only") == 0) {
