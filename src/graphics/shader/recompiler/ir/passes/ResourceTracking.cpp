@@ -827,7 +827,8 @@ private:
 				const auto& b = *descriptor.indirect_image;
 				if (a.material_source != b.material_source || a.table_source != b.table_source ||
 				    a.selector_stride != b.selector_stride || a.selector_offset != b.selector_offset ||
-				    a.table_offset != b.table_offset ||
+				    a.table_offset != b.table_offset || a.table_mask != b.table_mask ||
+				    a.table_array != b.table_array ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_mask.IsEmpty() != b.selector_mask.IsEmpty() ||
 				    (!a.selector_mask.IsEmpty() &&
@@ -858,6 +859,33 @@ private:
 		return !value.Uses().empty() && std::ranges::all_of(value.Uses(), [&](const Use& use) {
 			return std::ranges::find(users, use.user) != users.end();
 		});
+	}
+
+	// Whether a T# DWORD read feeds image descriptors only. The register may also flow into
+	// loop Phis that merge it with other loads of the same register; those are followed, and
+	// an image handle built from such a Phi is tracked on its own.
+	static bool ImageDescriptorUsesOnly(const Inst& read) {
+		bool                     direct = false;
+		std::vector<const Inst*> visited;
+		std::vector<const Inst*> pending {&read};
+		while (!pending.empty()) {
+			const auto* inst = pending.back();
+			pending.pop_back();
+			if (std::ranges::find(visited, inst) != visited.end()) {
+				continue;
+			}
+			visited.push_back(inst);
+			for (const auto& use: inst->Uses()) {
+				if (use.user->GetOpcode() == ValueOpcode::GetImageResource) {
+					direct |= inst == &read;
+				} else if (use.user->GetOpcode() == ValueOpcode::Phi) {
+					pending.push_back(use.user);
+				} else {
+					return false;
+				}
+			}
+		}
+		return direct;
 	}
 
 	const MemoryInfo* ScalarReadMemory(const Inst& read, uint32_t& index) const {
@@ -992,8 +1020,14 @@ private:
 		return false;
 	}
 
-	bool MatchTableOffset(Value value, Value& key, uint32_t& offset, uint32_t shift = 5u) const {
+	// Matches (key << shift) + offset. With a mask output it also accepts an outermost
+	// ((key << shift) & mask) + offset, as a shader clamps a key's bits before indexing.
+	bool MatchTableOffset(Value value, Value& key, uint32_t& offset, uint32_t shift = 5u,
+	                      uint32_t* mask = nullptr) const {
 		offset = 0;
+		if (mask != nullptr) {
+			*mask = UINT32_MAX;
+		}
 		for (;;) {
 			const auto* inst = value.Resolve().TryInstruction();
 			if (inst == nullptr || inst->NumArgs() != 2u) {
@@ -1005,7 +1039,20 @@ private:
 				key = inst->Arg(0).Resolve();
 				return key.GetType() == Type::U32;
 			}
-			if (inst->GetOpcode() != ValueOpcode::IAdd32) {
+			if (inst->GetOpcode() == ValueOpcode::BitwiseAnd32 && mask != nullptr &&
+			    *mask == UINT32_MAX) {
+				if (ImmediateU32(inst->Arg(1), immediate)) {
+					value = inst->Arg(0);
+				} else if (ImmediateU32(inst->Arg(0), immediate)) {
+					value = inst->Arg(1);
+				} else {
+					return false;
+				}
+				*mask = immediate;
+				continue;
+			}
+			// An addition inside the mask would be masked too.
+			if (inst->GetOpcode() != ValueOpcode::IAdd32 || (mask != nullptr && *mask != UINT32_MAX)) {
 				return false;
 			}
 			if (ImmediateU32(inst->Arg(0), immediate)) {
@@ -1421,15 +1468,21 @@ private:
 		return {};
 	}
 
-	bool TryMakeIndirectImage(Inst& handle, IndirectImagePlan& plan) {
+	// base_reg and pc name the T# registers of an image instruction using handle; the native
+	// CFG resolves register Phis the IR keeps for a T# reloaded along other paths.
+	bool TryMakeIndirectImage(Inst& handle, uint32_t base_reg, uint32_t pc,
+	                          IndirectImagePlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
 			return false;
 		}
 		Inst* table_handle = nullptr;
 		Value key;
 		uint32_t table_offset = 0;
+		uint32_t table_mask   = UINT32_MAX;
 		for (uint32_t dword = 0; dword < plan.reads.size(); ++dword) {
-			auto* read = handle.Arg(dword).Resolve().TryInstruction();
+			auto* read = NativeDescriptorSource(handle.Arg(dword), base_reg + dword, pc)
+			                 .Resolve()
+			                 .TryInstruction();
 			if (read == nullptr) {
 				return false;
 			}
@@ -1442,6 +1495,7 @@ private:
 			auto* current_handle = read->Arg(0).Resolve().TryInstruction();
 			Value current_key;
 			uint32_t offset = 0;
+			uint32_t mask   = UINT32_MAX;
 			if (current_handle == nullptr ||
 			    current_handle->GetOpcode() != (memory->kind == ResourceKind::ScalarAddress
 			                                      ? ValueOpcode::GetAddressResource
@@ -1449,21 +1503,22 @@ private:
 			    (memory->kind == ResourceKind::ScalarAddress && read->Parent() != handle.Parent()) ||
 			    (table_handle != nullptr &&
 			     !EquivalentValue(m_program, Value(table_handle), Value(current_handle))) ||
-			    !MatchTableOffset(read->Arg(1), current_key, offset) ||
-			    memory->offset > UINT32_MAX - offset) {
+			    !MatchTableOffset(read->Arg(1), current_key, offset, 5u, &mask) ||
+			    memory->offset > UINT32_MAX - offset || (dword != 0u && mask != table_mask)) {
 				return false;
 			}
 			offset += memory->offset;
 			if (dword == 0u) {
 				key = current_key;
 				table_offset = offset;
+				table_mask   = mask;
 			} else if (!EquivalentValue(m_program, key, current_key) ||
 			           static_cast<uint64_t>(table_offset) + dword * sizeof(uint32_t) != offset) {
 				return false;
 			}
 			table_handle = current_handle;
-			const std::array<const Inst*, 1> image_users {&handle};
-			if (!UsesOnly(*read, image_users)) {
+			// Several image instructions may share one T# load.
+			if (!ImageDescriptorUsesOnly(*read)) {
 				return false;
 			}
 			plan.memory[dword] = memory_index;
@@ -1477,7 +1532,11 @@ private:
 		DescriptorSource material_source;
 		DescriptorSource::IndirectImage indirect;
 		indirect.table_offset = table_offset;
+		indirect.table_mask   = table_mask;
 		if (table_source.dword_count == 2u) {
+			if (table_mask != UINT32_MAX) {
+				return false;
+			}
 			const auto* selector = key.Resolve().TryInstruction();
 			const bool bitscan = selector != nullptr && selector->GetOpcode() == ValueOpcode::FindILsb32 &&
 			    selector->NumArgs() == 1u && !m_shader_writes &&
@@ -1494,34 +1553,50 @@ private:
 			if ((table_offset & 3u) != 0u ||
 			    (bitscan && table_offset > UINT32_MAX - (32u * 32u - 1u))) return false;
 		} else {
+			// A whole material word read at probeable records is the invariant material key.
 			auto* material_read = key.Resolve().TryInstruction();
 			uint32_t material_memory_index = 0;
 			const auto* memory = material_read != nullptr
 			                         ? ScalarReadMemory(*material_read, material_memory_index) : nullptr;
-			if (table_offset != 0u || memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
-			    memory->offset > INT32_MAX || !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
-				return false;
-			}
-			Value selector;
-			if (!MatchMaterialOffset(material_read->Arg(1), selector, indirect.selector_stride,
-			                         indirect.selector_offset)) {
-				return false;
-			}
-			const auto step = std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u);
-			indirect.selector_offset =
-			    (static_cast<uint32_t>(indirect.selector_offset % step) & ~3u) + (memory->offset & ~3u);
 			const auto* shift = plan.reads[0]->Arg(1).Resolve().TryInstruction();
 			const std::array<const Inst*, 1> material_users {shift};
-			if (!UsesOnly(*material_read, material_users) || !UsesOnly(*shift, plan.reads)) {
+			Value selector;
+			bool plain = table_offset == 0u && table_mask == UINT32_MAX && memory != nullptr &&
+			             memory->kind == ResourceKind::ScalarBuffer && memory->offset <= INT32_MAX &&
+			             MemoryIndexBelongsTo(material_memory_index, *material_read) &&
+			             MatchMaterialOffset(material_read->Arg(1), selector,
+			                                 indirect.selector_stride, indirect.selector_offset) &&
+			             UsesOnly(*material_read, material_users);
+			if (plain) {
+				const auto step = std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u);
+				indirect.selector_offset =
+				    (static_cast<uint32_t>(indirect.selector_offset % step) & ~3u) +
+				    (memory->offset & ~3u);
+				const auto* material_handle = material_read->Arg(0).Resolve().TryInstruction();
+				plain = material_handle != nullptr &&
+				        material_handle->GetOpcode() == ValueOpcode::GetBufferResource &&
+				        MakeRuntimeTableSource(*material_read, material_source);
+			}
+			if (plain) {
+				indirect.material_source = InternSource(material_source);
+			} else {
+				// A negative scalar immediate is a malformed material read, not an opaque key.
+				if (memory != nullptr && memory->offset > INT32_MAX) {
+					return false;
+				}
+				// Any other key, such as a bitfield of GPU-written material data: bind every
+				// T# of the table and let the shader map entry key & mask to its descriptor.
+				if ((table_offset & 31u) != 0u) {
+					return false;
+				}
+				material_source          = {};
+				indirect.table_array     = true;
+				indirect.selector_stride = 0;
+				indirect.selector_offset = 0;
+			}
+			if (!UsesOnly(*shift, plan.reads)) {
 				return false;
 			}
-			const auto* material_handle = material_read->Arg(0).Resolve().TryInstruction();
-			if (material_handle == nullptr ||
-			    material_handle->GetOpcode() != ValueOpcode::GetBufferResource ||
-			    !MakeRuntimeTableSource(*material_read, material_source)) {
-				return false;
-			}
-			indirect.material_source = InternSource(material_source);
 		}
 		indirect.table_source = InternSource(table_source);
 		DescriptorSource image_source;
@@ -1566,8 +1641,13 @@ private:
 				if (handle == nullptr || FindIndirectImage(*handle) != nullptr) {
 					continue;
 				}
+				const auto flags = inst.Flags<MemoryFlags>();
+				if (flags.index >= m_program.memory_info.size()) {
+					continue;
+				}
 				IndirectImagePlan plan;
-				if (TryMakeIndirectImage(*handle, plan)) {
+				if (TryMakeIndirectImage(*handle, m_program.memory_info[flags.index].resource * 4u,
+				                         flags.pc, plan)) {
 					m_indirect_images.push_back(std::move(plan));
 				}
 			}
