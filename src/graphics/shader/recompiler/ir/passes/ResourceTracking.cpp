@@ -12,6 +12,7 @@
 #include <optional>
 #include <span>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -2120,6 +2121,95 @@ private:
 		return true;
 	}
 
+	// V_MOVRELD writes every VGPR it may index as Select(exec && m0 == k, value, previous).
+	static bool IsIndexedRegisterWrite(const Inst& inst) {
+		if (inst.GetOpcode() != ValueOpcode::SelectU32) {
+			return false;
+		}
+		const auto* condition = inst.Arg(0).Resolve().TryInstruction();
+		if (condition == nullptr || condition->GetOpcode() != ValueOpcode::LogicalAnd) {
+			return false;
+		}
+		for (uint32_t operand = 0; operand < 2u; ++operand) {
+			const auto* match = condition->Arg(operand).Resolve().TryInstruction();
+			uint32_t    index = 0;
+			if (match != nullptr && match->GetOpcode() == ValueOpcode::IEqual32 &&
+			    ImmediateU32(match->Arg(1), index)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// Resolves a V# DWORD kept in VGPRs across a loop that writes registers by index. The
+	// descriptor registers are assumed not to be indexed targets, as the guest relies on.
+	static Value ResolveDescriptorWord(Value value) {
+		const auto strip = [](Value current) {
+			for (;;) {
+				current          = current.Resolve();
+				const auto* inst = current.TryInstruction();
+				if (inst != nullptr && inst->GetOpcode() == ValueOpcode::ReadFirstLane) {
+					current = inst->Arg(0);
+				} else if (inst != nullptr && IsIndexedRegisterWrite(*inst)) {
+					current = inst->Arg(2);
+				} else {
+					return current;
+				}
+			}
+		};
+		value            = strip(value);
+		const auto* root = value.TryInstruction();
+		if (root == nullptr || root->GetOpcode() != ValueOpcode::Phi) {
+			return value;
+		}
+		Value                           invariant;
+		std::vector<Value>              pending {value};
+		std::unordered_set<const Inst*> visited;
+		while (!pending.empty()) {
+			const auto current = strip(pending.back());
+			pending.pop_back();
+			const auto* inst = current.TryInstruction();
+			if (inst != nullptr && inst->GetOpcode() == ValueOpcode::Phi) {
+				if (visited.insert(inst).second) {
+					for (size_t index = 0; index < inst->NumArgs(); ++index) {
+						pending.push_back(inst->Arg(index));
+					}
+				}
+				continue;
+			}
+			if (invariant.IsEmpty()) {
+				invariant = current;
+			} else if (invariant != current) {
+				return value;
+			}
+		}
+		return invariant.IsEmpty() ? value : invariant;
+	}
+
+	// Matches a V# whose base, stride and format are runtime values while NUM_RECORDS is computed
+	// by the shader. The source keeps the runtime DWORDs with NUM_RECORDS zeroed.
+	bool MatchDynamicRecordsSource(const Inst& handle, uint32_t pc, uint32_t& source) {
+		if (handle.GetOpcode() != ValueOpcode::GetBufferResource || handle.NumArgs() != 4u) {
+			return false;
+		}
+		DescriptorSource descriptor;
+		MakeSource(handle, 4u, false, false, UINT32_MAX, descriptor, pc);
+		for (const auto dword: {0u, 1u, 3u}) {
+			const auto resolved = ResolveDescriptorWord(descriptor.dwords[dword]);
+			if (resolved.Resolve().GetType() == Type::U32 &&
+			    ValidateRuntimeValue(m_program, resolved)) {
+				descriptor.dwords[dword] = resolved;
+			}
+		}
+		descriptor.dwords[2] = Value(0u);
+		uint32_t bad_dword = 0;
+		if (!ValidateSource(descriptor, bad_dword)) {
+			return false;
+		}
+		source = InternSource(descriptor);
+		return true;
+	}
+
 	void AddIndirectWriteTable(uint32_t source, uint32_t offset, uint32_t pc) {
 		for (const auto& table: m_indirect_write_tables) {
 			if (table.source == source) {
@@ -2352,8 +2442,21 @@ private:
 				source = indirect->source;
 			} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
 			               memory.resource * 4u, handle, source)) {
-				uint32_t   table_source = 0;
-				uint32_t   table_offset = 0;
+				uint32_t table_source = 0;
+				uint32_t table_offset = 0;
+				if (m_program.stage == ShaderType::Compute && memory.kind == ResourceKind::Buffer &&
+				    MatchDynamicRecordsSource(*handle, flags.pc, source)) {
+					// Only NUM_RECORDS is computed by the shader: bind the buffer normally and let
+					// the host size it for what the dispatch can reach.
+					resource = AddBuffer(source, memory, op, flags.pc);
+					if (resource == UINT32_MAX) {
+						Fail(flags.pc, "buffer resource limit exceeded");
+					}
+					m_info.buffers[resource].dynamic_records = true;
+					AddHandlePatch(handle, resource, flags.pc);
+					AddMemoryPatch(flags.index, resource, 0, false, flags.pc);
+					return;
+				}
 				// The host prepares V# table targets at compute dispatch only.
 				const bool indirect_store =
 				    m_program.stage == ShaderType::Compute && memory.kind == ResourceKind::Buffer &&

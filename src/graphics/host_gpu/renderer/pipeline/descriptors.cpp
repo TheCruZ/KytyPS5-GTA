@@ -826,6 +826,14 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
 			const auto address = descriptor.Base48();
 			auto size = descriptor.GetSize();
+			if (program.info.buffers[resource].dynamic_records) {
+				// One record per dispatched thread, the most a thread-indexed access can reach.
+				constexpr uint64_t DefaultThreads = uint64_t {1} << 20u;
+				const auto threads = prepared.dispatch_threads != 0 ? prepared.dispatch_threads
+				                                                    : DefaultThreads;
+				size = std::max<uint64_t>(descriptor.Stride(), 4u) * threads +
+				       program.info.buffers[resource].max_byte_extent;
+			}
 			if (address == 0 || size == 0) {
 				prepared.buffer_sources.push_back({});
 				continue;
