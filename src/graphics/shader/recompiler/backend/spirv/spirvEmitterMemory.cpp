@@ -796,7 +796,8 @@ struct IndirectBufferComponent {
 // address and bounds rules that the native buffer path gets from its descriptor.
 std::array<IndirectBufferComponent, 4> IndirectBufferComponents(ValueEmitContext& ctx,
                                                                 const IR::Inst& inst,
-                                                                uint32_t components) {
+                                                                uint32_t components,
+                                                                uint32_t access_bytes = 4u) {
 	auto&       state   = ctx.state;
 	const auto& handle  = *inst.Arg(0).ResolveInstruction();
 	const auto  word1   = ctx.Arg(handle, 1);
@@ -810,11 +811,11 @@ std::array<IndirectBufferComponent, 4> IndirectBufferComponents(ValueEmitContext
 		return Binary(state, spv::OpINotEqual, TypeBool(state), value, ConstantU32(state, 0));
 	};
 	const auto has_dword = [&](uint32_t offset, uint32_t size) {
+		const auto bytes = ConstantU32(state, access_bytes);
 		return AndCondition(
-		    state,
-		    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), size, ConstantU32(state, 4)),
+		    state, Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), size, bytes),
 		    Binary(state, spv::OpULessThanEqual, TypeBool(state), offset,
-		           Binary(state, spv::OpISub, TypeU32(state), size, ConstantU32(state, 4))));
+		           Binary(state, spv::OpISub, TypeU32(state), size, bytes)));
 	};
 	const auto stride       = field(word1, 16, 14);
 	const auto swizzle      = AndCondition(state, nonzero(stride), nonzero(field(word1, 31, 1)));
@@ -874,7 +875,44 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_
 		values[component] =
 		    LoadBda(ctx, parts[component].address, parts[component].active, 32u);
 	}
-	return ConstructU32Composite(ctx.state, components, values);
+	return components == 1u ? values[0] : ConstructU32Composite(ctx.state, components, values);
+}
+
+// The format of a V# selected at runtime is only known on the GPU: read the X component as each
+// unpacked 8, 16 or 32-bit format and select the one the descriptor's FORMAT field names.
+uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&       state  = ctx.state;
+	const auto& handle = *inst.Arg(0).ResolveInstruction();
+	const auto  format = EmitBitFieldUExtract(state, ctx.Arg(handle, 3), ConstantU32(state, 12u),
+	                                          ConstantU32(state, 7u));
+	std::array<uint32_t, 3> raw {};
+	for (uint32_t width = 0; width < raw.size(); ++width) {
+		const auto bytes = 1u << width;
+		const auto part  = IndirectBufferComponents(ctx, inst, 1u, bytes)[0];
+		raw[width]       = LoadBda(ctx, part.address, part.active, bytes * 8u);
+	}
+	auto result = ConstantU32(state, 0);
+	for (uint32_t value = 1; value < 128u; ++value) {
+		const auto info = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(value));
+		const auto bits = info.component_bits[0];
+		if (info.type == Format::ComponentType::Unknown || info.packed_bitfield ||
+		    (bits != 8u && bits != 16u && bits != 32u)) {
+			continue;
+		}
+		auto component = raw[bits == 8u ? 0 : bits == 16u ? 1 : 2];
+		if (bits < 32u && IsSignedFormatComponent(info.type)) {
+			const auto extended = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpBitFieldSExtract, TypeI32(state), extended,
+			                          Unary(state, spv::OpBitcast, TypeI32(state), component),
+			                          ConstantU32(state, 0), ConstantU32(state, bits));
+			component = Unary(state, spv::OpBitcast, TypeU32(state), extended);
+		}
+		result = Select(state, TypeU32(state),
+		                Binary(state, spv::OpIEqual, TypeBool(state), format,
+		                       ConstantU32(state, value)),
+		                NormalizeFormatComponent(state, info, 0u, component), result);
+	}
+	return result;
 }
 
 void StoreBdaDword(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t value) {
@@ -1299,7 +1337,12 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto shared_components = IR::SharedComponentCount(op);
 	const auto address_info      = IR::AddressOpcodeInfoOf(op);
 	uint32_t   value;
-	if (buffer_components > 1u)
+	if (mem.kind == IR::ResourceKind::IndirectBuffer && buffer_components <= 1u)
+		value = EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+			return mem.formatted ? LoadIndirectFormattedX(ctx, inst)
+			                     : LoadIndirectBuffer(ctx, inst, 1u);
+		});
+	else if (buffer_components > 1u)
 		value = LoadWideBuffer(ctx, inst, buffer_components);
 	else if (shared_components > 1u)
 		value = LoadWideShared(ctx, inst, shared_components);
