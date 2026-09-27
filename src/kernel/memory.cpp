@@ -1440,7 +1440,7 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	return clamped_size;
 }
 
-void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
+void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 	if (!TryWriteBacking(vaddr, data, size)) {
 		EXIT("Memory: required direct-backing write failed, addr=0x%016" PRIx64
 		     " size=0x%016" PRIx64 "\n",
@@ -1617,6 +1617,22 @@ static bool IsInPrtAperture(uint64_t address, uint64_t size = 1) {
 	}
 
 	return false;
+}
+
+bool IsBackingReadable(uint64_t vaddr, uint64_t size) {
+	if (g_guest_address_space == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
+		return false;
+	}
+	if (g_guest_address_space->BackingContains(vaddr, size)) {
+		return true;
+	}
+	std::vector<VirtualRanges::Range> ranges;
+	return g_virtual_ranges != nullptr && IsInPrtAperture(vaddr, size) &&
+	       g_virtual_ranges->QuerySpan(vaddr, size, &ranges) &&
+	       std::all_of(ranges.begin(), ranges.end(), [](const auto& range) {
+		       return IsReservedRangeType(range.type) ||
+		              g_guest_address_space->BackingContains(range.start, range.size);
+	       });
 }
 
 bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {

@@ -882,6 +882,16 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
 	if (examined != nullptr) {
 		*examined = desc.info.data;
 	}
+	if (table_candidate &&
+	    ((!texture_cache.IsRegionGpuModified(desc.info.data.address, desc.info.data.size) &&
+	      !Libs::LibKernel::Memory::IsBackingReadable(desc.info.data.address,
+	                                                  desc.info.data.size)) ||
+	     (desc.info.metadata.kind != ImageMetadataKind::None &&
+	      !Libs::LibKernel::Memory::IsBackingReadable(desc.info.metadata.range.address,
+	                                                  desc.info.metadata.range.size)))) {
+		EXIT("texture 0x%016" PRIx64 " size 0x%" PRIx64 " has no guest backing\n",
+		     desc.info.data.address, desc.info.data.size);
+	}
 	auto id = table_candidate ? texture_cache.FindImageSpeculative(desc, shader_conversion)
 	                          : texture_cache.FindImage(desc, shader_conversion);
 	if (!id) {
@@ -914,12 +924,27 @@ TextureBinding RenderExecutor::ResolveTableTexture(
     const ShaderRecompiler::IR::ImageResource&   root,
     const ShaderRecompiler::IR::DescriptorValue& value, GuestRange* examined) {
 	if (ShaderRecompiler::IR::ImageTableSlotCompatible(root, value)) {
-		auto texture = ResolveTexture(root, value, true, examined);
-		if (texture.image_id) {
-			return texture;
+		try {
+			Common::SoftExitScope soft_exit(true);
+			auto texture = ResolveTexture(root, value, true, examined);
+			if (texture.image_id) {
+				return texture;
+			}
+			Common::HackNotice::Report("bindless table texture bound as null image",
+			                           "RenderExecutor::ResolveTableTexture (no image resolved)", 0, 0);
+		} catch (const Common::SoftExitError& error) {
+			// Whatever fatal error the resolution raised (texture cache invariants included) is
+			// swallowed here: the original message is in the notice.
+			Common::HackNotice::Report(
+			    "bindless table texture bound as null image after a fatal error",
+			    "RenderExecutor::ResolveTableTexture (SoftExitScope)", 0,
+			    std::hash<std::string_view> {}(error.what()),
+			    std::string("original error: ") + error.what());
+			static std::atomic_uint reported = 0;
+			if (reported.fetch_add(1) < 8u) {
+				LOGF("bindless table texture bound as null: %s\n", error.what());
+			}
 		}
-		Common::HackNotice::Report("bindless table texture bound as null image",
-		                           "RenderExecutor::ResolveTableTexture (no image resolved)", 0, 0);
 	} else {
 		Common::HackNotice::Report("bindless table texture bound as null image",
 		                           "RenderExecutor::ResolveTableTexture (incompatible view)", 0, 0);
@@ -3564,7 +3589,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			heap->checked_count      = resolved.size();
 		}
 		const Image::GuestTransitScope guest_transits;
-		const auto transit = [&](TextureBinding& binding) {
+		// Table elements bound as null for this command only (the element itself is kept).
+		std::vector<const TextureBinding*> null_table_elements;
+		const auto transit = [&](TextureBinding& binding, bool table_element) {
 			if (!binding.image_id) return;
 			auto& image = m_context.GetTextureCache().GetImage(binding.image_id);
 			const auto&                 view = binding.desc.view_info;
@@ -3580,6 +3607,15 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					EXIT_IF(storage || host_view == image.views.end());
 					const auto aspect = host_view->info.aspect;
 					if (aspect & ~DepthReadableAspects(layout)) {
+						if (table_element) {
+							// A table holds T#s of textures the frame is rendering to; the shader
+							// does not sample the entry it selects for them.
+							Common::HackNotice::Report(
+							    "bindless table texture bound as null image",
+							    "RenderExecutor::CommitBindings (writable depth attachment)", 0, 0);
+							null_table_elements.push_back(&binding);
+							return;
+						}
 						EXIT("sampling a writable depth/stencil attachment aspect\n");
 					}
 				}
@@ -3606,10 +3642,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			binding.layout = image.backing.state.layout;
 		};
 		for (auto& binding: descriptors.images) {
-			transit(binding);
+			transit(binding, false);
 		}
 		for (auto& binding: descriptors.table_images) {
-			transit(binding);
+			transit(binding, true);
 		}
 
 		std::array<size_t, ShaderRecompiler::IR::ImageBindingCount> image_starts {};
@@ -3701,7 +3737,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			                   root.table_descriptor_base;
 			for (uint32_t slot = 0; slot < root.table_capacity; slot++) {
 				const auto& element = descriptors.table_images.at(table_element++);
-				m_descriptor_images[start + slot] = MakeImageInfo(element, 0u);
+				m_descriptor_images[start + slot] =
+				    std::ranges::find(null_table_elements, &element) != null_table_elements.end()
+				        ? MakeImageInfo(TextureBinding {.layout = vk::ImageLayout::eGeneral}, 0u)
+				        : MakeImageInfo(element, 0u);
 			}
 		});
 
