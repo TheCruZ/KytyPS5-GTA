@@ -271,7 +271,17 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		return false;
 	}
 	if (!cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
-		return false;
+		// A uniform fill of memory no image covers is performed like a DMA fill: on the CPU while
+		// the GPU does not own the range. DCC metadata cleared this way is read by fast-clear
+		// discovery without draining the GPU first.
+		// Larger fills stay on the GPU: a CPU fill would also have to be uploaded again.
+		constexpr uint64_t MaxBufferFill = uint64_t {1} << 20u;
+		if (((descriptor.Base48() | size) & 3u) != 0 || size > MaxBufferFill ||
+		    cache.HasImagesInRegion(descriptor.Base48(), size)) {
+			return false;
+		}
+		m_context.GetBufferCache().FillBuffer(descriptor.Base48(), size, packed_clear, false);
+		return true;
 	}
 	static std::atomic<uint32_t> logged_clears {0};
 	if (logged_clears.fetch_add(1, std::memory_order_relaxed) < 32) {
@@ -364,6 +374,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return;
 	}
+	ShaderBufferResource known_fill_descriptor;
+	uint32_t             known_fill_value = 0;
+	uint64_t             known_fill_size  = 0;
+	const bool           known_fill =
+	    ResolveComputeBufferFill(input_info, thread_group_x, thread_group_y, thread_group_z, mode,
+	                             known_fill_descriptor, known_fill_value, known_fill_size);
 	const bool large_workgroup =
 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
 	const bool                   has_sampler = !program.info.samplers.empty();
@@ -499,6 +515,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (known_fill) {
+		// Recorded after binding, which forgets older fills over the written ranges.
+		m_context.GetBufferCache().NoteKnownFill(known_fill_descriptor.Base48(), known_fill_size,
+		                                         known_fill_value);
+	}
 	ResetBindings();
 }
 
