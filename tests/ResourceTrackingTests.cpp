@@ -2411,8 +2411,9 @@ void TestPhiValidation() {
                                    MemoryFlags{0, 20}, merge);
   MemoryInfo memory;
   memory.kind = ResourceKind::Buffer;
-  fixture.Emit(ValueOpcode::LoadBufferU32,
-               {handle, Value(0u), Value(0u), Value(0u), Value(true)},
+  // A store: raw loads through a GPU-evaluated V# take the indirect path instead.
+  fixture.Emit(ValueOpcode::StoreBufferU32,
+               {handle, Value(0u), Value(0u), Value(0u), Value(7u), Value(true)},
                fixture.AddMemory(memory, 20), merge);
 
   CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",

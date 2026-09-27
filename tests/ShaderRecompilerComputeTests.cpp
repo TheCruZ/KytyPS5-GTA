@@ -24991,8 +24991,16 @@ TestCase BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail() {
   return test;
 }
 
-TestCase BufferLoadsGpuSelectedDescriptors(bool xyz) {
+enum class GpuSelectedLoad { X4X2, X3, X1, FormatX32, FormatX8 };
+
+TestCase BufferLoadsGpuSelectedDescriptors(GpuSelectedLoad load) {
   using O = ShaderOpcode;
+  const bool xyz = load == GpuSelectedLoad::X3;
+  const bool single = load != GpuSelectedLoad::X4X2 && !xyz;
+  const bool formatted =
+      load == GpuSelectedLoad::FormatX32 || load == GpuSelectedLoad::FormatX8;
+  // Bits 12..18 of DWORD 3 hold the buffer format: 5 = 8_UINT, 20 = 32_UINT.
+  const u32 format = load == GpuSelectedLoad::FormatX32 ? 20u : 5u;
   constexpr uint64_t GuestBase = 0x0000000110000000ull;
   struct DescriptorCase {
     u32 stride, records, mode, soffset;
@@ -25016,8 +25024,17 @@ TestCase BufferLoadsGpuSelectedDescriptors(bool xyz) {
       {12, 4, 3, 4, true, true, {}},
   };
   TestCase test;
-  test.name = xyz ? "BufferLoadDwordx3GpuSelectedDescriptors"
-                  : "BufferLoadsGpuSelectedDescriptors";
+  switch (load) {
+  case GpuSelectedLoad::X4X2: test.name = "BufferLoadsGpuSelectedDescriptors"; break;
+  case GpuSelectedLoad::X3: test.name = "BufferLoadDwordx3GpuSelectedDescriptors"; break;
+  case GpuSelectedLoad::X1: test.name = "BufferLoadDwordGpuSelectedDescriptors"; break;
+  case GpuSelectedLoad::FormatX32:
+    test.name = "BufferLoadFormatX32GpuSelectedDescriptors";
+    break;
+  case GpuSelectedLoad::FormatX8:
+    test.name = "BufferLoadFormatX8GpuSelectedDescriptors";
+    break;
+  }
   test.initial.resize(2048);
   for (u32 i = 0; i < std::size(cases); ++i) {
     const auto &input = cases[i];
@@ -25026,7 +25043,7 @@ TestCase BufferLoadsGpuSelectedDescriptors(bool xyz) {
     const std::array<u32, 4> descriptor{
         static_cast<u32>(GuestBase + data_offset),
         (input.stride << 16u) | (input.swizzle ? 1u << 31u : 0u) | 1u,
-        input.records, (input.bound ? 0x5204u : 0x204u) | (input.mode << 28u)};
+        input.records, (input.bound ? (format << 12u) | 0x204u : 0x204u) | (input.mode << 28u)};
     std::copy(descriptor.begin(), descriptor.end(), test.initial.begin() + 130 + i * 30);
     for (u32 word = 0; word < 32; ++word) {
       test.initial[data_offset / 4 + word] = i * 100 + word + 1;
@@ -25043,14 +25060,21 @@ TestCase BufferLoadsGpuSelectedDescriptors(bool xyz) {
     test.code.push_back(EncodeSmem1(520, 20));
     AppendSMovLiteral(&test.code, 22, cases[selected].soffset);
     AppendVMovU32(&test.code, 21, 1);
-    test.code.push_back(EncodeMubuf0(xyz ? 0x0f : 0x0e, 0, true, false));
+    const u32 first = single ? (formatted ? 0x00 : 0x0c) : xyz ? 0x0f : 0x0e;
+    const u32 second = single ? first : xyz ? 0x0f : 0x0d;
+    test.code.push_back(EncodeMubuf0(first, 0, true, false));
     test.code.push_back(EncodeMubuf1(0, 2, 21, 22));
-    test.code.push_back(EncodeMubuf0(xyz ? 0x0f : 0x0d, xyz ? 12 : 16, true, false));
+    test.code.push_back(EncodeMubuf0(second, xyz ? 12 : 16, true, false));
     test.code.push_back(EncodeMubuf1(xyz ? 3 : 4, 2, 21, 22));
     for (u32 component = 0; component < 6; ++component) {
-      AppendStoreVgpr(&test.code, component, i * 6 + component);
+      if (single && component != 0 && component != 4) {
+        continue;
+      }
+      AppendStoreVgpr(&test.code, component,
+                      single ? i * 2 + component / 4 : i * 6 + component);
       const u32 expected = cases[selected].expected[component];
-      test.expected.push_back(expected == 0 ? 0 : selected * 100 + expected);
+      const u32 value = expected == 0 ? 0 : selected * 100 + expected;
+      test.expected.push_back(load == GpuSelectedLoad::FormatX8 ? value & 0xffu : value);
     }
   }
   AppendEnd(&test.code);
@@ -25058,7 +25082,11 @@ TestCase BufferLoadsGpuSelectedDescriptors(bool xyz) {
   test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
                   O::V_READFIRSTLANE_B32, O::S_MUL_I32, O::S_BUFFER_LOAD_DWORDX4,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  if (xyz) {
+  if (formatted) {
+    test.opcodes.push_back(O::BUFFER_LOAD_FORMAT_X);
+  } else if (single) {
+    // BUFFER_LOAD_DWORD is already listed for the selector load.
+  } else if (xyz) {
     test.opcodes.push_back(O::BUFFER_LOAD_DWORDX3);
   } else {
     test.opcodes.insert(test.opcodes.end(), {O::BUFFER_LOAD_DWORDX4, O::BUFFER_LOAD_DWORDX2});
@@ -25068,11 +25096,24 @@ TestCase BufferLoadsGpuSelectedDescriptors(bool xyz) {
 }
 
 TestCase BufferLoadsGpuSelectedDescriptors() {
-  return BufferLoadsGpuSelectedDescriptors(false);
+  return BufferLoadsGpuSelectedDescriptors(GpuSelectedLoad::X4X2);
 }
 
 TestCase BufferLoadDwordx3GpuSelectedDescriptors() {
-  return BufferLoadsGpuSelectedDescriptors(true);
+  return BufferLoadsGpuSelectedDescriptors(GpuSelectedLoad::X3);
+}
+
+// PPSA04263 reads single DWORDs and FORMAT_X values through a GPU-selected V#.
+TestCase BufferLoadDwordGpuSelectedDescriptors() {
+  return BufferLoadsGpuSelectedDescriptors(GpuSelectedLoad::X1);
+}
+
+TestCase BufferLoadFormatX32GpuSelectedDescriptors() {
+  return BufferLoadsGpuSelectedDescriptors(GpuSelectedLoad::FormatX32);
+}
+
+TestCase BufferLoadFormatX8GpuSelectedDescriptors() {
+  return BufferLoadsGpuSelectedDescriptors(GpuSelectedLoad::FormatX8);
 }
 
 TestCase BufferStoresGpuSelectedDescriptors() {
@@ -30978,6 +31019,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadsGpuSelectedDescriptors);
   AddCase(BufferStoresGpuSelectedDescriptors);
   AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
+  AddCase(BufferLoadDwordGpuSelectedDescriptors);
+  AddCase(BufferLoadFormatX32GpuSelectedDescriptors);
+  AddCase(BufferLoadFormatX8GpuSelectedDescriptors);
   AddCase(BufferStoreDwordx4DropsOnlyOutOfBoundsTail);
   AddCase(BufferLoadFormatXyzwRejectsPartialRecord);
   AddCase(BufferStoreFormatXyzwDropsPartialRecord);
@@ -35927,6 +35971,9 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferLoadsGpuSelectedDescriptors());
     RunCase(&vulkan, BufferStoresGpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadDwordx3GpuSelectedDescriptors());
+    RunCase(&vulkan, BufferLoadDwordGpuSelectedDescriptors());
+    RunCase(&vulkan, BufferLoadFormatX32GpuSelectedDescriptors());
+    RunCase(&vulkan, BufferLoadFormatX8GpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadDwordx4SnapshotsOverlappingAddress());
     RunCase(&vulkan, BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail());
     RunCase(&vulkan, BufferLoadDwordIdxenUsesDescriptorStride());
