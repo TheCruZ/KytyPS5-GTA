@@ -298,11 +298,14 @@ uint32_t ImageType(EmitterState& state, const IR::ImageResource& image);
 
 uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension);
 
-uint32_t LoadSampledImageDescriptor(EmitterState& state, uint32_t resource);
+// A nonzero element id selects a runtime, possibly non-uniform, element of the resource's
+// descriptor array instead of the resource's own element.
+uint32_t LoadSampledImageDescriptor(EmitterState& state, uint32_t resource, uint32_t element = 0);
 
 uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler);
 
-uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler);
+uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler,
+                          uint32_t element = 0);
 
 uint32_t StorageImageDescriptorPointer(EmitterState& state, uint32_t resource);
 
