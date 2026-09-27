@@ -3,9 +3,11 @@
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <optional>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -539,6 +541,94 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 	return PackImageTexel(ctx, mem, texel);
 }
 
+// Texel offsets of SAMPLE*_O are three 6-bit signed values at bits [5:0], [13:8] and
+// [21:16] of one address DWORD. Returns them when the DWORD is an IR immediate.
+std::optional<std::array<int32_t, 3>> ConstantSampleOffsets(const IR::MemoryInfo& mem,
+                                                            const IR::Inst&       address,
+                                                            uint32_t              component) {
+	const auto layout = Decoder::ImageAddressComponentLayout(mem.image_sample_flags, component);
+	const auto packed = layout.bit_offset / 32u;
+	if (packed >= address.NumArgs()) return std::array<int32_t, 3> {};
+	auto value = address.Arg(packed).Resolve();
+	// The translator wraps the offset DWORD in select(exec, offset, 0): lanes that consume the
+	// sample take the true arm, so a constant there is the offset of every live lane.
+	if (const auto* select = value.TryInstruction();
+	    select != nullptr && select->GetOpcode() == IR::ValueOpcode::SelectU32 &&
+	    select->NumArgs() == 3u && select->Arg(2).Resolve().IsImmediate() &&
+	    select->Arg(2).Resolve().U32() == 0u) {
+		value = select->Arg(1).Resolve();
+	}
+	if (!value.IsImmediate()) return std::nullopt;
+	const auto bits = value.U32();
+	std::array<int32_t, 3> offsets {};
+	for (uint32_t index = 0; index < offsets.size(); index++) {
+		offsets[index] = static_cast<int32_t>(bits << (26u - index * 8u)) >> 26;
+	}
+	return offsets;
+}
+
+uint32_t ConstSampleOffsetOperand(EmitterState& state, const std::array<int32_t, 3>& offsets,
+                                  uint32_t components) {
+	if (components == 1u) return ConstantI32(state, offsets[0]);
+	const auto x = ConstantI32(state, offsets[0]);
+	const auto y = ConstantI32(state, offsets[1]);
+	if (components == 2u) {
+		return state.builder.Constant(spv::OpConstantComposite, TypeI32Vector(state, 2), x, y);
+	}
+	return state.builder.Constant(spv::OpConstantComposite, TypeI32Vector(state, 3), x, y,
+	                              ConstantI32(state, offsets[2]));
+}
+
+// Vulkan only accepts non-constant Offset on gathers and only guarantees ConstOffset values in
+// [-8, 7], so other offsets move the coordinates by offset / size of the sampled mip level.
+uint32_t OffsetSampleCoordinates(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                                 const IR::Inst& address, uint32_t offset_component,
+                                 uint32_t resource, uint32_t element, uint32_t coord,
+                                 uint32_t level) {
+	auto&       state = ctx.state;
+	const auto& info  = ImageDimensionInfoFor(state.program.info.images[resource].dimension);
+	state.builder.RequireCapability(spv::CapabilityImageQuery);
+	const auto rounded = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), rounded, GlslStd450(state),
+	                          GLSLstd450Floor,
+	                          Binary(state, spv::OpFAdd, TypeF32(state), level,
+	                                 ConstantF32(state, 0x3f000000u)));
+	const auto clamped = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state),
+	                          GLSLstd450FMax, rounded, ZeroF32(state));
+	const auto level_u32 = Unary(state, spv::OpConvertFToU, TypeU32(state), clamped);
+	const auto size      = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpImageQuerySizeLod, ImageViewSizeType(state, info.dimension),
+	                          size, LoadSampledImageDescriptor(state, resource, element),
+	                          level_u32);
+	const auto packed = Unary(state, spv::OpBitcast, TypeI32(state),
+	                          AddressU32(ctx, mem, address, offset_component));
+	auto result = coord;
+	for (uint32_t index = 0; index < info.spatial_components; index++) {
+		const auto offset = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpBitFieldSExtract, TypeI32(state), offset, packed,
+		                          ConstantU32(state, index * 8u), ConstantU32(state, 6));
+		auto extent = size;
+		auto value  = coord;
+		if (info.coordinate_components != 1u) {
+			extent = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), extent, size, index);
+			value = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), value, coord, index);
+		}
+		const auto delta = Binary(state, spv::OpFDiv, TypeF32(state),
+		                          Unary(state, spv::OpConvertSToF, TypeF32(state), offset),
+		                          Unary(state, spv::OpConvertUToF, TypeF32(state), extent));
+		const auto moved = Binary(state, spv::OpFAdd, TypeF32(state), value, delta);
+		if (info.coordinate_components == 1u) return moved;
+		const auto inserted = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeInsert, TypeF32Vector(state, info.coordinate_components),
+		                          inserted, moved, result, index);
+		result = inserted;
+	}
+	return result;
+}
+
 spv::Op ImageAtomicOpcode(IR::ValueOpcode opcode) {
 	switch (opcode) {
 		case IR::ValueOpcode::ImageAtomicSwap32: return spv::OpAtomicExchange;
@@ -752,20 +842,60 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
 		}
 		const auto EmitSample = [&](uint32_t resource, uint32_t element = 0) {
-			const auto& candidate = state.program.info.images[resource];
-			const auto coord =
-			    CoordF32(ctx, mem, *address, layout.coord,
-			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
-			             candidate.cube);
+			const auto& candidate      = state.program.info.images[resource];
+			const auto& candidate_info = ImageDimensionInfoFor(candidate.dimension);
+			auto        coord          = CoordF32(ctx, mem, *address, layout.coord,
+			                                      candidate_info.coordinate_components, candidate.cube);
 			const auto sampled = MakeSampledImage(state, resource, mem.sampler, element);
+			auto       sample_mask     = operand_mask;
+			auto       sample_extra    = operands;
+			// SAMPLE*_O texel offsets (cube maps have none).
+			if (layout.offset != NoImageComponent && !candidate.cube &&
+			    mem.image_address_components > layout.offset) {
+				const auto constant = ConstantSampleOffsets(mem, *address, layout.offset);
+				const bool in_range =
+				    constant.has_value() &&
+				    std::all_of(constant->begin(),
+				                constant->begin() + candidate_info.spatial_components,
+				                [](int32_t value) { return value >= -8 && value <= 7; });
+				if (in_range) {
+					if (std::any_of(constant->begin(),
+					                constant->begin() + candidate_info.spatial_components,
+					                [](int32_t value) { return value != 0; })) {
+						sample_mask |= spv::ImageOperandsConstOffsetMask;
+						sample_extra.push_back(ConstSampleOffsetOperand(
+						    state, *constant, candidate_info.spatial_components));
+					}
+				} else {
+					uint32_t level = ZeroF32(state);
+					if (HasFlag(mem, Decoder::ImageSampleFlagLod) &&
+					    layout.lod != NoImageComponent) {
+						level = AddressF32(ctx, mem, *address, layout.lod);
+					} else if (!HasFlag(mem, Decoder::ImageSampleFlagLevelZero) &&
+					           state.program.stage == ShaderType::Pixel) {
+						state.builder.RequireCapability(spv::CapabilityImageQuery);
+						const auto lod = state.builder.AllocateId();
+						state.builder.AddFunction(
+						    spv::OpImageQueryLod, TypeF32Vector(state, 2), lod, sampled,
+						    CoordF32(ctx, mem, *address, layout.coord,
+						             candidate_info.spatial_components));
+						level = state.builder.AllocateId();
+						state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), level,
+						                          lod, 0);
+					}
+					coord = OffsetSampleCoordinates(ctx, mem, *address, layout.offset, resource,
+					                                element, coord, level);
+				}
+			}
 			const auto            sample  = state.builder.AllocateId();
 			std::vector<uint32_t> sample_operands {result_type, sample, sampled, coord};
 			if (dref) {
 				sample_operands.push_back(dref_value);
 			}
-			if (operand_mask != 0u) {
-				sample_operands.push_back(operand_mask);
-				sample_operands.insert(sample_operands.end(), operands.begin(), operands.end());
+			if (sample_mask != 0u) {
+				sample_operands.push_back(sample_mask);
+				sample_operands.insert(sample_operands.end(), sample_extra.begin(),
+				                       sample_extra.end());
 			}
 			state.builder.AddFunction(opcode, sample_operands);
 			return sample;
