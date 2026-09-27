@@ -221,6 +221,11 @@ private:
 	ResolveTableTexture(const ShaderRecompiler::IR::ImageResource&   root,
 	                    const ShaderRecompiler::IR::DescriptorValue& value,
 	                    GuestRange*                                  examined = nullptr);
+	static constexpr uint32_t MaxRebindPasses = 8;
+	[[nodiscard]] bool        IsStaleImageBinding(const TextureBinding& binding);
+	// Rediscovers every stale direct or table image of one stage; true when any was replaced.
+	[[nodiscard]] bool ResolveStaleImages(PreparedBindings& bindings);
+	void               AcquireImageViews(PreparedBindings& bindings);
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
