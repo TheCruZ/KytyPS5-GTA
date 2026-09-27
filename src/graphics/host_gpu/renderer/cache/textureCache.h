@@ -52,6 +52,23 @@ public:
 	KYTY_CLASS_NO_COPY(TextureCache);
 
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// Lookup for bindings the shader may never read (bindless table candidates). It resolves
+	// like FindImage but returns an empty id instead of converting a depth image to color or
+	// back: those conversions replace the image other passes use, which then convert it again.
+	// When the description reads a color image of the same layout as depth, depth_source
+	// receives that image (see FindDepthCopy()).
+	[[nodiscard]] ImageId FindImageSpeculative(ImageDesc& desc, bool exact_format = false,
+	                                           ImageId* depth_source = nullptr);
+	// PS5 samples any memory as depth with a depth T#: a T# that compares against a color
+	// image's memory reads its bytes as depth values. Vulkan compares only depth formats, so the
+	// binding samples a depth image with the color image's layout, in `requested`'s depth
+	// format, that is not registered over the guest memory and is copied from the color image
+	// when it is acquired (FindTexture()) after the color image was written. The copy lives as
+	// long as the color image.
+	[[nodiscard]] ImageId FindDepthCopy(ImageId color_id, const ImageInfo& requested);
+	// Whether the depth copy `image` no longer holds its color image's contents (false for
+	// other images).
+	[[nodiscard]] bool DepthCopyStale(const Image& image) const;
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
@@ -78,6 +95,11 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
+	// Advances whenever an image is registered or unregistered.
+	[[nodiscard]] uint64_t ImageSetEpoch() const { return m_image_set_epoch; }
+	// The ImageSetEpoch of the last registration or unregistration of an image overlapping the
+	// range's pages: while it is unchanged, a lookup in the range finds the same images.
+	[[nodiscard]] uint64_t ImageEpochInRegion(uint64_t address, uint64_t size);
 	void RunGarbageCollector();
 
 private:
@@ -90,6 +112,11 @@ private:
 		ImageId image;
 		int32_t mip   = -1;
 		int32_t layer = -1;
+		// Speculative lookups only: resolving the overlap would replace an owned image.
+		bool rejected = false;
+		// Rejected lookups only: the color image the description reads as depth, when a depth
+		// copy of it can stand for the description (see FindDepthCopy()).
+		ImageId depth_source;
 	};
 
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
@@ -134,7 +161,12 @@ private:
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
-	                                           ImageId cached, ImageId merged);
+	                                           ImageId cached, ImageId merged,
+	                                           bool speculative = false);
+	[[nodiscard]] ImageId       FindImageImpl(ImageDesc& desc, bool exact_format, bool speculative,
+	                                          ImageId* depth_source = nullptr);
+	[[nodiscard]] static bool   DepthOverlapNeedsRecreate(const ImageInfo& requested,
+	                                                      BindingType binding, const Image& cached);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
@@ -159,6 +191,9 @@ private:
 	                               vk::CommandBuffer command);
 	void PrepareImageCopy(Image& image);
 	void RefreshCopySource(ImageId id);
+	// Caller holds m_lock.
+	void RefreshDepthCopy(ImageId copy_id);
+	void ReleaseDepthCopies(ImageId color_id);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
 	void               CopyImage(ImageId destination, ImageId source);
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
@@ -177,14 +212,20 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
+	MultiLevelPageTable<uint64_t, ImagePageTable::kPageBits, ImagePageTable::kAddressSpaceBits,
+	                    ImagePageTable::kFirstLevelBits>
+	    m_image_page_epochs;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
+	// Color image -> its depth copies, one per depth format (see FindDepthCopy).
+	std::unordered_map<ImageId, std::vector<ImageId>> m_depth_copies;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
+	uint64_t         m_image_set_epoch        = 0;
 	bool             m_readback_linear_images = false;
 	bool             m_readback_tiled_images  = false;
 
