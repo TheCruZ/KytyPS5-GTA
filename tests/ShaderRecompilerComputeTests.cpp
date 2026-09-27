@@ -40492,6 +40492,19 @@ void CheckImageSamplerSpecialization() {
     ResourceSpecialization specialization;
     const SrtRuntime runtime{.user_data = user_data, .read_memory = ReadTestMemory,
                              .userdata = &memory, .read_specialization_memory = ReadTestMemory};
+    // The fork binds the whole T# table (bindless) before expanding bounded material keys:
+    // GTA V's ray tracing shaders select among ~500 material T#s, and one image per key took
+    // the driver minutes to compile.
+    Require(name, "bindless table material plan",
+            !translated.program.has_address_writes &&
+                MaterializeResources(plan, runtime, snapshot, specialization) &&
+                !specialization.images.empty() &&
+                std::ranges::any_of(specialization.images,
+                                    [](const auto &image) { return image.table_capacity != 0u; }) &&
+                snapshot.image_tables.size() == 1u &&
+                snapshot.image_tables[0].mapping.size() == count + 1u,
+            "GPU-selected material descriptors did not bind the T# table");
+    continue;
     Require(name, "bounded native material plan",
             plan.capture_specialization_reads && !translated.program.has_address_writes &&
                 MaterializeResources(plan, runtime, snapshot, specialization) &&

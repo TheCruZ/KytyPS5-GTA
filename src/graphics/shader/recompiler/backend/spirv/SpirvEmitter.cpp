@@ -25,7 +25,10 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 		return resource.indirect_root != UINT32_MAX;
 	};
 	bool uses_flattened_srt = std::ranges::any_of(program.info.buffers, uses_mapping) ||
-	                          std::ranges::any_of(program.info.images, uses_mapping);
+	                          std::ranges::any_of(program.info.images, uses_mapping) ||
+	                          std::ranges::any_of(program.info.images, [](const IR::ImageResource& image) {
+		                          return image.table_capacity != 0u;
+	                          });
 	const auto planning_only_handle = [&](const IR::Inst& handle) {
 		return !handle.Uses().empty() &&
 		       std::ranges::all_of(handle.Uses(), [&](const IR::Use& use) {
@@ -164,6 +167,12 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 			Fail(program, "native image descriptor index does not match shader topology");
 		}
 		count += image.mip_count;
+	}
+	const auto table_bases = IR::AllocateImageTableDescriptors(program.info.images, expected);
+	for (size_t index = 0; index < program.info.images.size(); ++index) {
+		if (program.info.images[index].table_descriptor_base != table_bases[index]) {
+			Fail(program, "native image table descriptors do not match shader topology");
+		}
 	}
 	expected[static_cast<size_t>(Kind::Samplers)] = static_cast<uint32_t>(program.info.samplers.size());
 	expected[static_cast<size_t>(Kind::Gds)] = uses_gds;
