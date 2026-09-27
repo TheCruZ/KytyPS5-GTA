@@ -694,9 +694,56 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program, co
 
 // Nonnegative affine coefficients for constant, local and workgroup coordinates. Reject modular
 // arithmetic that could wrap; runtime coverage also bounds the largest invocation index.
+// A dispatch sized in threads runs only the threads below the dispatch thread limit. A host
+// fill covers exactly those threads, so this predicate and its exec-masked writes are
+// equivalent to unconditional ones for fill analysis.
+static bool IsDispatchLimitPredicate(Value value) {
+	value = value.Resolve();
+	if (value == Value(true)) {
+		return true;
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr) {
+		return false;
+	}
+	if (inst->GetOpcode() == ValueOpcode::LogicalAnd) {
+		return IsDispatchLimitPredicate(inst->Arg(0)) && IsDispatchLimitPredicate(inst->Arg(1));
+	}
+	if (inst->GetOpcode() != ValueOpcode::ULessThan32) {
+		return false;
+	}
+	const auto builtin = [](Value operand, StageInputKind kind, uint32_t& axis) {
+		const auto* read = operand.Resolve().TryInstruction();
+		if (read == nullptr || read->GetOpcode() != ValueOpcode::GetBuiltin ||
+		    read->Arg(0).U32() != static_cast<uint32_t>(kind)) {
+			return false;
+		}
+		axis = read->Arg(1).U32();
+		return true;
+	};
+	uint32_t id_axis    = 0;
+	uint32_t limit_axis = 0;
+	return builtin(inst->Arg(0), StageInputKind::GlobalInvocationId, id_axis) &&
+	       builtin(inst->Arg(1), StageInputKind::DispatchThreadLimit, limit_axis) &&
+	       id_axis == limit_axis;
+}
+
+// Returns the value a write produces in the threads the dispatch runs.
+static Value StripDispatchLimitSelect(Value value) {
+	for (;;) {
+		value            = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::SelectU32 ||
+		    !IsDispatchLimitPredicate(inst->Arg(0))) {
+			return value;
+		}
+		value = inst->Arg(1);
+	}
+}
+
 static std::optional<std::array<uint64_t, 3>> FillIndex(Value value, uint32_t axis,
                                                       uint32_t depth = 0) {
-	value = value.Resolve();
+	value = StripDispatchLimitSelect(value);
 	if (depth > 32 || value.GetType() != Type::U32) {
 		return {};
 	}
@@ -781,7 +828,7 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		if (program.info.images.size() != 1 || memory.dmask != 1 || memory.data_bits != 32 ||
 		    memory.image_has_mip || memory.image_sample_flags != 0 || memory.image_r128 ||
 		    memory.image_dimension != Decoder::ImageDimension::Dim2DArray ||
-		    store->Arg(3).Resolve() != Value(true)) return {};
+		    !IsDispatchLimitPredicate(store->Arg(3))) return {};
 		const auto& image = program.info.images[memory.resource];
 		if (image.read || image.atomic || image.mip_mode != ImageMipMode::None) return {};
 		const auto* address = store->Arg(1).ResolveInstruction();
@@ -809,7 +856,7 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		                             ValueOpcode::StoreBufferU32x3, ValueOpcode::StoreBufferU32x4};
 		const auto           store_op = std::ranges::find(stores, op);
 		if (store_op == stores.end() || store->Arg(2).Resolve() != Value(0u) ||
-		    store->Arg(3).Resolve() != Value(0u) || store->Arg(5).Resolve() != Value(true))
+		    store->Arg(3).Resolve() != Value(0u) || !IsDispatchLimitPredicate(store->Arg(5)))
 			return {};
 		if (!memory.formatted || memory.typed || !memory.idxen || memory.offen || memory.offset != 0 ||
 		    memory.data_bits != 32 ||
@@ -822,7 +869,7 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		result.fill.words = memory.data_dwords;
 		data = store->Arg(4);
 	}
-	data = data.Resolve();
+	data = StripDispatchLimitSelect(data);
 	const auto*          vector = data.TryInstruction();
 	constexpr std::array composites {ValueOpcode::CompositeConstructU32x2,
 	                                 ValueOpcode::CompositeConstructU32x3,
@@ -831,7 +878,7 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	    (vector == nullptr || vector->GetOpcode() != composites[result.fill.words - 2]))
 		return {};
 	for (uint32_t i = 0; i < result.fill.words; ++i) {
-		const auto word = result.fill.words == 1 ? data : vector->Arg(i);
+		const auto word = StripDispatchLimitSelect(result.fill.words == 1 ? data : vector->Arg(i));
 		if (word.GetType() != Type::U32 ||
 		    !ValidateRuntimeValue(program, word, RuntimeValueType::Integer))
 			return {};

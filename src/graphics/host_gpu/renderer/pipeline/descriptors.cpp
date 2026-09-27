@@ -839,7 +839,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	prepared.buffers.reserve(layout.memory_offset_count);
 	EXIT_IF(prepared.shader_data.size() != layout.ShaderDataDwords());
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
-	          prepared.shader_data.end(), 0);
+	          prepared.shader_data.begin() + layout.DispatchThreadLimitDword(), 0);
 	auto pack_memory_offset = [&](uint32_t index, uint32_t offset) {
 		const auto dword = layout.memory_offset_dword + index / 4u;
 		const auto shift = (index % 4u) * 8u;

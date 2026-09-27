@@ -203,6 +203,8 @@ enum class StageInputKind {
 	LocalInvocationIndex,
 	GlobalInvocationId,
 	Parameter,
+	// Thread count of a USE_THREAD_DIMENSIONS dispatch, per axis, read from shader data.
+	DispatchThreadLimit,
 };
 
 enum class StageOutputKind {
@@ -432,11 +434,15 @@ struct BindingLayout {
 	uint32_t                       push_data_start_dword = PushData::NoStart;
 	uint32_t                       memory_offset_dword = 0;
 	uint32_t                       memory_offset_count = 0;
+	bool                           dispatch_thread_limit = false;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	[[nodiscard]] uint32_t DispatchThreadLimitDword() const {
 		return memory_offset_dword + (memory_offset_count + 3u) / 4u;
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return DispatchThreadLimitDword() + (dispatch_thread_limit ? 3u : 0u);
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;

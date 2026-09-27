@@ -15,6 +15,18 @@ namespace {
 	std::abort();
 }
 
+bool UsesDispatchThreadLimit(const Program& program) {
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() == ValueOpcode::GetBuiltin && inst.HasUses() &&
+			    inst.Arg(0).U32() == static_cast<uint32_t>(StageInputKind::DispatchThreadLimit)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 std::vector<uint32_t> CollectUserData(const Program& program) {
 	std::array<bool, NumScalarRegs> registers {};
 	for (const auto* block: program.blocks) {
@@ -107,6 +119,7 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	next.user_data_registers = CollectUserData(program);
 	next.memory_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
 	next.memory_offset_count       = static_cast<uint32_t>(buffers.size());
+	next.dispatch_thread_limit     = UsesDispatchThreadLimit(program);
 	next.push_data_start_dword =
 	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 
