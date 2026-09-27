@@ -77,6 +77,10 @@ public:
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	// Fills memory the emulator itself rewrites, such as consumed color metadata, without
+	// invalidating images over it. Memory the GPU owns is filled on the GPU, so the fill never
+	// drains it; other memory gets a backing write.
+	void FillInternalMemory(uint64_t vaddr, uint64_t size, uint32_t value);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
@@ -108,6 +112,11 @@ public:
 		m_released_ranges.Clear();
 		m_record_released = true;
 	}
+	// Guest ranges whose GPU contents are a uniform 32-bit value written by a recorded compute
+	// fill. Lets CPU-side consumers read the value without draining the GPU.
+	void               NoteKnownFill(uint64_t vaddr, uint64_t size, uint32_t value);
+	[[nodiscard]] bool KnownFill(uint64_t vaddr, uint64_t size, uint32_t& value) const;
+	void               ForgetKnownFills(uint64_t vaddr, uint64_t size);
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	// Uploads the pending CPU writes of the buffers within `ranges`. Unless `all`, visits only the
 	// tracking regions whose pages became CPU dirty since the previous call: that call left no
@@ -180,6 +189,7 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	std::map<uint64_t, std::pair<uint64_t, uint32_t>> m_known_fills;
 	// CPU-dirty epoch of each tracking region as SynchronizeBuffersInRanges last visited it.
 	std::unordered_map<uint64_t, uint64_t>     m_synced_region_epochs;
 	std::vector<std::pair<uint64_t, uint64_t>> m_sync_regions;
