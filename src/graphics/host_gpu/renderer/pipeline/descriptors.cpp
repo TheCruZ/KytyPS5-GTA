@@ -1022,37 +1022,77 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	}
 }
 
-void RenderExecutor::RebindImages(PreparedBindings& prepared) {
-	KYTY_PROFILER_FUNCTION();
+bool RenderExecutor::IsStaleImageBinding(const TextureBinding& binding) {
+	const auto* image = m_context.GetTextureCache().m_slot_images.try_get(binding.image_id);
+	return image == nullptr || (!image->registered && !image->info.data.Empty()) ||
+	       image->binding.needs_rebind;
+}
+
+bool RenderExecutor::ResolveStaleImages(PreparedBindings& prepared) {
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = *prepared.runtime->program;
 	const auto& snapshot = *prepared.runtime->resources;
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
-	const auto stale = [&](const TextureBinding& binding) {
-		const auto* image = texture_cache.m_slot_images.try_get(binding.image_id);
-		return image == nullptr || (!image->registered && !image->info.data.Empty()) ||
-		       image->binding.needs_rebind;
-	};
-	// Table elements may share images with each other and with the direct images: decide which
-	// are stale before any rebind clears an image's binding state.
+	// Bindings may share images: decide which are stale before any rebind clears an image's
+	// binding state.
+	std::vector<bool> stale_images(images.size());
 	std::vector<bool> stale_tables(prepared.table_images.size());
+	bool              any = false;
+	for (size_t i = 0; i < images.size(); i++) {
+		any |= stale_images[i] = IsStaleImageBinding(images[i]);
+	}
 	for (size_t k = 0; k < prepared.table_images.size(); k++) {
-		stale_tables[k] = stale(prepared.table_images[k]);
+		any |= stale_tables[k] = IsStaleImageBinding(prepared.table_images[k]);
+	}
+	if (!any) {
+		return false;
 	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
-		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
-		    old_image->binding.needs_rebind) {
-			if (old_image != nullptr) {
-				old_image->binding = {};
-			}
-			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
-			BindImage(images[i].image_id,
-			          images[i].desc.type == TextureCache::BindingType::Storage);
+		if (!stale_images[i]) {
+			continue;
+		}
+		if (auto* old_image = texture_cache.m_slot_images.try_get(images[i].image_id)) {
+			old_image->binding = {};
+		}
+		images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
+		BindImage(images[i].image_id, images[i].desc.type == TextureCache::BindingType::Storage);
+	}
+	for (size_t k = 0; k < prepared.table_images.size(); k++) {
+		if (!stale_tables[k]) {
+			continue;
+		}
+		auto& texture = prepared.table_images[k];
+		if (auto* old_image = texture_cache.m_slot_images.try_get(texture.image_id)) {
+			old_image->binding = {};
+		}
+		texture = ResolveTableTexture(program.info.images.at(prepared.table_roots[k]),
+		                              prepared.table_sources[k]);
+		BindImage(texture.image_id, false);
+	}
+	return true;
+}
+
+void RenderExecutor::RebindImages(PreparedBindings& prepared) {
+	KYTY_PROFILER_FUNCTION();
+	// Rediscovering one binding can replace (expand, merge or recreate) the image another binding,
+	// direct or table element, already resolved to. Repeat until every binding names a current
+	// image before acquiring any view.
+	for (uint32_t pass = 0; ResolveStaleImages(prepared); pass++) {
+		if (pass == MaxRebindPasses) {
+			EXIT("image bindings did not settle after %u rediscovery passes\n", MaxRebindPasses);
 		}
 	}
+	AcquireImageViews(prepared);
+}
+
+void RenderExecutor::AcquireImageViews(PreparedBindings& prepared) {
+	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
+	const auto& program       = *prepared.runtime->program;
+	auto&       images        = prepared.images;
+	auto&       texture_cache = m_context.GetTextureCache();
+	EXIT_IF(images.size() != program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto& binding = images[i];
 		binding.mip_views.clear();
@@ -1076,16 +1116,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		image.usage.storage |= storage;
 		image.usage.texture |= !storage;
 	}
-	for (size_t k = 0; k < prepared.table_images.size(); k++) {
-		auto& texture = prepared.table_images[k];
-		if (stale_tables[k]) {
-			if (auto* old_image = texture_cache.m_slot_images.try_get(texture.image_id)) {
-				old_image->binding = {};
-			}
-			texture = ResolveTableTexture(program.info.images.at(prepared.table_roots[k]),
-			                              prepared.table_sources[k]);
-			BindImage(texture.image_id, false);
-		}
+	for (auto& texture: prepared.table_images) {
 		texture.image_view = texture_cache.FindTexture(texture.image_id, texture.desc);
 		texture_cache.GetImage(texture.image_id).usage.texture = true;
 	}
@@ -1101,23 +1132,40 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	if (uses_dma) {
 		m_context.PrepareBda();
 	}
-	for (auto* stage: stages) {
-		RebindImages(*stage);
-	}
 	auto& cache = m_context.GetTextureCache();
-	for (auto& target: colors) {
-		EXIT_IF(!target.image_id);
-		const auto old_image = cache.m_slot_images.try_get(target.image_id);
-		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
-		    old_image->binding.needs_rebind) {
-			if (old_image != nullptr) {
-				old_image->binding = {};
-			}
-			target.desc.view_info.base_level = target.guest_mip_level;
-			target.desc.view_info.base_layer = target.guest_array_layer;
-			target.image_id = cache.FindImage(target.desc);
-			BindRenderTarget(target.image_id);
+	// Rediscovering a texture of one stage, or a color target, can replace an image that another
+	// stage or target already resolved to. Settle every identity before acquiring views.
+	for (uint32_t pass = 0;; pass++) {
+		if (pass > MaxRebindPasses) {
+			EXIT("graphics image bindings did not settle after %u rediscovery passes\n",
+			     MaxRebindPasses);
 		}
+		bool changed = false;
+		for (auto* stage: stages) {
+			changed |= ResolveStaleImages(*stage);
+		}
+		for (auto& target: colors) {
+			EXIT_IF(!target.image_id);
+			const auto old_image = cache.m_slot_images.try_get(target.image_id);
+			if (old_image == nullptr ||
+			    (!old_image->registered && !old_image->info.data.Empty()) ||
+			    old_image->binding.needs_rebind) {
+				if (old_image != nullptr) {
+					old_image->binding = {};
+				}
+				target.desc.view_info.base_level = target.guest_mip_level;
+				target.desc.view_info.base_layer = target.guest_array_layer;
+				target.image_id                  = cache.FindImage(target.desc);
+				BindRenderTarget(target.image_id);
+				changed = true;
+			}
+		}
+		if (!changed) {
+			break;
+		}
+	}
+	for (auto* stage: stages) {
+		AcquireImageViews(*stage);
 	}
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
 	// after image identities are final; attachment layout transitions follow buffer alias copies.
