@@ -123,6 +123,9 @@ struct BufferResource {
 	// selects the targets of IndirectBuffer stores; the host caches every entry it names.
 	bool                   indirect_write_table  = false;
 	uint32_t               indirect_table_offset = 0;
+	// NUM_RECORDS is computed by the shader and zeroed in the source; the host binds the range
+	// that one record per dispatched thread can reach.
+	bool                   dynamic_records = false;
 
 	bool operator==(const BufferResource& other) const = default;
 };
