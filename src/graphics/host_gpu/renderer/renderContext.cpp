@@ -141,9 +141,16 @@ void RenderContext::PrepareBda() {
 	}
 	m_buffer_cache.PrepareFaultBuffer();
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
+	// Nothing to upload when no page became CPU dirty, no buffer was registered and no range was
+	// mapped since the last synchronization started.
+	const std::array<uint64_t, 3> epochs {RegionManager::CpuDirtyEpoch(),
+	                                      m_buffer_cache.RegisterEpoch(), m_mapped_ranges_version};
+	if (epochs != m_bda_sync_epochs) {
+		// A new buffer or mapped range may cover CPU-dirty pages that earlier passes skipped.
+		const bool all = epochs[1] != m_bda_sync_epochs[1] || epochs[2] != m_bda_sync_epochs[2];
+		m_buffer_cache.SynchronizeBuffersInRanges(m_mapped_ranges, all);
+		m_bda_sync_epochs = epochs;
+	}
 	m_fault_process_pending = true;
 }
 

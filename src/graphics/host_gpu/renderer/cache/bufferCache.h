@@ -13,6 +13,7 @@
 
 #include <map>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -108,6 +109,14 @@ public:
 		m_record_released = true;
 	}
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Uploads the pending CPU writes of the buffers within `ranges`. Unless `all`, visits only the
+	// tracking regions whose pages became CPU dirty since the previous call: that call left no
+	// pending write under a buffer anywhere else in `ranges`, provided no buffer was registered
+	// and `ranges` did not change since. Callers pass `all` otherwise.
+	void SynchronizeBuffersInRanges(const RangeSet& ranges, bool all);
+	// Advances whenever a buffer is registered: a new buffer may cover CPU-dirty pages that no
+	// earlier synchronization uploaded.
+	[[nodiscard]] uint64_t RegisterEpoch() const { return m_register_epoch; }
 	void               RunGarbageCollector();
 
 private:
@@ -167,9 +176,13 @@ private:
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
 	uint64_t                                          m_total_used_memory  = 0;
+	uint64_t                                          m_register_epoch     = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	// CPU-dirty epoch of each tracking region as SynchronizeBuffersInRanges last visited it.
+	std::unordered_map<uint64_t, uint64_t>     m_synced_region_epochs;
+	std::vector<std::pair<uint64_t, uint64_t>> m_sync_regions;
 };
 
 } // namespace Libs::Graphics

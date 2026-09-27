@@ -97,6 +97,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		const auto [it, inserted] = m_buffers.emplace(buffer.CpuAddress(), id);
 		(void)it;
 		EXIT_IF(!inserted);
+		m_register_epoch++;
 		m_total_used_memory += buffer.Size();
 		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
 		std::vector<vk::DeviceAddress> addresses;
@@ -705,20 +706,65 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 	}
 }
 
-void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
-	const auto end = vaddr + size;
-	auto       it  = m_buffers.upper_bound(vaddr);
-	if (it != m_buffers.begin()) {
-		--it;
-	}
-	for (; it != m_buffers.end() && it->first < end; ++it) {
-		auto&      buffer = m_slot_buffers[it->second];
-		const auto start  = std::max(buffer.CpuAddress(), vaddr);
-		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
-		if (start < finish) {
-			(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
+void BufferCache::SynchronizeBuffersInRanges(const RangeSet& ranges, bool all) {
+	// Read each region's epoch before scanning it: pages dirtied during or after the scan advance
+	// it again, and the next call visits the region again.
+	m_sync_regions.clear();
+	ranges.ForEach([&](uint64_t start, uint64_t end) {
+		for (auto index = start / TRACKER_REGION_SIZE; index * TRACKER_REGION_SIZE < end; index++) {
+			if (!m_sync_regions.empty() && m_sync_regions.back().first == index) {
+				continue;
+			}
+			const auto epoch = m_memory_tracker.RegionCpuDirtyEpoch(index);
+			if (!all) {
+				// Synchronizing a buffer tracks its pages, so an untracked region holds no buffer
+				// since the last full pass.
+				if (epoch == 0) {
+					continue;
+				}
+				const auto synced = m_synced_region_epochs.find(index);
+				if (synced != m_synced_region_epochs.end() && synced->second == epoch) {
+					continue;
+				}
+			}
+			m_sync_regions.emplace_back(index, epoch);
+		}
+	});
+	if (all) {
+		m_synced_region_epochs.clear();
+		ranges.ForEach([this](uint64_t start, uint64_t end) {
+			SynchronizeBuffersInRange(start, end - start);
+		});
+	} else {
+		for (const auto& [index, epoch]: m_sync_regions) {
+			ranges.ForEachInRange(index * TRACKER_REGION_SIZE, TRACKER_REGION_SIZE,
+			                      [this](uint64_t start, uint64_t end) {
+				                      SynchronizeBuffersInRange(start, end - start);
+			                      });
 		}
 	}
+	for (const auto& [index, epoch]: m_sync_regions) {
+		m_synced_region_epochs[index] = epoch;
+	}
+}
+
+void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
+	// Only tracking regions with pending CPU writes can have anything to upload.
+	m_memory_tracker.ForEachCpuDirtySpan(vaddr, size, [&](uint64_t span, uint64_t span_size) {
+		const auto end = span + span_size;
+		auto       it  = m_buffers.upper_bound(span);
+		if (it != m_buffers.begin()) {
+			--it;
+		}
+		for (; it != m_buffers.end() && it->first < end; ++it) {
+			auto&      buffer = m_slot_buffers[it->second];
+			const auto start  = std::max(buffer.CpuAddress(), span);
+			const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+			if (start < finish) {
+				(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
+			}
+		}
+	});
 }
 
 } // namespace Libs::Graphics
