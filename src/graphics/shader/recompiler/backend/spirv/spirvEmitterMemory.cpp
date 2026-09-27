@@ -1206,21 +1206,12 @@ void EmitSharedFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst) {
 			    const auto data = ctx.state.builder.AllocateId();
 			    ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), data,
 			                                  ctx.scratch_u32_variable);
+			    // The ISA pseudo-code compares against DATA1, but compilers encode these as
+			    // one-data atomics (DATA1 = v0) and hardware computes min/max(MEM, DATA0).
 			    AtomicUpdate(
 			        ctx.state, EmitMemoryElementPointer(ctx.state, access.resource, access.index),
 			        mem.kind, [&](uint32_t old) {
-				        const auto old_f =
-				            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), old);
-				        const auto compare_f =
-				            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), ctx.Arg(inst, 2));
-				        const auto data_f =
-				            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), data);
-				        const auto compare = Binary(
-				            ctx.state, max_value ? spv::OpFOrdGreaterThan : spv::OpFOrdLessThan,
-				            TypeBool(ctx.state), max_value ? old_f : compare_f,
-				            max_value ? compare_f : old_f);
-				        return Unary(ctx.state, spv::OpBitcast, TypeU32(ctx.state),
-				                     Select(ctx.state, TypeF32(ctx.state), compare, data_f, old_f));
+				        return EmitFloatAtomicReplacement(ctx.state, old, data, max_value);
 			        });
 		    });
 	});
