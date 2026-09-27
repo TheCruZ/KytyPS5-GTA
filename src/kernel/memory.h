@@ -201,6 +201,9 @@ MapCost MapCostSnapshot();
 void SetUnhandledFaultHook(void (*hook)(uint64_t vaddr));
 
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
+// Changes whenever backing is mapped or unmapped, or a PRT aperture changes: an unchanged value
+// means IsBackingReadable still answers as before.
+[[nodiscard]] uint64_t BackingEpoch() noexcept;
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 // Like ClampRangeSize, but 0 for a range that starts outside committed memory instead of EXIT.
 [[nodiscard]] uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size);

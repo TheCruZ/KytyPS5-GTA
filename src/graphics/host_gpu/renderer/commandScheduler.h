@@ -94,6 +94,9 @@ public:
 	void EnableRecordingThread();
 	// The current command buffer's commands go through the recording thread.
 	[[nodiscard]] bool Threaded() const noexcept { return m_threaded; }
+	// The most one Stash() or Record() can take: a larger copy is made another way (a bindless
+	// image table's descriptor array is megabytes).
+	static constexpr size_t MaxStashBytes = 128 * 1024;
 	// Queues fn(vk::CommandBuffer) for the recording thread (threaded only). Captures must be
 	// values; arrays go through Stash().
 	template <typename F>

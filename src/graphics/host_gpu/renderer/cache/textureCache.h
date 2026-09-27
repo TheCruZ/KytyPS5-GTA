@@ -62,6 +62,10 @@ public:
 	KYTY_CLASS_NO_COPY(TextureCache);
 
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// Lookup for bindings the shader may never read (bindless table candidates). It resolves
+	// like FindImage but returns an empty id instead of converting a depth image to color or
+	// back: those conversions replace the image other passes use, which then convert it again.
+	[[nodiscard]] ImageId FindImageSpeculative(ImageDesc& desc, bool exact_format = false);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
@@ -92,6 +96,11 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
+	// Advances whenever an image is registered or unregistered.
+	[[nodiscard]] uint64_t ImageSetEpoch() const { return m_image_set_epoch; }
+	// The ImageSetEpoch of the last registration or unregistration of an image overlapping the
+	// range's pages: while it is unchanged, a lookup in the range finds the same images.
+	[[nodiscard]] uint64_t ImageEpochInRegion(uint64_t address, uint64_t size);
 	void RunGarbageCollector();
 	// The guest no longer refers to this bindless image from any heap entry (it replaced or
 	// cleared them): free it once no draw has used it for a few frames (engine method).
@@ -124,6 +133,8 @@ private:
 		ImageId image;
 		int32_t mip   = -1;
 		int32_t layer = -1;
+		// Speculative lookups only: resolving the overlap would replace an owned image.
+		bool rejected = false;
 	};
 
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
@@ -187,7 +198,11 @@ private:
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
-	                                           ImageId cached, ImageId merged);
+	                                           ImageId cached, ImageId merged,
+	                                           bool speculative = false);
+	[[nodiscard]] ImageId       FindImageImpl(ImageDesc& desc, bool exact_format, bool speculative);
+	[[nodiscard]] static bool   DepthOverlapNeedsRecreate(const ImageInfo& requested,
+	                                                      BindingType binding, const Image& cached);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
@@ -219,6 +234,8 @@ private:
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
+	// Whether a cached image in the region holds bytes the GPU wrote that guest memory lacks.
+	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 	// evicting: the collector writes the image back before freeing it; the write is dropped if
 	// the guest bytes change before it lands (KYTY_EVICT_WRITEBACK_GUARD).
 	// `landed`, when given, is set once the write-back has reached guest memory (or was dropped
@@ -251,6 +268,9 @@ private:
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
 	RegisteredPageCounts                              m_registered_pages;
+	MultiLevelPageTable<uint64_t, ImagePageTable::kPageBits, ImagePageTable::kAddressSpaceBits,
+	                    ImagePageTable::kFirstLevelBits>
+	    m_image_page_epochs;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::unordered_set<ImageId>                       m_bindless_evictable;
@@ -298,6 +318,7 @@ private:
 	// stretch without presents (a loading screen) still ages its entries.
 	[[nodiscard]] uint64_t LruClock() const noexcept;
 	mutable uint32_t m_image_query_epoch      = 0;
+	uint64_t         m_image_set_epoch        = 0;
 	bool             m_readback_linear_images = false;
 	bool             m_readback_tiled_images  = false;
 	// Lookups that found an existing image with the same backing, by description: while no image

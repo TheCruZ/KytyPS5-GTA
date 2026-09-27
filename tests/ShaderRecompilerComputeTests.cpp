@@ -17391,7 +17391,8 @@ public:
                 const Image *storage_image_uint = nullptr,
                 vk::Sampler sampler = nullptr,
                 std::span<const Image> image_resources = {},
-                std::span<const vk::Sampler> sampler_resources = {}) {
+                std::span<const vk::Sampler> sampler_resources = {},
+                std::span<const Image> table_images = {}) {
     using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
     const auto &layout = compiled.program.bindings;
     auto shader_data = compiled.packed_user_data;
@@ -17682,6 +17683,14 @@ public:
               ? storage_image : storage_image_uint;
       Require(test.name, "dispatch", source_image != nullptr,
               "image descriptor requested but no matching image was provided");
+      // The slots of a bindless image table follow the resources of the binding.
+      for (u32 slot = 0; image.table_capacity != 0u && !table_images.empty() &&
+                         slot < image.table_capacity; ++slot) {
+        const auto &table_image = table_images[std::min<size_t>(slot, table_images.size() - 1u)];
+        auto &info = infos[image.table_descriptor_base + slot];
+        info.imageView = table_image.view;
+        info.imageLayout = table_image.layout;
+      }
       for (u32 mip_index = 0; mip_index < image.mip_count; ++mip_index) {
         auto &info = infos[image.descriptor_index + mip_index];
         info.imageView = source_image->view;
@@ -41403,8 +41412,17 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
     const auto producer_shader = CompileCase(producer, vulkan.SubgroupSize());
     auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
     vulkan.Dispatch(producer, producer_shader, buffer);
+    // A bindless image table (the fork's GPU-indexed T# tables) binds one image per distinct T#.
+    std::vector<VulkanHarness::Image> table_images;
+    for (const auto &table : compiled.resources.image_tables)
+      for (const auto &slot : table.slots)
+        table_images.push_back(vulkan.CreateImage2D(test.name, 2, 1, vk::Format::eR32Sfloat,
+            vk::ImageUsageFlagBits::eSampled,
+            {0u, std::bit_cast<u32>(float(slot.dwords[0]))}, 1,
+            vk::ImageLayout::eShaderReadOnlyOptimal));
     vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr,
-                     nullptr, images, samplers);
+                     nullptr, images, samplers, table_images);
+    for (auto &image : table_images) vulkan.DestroyImage(&image);
     CompareWords(test, "GPU-selected parent/child, paired sampler, EXEC restoration and canaries",
                  test.expected, vulkan.ReadBuffer(test.name, buffer, test.expected.size()));
     vulkan.DestroyBuffer(&buffer);
@@ -47424,6 +47442,19 @@ void CheckImageSamplerSpecialization() {
     ResourceSpecialization specialization;
     const SrtRuntime runtime{.user_data = user_data, .read_memory = ReadTestMemory,
                              .userdata = &memory, .read_specialization_memory = ReadTestMemory};
+    // The fork binds the whole T# table (bindless) before expanding bounded material keys:
+    // GTA V's ray tracing shaders select among ~500 material T#s, and one image per key took
+    // the driver minutes to compile.
+    Require(name, "bindless table material plan",
+            !translated.program.has_address_writes &&
+                MaterializeResources(plan, runtime, snapshot, specialization) &&
+                !specialization.images.empty() &&
+                std::ranges::any_of(specialization.images,
+                                    [](const auto &image) { return image.table_capacity != 0u; }) &&
+                snapshot.image_tables.size() == 1u &&
+                snapshot.image_tables[0].mapping.size() == count + 1u,
+            "GPU-selected material descriptors did not bind the T# table");
+    continue;
     Require(name, "bounded native material plan",
             plan.capture_specialization_reads && !translated.program.has_address_writes &&
                 MaterializeResources(plan, runtime, snapshot, specialization) &&
@@ -50221,11 +50252,14 @@ int main(int argc, char **argv) {
   // Frank's readback window (KYTY_READBACK_WINDOW_KB, default 4096) widens every download.
 #ifdef _WIN32
   _putenv("KYTY_READBACK_WINDOW_KB=0");
+  // The T# table cases exercise the sampled-array path, which is opt-in.
+  _putenv("KYTY_IMAGE_TABLES=1");
   // And upstream's materialization contract: a count the GPU wrote and the host cannot read clean
   // fails the evaluation (the fork's dynamic bounds read it on the GPU instead).
   _putenv("KYTY_GPU_SIZED_DYNAMIC=0");
 #else
   setenv("KYTY_READBACK_WINDOW_KB", "0", 1);
+  setenv("KYTY_IMAGE_TABLES", "1", 1);
   setenv("KYTY_GPU_SIZED_DYNAMIC", "0", 1);
 #endif
   EnsureConfigInitialized();

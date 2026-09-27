@@ -38,6 +38,10 @@ struct ResourceSpecialization {
 		uint32_t                      indirect_root              = ImageResource::NoIndirectImage;
 		uint32_t                      indirect_mapping_offset    = 0;
 		uint32_t                      indirect_search_iterations = 0;
+		uint32_t                      table                      = ImageResource::NoImageTable;
+		uint32_t                      table_capacity             = 0;
+		uint32_t                      table_mapping_offset       = 0;
+		uint32_t                      table_entry_mask           = 0;
 		bool                          cube                       = false;
 		bool                          fmask                      = false;
 		bool                          bindless                   = false;
@@ -74,6 +78,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 // Diagnostics: the source line of the indirect-image check that failed the last
 // MaterializeResources call on this thread, or 0.
 int LastIndirectImageFailureLine();
+
+// Whether the host can bind a bindless table T# in the descriptor array of a specialized root.
+bool ImageTableSlotCompatible(const ImageResource& root, const DescriptorValue& descriptor);
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);

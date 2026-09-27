@@ -403,6 +403,16 @@ static callback_func_t g_test_before_backing_map                   = nullptr;
 static callback_func_t g_test_backing_read                         = nullptr;
 #endif
 
+static std::atomic<uint64_t> g_backing_epoch {0};
+
+static void BumpBackingEpoch() noexcept {
+	g_backing_epoch.fetch_add(1, std::memory_order_acq_rel);
+}
+
+uint64_t BackingEpoch() noexcept {
+	return g_backing_epoch.load(std::memory_order_acquire);
+}
+
 #include "memoryAddressSpace.inc"
 
 enum class VirtualRangeType {
@@ -524,6 +534,7 @@ public:
 		r.disallow_merge = disallow_merge;
 		CopyVirtualRangeName(r.name, name);
 		MergeAroundUnlocked(m_ranges.emplace(start, r).first);
+		BumpBackingEpoch();
 		return true;
 	}
 
@@ -532,6 +543,7 @@ public:
 		RecordRangeChange('R', start, size, 0, 0);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
+		BumpBackingEpoch();
 
 		if (const auto it = m_ranges.find(start); it != m_ranges.end() && it->second.size == size) {
 			m_ranges.erase(it);
@@ -3088,6 +3100,7 @@ int KYTY_SYSV_ABI KernelSetPrtAperture(int index, void* addr, size_t len) {
 		g_prt_apertures[static_cast<size_t>(index)] =
 		    len == 0 ? PrtAperture {} : PrtAperture {address, static_cast<uint64_t>(len)};
 	}
+	BumpBackingEpoch();
 	if (len != 0) {
 		MapGpuRange(address, len);
 	}

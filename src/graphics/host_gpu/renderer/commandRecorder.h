@@ -140,6 +140,12 @@ public:
 			m_direct.pushDescriptorSetKHR(bind_point, layout, set, count, writes);
 			return;
 		}
+		if (WritesTooLarge(writes, count)) {
+			// A bindless image table: record it directly after the recording thread caught up.
+			m_scheduler->DrainRecording().pushDescriptorSetKHR(bind_point, layout, set, count,
+			                                                   writes);
+			return;
+		}
 		const auto* copy = StashWrites(writes, count);
 		m_scheduler->Record([=](vk::CommandBuffer command) {
 			command.pushDescriptorSetKHR(bind_point, layout, set, count, copy);
@@ -153,6 +159,15 @@ public:
 		if (!Threaded()) {
 			device.updateDescriptorSets(count, writes, 0, nullptr);
 			m_direct.bindDescriptorSets(bind_point, layout, 0, 1, &set, 0, nullptr);
+			return;
+		}
+		if (WritesTooLarge(writes, count)) {
+			// A bindless image table's descriptor array does not fit the recording chunk. The set
+			// is fresh (no recorded command or pending work uses it), so it is updated here.
+			device.updateDescriptorSets(count, writes, 0, nullptr);
+			m_scheduler->Record([=](vk::CommandBuffer command) {
+				command.bindDescriptorSets(bind_point, layout, 0, 1, &set, 0, nullptr);
+			});
 			return;
 		}
 		const auto* copy = StashWrites(writes, count);
@@ -503,6 +518,19 @@ private:
 		for (uint32_t i = 0; i < count; i++) {
 			EXIT_IF(items[i].pNext != nullptr);
 		}
+	}
+	// Whether the writes' info arrays are too large to stash.
+	static bool WritesTooLarge(const vk::WriteDescriptorSet* writes, uint32_t count) {
+		for (uint32_t i = 0; i < count; i++) {
+			const auto& write = writes[i];
+			const size_t bytes =
+			    write.pImageInfo != nullptr ? write.descriptorCount * sizeof(vk::DescriptorImageInfo)
+			    : write.pBufferInfo != nullptr
+			        ? write.descriptorCount * sizeof(vk::DescriptorBufferInfo)
+			        : 0u;
+			if (bytes > CommandScheduler::MaxStashBytes) return true;
+		}
+		return false;
 	}
 	// A deep copy of descriptor writes: the writes and the info arrays they point to.
 	const vk::WriteDescriptorSet* StashWrites(const vk::WriteDescriptorSet* writes,

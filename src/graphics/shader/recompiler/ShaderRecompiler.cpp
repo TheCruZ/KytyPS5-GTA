@@ -1175,7 +1175,8 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 			} else if (op == IR::ValueOpcode::GetImageResource) {
 				const auto resource = inst.Flags<uint32_t>();
 				first = resource < ir.info.images.size() &&
-				                ir.info.images[resource].indirect_root == resource ? 1u : 0u;
+				                (ir.info.images[resource].indirect_root == resource ||
+				                 ir.info.images[resource].table_capacity != 0u) ? 1u : 0u;
 			} else if (op == IR::ValueOpcode::GetSamplerResource) {
 				// A bindless sampler handle carries its GPU-computed key in dword 0 (the shader
 				// indexes the mirrored sampler heap with it, BindlessSamplerSlot), as a bindless
