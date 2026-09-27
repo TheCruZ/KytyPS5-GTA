@@ -6,6 +6,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -113,6 +114,25 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 	if (samplers > limits.maxDescriptorSetSamplers) {
 		EXIT("native sampler descriptors exceed device limit: %" PRIu64 "/%u\n",
 		     samplers, limits.maxDescriptorSetSamplers);
+	}
+	// Bindless image tables can need more sampled images than the device or a descriptor pool
+	// provides: fail clearly instead of creating an invalid layout.
+	uint64_t                 sampled_images = 0;
+	std::array<uint64_t, 32> stage_sampled {};
+	for (const auto& binding: bindings) {
+		if (binding.descriptorType != vk::DescriptorType::eSampledImage) continue;
+		sampled_images += binding.descriptorCount;
+		for (auto stages = static_cast<uint32_t>(binding.stageFlags); stages != 0; stages &= stages - 1u)
+			stage_sampled[std::countr_zero(stages)] += binding.descriptorCount;
+	}
+	const auto max_stage_sampled = *std::ranges::max_element(stage_sampled);
+	if (sampled_images > limits.maxDescriptorSetSampledImages ||
+	    max_stage_sampled > limits.maxPerStageDescriptorSampledImages ||
+	    sampled_images > DescriptorHeap::MaxSampledImages) {
+		EXIT("pipeline needs %" PRIu64 " sampled images (%" PRIu64 " in one stage); the device allows "
+		     "%u per set and %u per stage, a descriptor pool holds %u\n",
+		     sampled_images, max_stage_sampled, limits.maxDescriptorSetSampledImages,
+		     limits.maxPerStageDescriptorSampledImages, DescriptorHeap::MaxSampledImages);
 	}
 	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
 
