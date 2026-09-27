@@ -1928,7 +1928,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	return true;
 }
 
-void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
+void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, bool possible_write) {
 	if (!GuestRange {address, size}.Valid()) {
 		return;
 	}
@@ -1936,6 +1936,11 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto& image = m_slot_images[id];
 		if (image.info.data.address != address) {
+			continue;
+		}
+		// Invalidation replaces the native contents with the buffer's bytes, which never received
+		// this image's GPU writes. For a write that may not happen, keep the native contents.
+		if (possible_write && (image.IsGpuModified() || image.depth_id)) {
 			continue;
 		}
 		if (image.IsGpuModified()) {

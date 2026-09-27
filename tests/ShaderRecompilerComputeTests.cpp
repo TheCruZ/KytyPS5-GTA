@@ -2095,6 +2095,90 @@ public:
     std::printf("[host]    %-32s ok\n", "DescriptorHeapLargeSet");
   }
 
+  // A dynamic-records buffer range only bounds what the shader may write: it must not replace a
+  // GPU-written image with the buffer's stale bytes, while a real buffer store still must.
+  void CheckPossibleWriteKeepsImages() {
+    constexpr const char *name = "PossibleWriteKeepsImages";
+    constexpr uintptr_t base = 0x0000000207000000ull;
+    constexpr uint64_t allocation_size = 0x1000000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t image_address = base + 0x100000;
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      context.InitializeGpu(nullptr);
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &texture_cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+
+      // 64x64 RGBA8, 64 KiB-swizzled.
+      constexpr uint32_t side = 64;
+      ShaderRecompiler::IR::DescriptorValue descriptor{};
+      descriptor.dword_count = 8;
+      descriptor.dwords = {
+          static_cast<uint32_t>(image_address >> 8u),
+          (static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8UNorm) << 20u) |
+              (((side - 1u) & 3u) << 30u),
+          ((side - 1u) >> 2u) | ((side - 1u) << 14u),
+          0x90900facu,
+          0,
+          0x00700000u,
+          0,
+          0};
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+
+      ShaderRecompiler::IR::CompiledShaderInfo program{};
+      program.stage = ShaderType::Compute;
+      program.info.images = {resource};
+      ShaderRecompiler::IR::ResourceSnapshot snapshot{};
+      snapshot.images = {descriptor};
+      ShaderStageRuntime runtime{&program, &snapshot};
+
+      PreparedBindings prepared;
+      executor.PrepareBindings(runtime, prepared);
+      const auto written_id = prepared.images[0].image_id;
+      texture_cache.MarkGpuWritten(written_id);
+      texture_cache.InvalidateMemoryFromGPU(image_address, 0x100, true);
+      Require(name, "possible write keeps native contents",
+              texture_cache.GetImage(written_id).IsGpuModified() &&
+                  !texture_cache.GetImage(written_id).IsBufferModified(),
+              "a possible dynamic-records store discarded a GPU-written image");
+      texture_cache.InvalidateMemoryFromGPU(image_address, 0x100);
+      Require(name, "buffer store invalidates native contents",
+              !texture_cache.GetImage(written_id).IsGpuModified() &&
+                  texture_cache.GetImage(written_id).IsBufferModified(),
+              "a buffer store did not invalidate the overlapping image");
+      RenderExecutorTestAccess::ResetBindings(executor);
+      scheduler.Finish();
+    }
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckGraphicsPushConstantBank() {
     constexpr const char *name = "GraphicsPushConstantStages";
     EnsureRuntimeContext();
@@ -41367,6 +41451,11 @@ int main(int argc, char **argv) {
     vulkan.CheckDescriptorHeapLargeSet();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--possible-write-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckPossibleWriteKeepsImages();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--push-constant-bank-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGraphicsPushConstantBank();
@@ -41923,6 +42012,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
+    vulkan.CheckPossibleWriteKeepsImages();
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     vulkan.CheckIndirectWriteTables();
 #endif
