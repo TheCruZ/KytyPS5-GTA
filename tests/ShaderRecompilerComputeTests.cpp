@@ -2070,6 +2070,21 @@ public:
                   prepared.images[1].image_view != nullptr,
               "a binding kept an image replaced by another binding's rediscovery");
       RenderExecutorTestAccess::ResetBindings(executor);
+
+      // A V# table store only possibly writes each entry: it must not replace a GPU-written
+      // image with the buffer's stale bytes, while a real buffer store still must.
+      texture_cache.MarkGpuWritten(prepared.images[1].image_id);
+      const auto written_id = prepared.images[1].image_id;
+      texture_cache.InvalidateMemoryFromGPU(image_address, 0x100, true);
+      Require(name, "possible write keeps native contents",
+              texture_cache.GetImage(written_id).IsGpuModified() &&
+                  !texture_cache.GetImage(written_id).IsBufferModified(),
+              "a possible V# table store discarded a GPU-written image");
+      texture_cache.InvalidateMemoryFromGPU(image_address, 0x100);
+      Require(name, "buffer store invalidates native contents",
+              !texture_cache.GetImage(written_id).IsGpuModified() &&
+                  texture_cache.GetImage(written_id).IsBufferModified(),
+              "a buffer store did not invalidate the overlapping image");
       scheduler.Finish();
     }
     std::printf("[gpu]     %-32s ok\n", name);

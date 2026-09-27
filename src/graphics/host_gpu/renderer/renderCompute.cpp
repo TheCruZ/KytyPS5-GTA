@@ -127,7 +127,9 @@ static bool PrepareIndirectWriteTargets(RenderContext& context, const PreparedBi
 				continue;
 			}
 			(void)context.GetBufferCache().ObtainBuffer(range.address, range.size, true);
-			context.GetTextureCache().InvalidateMemoryFromGPU(range.address, range.size);
+			// The shader selects one entry per wave; stale entries of the table may cover live
+			// render targets that the dispatch never writes.
+			context.GetTextureCache().InvalidateMemoryFromGPU(range.address, range.size, true);
 			prepared = true;
 		}
 	}
