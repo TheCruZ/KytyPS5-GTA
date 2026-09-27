@@ -1844,6 +1844,46 @@ void TestVSharpTableStores() {
   }
 }
 
+// GTA V ray tracing: a V# built from user data whose NUM_RECORDS the shader computes. A count
+// read the host can evaluate binds the exact capacity; an indexed one is sized by the host.
+void TestDynamicRecordsBuffer() {
+  Fixture fixture;
+  const auto counts = fixture.Buffer(
+      {fixture.UserData(4), fixture.UserData(5), fixture.UserData(6),
+       fixture.UserData(7)},
+      4);
+  MemoryInfo load_info;
+  load_info.kind = ResourceKind::Buffer;
+  load_info.idxen = true;
+  const auto records =
+      fixture.Emit(ValueOpcode::LoadBufferU32,
+                   {counts, Value(0u), Value(0u), Value(0u), Value(true)},
+                   fixture.AddMemory(load_info, 4));
+  const auto target = fixture.Buffer(
+      {fixture.UserData(0), fixture.UserData(1),
+       fixture.Emit(ValueOpcode::ReadFirstLane, {records, Value(true)}),
+       fixture.UserData(3)},
+      8);
+  MemoryInfo store_info;
+  store_info.kind = ResourceKind::Buffer;
+  const auto store = fixture.AddMemory(store_info, 8);
+  fixture.Emit(ValueOpcode::StoreBufferU32,
+               {target, Value(0u), Value(0u), Value(0u), Value(7u), Value(true)},
+               store);
+  fixture.PlanAndTrack();
+
+  Check(fixture.program.memory_info[store.index].kind == ResourceKind::Buffer,
+        "dynamic NUM_RECORDS store did not stay a bound buffer");
+  const auto &resource =
+      fixture.program.info
+          .buffers[fixture.program.memory_info[store.index].resource];
+  Check(resource.dynamic_records && resource.written,
+        "dynamic NUM_RECORDS buffer was not marked for host sizing");
+  const auto &source = fixture.program.descriptor_sources[resource.source];
+  Check(source.dwords[2].Resolve() == Value(0u),
+        "dynamic NUM_RECORDS was not removed from the descriptor source");
+}
+
 void TestScalarAndVectorBufferAlias() {
   Fixture fixture;
   const auto d0 = fixture.UserData(0);
@@ -2943,8 +2983,12 @@ void TestBoundedRelativeRegisterWrites() {
         {handle, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
         fixture.AddMemory(memory, 0x3e8), exit);
     if (variant != Variant::Bounded) {
-      CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
-                 "relative register proof discarded a possible loop clobber");
+      // NUM_RECORDS is not proven: the compute buffer is bound with a host-sized range
+      // (dynamic records) instead of trusting the clobbered word.
+      fixture.PlanAndTrack();
+      Check(fixture.program.info.buffers.size() == 1 &&
+                fixture.program.info.buffers[0].dynamic_records,
+            "relative register proof discarded a possible loop clobber");
       continue;
     }
     fixture.PlanAndTrack();
@@ -3692,6 +3736,7 @@ int main() {
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
     Run("V# table stores", TestVSharpTableStores);
+    Run("dynamic NUM_RECORDS buffer", TestDynamicRecordsBuffer);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
     Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);
