@@ -64,7 +64,9 @@ public:
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
-	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
+	// possible_write: the range is only a conservative bound of what the GPU may write (e.g. every
+	// V# of a table a shader selects from), so images holding GPU-written contents are kept.
+	void InvalidateMemoryFromGPU(uint64_t address, uint64_t size, bool possible_write = false);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
