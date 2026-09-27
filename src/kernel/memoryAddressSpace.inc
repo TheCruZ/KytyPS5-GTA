@@ -258,10 +258,12 @@ public:
 		RemoveMappingsUnlocked(vaddr, size);
 #endif
 		m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode});
+		BumpBackingEpoch();
 		return true;
 	}
 
 	bool Unmap(uint64_t vaddr, uint64_t size) {
+		BumpBackingEpoch();
 		const auto            end = vaddr + size;
 		std::vector<MapEntry> targets;
 		{
