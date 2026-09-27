@@ -90,6 +90,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 // MaterializeResources call on this thread, or 0.
 int LastIndirectImageFailureLine();
 
+// Whether the host can bind a bindless table T# in the descriptor array of a specialized root.
+bool ImageTableSlotCompatible(const ImageResource& root, const DescriptorValue& descriptor);
+
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
 

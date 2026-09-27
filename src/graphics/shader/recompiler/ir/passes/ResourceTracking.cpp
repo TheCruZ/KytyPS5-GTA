@@ -1198,7 +1198,7 @@ private:
 				    a.key_shift != b.key_shift || a.key_mask != b.key_mask ||
 				    a.bindless != b.bindless ||
 				    a.signed_count != b.signed_count ||
-				    a.table_mask != b.table_mask || a.table_array != b.table_array ||
+				    a.table_array != b.table_array ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_first.IsEmpty() != b.selector_first.IsEmpty() ||
 				    (!a.selector_first.IsEmpty() &&
@@ -1655,9 +1655,17 @@ private:
 				const auto* shift = masked < 2u ? inst->Arg(masked).Resolve().TryInstruction()
 				                                : nullptr;
 				uint32_t    amount = 0;
-				if (shift == nullptr || shift->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
-				    shift->NumArgs() != 2u || !ImmediateU32(shift->Arg(1), amount) ||
-				    amount >= 32u || (immediate & ((1u << amount) - 1u)) != 0u) {
+				// The scaled key is a shift or a multiplication by a power of two.
+				uint32_t scale = 0;
+				const bool scaled =
+				    shift != nullptr && shift->NumArgs() == 2u &&
+				    (shift->GetOpcode() == ValueOpcode::ShiftLeftLogical32
+				         ? ImmediateU32(shift->Arg(1), amount) && amount < 32u
+				         : shift->GetOpcode() == ValueOpcode::IMul32 &&
+				               (ImmediateU32(shift->Arg(0), scale) ||
+				                ImmediateU32(shift->Arg(1), scale)) &&
+				               std::has_single_bit(scale) && (amount = std::countr_zero(scale), true));
+				if (!scaled || (immediate & ((1u << amount) - 1u)) != 0u) {
 					return false;
 				}
 				*key_mask = immediate >> amount;
@@ -3764,7 +3772,52 @@ private:
 		// run time.
 		const bool bindless = m_program.bindless_images && sampled_only &&
 		                      table_source.dword_count == 4u && !plan.table_indexed;
-		if (indirect.workgroup_axis == UINT32_MAX && !plan.table_indexed && bindless) {
+		// A 32-byte T# table read through scalar loads at (key * 32) & mask, such as a bindless
+		// heap indexed by a material word or by a bitfield of GPU-written material data: bind
+		// every T# of the table and let the shader map entry key & mask to its descriptor. This
+		// reads only the table, never the material data. A specialization with one image per
+		// material T# (the direct image-table lookup below) took the driver minutes to compile on
+		// GTA V's ray tracing heaps, which hold thousands of T#s and words that only look like
+		// T#s; KYTY_IMAGE_TABLES=1 selects this path (it overrides the bindless engine).
+		const auto* table_address = !plan.table_indexed && plan.reads[0] != nullptr
+		                                ? plan.reads[0]->Arg(1).Resolve().TryInstruction() : nullptr;
+		const auto* table_key_read = key.Resolve().TryInstruction();
+		uint32_t    table_key_memory_index = 0;
+		const auto* table_key_memory =
+		    table_key_read != nullptr ? ScalarReadMemory(*table_key_read, table_key_memory_index)
+		                              : nullptr;
+		const auto table_base = uint64_t {table_offset} + table_immediate;
+		const bool table_array =
+		    ImageTableArraysEnabled(m_program.shader_hash) && !sampler && table_source.dword_count == 4u &&
+		    indirect.workgroup_axis == UINT32_MAX && table_stride == 32u &&
+		    (table_key_memory == nullptr || table_key_memory->offset <= INT32_MAX) &&
+		    table_base <= UINT32_MAX && (table_base & 31u) == 0u && table_address != nullptr &&
+		    // The array is sampled: any other access (loads, gathers of other classes) needs its
+		    // own image.
+		    std::ranges::all_of(handle.Uses(), [](const Use& use) {
+			    return use.user->GetOpcode() == ValueOpcode::ImageSampleRaw;
+		    }) &&
+		    std::ranges::all_of(plan.reads, [&](const Inst* read) {
+			    return read != nullptr && UsesOnlyImageDescriptors(*read);
+		    }) &&
+		    std::ranges::all_of(table_address->Uses(), [&](const Use& use) {
+			    return std::ranges::find(plan.reads, use.user) != plan.reads.end();
+		    });
+		const auto use_table_array = [&] {
+			Common::HackNotice::ReportTranslation(
+			    "T# table arrays selected by shader hash",
+			    "ResourceTracking indirect descriptor (ImageTableArraysEnabled)",
+			    m_program.shader_hash, 0,
+			    "GTA V's ray tracing shaders; the list is in ImageTableArraysEnabled()");
+			indirect.table_offset    = static_cast<uint32_t>(table_base);
+			indirect.table_immediate = 0u;
+			indirect.table_array     = true;
+			indirect.key_mask        = key_mask;
+		};
+		if (indirect.workgroup_axis == UINT32_MAX && !plan.table_indexed && bindless &&
+		    table_array) {
+			use_table_array();
+		} else if (indirect.workgroup_axis == UINT32_MAX && !plan.table_indexed && bindless) {
 			if (table_stride != 32u) return false;
 			indirect = {};
 			// The heap's byte offset of a record's descriptor: the key-scaled part plus the
@@ -3783,8 +3836,11 @@ private:
 				                                    {key, Value(key_mask)}));
 			}
 		} else if (indirect.workgroup_axis == UINT32_MAX && key_mask != UINT32_MAX) {
-			return false;
-		} else if (indirect.workgroup_axis != UINT32_MAX && !plan.table_indexed) {
+			// Without the bindless engine only a table of T# can follow a masked key.
+			if (!table_array) return false;
+			use_table_array();
+		} else if (indirect.workgroup_axis != UINT32_MAX && !plan.table_indexed &&
+		           key_mask == UINT32_MAX) {
 			// The descriptor also supplies dimensions to shader arithmetic. Keep its reads;
 			// only the image handle is projected onto the bounded workgroup key.
 			plan.retain_reads = true;
@@ -3807,7 +3863,7 @@ private:
 			indirect.table_scalar = true;
 			plan.retain_reads = true;
 		} else if (table_source.dword_count == 2u) {
-			if (table_mask != UINT32_MAX) return false;
+			if (key_mask != UINT32_MAX) return false;
 			auto guarded_count = UnsignedBoundOnEntry(key, handle.Parent());
 			if (guarded_count.IsEmpty()) guarded_count = UnsignedResourceBound(key, handle);
 			// A runtime count can describe fewer rows than the mask's static bit range.
@@ -3876,6 +3932,8 @@ private:
 					return false;
 			}
 			if ((table_offset & 3u) != 0u) return false;
+		} else if (table_array) {
+			use_table_array();
 		} else {
 			// A 32-byte T# table read through scalar loads at (key * 32) & mask, such as a bindless
 			// heap indexed by a material word or by a bitfield of GPU-written material data: bind

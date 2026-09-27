@@ -51064,9 +51064,8 @@ void CheckImageSamplerSpecialization() {
     auto plan = ExtractResourcePlan(translated.program);
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
-    const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
-                             .read_specialization_memory = ReadTestMemory};
-    FakeGuestMemory fake(ReadTestMemory, &memory);
+    const SrtRuntime runtime{.user_data = user_data, .read_memory = ReadTestMemory,
+                             .userdata = &memory, .read_specialization_memory = ReadTestMemory};
     // The fork binds the whole T# table (bindless) before expanding bounded material keys:
     // GTA V's ray tracing shaders select among ~500 material T#s, and one image per key took
     // the driver minutes to compile.
@@ -54094,11 +54093,14 @@ int main(int argc, char **argv) {
   // Frank's readback window (KYTY_READBACK_WINDOW_KB, default 4096) widens every download.
 #ifdef _WIN32
   _putenv("KYTY_READBACK_WINDOW_KB=0");
+  // The T# table cases exercise the sampled-array path, which is opt-in.
+  _putenv("KYTY_IMAGE_TABLES=1");
   // And upstream's materialization contract: a count the GPU wrote and the host cannot read clean
   // fails the evaluation (the fork's dynamic bounds read it on the GPU instead).
   _putenv("KYTY_GPU_SIZED_DYNAMIC=0");
 #else
   setenv("KYTY_READBACK_WINDOW_KB", "0", 1);
+  setenv("KYTY_IMAGE_TABLES", "1", 1);
   setenv("KYTY_GPU_SIZED_DYNAMIC", "0", 1);
 #endif
   EnsureConfigInitialized();

@@ -19,7 +19,6 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
-#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -316,12 +315,53 @@ private:
 		std::optional<PreparedBindings> pixel;
 	};
 
+	// Bindless table elements resolved for one root image, by T#. Most of a table is unchanged
+	// from dispatch to dispatch, and resolving an element repeats the same texture-cache lookup
+	// while no image in its range was registered or unregistered and the guest backing did not
+	// change. Elements with DCC metadata are resolved again on every use: their lookup
+	// materializes fast clears.
+	struct TableElementResolution {
+		TextureBinding texture;
+		GuestRange     range; // Guest memory whose images decide the lookup, if any.
+		uint64_t       image_epoch   = 0;
+		uint64_t       backing_epoch = 0;
+		// The global image-set epoch at which the element was last known valid: while it holds,
+		// no image anywhere changed and the range needs no check.
+		uint64_t       checked_epoch = 0;
+		bool           permanent     = false; // Null for the root's view, whatever the memory.
+		bool           volatile_dcc  = false;
+	};
+	struct TableDescriptorHash {
+		size_t operator()(const std::array<uint32_t, 8>& dwords) const noexcept;
+	};
+	struct TableResolution {
+		ShaderRecompiler::IR::ImageResource root;
+		uint64_t                            last_use = 0;
+		std::unordered_map<std::array<uint32_t, 8>, TableElementResolution, TableDescriptorHash>
+		    elements;
+	};
+
+	[[nodiscard]] const TextureBinding&
+	ResolveTableElement(TableResolution& table, const ShaderRecompiler::IR::DescriptorValue& value);
+	[[nodiscard]] TableResolution& FindTableResolution(const ShaderRecompiler::IR::ImageResource& root);
+
+	// table_candidate rejects (EXIT) a texture whose guest memory cannot be read, for tables
+	// that keep T#s of freed textures, and declines depth/color conversions. examined receives
+	// the guest range before the lookup depends on the texture cache: a failure without it
+	// depends only on the T# and the guest backing.
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
-	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	                                            const ShaderRecompiler::IR::DescriptorValue& value,
+	                                            bool        table_candidate = false,
+	                                            GuestRange* examined        = nullptr);
 	[[nodiscard]] TextureBinding FindResolvedTexture(
 	    const ShaderRecompiler::IR::ImageResource& resource, const ShaderTextureResource& descriptor,
 	    TextureCache::ImageDesc desc, bool shader_conversion, vk::Format pixel_format,
-	    vk::Format view_format, uint32_t size);
+	    vk::Format view_format, uint32_t size, bool table_candidate = false,
+	    GuestRange* examined = nullptr);
+	[[nodiscard]] TextureBinding
+	ResolveTableTexture(const ShaderRecompiler::IR::ImageResource&   root,
+	                    const ShaderRecompiler::IR::DescriptorValue& value,
+	                    GuestRange*                                  examined = nullptr);
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
@@ -413,6 +453,8 @@ private:
 	// entry); an entry is rewritten only after the ring has gone round, behind its last read.
 	std::unique_ptr<Buffer>                 m_mesh_indirect;
 	uint32_t                                m_mesh_indirect_next = 0;
+	std::vector<TableResolution>          m_table_resolutions;
+	uint64_t                              m_table_resolution_tick = 0;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

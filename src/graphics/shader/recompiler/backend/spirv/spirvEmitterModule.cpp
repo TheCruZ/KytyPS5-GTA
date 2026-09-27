@@ -392,14 +392,6 @@ void DefineDescriptors(EmitterState& state) {
 		    (image.mip_mode != IR::ImageMipMode::Dynamic && image.mip_count != 1u)) {
 			EXIT("shader image has an invalid descriptor type or mip count");
 		}
-		if (image.heap) {
-			// Heap kinds alias one array; the root itself is never accessed.
-			auto& definition = state.heap_images[IR::ImageBindingIndex(*kind)];
-			if (image.indirect_resources.empty() && definition.variable == 0) {
-				DefineImageArray(state, definition, image, IR::ImageHeapCapacity, IR::ImageHeapSet, 0u);
-			}
-			continue;
-		}
 		auto& count = counts[static_cast<size_t>(*kind)];
 		image.descriptor_index = count;
 		if (count == 0) image_types[IR::ImageBindingIndex(*kind)] = &image;
@@ -535,11 +527,14 @@ void DefineDescriptors(EmitterState& state) {
 			default: {
 				EXIT_IF(IR::ImageBindingResourceClass(kind) ==
 				        IR::ImageResourceClass::None);
+				const auto& image = *image_types[IR::ImageBindingIndex(kind)];
+				const auto  name  = "image_" + std::to_string(static_cast<uint32_t>(kind));
 				auto& definition = state.images[IR::ImageBindingIndex(kind)];
-				DefineImageArray(state, definition, *image_types[IR::ImageBindingIndex(kind)],
-				                 counts[index], 0u, IR::NativeBinding(state.program.stage, kind));
-				state.builder.AddName(definition.variable,
-				                      ("image_" + std::to_string(static_cast<uint32_t>(kind))).c_str());
+				definition.type = ImageType(state, image);
+				definition.variable = Define(ArrayType(definition.type), name.c_str(),
+				                             spv::StorageClassUniformConstant);
+				definition.pointer_type = TypePointer(
+				    state, spv::StorageClassUniformConstant, definition.type);
 				if (image_tables[IR::ImageBindingIndex(kind)]) {
 					// Bindless table descriptors are indexed per lane.
 					state.builder.RequireVersion(0x00010500u);
@@ -547,6 +542,13 @@ void DefineDescriptors(EmitterState& state) {
 					state.builder.RequireCapability(spv::CapabilitySampledImageArrayDynamicIndexing);
 					state.builder.RequireCapability(
 					    spv::CapabilitySampledImageArrayNonUniformIndexing);
+				}
+				if (image.dimension == ImageDimension::Dim1D ||
+				    image.dimension == ImageDimension::Dim1DArray) {
+					state.builder.RequireCapability(image.resource_class ==
+					                                        IR::ImageResourceClass::Sampled
+					                                    ? spv::CapabilitySampled1D
+					                                    : spv::CapabilityImage1D);
 				}
 				break;
 			}
@@ -669,8 +671,6 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 		case IR::StageInputKind::LocalInvocationId: return spv::BuiltInLocalInvocationId;
 		case IR::StageInputKind::LocalInvocationIndex: return spv::BuiltInLocalInvocationIndex;
 		case IR::StageInputKind::GlobalInvocationId: return spv::BuiltInGlobalInvocationId;
-		case IR::StageInputKind::BaseVertex: return spv::BuiltInBaseVertex;
-		case IR::StageInputKind::BaseInstance: return spv::BuiltInBaseInstance;
 		default: return UINT32_MAX;
 	}
 }
@@ -721,9 +721,7 @@ void DefineInputs(EmitterState& state) {
 			case IR::StageInputKind::PrimitiveId:
 			case IR::StageInputKind::InstanceIndex:
 			case IR::StageInputKind::Layer:
-			case IR::StageInputKind::SampleId:
-			case IR::StageInputKind::BaseVertex:
-			case IR::StageInputKind::BaseInstance: type = TypeI32(state); break;
+			case IR::StageInputKind::SampleId: type = TypeI32(state); break;
 			case IR::StageInputKind::WorkgroupId:
 			case IR::StageInputKind::NumWorkgroups:
 			case IR::StageInputKind::LocalInvocationId:
@@ -791,13 +789,6 @@ void DefineInputs(EmitterState& state) {
 		if (state.program.stage == ShaderType::Pixel) {
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationFlat);
 		}
-	}
-	if (state.program.info.helper_invocation) {
-		const auto variable = DefineInterfaceVariable(state, TypeBool(state), spv::StorageClassInput,
-		                                              "gl_HelperInvocation");
-		state.helper_invocation_variable = variable;
-		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBuiltIn,
-		                            spv::BuiltInHelperInvocation);
 	}
 }
 
@@ -1031,10 +1022,6 @@ void DefineModule(EmitterState& state) {
 	}
 	if (InputVariableForKind(state, IR::StageInputKind::SampleId) != 0) {
 		state.builder.RequireCapability(spv::CapabilitySampleRateShading);
-	}
-	if (InputVariableForKind(state, IR::StageInputKind::BaseVertex) != 0 ||
-	    InputVariableForKind(state, IR::StageInputKind::BaseInstance) != 0) {
-		state.builder.RequireCapability(spv::CapabilityDrawParameters);
 	}
 	if (state.program.info.image_gather_extended) {
 		state.builder.RequireCapability(spv::CapabilityImageGatherExtended);

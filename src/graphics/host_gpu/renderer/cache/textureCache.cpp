@@ -347,6 +347,9 @@ void TextureCache::RegisterImage(ImageId id) {
 	NoteBindlessStateChange(image);
 	image.lru_tick   = LruClock();
 	image.lru_id     = m_lru_cache.Insert(id, image.lru_tick);
+	const auto epoch = ++m_image_set_epoch;
+	ForEachPage(image.info.data.address, image.info.data.size,
+	            [this, epoch](uint64_t page) { m_image_page_epochs[page] = epoch; });
 	m_total_used_memory += image.AccountedSize();
 }
 
@@ -382,42 +385,23 @@ void TextureCache::UnregisterImage(ImageId id) {
 	m_total_used_memory -= accounted;
 	image.registered = false;
 	const auto epoch = ++m_image_set_epoch;
-	m_image_set_changes[epoch % ImageSetChangeHistory] = {image.info.data.address,
-	                                                      image.info.data.size};
 	ForEachPage(image.info.data.address, image.info.data.size,
 	            [this, epoch](uint64_t page) { m_image_page_epochs[page] = epoch; });
 }
 
-bool TextureCache::HasImagesInRegion(uint64_t address, uint64_t size) {
-	std::scoped_lock lock {m_lock};
-	return FindImagesInRegion(address, size, false).size() != 0;
-}
-
 uint64_t TextureCache::ImageEpochInRegion(uint64_t address, uint64_t size) {
-	std::scoped_lock lock {m_lock};
-	return ImageEpochInRegionUnlocked(address, size);
-}
-
-uint64_t TextureCache::ImageEpochInRegionUnlocked(uint64_t address, uint64_t size) const {
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
 		return UINT64_MAX;
 	}
-	uint64_t epoch = 0;
+	std::scoped_lock lock {m_lock};
+	uint64_t         epoch = 0;
 	ForEachPage(address, size, [&](uint64_t page) {
 		if (const auto* page_epoch = m_image_page_epochs.Find(page)) {
 			epoch = std::max(epoch, *page_epoch);
 		}
 	});
 	return epoch;
-}
-
-size_t TextureCache::ExactLookupSlot(const ImageInfo& info) noexcept {
-	uint64_t hash = info.data.address * 0x9e3779b97f4a7c15ull;
-	hash ^= (info.data.size + static_cast<uint64_t>(info.pixel_format)) * 0xc2b2ae3d27d4eb4full;
-	hash ^= (static_cast<uint64_t>(info.extent.width) << 32u | info.extent.height) *
-	        0x165667b19e3779f9ull;
-	return static_cast<size_t>(hash >> 32u) % ExactLookupWays;
 }
 
 void TextureCache::DeleteImage(ImageId id) {
@@ -1077,8 +1061,8 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
                                                          BindingType binding, ImageId cached_id,
                                                          ImageId merged_id, bool speculative) {
-	auto& cached = m_slot_images[cached_id];
-	if (!cached.registered) {
+	auto owner = m_slot_images.try_get(cached_id);
+	if (owner == nullptr || !owner->registered) {
 		return {merged_id};
 	}
 	// PS5: image heaps keep BC images and raw block views of their layers resident together, so a
@@ -2549,9 +2533,8 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size, false)) {
 		const auto& image = m_slot_images[id];
-		// PPSA17168: S_LOAD_DWORD reads shader data at an address overlapping an old
-		// render target whose memory the CPU has reused. The cached image still retains
-		// its earlier GPU-modified flag.
+		// An old render target whose memory the CPU has reused keeps its earlier GPU-modified
+		// flag (PPSA17168: S_LOAD_DWORD reads shader data over such memory).
 		if (!image.depth_id && image.IsGpuModified() && !image.IsDefinitelyCpuDirty()) {
 			return true;
 		}

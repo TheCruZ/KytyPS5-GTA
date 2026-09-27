@@ -105,6 +105,17 @@ inline bool SrtVerifyEnabled() {
 // Most recorded dwords per refresh; past it, reads wait as before.
 inline constexpr uint32_t SrtVerifyMaxEntries = 256;
 
+// The distinct T#s of a bindless image table; slot 0 is null.
+struct ImageTableSnapshot {
+	uint64_t                     base         = 0;
+	uint64_t                     size         = 0;
+	uint32_t                     offset       = 0;
+	uint32_t                     entry_mask   = 0;
+	std::vector<uint32_t>        raw;     // The table words the slots were built from.
+	std::vector<DescriptorValue> slots;
+	std::vector<uint32_t>        mapping; // Entry count, then the slot of each entry.
+};
+
 struct ResourceSnapshot {
 	std::vector<BufferWriteExtent>      buffer_write_extents;
 	std::vector<BindlessHeapUse>        bindless_heaps;

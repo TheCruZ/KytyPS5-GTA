@@ -561,6 +561,68 @@ DescriptorBindingForImage(const ImageResource& image) {
 }
 
 // Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
+// GPU-indexed T# tables become sampled image arrays (a root per table, one descriptor per
+// distinct T#) instead of going through the bindless engine (see ResourceTracking,
+// TryMakeTableDescriptor). KYTY_IMAGE_TABLES=1 does it for every table that fits, =0 for none;
+// without it only the shaders that index a 65536-entry heap of T#s by GPU-written material
+// records do (GTA V's ray tracing compute shaders): there the bindless lookup specializes every
+// distinct T# of the heap and a driver took minutes to compile it. The tables of the other
+// games (Wolverine binds 5 roots of 4096 elements a dispatch) stay with the bindless engine,
+// whose per-dispatch cost is lower.
+[[nodiscard]] inline bool ImageTableArraysEnabled(uint64_t shader_hash) {
+	static const int forced = [] {
+		const char* value = std::getenv("KYTY_IMAGE_TABLES");
+		if (value == nullptr || value[0] == 0) {
+			return -1;
+		}
+		return value[0] == '1' ? 1 : 0;
+	}();
+	if (forced >= 0) {
+		return forced == 1;
+	}
+	switch (shader_hash) {
+		case 0xc6c91cf1882cdc3bull:
+		case 0xca313cf56ef25496ull:
+		case 0xfa8b1616fddc203bull:
+		case 0x651da332bc4a3f98ull:
+		case 0x6db33a2bcb077bc3ull:
+		case 0xedc5bdc9a5687671ull: return true;
+		default: return false;
+	}
+}
+
+// The first table descriptor of each image (UINT32_MAX without a bindless table): the
+// descriptors of a table follow the resources of its roots' binding, whose count grows by the
+// table capacity; roots of one table and binding share them.
+[[nodiscard]] inline std::vector<uint32_t> AllocateImageTableDescriptors(
+    const std::vector<ImageResource>& images,
+    std::array<uint32_t, static_cast<size_t>(DescriptorBindingKind::Count)>& counts) {
+	std::vector<uint32_t> bases(images.size(), UINT32_MAX);
+	for (size_t i = 0; i < images.size(); i++) {
+		const auto& image = images[i];
+		if (image.table_capacity == 0u) {
+			continue;
+		}
+		const auto kind = *DescriptorBindingForImage(image);
+		for (size_t j = 0; j < i && bases[i] == UINT32_MAX; j++) {
+			if (bases[j] != UINT32_MAX && images[j].table == image.table &&
+			    DescriptorBindingForImage(images[j]) == kind) {
+				if (images[j].table_capacity != image.table_capacity) {
+					EXIT("shader binding layout failed: image table %u has two capacities",
+					     image.table);
+				}
+				bases[i] = bases[j];
+			}
+		}
+		if (bases[i] == UINT32_MAX) {
+			auto& count = counts[static_cast<size_t>(kind)];
+			bases[i]    = count;
+			count += image.table_capacity;
+		}
+	}
+	return bases;
+}
+
 struct Bindings {
 	std::array<uint32_t, static_cast<size_t>(DescriptorBindingKind::Count)> descriptor_counts {};
 	uint64_t descriptor_mask = 0;
@@ -720,6 +782,8 @@ struct DescriptorSource {
 		uint32_t key_mask  = UINT32_MAX;
 		// No enumeration: the shader looks the key up in the bindless translation table.
 		bool     bindless  = false;
+		// A bindless T# table (entry = key & key_mask): every table entry is a candidate.
+		bool     table_array     = false;
 		Value    key_count;
 		// First selector index, workgroup key base, or first descriptor key for a direct or bitmap
 		// range.

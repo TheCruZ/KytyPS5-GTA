@@ -716,7 +716,8 @@ bool TextureDescCacheEnabled() {
 } // namespace
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                                              const ShaderRecompiler::IR::DescriptorValue& value) {
+                                              const ShaderRecompiler::IR::DescriptorValue& value,
+                                              bool table_candidate, GuestRange* examined) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
@@ -738,7 +739,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (const auto it = cache.find(key); it != cache.end()) {
 			return FindResolvedTexture(resource, descriptor, it->second.desc,
 			                           it->second.shader_conversion, it->second.pixel_format,
-			                           it->second.view_format, it->second.size);
+			                           it->second.view_format, it->second.size, table_candidate,
+			                           examined);
 		}
 	}
 
@@ -878,7 +880,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		                                     shader_conversion});
 	}
 	return FindResolvedTexture(resource, descriptor, std::move(desc), shader_conversion,
-	                           pixel_format, view_format, texture_size);
+	                           pixel_format, view_format, texture_size, table_candidate, examined);
 }
 
 // ResolveTexture's texture cache lookup for a description (FindImage may adjust it).
@@ -886,10 +888,19 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
                                                    const ShaderTextureResource&               descriptor,
                                                    TextureCache::ImageDesc desc,
                                                    bool shader_conversion, vk::Format pixel_format,
-                                                   vk::Format view_format, uint32_t size) {
+                                                   vk::Format view_format, uint32_t size,
+                                                   bool table_candidate, GuestRange* examined) {
 	auto&      texture_cache       = m_context.GetTextureCache();
 	const bool storage             = resource.written;
-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
+	if (examined != nullptr) {
+		*examined = desc.info.data;
+	}
+	auto id = table_candidate ? texture_cache.FindImageSpeculative(desc, shader_conversion)
+	                          : texture_cache.FindImage(desc, shader_conversion);
+	if (!id) {
+		// Only speculative lookups decline: the table binds this element as a null image.
+		return {id, nullptr, std::move(desc)};
+	}
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
@@ -922,27 +933,15 @@ TextureBinding RenderExecutor::ResolveTableTexture(
     const ShaderRecompiler::IR::ImageResource&   root,
     const ShaderRecompiler::IR::DescriptorValue& value, GuestRange* examined) {
 	if (ShaderRecompiler::IR::ImageTableSlotCompatible(root, value)) {
-		try {
-			Common::SoftExitScope soft_exit(true);
-			auto texture = ResolveTexture(root, value, true, examined);
-			if (texture.image_id) {
-				return texture;
-			}
-			Common::HackNotice::Report("bindless table texture bound as null image",
-			                           "RenderExecutor::ResolveTableTexture (no image resolved)", 0, 0);
-		} catch (const Common::SoftExitError& error) {
-			// Whatever fatal error the resolution raised (texture cache invariants included) is
-			// swallowed here: the original message is in the notice.
-			Common::HackNotice::Report(
-			    "bindless table texture bound as null image after a fatal error",
-			    "RenderExecutor::ResolveTableTexture (SoftExitScope)", 0,
-			    std::hash<std::string_view> {}(error.what()),
-			    std::string("original error: ") + error.what());
-			static std::atomic_uint reported = 0;
-			if (reported.fetch_add(1) < 8u) {
-				LOGF("bindless table texture bound as null: %s\n", error.what());
-			}
+		auto texture = ResolveTexture(root, value, true, examined);
+		if (texture.image_id) {
+			return texture;
 		}
+		Common::HackNotice::Report("bindless table texture bound as null image",
+		                           "RenderExecutor::ResolveTableTexture (no image resolved)", 0, 0);
+	} else {
+		Common::HackNotice::Report("bindless table texture bound as null image",
+		                           "RenderExecutor::ResolveTableTexture (incompatible view)", 0, 0);
 	}
 	return ResolveTexture(root, ShaderRecompiler::IR::DescriptorValue {.dword_count = 8u});
 }
@@ -980,59 +979,26 @@ RenderExecutor::FindTableResolution(const ShaderRecompiler::IR::ImageResource& r
 			found = std::ranges::min_element(m_table_resolutions, {}, &TableResolution::last_use);
 		}
 		found->root = std::move(view);
-		m_retired_table_elements.push_back(std::move(found->elements));
 		found->elements.clear();
-		found->slots.clear();
-		m_table_generation++;
 	} else if (found->elements.size() > MaxElements) {
-		m_retired_table_elements.push_back(std::move(found->elements));
 		found->elements.clear();
-		found->slots.clear();
-		m_table_generation++;
 	}
 	found->last_use = tick;
 	return *found;
 }
 
-// What ResolveTexture checks of the backing for a table candidate (a GPU-modified range needs no
-// backing).
-bool RenderExecutor::TableElementBackingReadable(const TableElementResolution& element) {
-	const auto& data = element.range;
-	const bool  data_readable =
-	    m_context.GetTextureCache().IsRegionGpuModified(data.address, data.size) ||
-	    Libs::LibKernel::Memory::IsBackingReadable(data.address, data.size);
-	return data_readable &&
-	       (element.metadata_range.Empty() ||
-	        Libs::LibKernel::Memory::IsBackingReadable(element.metadata_range.address,
-	                                                   element.metadata_range.size));
-}
-
-RenderExecutor::TableElementResolution&
+const TextureBinding&
 RenderExecutor::ResolveTableElement(TableResolution&                             table,
-                                    const ShaderRecompiler::IR::DescriptorValue& value,
-                                    uint64_t stamp, TableElementResolution* known) {
+                                    const ShaderRecompiler::IR::DescriptorValue& value) {
 	auto&      texture_cache = m_context.GetTextureCache();
 	const auto backing_epoch = Libs::LibKernel::Memory::BackingEpoch();
-	bool       inserted      = false;
-	if (known == nullptr) {
-		const auto [entry, emplaced] = table.elements.try_emplace(value.dwords);
-		known                        = &entry->second;
-		inserted                     = emplaced;
-	}
-	auto& element = *known;
-	if (!inserted && element.prepared_stamp == stamp) {
-		// Resolved for an earlier slot of the same bindings.
-		return element;
-	}
+	const auto [entry, inserted] = table.elements.try_emplace(value.dwords);
+	auto& element                = entry->second;
 	const auto set_epoch = texture_cache.ImageSetEpoch();
 	if (!inserted && !element.volatile_dcc) {
 		if (element.permanent ||
 		    (element.checked_epoch == set_epoch && element.backing_epoch == backing_epoch)) {
-			return element;
-		}
-		if (element.backing_epoch != backing_epoch && element.backing_checkable &&
-		    TableElementBackingReadable(element) == element.backing_readable) {
-			element.backing_epoch = backing_epoch;
+			return element.texture;
 		}
 		const auto image_epoch =
 		    element.range.Valid()
@@ -1040,17 +1006,13 @@ RenderExecutor::ResolveTableElement(TableResolution&                            
 		        : 0;
 		if (image_epoch <= element.image_epoch && element.backing_epoch == backing_epoch) {
 			element.checked_epoch = set_epoch;
-			return element;
+			return element.texture;
 		}
 	}
 	// Record the epoch before resolving: an image the lookup itself inserts makes the next use
 	// resolve again, after which the element is stable.
-	const auto prepared_stamp = element.prepared_stamp;
-	const auto prepared_index = element.prepared_index;
-	element                   = {};
-	element.prepared_stamp    = prepared_stamp;
-	element.prepared_index    = prepared_index;
-	element.image_epoch       = set_epoch;
+	element               = {};
+	element.image_epoch   = set_epoch;
 	element.checked_epoch = set_epoch;
 	element.backing_epoch = backing_epoch;
 	GuestRange examined {};
@@ -1059,11 +1021,6 @@ RenderExecutor::ResolveTableElement(TableResolution&                            
 	if (!data.Empty()) {
 		element.range        = data;
 		element.volatile_dcc = element.texture.desc.info.metadata.kind == ImageMetadataKind::Dcc;
-		if (element.texture.desc.info.metadata.kind != ImageMetadataKind::None) {
-			element.metadata_range = element.texture.desc.info.metadata.range;
-		}
-		element.backing_checkable = data.Valid();
-		element.backing_readable  = element.backing_checkable && TableElementBackingReadable(element);
 	} else if (!ShaderRecompiler::IR::ImageTableSlotCompatible(table.root, value)) {
 		element.permanent = true;
 	} else {
@@ -1071,12 +1028,13 @@ RenderExecutor::ResolveTableElement(TableResolution&                            
 		// backing alone (no range examined: only a backing change can alter the outcome).
 		element.range = examined;
 	}
-	return element;
+	return element.texture;
 }
 
-vk::Sampler RenderExecutor::NativeSampler(const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                                          uint32_t                                        index,
-                                          const ShaderRecompiler::IR::DescriptorValue&    value) {
+static vk::Sampler NativeSampler(RenderContext&                       context,
+                                 const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                 uint32_t index,
+                                 const ShaderRecompiler::IR::DescriptorValue& value) {
 	auto        descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
 	const auto& sampler    = program.info.samplers[index];
 	if (!sampler.depth_compare) {
@@ -2940,8 +2898,35 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		binding.mip_views.clear();
 		prepared.images[i] = std::move(binding);
 	}
-	if (!same_images) {
-		prepared.last_images = snapshot.images;
+	prepared.table_images.clear();
+	prepared.table_sources.clear();
+	prepared.table_roots.clear();
+	ForEachImageTable(program.info.images, [&](uint32_t root_index, auto /*kind*/) {
+		{
+			const auto& root  = program.info.images.at(root_index);
+			const auto& table = snapshot.image_tables.at(root.table);
+			const ShaderRecompiler::IR::DescriptorValue null_value {.dword_count = 8u};
+			auto&       resolution   = FindTableResolution(root);
+			const auto& null_texture = ResolveTableElement(resolution, null_value);
+			BindImage(null_texture.image_id, false);
+			for (uint32_t slot = 0; slot < root.table_capacity; slot++) {
+				const bool real = slot != 0u && slot < table.slots.size();
+				if (real) {
+					const auto& texture = ResolveTableElement(resolution, table.slots[slot]);
+					BindImage(texture.image_id, false);
+					prepared.table_images.push_back(texture);
+				} else {
+					prepared.table_images.push_back(null_texture);
+				}
+				prepared.table_sources.push_back(real ? table.slots[slot] : null_value);
+				prepared.table_roots.push_back(root_index);
+			}
+		}
+	});
+	prepared.samplers.reserve(program.info.samplers.size());
+	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
+		prepared.samplers.push_back(NativeSampler(
+		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
 	}
 	for (const auto& use: snapshot.bindless_heaps) {
 		if (m_bindless_surveyed.insert(use.base ^ (static_cast<uint64_t>(use.table_offset) << 48u))
@@ -3296,11 +3281,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
-	// A null element (a null T# or a declined lookup) has no image to be stale.
 	const auto stale = [&](const TextureBinding& binding) {
-		if (!binding.image_id) {
-			return false;
-		}
 		const auto* image = texture_cache.m_slot_images.try_get(binding.image_id);
 		return image == nullptr || (!image->registered && !image->info.data.Empty()) ||
 		       image->binding.needs_rebind;
@@ -3309,7 +3290,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	// are stale before any rebind clears an image's binding state.
 	std::vector<bool> stale_tables(prepared.table_images.size());
 	for (size_t k = 0; k < prepared.table_images.size(); k++) {
-		stale_tables[k] = stale(*prepared.table_images[k]);
+		stale_tables[k] = stale(prepared.table_images[k]);
 	}
 	// Acquire each view before a later overlapping descriptor can replace its image.
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
@@ -3400,6 +3381,23 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	}
 	if (prepared.tables_reused) {
 		RebindReusedTables(prepared);
+	}
+	for (size_t k = 0; k < prepared.table_images.size(); k++) {
+		auto& texture = prepared.table_images[k];
+		// A rediscovery above may have replaced (expanded, merged or recreated) the image this
+		// element resolved to.
+		if (stale_tables[k] || stale(texture)) {
+			if (auto* old_image = texture_cache.m_slot_images.try_get(texture.image_id)) {
+				if (old_image->binding.is_target) {
+					NoteBindlessStateChange(*old_image);
+				}
+				old_image->binding = {};
+			}
+			texture = ResolveTableTexture(program.info.images.at(prepared.table_roots[k]),
+			                              prepared.table_sources[k]);
+			BindImage(texture.image_id, false);
+		}
+		texture.image_view = texture_cache.FindTexture(texture.image_id, texture.desc);
 	}
 }
 
@@ -3714,9 +3712,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			heap->checked_count      = resolved.size();
 		}
 		const Image::GuestTransitScope guest_transits;
-		for (uint32_t i = 0; i < program.info.images.size(); i++) {
-			auto& binding = descriptors.images[i];
-			if (!binding.image_id) continue;
+		const auto transit = [&](TextureBinding& binding) {
+			if (!binding.image_id) return;
 			auto& image = m_context.GetTextureCache().GetImage(binding.image_id);
 			const auto&                 view = binding.desc.view_info;
 			const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
@@ -3757,14 +3754,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		for (auto& binding: descriptors.images) {
 			transit(binding);
 		}
-		for (auto* binding: descriptors.table_images) {
-			transit(*binding);
-		}
-		auto* table_state = static_cast<TableBindingState*>(descriptors.table_state);
-		if (descriptors.tables_reused) {
-			for (const auto index: descriptors.table_visits) {
-				transit(table_state->elements[index].resolution->texture);
-			}
+		for (auto& binding: descriptors.table_images) {
+			transit(binding);
 		}
 
 		std::array<size_t, ShaderRecompiler::IR::ImageBindingCount> image_starts {};
@@ -3851,49 +3842,15 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 		}
 		size_t table_element = 0;
-		m_table_image_infos.clear();
-		if (descriptors.tables_reused) {
-			for (const auto index: descriptors.table_visits) {
-				table_state->infos[index] =
-				    MakeImageInfo(table_state->elements[index].resolution->texture, 0u);
-			}
-			// Only the slots of the visited elements change.
-			for (const auto index: descriptors.table_visits) {
-				for (auto k = table_state->element_slot_begin[index];
-				     k < table_state->element_slot_begin[index + 1]; k++) {
-					table_state->slot_infos[table_state->element_slots[k]] =
-					    table_state->infos[index];
-				}
-			}
-		}
 		ForEachImageTable(program.info.images, [&](uint32_t root_index, BindingKind kind) {
 			const auto& root  = program.info.images[root_index];
 			const auto  start = image_starts[ShaderRecompiler::IR::ImageBindingIndex(kind)] +
 			                   root.table_descriptor_base;
-			if (descriptors.tables_reused) {
-				EXIT_IF(table_element + root.table_capacity > table_state->slot_infos.size());
-				std::copy_n(table_state->slot_infos.begin() +
-				                static_cast<std::ptrdiff_t>(table_element),
-				            root.table_capacity,
-				            m_descriptor_images.begin() + static_cast<std::ptrdiff_t>(start));
-				table_element += root.table_capacity;
-				return;
-			}
-			if (m_table_image_infos.empty()) {
-				m_table_image_infos.reserve(descriptors.table_images.size());
-				for (const auto* texture: descriptors.table_images) {
-					m_table_image_infos.push_back(MakeImageInfo(*texture, 0u));
-				}
-			}
-			EXIT_IF(table_element + root.table_capacity > descriptors.table_slots.size());
 			for (uint32_t slot = 0; slot < root.table_capacity; slot++) {
-				m_descriptor_images[start + slot] =
-				    m_table_image_infos[descriptors.table_slots[table_element++]];
+				const auto& element = descriptors.table_images.at(table_element++);
+				m_descriptor_images[start + slot] = MakeImageInfo(element, 0u);
 			}
 		});
-		if (table_state != nullptr && !descriptors.tables_reused) {
-			FinishTableBindings(*table_state, descriptors);
-		}
 
 		const auto shader_data_dwords = program.bindings.ShaderDataDwords();
 		EXIT_IF(prepared->shader_data.size() != shader_data_dwords);

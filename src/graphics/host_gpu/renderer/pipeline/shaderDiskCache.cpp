@@ -25,7 +25,7 @@ namespace {
 
 // Bump when the encoding below changes in a way the source version cannot see (it hashes this
 // file too, so this is belt and braces).
-constexpr uint32_t FormatVersion = 6;
+constexpr uint32_t FormatVersion = 7;
 constexpr uint32_t FileMagic     = 0x4344534bu; // "KSDC"
 constexpr uint64_t MaxFileSize   = uint64_t {256} << 20u;
 
@@ -141,6 +141,11 @@ void Visit(Io& io, T& v) {
 	io(v.indirect_search_iterations);
 	io(v.bindless);
 	io(v.indirect_resources);
+	io(v.table);
+	io(v.table_capacity);
+	io(v.table_mapping_offset);
+	io(v.table_entry_mask);
+	io(v.table_descriptor_base);
 }
 
 template <typename Io, typename T>
@@ -305,6 +310,7 @@ void Visit(Io& io, T& v) {
 	io(v.key_shift);
 	io(v.key_mask);
 	io(v.bindless);
+	io(v.table_array);
 	io(v.key_count);
 	io(v.selector_first);
 	io(v.selector_mask);
@@ -405,6 +411,10 @@ void Visit(Io& io, T& v) {
 	io(v.cube);
 	io(v.fmask);
 	io(v.bindless);
+	io(v.table);
+	io(v.table_capacity);
+	io(v.table_mapping_offset);
+	io(v.table_entry_mask);
 }
 
 template <typename Io, typename T>

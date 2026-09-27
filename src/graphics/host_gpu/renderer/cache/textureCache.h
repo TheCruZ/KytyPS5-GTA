@@ -106,27 +106,6 @@ public:
 	// The ImageSetEpoch of the last registration or unregistration of an image overlapping the
 	// range's pages: while it is unchanged, a lookup in the range finds the same images.
 	[[nodiscard]] uint64_t ImageEpochInRegion(uint64_t address, uint64_t size);
-	// The granularity of ImageEpochInRegion(): log2 of its page size.
-	static constexpr uint32_t ImagePageBits = 20;
-	// Calls `function(address, size)` for the image range of every registration and
-	// unregistration after ImageSetEpoch() was `epoch`, oldest first. False when the history no
-	// longer reaches back that far.
-	template <typename Function>
-	[[nodiscard]] bool ForEachImageSetChangeSince(uint64_t epoch, Function&& function) {
-		std::scoped_lock lock {m_lock};
-		if (m_image_set_epoch - epoch > ImageSetChangeHistory) {
-			return false;
-		}
-		for (auto change = epoch + 1; change <= m_image_set_epoch; ++change) {
-			const auto& range = m_image_set_changes[change % ImageSetChangeHistory];
-			function(range.first, range.second);
-		}
-		return true;
-	}
-	// A pinned image is used without its bindings looking it up or touching it: the garbage
-	// collector keeps it and overlapping lookups do not delete it as unused. Pins nest.
-	void PinImage(ImageId id);
-	void UnpinImage(ImageId id);
 	void RunGarbageCollector();
 	// The guest no longer refers to this bindless image from any heap entry (it replaced or
 	// cleared them): free it once no draw has used it for a few frames (engine method).
@@ -284,6 +263,8 @@ private:
 	void ValidateImageViewDesc(const ImageDesc& desc) const;
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
+	// Whether a cached image in the region holds bytes the GPU wrote that guest memory lacks.
+	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 	// evicting: the collector writes the image back before freeing it; the write is dropped if
 	// the guest bytes change before it lands (KYTY_EVICT_WRITEBACK_GUARD).
 	// `landed`, when given, is set once the write-back has reached guest memory (or was dropped
@@ -316,6 +297,9 @@ private:
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
 	RegisteredPageCounts                              m_registered_pages;
+	MultiLevelPageTable<uint64_t, ImagePageTable::kPageBits, ImagePageTable::kAddressSpaceBits,
+	                    ImagePageTable::kFirstLevelBits>
+	    m_image_page_epochs;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::unordered_set<ImageId>                       m_bindless_evictable;
@@ -363,6 +347,7 @@ private:
 	// stretch without presents (a loading screen) still ages its entries.
 	[[nodiscard]] uint64_t LruClock() const noexcept;
 	mutable uint32_t m_image_query_epoch      = 0;
+	uint64_t         m_image_set_epoch        = 0;
 	bool             m_readback_linear_images = false;
 	bool             m_readback_tiled_images  = false;
 	// Lookups that found an existing image with the same backing, by description: while no image

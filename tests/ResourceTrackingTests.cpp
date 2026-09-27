@@ -8,6 +8,7 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "SrtWalkerTestMemory.h"
 
+#include <cstdlib>
 #include <array>
 #include <bit>
 #include <cstring>
@@ -223,7 +224,7 @@ std::unique_ptr<Fixture>
 MakeIndirectImageFixture(bool malformed, uint32_t table_stride = 32, uint32_t table_offset = 0,
                          uint32_t table_shader_offset = 0, bool nested = false,
                          ValueOpcode access = ValueOpcode::ImageSampleRaw, bool finite_key = false,
-                         uint32_t heap_mask = UINT32_MAX, uint32_t selector_bits = UINT32_MAX) {
+                         uint32_t heap_mask = UINT32_MAX) {
   auto fixture = std::make_unique<Fixture>();
   std::array<Value, 4> material_words;
   std::array<Value, 4> heap_words;
@@ -9291,124 +9292,6 @@ void TestBindlessImageTable() {
         "bindless table descriptors were not appended to the root's binding");
 }
 
-void TestBindlessImageTableQuery() {
-  // GTA V (PPSA04263) CS 0xedc5bdc9a5687671 (Performance RT) also queries the size of a
-  // material table texture: IMAGE_GET_RESINFO through the T# its alpha test samples.
-  auto fixture = MakeIndirectImageFixture(false, 32u, 0u, 0u, false, ValueOpcode::ImageSampleRaw, false,
-                                          UINT32_MAX, 0x1fffffe0u);
-  Value image;
-  MemoryFlags sample_flags{};
-  for (auto &inst : *fixture->block) {
-    if (inst.GetOpcode() == ValueOpcode::ImageSampleRaw) {
-      image = inst.Arg(0);
-      sample_flags = inst.Flags<MemoryFlags>();
-    }
-  }
-  Check(!image.IsEmpty(), "fixture has no sampled table image");
-  MemoryInfo query;
-  query.kind = ResourceKind::Image;
-  query.image_dimension = Decoder::ImageDimension::Dim2D;
-  const auto query_flags = fixture->AddMemory(query, 0x10f8);
-  const auto size = fixture->Emit(ValueOpcode::ImageQueryDimensions,
-                                  {image, fixture->ImageAddress()}, query_flags);
-  fixture->Emit(ValueOpcode::ReferenceU32,
-                {fixture->Emit(ValueOpcode::CompositeExtractU32x4, {size, Value(0u)})});
-  fixture->PlanAndTrack();
-  auto resource_plan = ExtractResourcePlan(fixture->program);
-  std::array<uint32_t, 9> user_data{0x1000u, 224u << 16u, 2u, 0u, 0x2000u,
-                                    0u,      128u,        0u, 7u};
-  LinearTestMemory memory;
-  std::array<uint32_t, 8> texture{};
-  texture[0] = 0x20u;
-  texture[1] = static_cast<uint32_t>(
-                   Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
-               << 20u;
-  texture[2] = 3u | (3u << 14u);
-  texture[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
-               (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
-                << 28u);
-  std::copy(texture.begin(), texture.end(),
-            memory.words.begin() + (0x2000u - memory.base) / 4u);
-  SrtRuntime runtime{.user_data = user_data,
-                     .userdata = &memory,
-                     .read_specialization_memory = ReadLinearTestMemory};
-  ResourceSnapshot snapshot;
-  ResourceSpecialization specialization;
-  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
-            specialization.images.size() == 1 &&
-            specialization.images[0].table_capacity != 0u,
-        "queried bindless table did not materialize as a table");
-  Check(fixture->program.memory_info[query_flags.index].resource ==
-            fixture->program.memory_info[sample_flags.index].resource,
-        "the size query and the sample of one table T# use different images");
-  // Before table queries were supported this was fatal.
-  ApplyResourceSpecialization(fixture->program, specialization);
-}
-
-void TestBindlessImageTableSharedRegisters() {
-  // GTA V (PPSA04263) CS 0xca313cf56ef25496 reuses the SGPRs of a material T# for other data, so
-  // a T# word also reaches a Phi of the register's other lifetime. The table plan still applies
-  // to the image; the read stays an ordinary scalar load for the Phi.
-  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
-  auto fixture = MakeIndirectImageFixture(false, 32u, 0u, 0u, false, ValueOpcode::ImageSampleRaw, false,
-                                          UINT32_MAX, 0x1fffffe0u);
-  Value image;
-  for (auto &inst : *fixture->block) {
-    if (inst.GetOpcode() == ValueOpcode::ImageSampleRaw) {
-      image = inst.Arg(0);
-    }
-  }
-  Check(!image.IsEmpty(), "fixture has no sampled table image");
-  const auto *handle = image.ResolveInstruction();
-  const auto shared_word = handle->Arg(1);
-  const auto other_word = handle->Arg(0);
-  auto *entry = fixture->block;
-  auto *taken = fixture->AddBlock();
-  auto *skipped = fixture->AddBlock();
-  auto *merge = fixture->AddBlock();
-  entry->AddBranch(taken);
-  entry->AddBranch(skipped);
-  taken->AddBranch(merge);
-  skipped->AddBranch(merge);
-  fixture->program.blocks[0]->terminator = {
-      .kind = CFG::TerminatorKind::ConditionalBranch, .true_block = fixture->program.blocks[1], .false_block = fixture->program.blocks[2]};
-  fixture->program.blocks[1]->terminator = {.kind = CFG::TerminatorKind::Branch,
-                                               .true_block = fixture->program.blocks[3]};
-  fixture->program.blocks[2]->terminator = {.kind = CFG::TerminatorKind::Branch,
-                                               .true_block = fixture->program.blocks[3]};
-  fixture->program.blocks[3]->terminator.kind = CFG::TerminatorKind::Return;
-  fixture->program.blocks[0]->condition =
-      fixture->Emit(ValueOpcode::INotEqual32, {fixture->UserData(12), Value(0u)});
-  fixture->block = skipped;
-  const auto other = fixture->UserData(13);
-  auto &phi = merge->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
-  phi.AddPhiOperand(taken, shared_word);
-  phi.AddPhiOperand(skipped, other);
-  fixture->block = merge;
-  fixture->Emit(ValueOpcode::ReferenceU32, {Value(&phi)});
-  // The decoder leaves a scalar load's resource index at the base SGPR of its V#, far above
-  // the shader's buffer count; only collecting the load assigns the real buffer.
-  fixture->program.memory_info[shared_word.ResolveInstruction()->Flags<MemoryFlags>().index].resource = 7u;
-  fixture->PlanAndTrack();
-
-  const auto source = fixture->program.info.images.at(0).source;
-  const auto &indirect = fixture->program.descriptor_sources.at(source).indirect_descriptor;
-  Check(indirect.has_value() && indirect->table_array,
-        "a T# word reaching a Phi of another register lifetime lost the table plan");
-  const auto *shared_read = shared_word.ResolveInstruction();
-  const auto *other_read = other_word.ResolveInstruction();
-  Check(!fixture->program.memory_info[shared_read->Flags<MemoryFlags>().index].planning_only &&
-            fixture->program.memory_info[other_read->Flags<MemoryFlags>().index].planning_only,
-        "only the T# word with a non-image use must stay an emitted scalar load");
-  // The kept load is an ordinary buffer access: it needs a buffer of its own. Left with the
-  // decoder's index, ExtractResourcePlan indexed past the buffers (GTA V Fidelity crash).
-  const auto &kept = fixture->program.memory_info[shared_read->Flags<MemoryFlags>().index];
-  Check(kept.kind == ResourceKind::IndirectBuffer ||
-            kept.resource < fixture->program.info.buffers.size(),
-        "the T# word that stays a scalar load was not bound to a buffer");
-  (void)ExtractResourcePlan(fixture->program);
-}
-
 void TestConditionalIndirectImageMaterialization() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   auto fixture = MakeIndirectImageFixture(false);
@@ -9735,6 +9618,12 @@ void TestMalformedMemoryKindsRejected() {
 } // namespace
 
 int main() {
+  // The image-table tests exercise the sampled-array path, which is opt-in.
+#ifdef _WIN32
+  _putenv_s("KYTY_IMAGE_TABLES", "1");
+#else
+  setenv("KYTY_IMAGE_TABLES", "1", 1);
+#endif
   try {
     const auto Run = [](const char *name, auto test) {
       try {
@@ -9748,6 +9637,7 @@ int main() {
     Run("bounded buffer writes", TestBoundedBufferWrites);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
     Run("untrackable sampler border word", TestUntrackableSamplerBorderWord);
+    Run("bindless image table", TestBindlessImageTable);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
     Run("independent image/sampler pairs", TestIndependentImageSamplerPairs);

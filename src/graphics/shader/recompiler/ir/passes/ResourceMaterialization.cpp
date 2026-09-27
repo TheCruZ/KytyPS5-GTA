@@ -1082,6 +1082,124 @@ bool MaterializeImageTable(const ResourcePlan& program,
 	}
 	return true;
 }
+
+// Exemplar that specializes a table root: a T# with the root's dimension and a native format,
+// preferring the float textures that sampled material tables mostly hold.
+bool TableExemplar(const ImageResource& root, const DescriptorValue& descriptor, bool float_only) {
+	if (NullImageDescriptor(descriptor) || DescriptorIsCube(descriptor) != root.cube) {
+		return false;
+	}
+	const auto format = static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
+	const auto numeric_class = Prospero::SampledTextureNumericClass(format);
+	return DescriptorDimension(descriptor, root.dimension) == root.dimension &&
+	       numeric_class != Prospero::TextureNumericClass::Unsupported &&
+	       (!float_only || numeric_class == Prospero::TextureNumericClass::Float) &&
+	       ImageConversionFormat(format) == Prospero::BufferFormat::kInvalid &&
+	       !Prospero::IsFmaskTextureFormat(format);
+}
+
+uint32_t ImageTableCapacity(size_t slots) {
+	return std::bit_ceil(std::max<uint32_t>(static_cast<uint32_t>(slots), 256u));
+}
+
+// A bindless table: the key the shader computes from GPU data selects entry key & entry_mask,
+// so every entry the table holds is a candidate. Distinct valid T#s become descriptor slots and
+// the per-entry slot mapping is appended to the flattened SRT.
+bool MaterializeImageTable(const ResourcePlan& program,
+                           const DescriptorSource::IndirectDescriptor& indirect,
+                           const DescriptorValue& table_value, uint32_t image_index,
+                           const SrtRuntime& runtime, ResourceSnapshot& snapshot,
+                           ResourceSpecialization& specialization,
+                           std::vector<ImageTableSnapshot>& previous,
+                           std::vector<uint32_t>& mapping_offsets) {
+	ShaderBufferResource table;
+	if (table_value.dword_count != 4u || !DecodeBufferDescriptor(table_value, table) ||
+	    (indirect.table_offset & 31u) != 0u) {
+		return false;
+	}
+	const auto base       = table.Base48();
+	const auto size       = table.GetSize();
+	const auto entry_mask = indirect.key_mask;
+	const auto entries    = std::min<uint64_t>(
+	    {size > indirect.table_offset ? (size - indirect.table_offset) / 32u : 0u,
+	     uint64_t {entry_mask} + 1u, MaxIndirectDescriptorProbes});
+	const auto& root = program.info.images[image_index];
+	const auto same_table = [&](const ImageTableSnapshot& candidate) {
+		return candidate.base == base && candidate.size == size &&
+		       candidate.offset == indirect.table_offset && candidate.entry_mask == entry_mask;
+	};
+	auto found = std::ranges::find_if(snapshot.image_tables, same_table);
+	if (found == snapshot.image_tables.end()) {
+		ImageTableSnapshot next {.base = base, .size = size, .offset = indirect.table_offset,
+		                         .entry_mask = entry_mask};
+		// Tables span megabytes and rarely change: read into a reused buffer and keep the
+		// previous snapshot's words when they are equal.
+		static thread_local std::vector<uint32_t> words;
+		words.resize(static_cast<size_t>(entries) * 8u);
+		if (!words.empty() && !ReadScalarTable(base, size, indirect.table_offset, runtime, words)) {
+			return false;
+		}
+		const auto reusable = std::ranges::find_if(previous, [&](const ImageTableSnapshot& old) {
+			return same_table(old) && old.raw == words && !old.slots.empty();
+		});
+		if (reusable != previous.end()) {
+			next.raw     = std::move(reusable->raw);
+			next.slots   = std::move(reusable->slots);
+			next.mapping = std::move(reusable->mapping);
+		} else {
+			next.raw.swap(words);
+			next.slots.push_back(DescriptorValue {.dword_count = 8u});
+			next.mapping.assign(static_cast<size_t>(entries) + 1u, 0u);
+			next.mapping[0] = static_cast<uint32_t>(entries);
+			std::unordered_map<std::string_view, uint32_t> slot_of;
+			for (uint32_t entry = 0; entry < entries; entry++) {
+				DescriptorValue candidate {.dword_count = 8u};
+				std::copy_n(next.raw.begin() + entry * 8u, 8u, candidate.dwords.begin());
+				if (NullImageDescriptor(candidate)) {
+					continue;
+				}
+				if (!ValidImageDescriptor(candidate, root.r128)) {
+					Common::HackNotice::Report("invalid T# in a bindless table bound as a null image",
+					                           "MaterializeImageTable", program.shader_hash, 0,
+					                           "words that only look like a T# are not bound");
+					continue;
+				}
+				const std::string_view key(
+				    reinterpret_cast<const char*>(next.raw.data() + entry * 8u),
+				    8u * sizeof(uint32_t));
+				const auto [slot, inserted] =
+				    slot_of.try_emplace(key, static_cast<uint32_t>(next.slots.size()));
+				if (inserted) {
+					next.slots.push_back(candidate);
+				}
+				next.mapping[entry + 1u] = slot->second;
+			}
+		}
+		snapshot.image_tables.push_back(std::move(next));
+		mapping_offsets.push_back(static_cast<uint32_t>(snapshot.flattened_srt.size()));
+		const auto& mapping = snapshot.image_tables.back().mapping;
+		snapshot.flattened_srt.insert(snapshot.flattened_srt.end(), mapping.begin(), mapping.end());
+		found = snapshot.image_tables.end() - 1;
+	}
+	const auto table_index     = static_cast<uint32_t>(found - snapshot.image_tables.begin());
+	auto&      image           = specialization.images[image_index];
+	image.table                = table_index;
+	image.table_capacity       = ImageTableCapacity(found->slots.size());
+	image.table_mapping_offset = mapping_offsets[table_index];
+	image.table_entry_mask     = entry_mask;
+	snapshot.images[image_index] = {.dword_count = 8u};
+	for (const bool float_only: {true, false}) {
+		const auto exemplar = std::ranges::find_if(found->slots, [&](const DescriptorValue& slot) {
+			return TableExemplar(root, slot, float_only);
+		});
+		if (exemplar != found->slots.end()) {
+			snapshot.images[image_index] = *exemplar;
+			break;
+		}
+	}
+	return true;
+}
+
 } // namespace
 
 bool ImageTableSlotCompatible(const ImageResource& root, const DescriptorValue& descriptor) {
@@ -3058,6 +3176,15 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				}
 				continue;
 			}
+			if (indirect.table_array) {
+				DescriptorValue table;
+				if (!clean.EvaluateDescriptor(indirect.table_source, table) ||
+				    !MaterializeImageTable(program, indirect, table, i, observed, snapshot,
+				                           specialization, previous_tables, table_mappings)) {
+					return FailIndirect(__LINE__);
+				}
+				continue;
+			}
 			const auto srt_size        = snapshot.flattened_srt.size();
 			const auto image_count     = snapshot.images.size();
 			const auto spec_count      = specialization.images.size();
@@ -3322,6 +3449,10 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;
 		image.indirect_search_iterations = source.indirect_search_iterations;
 		image.bindless                   = source.bindless;
+		image.table                      = source.table;
+		image.table_capacity             = source.table_capacity;
+		image.table_mapping_offset       = source.table_mapping_offset;
+		image.table_entry_mask           = source.table_entry_mask;
 		image.cube                       = source.cube;
 		image.heap                       = source.heap;
 		image.indirect_resources.clear();
@@ -3506,8 +3637,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			        inst.GetOpcode() != ValueOpcode::ImageQueryDimensions &&
 			        inst.GetOpcode() != ValueOpcode::ImageRead &&
 			        inst.GetOpcode() != ValueOpcode::ImageWrite);
-			EXIT_IF(image.table_capacity != 0u && inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
-			        inst.GetOpcode() != ValueOpcode::ImageQueryDimensions);
+			EXIT_IF(image.table_capacity != 0u && inst.GetOpcode() != ValueOpcode::ImageSampleRaw);
 		}
 	}
 	// Tracking gives an image index only to the accesses that survived its dead-code pass; an
