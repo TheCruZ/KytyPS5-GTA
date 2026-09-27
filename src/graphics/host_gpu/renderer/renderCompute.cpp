@@ -22,6 +22,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
@@ -47,6 +48,90 @@ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::Descriptor
 			return false;
 	}
 	return true;
+}
+
+// Stores through V#s selected from a descriptor table write guest memory by device address.
+// Prepare every table entry as a written cache range so the BDA page table covers the
+// targets and later readers observe the GPU data. Returns whether any target was prepared.
+static bool PrepareIndirectWriteTargets(RenderContext& context, const PreparedBindings& bindings) {
+	constexpr uint64_t MaxTableEntries = 4096;
+	constexpr uint64_t MaxTargetSize   = uint64_t {256} << 20u;
+	const auto&        program         = *bindings.runtime->program;
+	const auto&        layout          = program.bindings;
+	if (layout.memory_offset_count == 0) {
+		return false;
+	}
+	// Buffer sources follow the bound resources, which leave out buffers the shader never
+	// accesses, not the shader's buffer list.
+	const auto& resources = layout.descriptors.front().resources;
+	bool        prepared  = false;
+	for (uint32_t i = 0; i < bindings.buffer_sources.size() && i < resources.size(); ++i) {
+		const auto& resource = program.info.buffers[resources[i]];
+		const auto& table    = bindings.buffer_sources[i];
+		if (!resource.indirect_write_table || table.address == 0 ||
+		    table.size <= resource.indirect_table_offset) {
+			continue;
+		}
+		const auto available =
+		    (table.size - resource.indirect_table_offset) / sizeof(ShaderBufferResource);
+		if (available > MaxTableEntries) {
+			static bool logged = false;
+			if (!logged) {
+				logged = true;
+				LOGF("Compute: V# table 0x%016" PRIx64 " has %" PRIu64
+				     " entries; stores through entries past %" PRIu64 " are dropped\n",
+				     table.address, available, MaxTableEntries);
+			}
+		}
+		const auto                        entries = std::min<uint64_t>(available, MaxTableEntries);
+		std::vector<ShaderBufferResource> targets(entries);
+		const auto address = table.address + resource.indirect_table_offset;
+		const auto bytes   = entries * sizeof(ShaderBufferResource);
+		if (!LibKernel::Memory::TryReadGpuCleanBacking(address, targets.data(), bytes)) {
+			// The guest copy of a table the GPU wrote is stale: download it before scanning.
+			auto& buffer_cache = context.GetBufferCache();
+			if (buffer_cache.HasGpuDirtyBytes(address, bytes)) {
+				buffer_cache.ReadMemory(address, bytes);
+			}
+			if (!LibKernel::Memory::TryReadBacking(address, targets.data(), bytes)) {
+				LOGF("Compute: V# table 0x%016" PRIx64 " is unreadable\n", address);
+				continue;
+			}
+		}
+		std::vector<GuestRange> ranges;
+		ranges.reserve(targets.size());
+		for (const auto& target: targets) {
+			// A table may also hold T#s, S#s or stale entries. The shader drops stores through a
+			// V# without a data format, so only buffer V#s with one can be written.
+			if (target.Type() != 0 || target.RawFormat() == 0) {
+				continue;
+			}
+			const GuestRange range {target.Base48(), target.GetSize()};
+			if (range.size <= MaxTargetSize && range.Valid()) {
+				ranges.push_back(range);
+			}
+		}
+		// Tables repeat V#s; preparing a range twice changes nothing.
+		std::ranges::sort(ranges);
+		ranges.erase(std::unique(ranges.begin(), ranges.end()), ranges.end());
+		for (const auto& range: ranges) {
+			// Creating a buffer copies its guest memory, so the whole range must be mapped.
+			if (!context.IsMapped(range.address, range.size)) {
+				static bool logged = false;
+				if (!logged) {
+					logged = true;
+					LOGF("Compute: V# table 0x%016" PRIx64 " names unmapped range 0x%016" PRIx64
+					     " size 0x%016" PRIx64 "; stores through it are dropped\n",
+					     table.address, range.address, range.size);
+				}
+				continue;
+			}
+			(void)context.GetBufferCache().ObtainBuffer(range.address, range.size, true);
+			context.GetTextureCache().InvalidateMemoryFromGPU(range.address, range.size);
+			prepared = true;
+		}
+	}
+	return prepared;
 }
 
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
@@ -373,13 +458,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		m_context.PrepareBda();
 	}
 	RebindImages(bindings);
+	const bool indirect_writes = PrepareIndirectWriteTargets(m_context, bindings);
 	RebindBuffers(bindings);
 
 	auto              vk_buffer        = buffer.Handle();
 	PreparedBindings* descriptor_stage = &bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
-	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
+	bool has_storage_writes = HasShaderBufferWrites(input_info.stage) || indirect_writes;
 	has_storage_writes =
 	    std::any_of(program.info.images.begin(), program.info.images.end(),
 	                [](const auto& image) {
@@ -431,6 +517,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		m_context.PrepareBda();
 	}
 	RebindImages(bindings);
+	// Preparing written targets can merge cache buffers too; acquire the arguments afterward.
+	const bool indirect_writes = PrepareIndirectWriteTargets(m_context, bindings);
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
@@ -440,7 +528,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const auto vk_buffer = buffer.Handle();
-	const bool has_storage_writes = HasShaderBufferWrites(input_info.stage) ||
+	const bool has_storage_writes =
+	    HasShaderBufferWrites(input_info.stage) || indirect_writes ||
 	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
 		    return image.written && image.resource_class ==
 		                                ShaderRecompiler::IR::ImageResourceClass::Storage;

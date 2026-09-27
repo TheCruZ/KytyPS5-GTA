@@ -787,7 +787,16 @@ void FormattedStore(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memor
 	});
 }
 
-uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
+struct IndirectBufferComponent {
+	uint32_t address = 0;
+	uint32_t active  = 0;
+};
+
+// Resolves one DWORD of a buffer access whose V# is a runtime value, following the RDNA2
+// address and bounds rules that the native buffer path gets from its descriptor.
+std::array<IndirectBufferComponent, 4> IndirectBufferComponents(ValueEmitContext& ctx,
+                                                                const IR::Inst& inst,
+                                                                uint32_t components) {
 	auto&       state   = ctx.state;
 	const auto& handle  = *inst.Arg(0).ResolveInstruction();
 	const auto  word1   = ctx.Arg(handle, 1);
@@ -824,7 +833,7 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_
 	const auto raw_records = Binary(state, spv::OpISub, TypeU32(state), records, soffset);
 	const auto raw_index_in_bounds =
 	    Binary(state, spv::OpULessThan, TypeBool(state), index, raw_records);
-	std::array<uint32_t, 4> values {};
+	std::array<IndirectBufferComponent, 4> result {};
 	for (uint32_t component = 0; component < components; component++) {
 		const auto address = CalculateBufferAddress(state, index, ctx.Arg(inst, 2), soffset,
 		                                            ctx.Memory(inst).offset + component * 4u,
@@ -850,12 +859,59 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_
 		    Select(state, TypeBool(state),
 		           Binary(state, spv::OpIEqual, TypeBool(state), mode, ConstantU32(state, 2)),
 		           nonzero(records), raw_bounds));
-		const auto guest =
+		result[component].address =
 		    Binary(state, spv::OpIAdd, TypeScalarU64(state), base,
 		           Unary(state, spv::OpUConvert, TypeScalarU64(state), address.byte));
-		values[component] = LoadBda(ctx, guest, AndCondition(state, valid_format, in_bounds), 32u);
+		result[component].active = AndCondition(state, valid_format, in_bounds);
 	}
-	return ConstructU32Composite(state, components, values);
+	return result;
+}
+
+uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
+	const auto parts = IndirectBufferComponents(ctx, inst, components);
+	std::array<uint32_t, 4> values {};
+	for (uint32_t component = 0; component < components; component++) {
+		values[component] =
+		    LoadBda(ctx, parts[component].address, parts[component].active, 32u);
+	}
+	return ConstructU32Composite(ctx.state, components, values);
+}
+
+void StoreBdaDword(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t value) {
+	auto& state = ctx.state;
+	EmitIfCondition(state, active, [&]() {
+		// RDNA2 DWORD accesses ignore the two low address bits.
+		const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeScalarU64(state), address,
+		                            ConstantDeviceAddress(state, ~uint64_t {3}));
+		const auto bda     = GetBdaPointer(ctx, aligned);
+		const auto present =
+		    Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantDeviceAddress(state, 0));
+		EmitIfCondition(state, present, [&]() {
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+			                          bda);
+			constexpr uint32_t alignment = sizeof(uint32_t);
+			state.builder.AddFunction(spv::OpStore, pointer, value, spv::MemoryAccessAlignedMask,
+			                          alignment);
+		});
+	});
+}
+
+void StoreIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
+	auto& state = ctx.state;
+	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto parts = IndirectBufferComponents(ctx, inst, components);
+		const auto data  = ctx.Arg(inst, inst.NumArgs() - 2);
+		for (uint32_t component = 0; component < components; component++) {
+			auto value = data;
+			if (components != 1u) {
+				value = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, data,
+				                          component);
+			}
+			StoreBdaDword(ctx, parts[component].address, parts[component].active, value);
+		}
+	});
 }
 
 uint32_t LoadWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
@@ -1270,7 +1326,9 @@ void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  buffer_components = IR::BufferComponentCount(op);
 	const auto  shared_components = IR::SharedComponentCount(op);
 	const auto  type              = inst.Arg(inst.NumArgs() - 2).GetType();
-	if (buffer_components > 1u)
+	if (mem.kind == IR::ResourceKind::IndirectBuffer)
+		StoreIndirectBuffer(ctx, inst, std::max(buffer_components, 1u));
+	else if (buffer_components > 1u)
 		StoreWideBuffer(ctx, inst, buffer_components);
 	else if (shared_components > 1u)
 		StoreWideShared(ctx, inst, shared_components);
