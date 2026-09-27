@@ -50,12 +50,11 @@ public:
 	              "bufferCachePages.h is out of date");
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
-	// The fault buffer holds three bitmaps of CACHING_NUMPAGES bits: pages that device-address
-	// accesses found without a cached buffer, pages that V#-table stores wrote, and pages that
-	// device-address accesses found cached (their buffers are in use).
-	static constexpr uint64_t WRITE_BITMAP_OFFSET = CACHING_NUMPAGES / 8;
-	static constexpr uint64_t USE_BITMAP_OFFSET   = 2 * WRITE_BITMAP_OFFSET;
-	static constexpr uint64_t FAULT_BUFFER_SIZE   = 3 * WRITE_BITMAP_OFFSET;
+	// The fault buffer holds two bitmaps of CACHING_NUMPAGES bits: pages that device-address
+	// accesses found without a cached buffer, then (after the shader trap record) pages that
+	// V#-table stores wrote.
+	static constexpr uint64_t WRITE_BITMAP_OFFSET = BufferCachePages::kWriteBitmapOffset;
+	static constexpr uint64_t FAULT_BUFFER_SIZE   = BufferCachePages::kFaultBufferBytes;
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
@@ -210,6 +209,32 @@ public:
 	// GPU thread, before guest memory is unmapped: drops the shared buffers over it (their
 	// imports point into that memory).
 	void UnmapShared(uint64_t vaddr, uint64_t size);
+	// Clears the fault buffer before the first shader that records into it runs.
+	void PrepareFaultBuffer() { (void)GetFaultBuffer(); }
+	// Records stores that a shader made through device addresses, known once it completed: the
+	// bytes of [vaddr, vaddr + size) that a cached buffer holds become GPU modified, except on
+	// pages the CPU dirtied since, whose upload replaces them.
+	void NoteGpuWrites(uint64_t vaddr, uint64_t size);
+	// Clears the page-write bitmap of V#-table stores and, once the GPU work recorded so far
+	// completes, passes the guest addresses of the written caching pages to `handler`.
+	void ProcessWriteBuffer(FaultManager::PagesHandler&& handler) {
+		m_fault_manager.ProcessWriteBuffer(std::move(handler));
+	}
+	// Calls func(address, size) for the runs of [vaddr, vaddr + size) the CPU may have written
+	// since the previous call over them (see MemoryTracker::ConsumeCpuWrites).
+	template <typename Func>
+	void ConsumeCpuWrites(uint64_t vaddr, uint64_t size, Func&& func) {
+		m_memory_tracker.ConsumeCpuWrites(vaddr, size, std::forward<Func>(func));
+	}
+	// Calls func(address, size) for the ranges whose buffers the garbage collector released since
+	// the previous call, and forgets them; the first call starts recording them. Merging buffers
+	// keeps every address cached.
+	template <typename Func>
+	void ConsumeReleasedRanges(Func&& func) {
+		m_released_ranges.ForEach(func);
+		m_released_ranges.Clear();
+		m_record_released = true;
+	}
 
 private:
 	// Shared buffers (KYTY_SHARED_BUFFERS=1): a small buffer the game threads keep reading back is
@@ -411,6 +436,9 @@ private:
 	BufferMap                                          m_buffers;
 	PageTable                                          m_page_table;
 	RangeSet                                           m_gpu_modified_ranges;
+	// Ranges whose buffers the garbage collector released (ConsumeReleasedRanges).
+	RangeSet                                           m_released_ranges;
+	bool                                               m_record_released = false;
 	// Bytes whose download is recorded but not yet in guest memory.
 	RangeSet                                           m_downloading_ranges;
 	// Every in-flight download's ranges, one entry each: m_downloading_ranges is their union. A

@@ -5513,88 +5513,6 @@ void TestDenseBufferTracking() {
              "resource tracking allowed a second mutation pass");
 }
 
-// GTA V ray tracing: after a hit, S_BUFFER_LOAD reads instance data through a V# that
-// S_BUFFER_LOAD_DWORDX4 selected from a table at a GPU-computed offset.
-void TestIndirectScalarReads() {
-  Fixture fixture;
-  const auto table = fixture.Buffer(
-      {fixture.UserData(0), fixture.UserData(1), fixture.UserData(2),
-       fixture.UserData(3)},
-      4);
-  const auto key = fixture.Emit(ValueOpcode::ReadFirstLane,
-                                {fixture.Emit(ValueOpcode::LaneId), Value(true)});
-  const auto offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(4u)});
-  std::array<Value, 4> dwords;
-  for (uint32_t dword = 0; dword < dwords.size(); dword++) {
-    MemoryInfo scalar;
-    scalar.kind = ResourceKind::ScalarBuffer;
-    scalar.offset = dword * 4;
-    dwords[dword] = fixture.Emit(ValueOpcode::ReadConstBuffer, {table, offset},
-                                 fixture.AddMemory(scalar, 8));
-  }
-  const auto instance = fixture.Buffer(dwords, 16);
-  MemoryInfo data;
-  data.kind = ResourceKind::ScalarBuffer;
-  data.offset = 8;
-  const auto data_flags = fixture.AddMemory(data, 16);
-  fixture.Emit(ValueOpcode::ReadConstBuffer,
-               {instance, fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(3u)})},
-               data_flags);
-  fixture.PlanAndTrack();
-
-  Check(fixture.program.memory_info[data_flags.index].kind == ResourceKind::IndirectBuffer &&
-            fixture.program.info.uses_dma,
-        "a scalar read through a GPU-selected V# did not use the indirect buffer path");
-  Check(fixture.program.info.buffers.size() == 1 && fixture.program.info.buffers[0].scalar,
-        "a GPU-selected scalar read bound more than its V# table");
-}
-
-// GTA V ray tracing: the BVH traversal reads instance nodes at base + (node >> 3) << 7 with the
-// node it popped off a lane stack. Reads behind such an address cannot be flattened into host SRT
-// reads; reads the host can evaluate still are.
-void TestGpuDependentAddressReads() {
-  Fixture fixture;
-  const auto node = fixture.Emit(ValueOpcode::ReadFirstLane,
-                                 {fixture.Emit(ValueOpcode::LaneId), Value(true)});
-  const auto instance_base = fixture.Emit(
-      ValueOpcode::IAdd32,
-      {fixture.UserData(2),
-       fixture.Emit(ValueOpcode::ShiftLeftLogical32,
-                    {fixture.Emit(ValueOpcode::ShiftRightLogical32, {node, Value(3u)}),
-                     Value(7u)})});
-  MemoryInfo scalar;
-  scalar.kind = ResourceKind::ScalarAddress;
-  scalar.offset = 60;
-  const auto gpu_flags = fixture.AddMemory(scalar, 0x20);
-  const auto instance_word = fixture.Emit(
-      ValueOpcode::LoadAddressU32,
-      {fixture.Address(instance_base, fixture.UserData(3)), Value(0u), Value(0u), Value(true)},
-      gpu_flags);
-  scalar.offset = 4;
-  const auto host_flags = fixture.AddMemory(scalar, 0x10);
-  const auto host_word = fixture.Emit(
-      ValueOpcode::LoadAddressU32,
-      {fixture.Address(fixture.UserData(0), fixture.UserData(1)), Value(0u), Value(0u),
-       Value(true)},
-      host_flags);
-  MemoryInfo global;
-  global.kind = ResourceKind::Global;
-  global.address_is_full = false;
-  const auto load_flags = fixture.AddMemory(global, 0x30);
-  fixture.Emit(ValueOpcode::LoadAddressU32,
-               {fixture.Address(fixture.Emit(ValueOpcode::IAdd32, {instance_word, host_word}),
-                                fixture.UserData(5)),
-                Value(0u), Value(0u), Value(true)},
-               load_flags);
-  fixture.PlanAndTrack();
-
-  Check(!fixture.program.memory_info[gpu_flags.index].planning_only,
-        "a read behind a GPU-dependent address was flattened into a host SRT read");
-  Check(fixture.program.memory_info[host_flags.index].planning_only,
-        "a host-evaluable read behind an address was not flattened");
-  Check(fixture.program.info.uses_dma, "GPU-dependent address reads did not use DMA");
-}
-
 // GTA V skinning: the store V# is S_BUFFER_LOAD_DWORDX4 from a V# table at key * 16.
 void EmitVSharpTableStore(Fixture &fixture, std::array<MemoryFlags, 4> &reads,
                           MemoryFlags &store) {
@@ -9638,6 +9556,7 @@ int main() {
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
     Run("untrackable sampler border word", TestUntrackableSamplerBorderWord);
     Run("bindless image table", TestBindlessImageTable);
+    Run("V# table stores", TestVSharpTableStores);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
     Run("independent image/sampler pairs", TestIndependentImageSamplerPairs);

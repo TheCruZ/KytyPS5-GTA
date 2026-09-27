@@ -182,8 +182,8 @@ uint64_t RenderContext::MappedRangesVersion() const noexcept {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	m_buffer_cache.QueueBdaSync(vaddr, size);
 	m_mapped_ranges_version++;
-	m_bda_mapped_since_sync.emplace_back(vaddr, size);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -336,9 +336,6 @@ void RenderContext::PrepareBda() {
 		m_bda_logged = true;
 	}
 	m_buffer_cache.PrepareFaultBuffer();
-	if (may_write) {
-		m_buffer_cache.NoteDeviceAddressUse();
-	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	// Nothing to upload when no page became CPU dirty, no buffer was registered and no range was
 	// mapped since the last synchronization started.
@@ -435,15 +432,6 @@ void RenderContext::RunGarbageCollector() {
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
-	}
-	m_image_heap.RunGarbageCollector();
-	constexpr uint32_t UseScanPeriod = 256;
-	if (m_use_scan_countdown != 0) {
-		m_use_scan_countdown--;
-	} else if (m_use_scan_pending) {
-		m_use_scan_pending   = false;
-		m_use_scan_countdown = UseScanPeriod;
-		m_buffer_cache.ProcessUseBuffer();
 	}
 	if (m_indirect_write_tables.TakePendingWrites()) {
 		m_buffer_cache.ProcessWriteBuffer([this](std::span<const uint64_t> pages) {

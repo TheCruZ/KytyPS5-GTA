@@ -175,24 +175,27 @@ uint32_t FaultElementPointer(EmitterState& state, uint32_t index) {
 uint32_t BdaPageIndex(EmitterState& state, uint32_t address) {
 	const auto type     = TypeU64(state);
 	const auto extended = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), address,
-	                             ConstantU64(state, LibKernel::Memory::kExtendedMemoryBase));
+	                             ConstantU64(state, BufferCachePages::kExtendedMemoryBase));
 	const auto packed   = Select(state, type, extended,
 	                             Binary(state, spv::OpISub, type, address,
-	                                    ConstantU64(state,
-	                                        LibKernel::Memory::kExtendedMemoryBase - LOWER_ADDRESS_SIZE)),
+	                                    ConstantU64(state, BufferCachePages::kExtendedMemoryBase -
+	                                                           BufferCachePages::kLowerAddressSize)),
 	                             address);
 	const auto page64   = Binary(state, spv::OpShiftRightLogical, type, packed,
-	                             ConstantU64(state, BufferCache::CACHING_PAGEBITS));
+	                             ConstantU64(state, BufferCachePages::kPageBits));
 	return Unary(state, spv::OpUConvert, TypeU32(state), page64);
 }
 
-// Sets the page's bit in the fault buffer bitmap at `bitmap_offset`. Most accesses find the bit
-// set already; only the first one to a page since the host last read the bitmap pays the atomic.
-void RecordBdaPageBit(EmitterState& state, uint32_t page, uint64_t bitmap_offset) {
+// Sets the page's bit in the write bitmap, so the host learns which pages V#-table stores wrote.
+// Most stores find the bit set already; only the first store to a page pays for the atomic.
+void RecordBdaWrite(EmitterState& state, uint32_t page) {
+	static_assert(BufferCachePages::kWriteBitmapOffset % sizeof(uint32_t) == 0 &&
+	              BufferCachePages::kWriteBitmapOffset / sizeof(uint32_t) <= UINT32_MAX);
 	const auto word = Binary(
 	    state, spv::OpIAdd, TypeU32(state),
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), page, ConstantU32(state, 5)),
-	    ConstantU32(state, static_cast<uint32_t>(bitmap_offset / sizeof(uint32_t))));
+	    ConstantU32(state,
+	                static_cast<uint32_t>(BufferCachePages::kWriteBitmapOffset / sizeof(uint32_t))));
 	const auto bit =
 	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
 	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
@@ -208,13 +211,6 @@ void RecordBdaPageBit(EmitterState& state, uint32_t page, uint64_t bitmap_offset
 		state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), state.builder.AllocateId(),
 		                          pointer, scope, relaxed, bit);
 	});
-}
-
-// The host learns which pages V#-table stores wrote.
-void RecordBdaWrite(EmitterState& state, uint32_t page) {
-	static_assert(BufferCache::WRITE_BITMAP_OFFSET % sizeof(uint32_t) == 0 &&
-	              BufferCache::WRITE_BITMAP_OFFSET / sizeof(uint32_t) <= UINT32_MAX);
-	RecordBdaPageBit(state, page, BufferCache::WRITE_BITMAP_OFFSET);
 }
 
 void RecordBdaFault(EmitterState& state, uint32_t page) {
@@ -1539,16 +1535,7 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction(spv::OpFunctionParameter, type, address);
 	EmitLabel(state, entry_label);
 
-	const auto extended = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), address,
-	                             ConstantU64(state, BufferCachePages::kExtendedMemoryBase));
-	const auto packed = Select(state, type, extended,
-	                           Binary(state, spv::OpISub, type, address,
-	                                  ConstantU64(state,
-	                                      BufferCachePages::kExtendedMemoryBase - BufferCachePages::kLowerAddressSize)),
-	                           address);
-	const auto page64        = Binary(state, spv::OpShiftRightLogical, type, packed,
-	                                  ConstantU64(state, BufferCachePages::kPageBits));
-	const auto page          = Unary(state, spv::OpUConvert, TypeU32(state), page64);
+	const auto page          = BdaPageIndex(state, address);
 	const auto entry_pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state, 64),
 	                          entry_pointer, state.bda_pagetable_variable, ConstantU32(state, 0),

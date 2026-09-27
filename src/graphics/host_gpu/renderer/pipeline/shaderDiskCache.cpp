@@ -25,7 +25,7 @@ namespace {
 
 // Bump when the encoding below changes in a way the source version cannot see (it hashes this
 // file too, so this is belt and braces).
-constexpr uint32_t FormatVersion = 7;
+constexpr uint32_t FormatVersion = 8;
 constexpr uint32_t FileMagic     = 0x4344534bu; // "KSDC"
 constexpr uint64_t MaxFileSize   = uint64_t {256} << 20u;
 
@@ -113,6 +113,8 @@ void Visit(Io& io, T& v) {
 	io(v.gpu_records_add);
 	io(v.gpu_records_ssa);
 	io(v.indirect_resources);
+	io(v.indirect_write_table);
+	io(v.indirect_table_offset);
 }
 
 template <typename Io, typename T>

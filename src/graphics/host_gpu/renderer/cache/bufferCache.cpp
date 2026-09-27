@@ -3973,10 +3973,32 @@ void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 }
 
 void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
-	m_gpu_write_generation++;
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid GPU write range\n");
 	}
+	const auto end = vaddr + size;
+	auto       it  = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < end; ++it) {
+		const auto& buffer = m_slot_buffers[it->second];
+		const auto  start  = std::max(buffer.CpuAddress(), vaddr);
+		const auto  finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+		if (start >= finish) {
+			continue;
+		}
+		TouchBuffer(buffer);
+		m_memory_tracker.MarkRegionAsGpuModifiedUnlessCpuDirty(
+		    start, finish - start, [&](uint64_t page, uint64_t bytes) {
+			    const auto first = std::max(page, start);
+			    const auto last  = std::min(page + bytes, finish);
+			    m_gpu_modified_ranges.Add(first, last - first);
+		    });
+	}
+}
+
+void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 	const auto end = vaddr + size;
 	auto       it  = m_buffers.upper_bound(vaddr);
 	if (it != m_buffers.begin()) {

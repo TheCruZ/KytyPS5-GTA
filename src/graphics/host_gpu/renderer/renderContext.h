@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
+#include "graphics/host_gpu/renderer/indirectWriteTables.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -55,6 +56,7 @@ public:
 	BufferCache&        GetBufferCache() { return m_buffer_cache; }
 	TextureCache&       GetTextureCache() { return m_texture_cache; }
 	BindlessTable&      GetBindlessTable() { return m_bindless_table; }
+	IndirectWriteTables& GetIndirectWriteTables() { return m_indirect_write_tables; }
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }
 
@@ -102,23 +104,10 @@ private:
 	BufferCache               m_buffer_cache;
 	TextureCache              m_texture_cache;
 	BindlessTable             m_bindless_table;
+	IndirectWriteTables       m_indirect_write_tables {*this};
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	uint64_t                  m_mapped_ranges_version = 0;
-	// Ranges mapped since the last BDA synchronization (under m_mapped_ranges_mutex): that
-	// synchronization forces their regions (BufferCache::ForceSynchronization()).
-	std::vector<std::pair<uint64_t, uint64_t>> m_bda_mapped_since_sync;
-	// SynchronizeDmaFootprint(): the spans of an operation.
-	std::vector<std::pair<uint64_t, uint64_t>> m_dma_spans;
-	// Epochs (CPU dirty, buffer registrations, mapped ranges) read before the last full BDA
-	// synchronization.
-	std::array<uint64_t, 3> m_bda_sync_epochs {UINT64_MAX, UINT64_MAX, UINT64_MAX};
-	// Advances with each guest submission an operation belongs to, after each WAIT_REG_MEM the
-	// command processor resolved and whenever the execution thread itself writes guest memory
-	// the CPU tracks (see PrepareBda()).
-	uint64_t m_bda_generation        = 1;
-	uint64_t m_bda_synced_generation = 0;
-	uint64_t m_bda_submit            = UINT64_MAX;
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;

@@ -25,12 +25,22 @@ namespace {
 constexpr size_t MaxPageFaults       = 1024;
 constexpr size_t PageFaultAreaSize   = MaxPageFaults * sizeof(uint64_t);
 constexpr size_t PageFaultBitsetSize = BufferCache::CACHING_NUMPAGES / 8;
+// Pages V#-table stores may write between two reads; more stay in the bitmap for the next read.
+constexpr size_t MaxPageWrites       = 16384;
 
 size_t DownloadAreaSize(const GraphicContext& graphics) {
 	const auto& limits = graphics.physical_device_properties.limits;
 	const auto  alignment =
 	    std::max(limits.nonCoherentAtomSize, limits.minStorageBufferOffsetAlignment);
 	return (PageFaultAreaSize + sizeof(ShaderTrapRecord) + alignment - 1) & ~(alignment - 1);
+}
+
+// The write bitmap's readback area: the count, then the pages (MaxPageWrites at most).
+size_t WriteAreaSize(const GraphicContext& graphics) {
+	const auto& limits = graphics.physical_device_properties.limits;
+	const auto  alignment =
+	    std::max(limits.nonCoherentAtomSize, limits.minStorageBufferOffsetAlignment);
+	return ((MaxPageWrites + 1) * sizeof(uint64_t) + alignment - 1) & ~(alignment - 1);
 }
 
 } // namespace
@@ -46,9 +56,12 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
     : m_graphics(graphics), m_scheduler(scheduler), m_buffer_cache(buffer_cache),
       m_download_area_size(DownloadAreaSize(graphics)),
       m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                     PageFaultBitsetSize + sizeof(ShaderTrapRecord)),
+                     BufferCache::FAULT_BUFFER_SIZE),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
-                        MaxPendingFaults * m_download_area_size) {
+                        MaxPendingFaults * m_download_area_size),
+      m_write_download(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
+                       MaxPendingFaults * WriteAreaSize(graphics)),
+      m_write_area_size(WriteAreaSize(graphics)) {
 	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
 
 	const vk::DescriptorSetLayoutBinding bindings[] {
@@ -241,6 +254,95 @@ void FaultManager::ProcessFaultBufferImpl(ShaderFaultReport* report) {
 
 	reader.ticks[reader.current++] = m_scheduler.CurrentTick();
 	reader.current %= MaxPendingFaults;
+}
+
+void FaultManager::ProcessWriteBuffer(PagesHandler&& handler) {
+	KYTY_PROFILER_FUNCTION();
+	(void)GetFaultBuffer();
+	if (const auto wait_tick = m_write_areas[m_current_write_area]; wait_tick != 0) {
+		m_scheduler.Wait(wait_tick);
+		m_scheduler.PopPendingOperations();
+	}
+
+	const auto offset = m_current_write_area * m_write_area_size;
+	auto*      mapped = m_write_download.Mapped().data() + offset;
+	// The parser appends after the count; the host reads only the entries it counted.
+	std::memset(mapped, 0, sizeof(uint64_t));
+	m_write_download.Flush(offset, sizeof(uint64_t));
+
+	vk::BufferMemoryBarrier2 pre_barrier {};
+	pre_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	pre_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	pre_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+	pre_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderRead;
+	pre_barrier.buffer        = m_fault_buffer.Handle();
+	pre_barrier.offset        = BufferCache::WRITE_BITMAP_OFFSET;
+	pre_barrier.size          = PageFaultBitsetSize;
+	auto post_barrier          = pre_barrier;
+	post_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+	post_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	post_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	post_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderWrite;
+
+	const vk::DescriptorBufferInfo infos[] {
+	    {m_fault_buffer.Handle(), BufferCache::WRITE_BITMAP_OFFSET, PageFaultBitsetSize},
+	    {m_write_download.Handle(), offset, m_write_area_size},
+	};
+	std::array<vk::WriteDescriptorSet, 2> writes {};
+	for (uint32_t index = 0; index < writes.size(); ++index) {
+		writes[index].dstBinding      = index;
+		writes[index].descriptorCount = 1;
+		writes[index].descriptorType  = vk::DescriptorType::eStorageBuffer;
+		writes[index].pBufferInfo     = &infos[index];
+	}
+
+	m_scheduler.EndRendering();
+	auto               command = m_scheduler.Current().Recorder();
+	vk::DependencyInfo dependency {};
+	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
+	dependency.bufferMemoryBarrierCount = 1;
+	dependency.pBufferMemoryBarriers    = &pre_barrier;
+	command.pipelineBarrier2(dependency);
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_fault_process_pipeline);
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_fault_process_pipeline_layout,
+	                             0, writes);
+	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32;
+	const auto num_workgroups = (num_threads + 63) / 64;
+	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
+	dependency.pBufferMemoryBarriers = &post_barrier;
+	command.pipelineBarrier2(dependency);
+	vk::BufferMemoryBarrier2 download_barrier {};
+	download_barrier.srcStageMask    = vk::PipelineStageFlagBits2::eComputeShader;
+	download_barrier.srcAccessMask   = vk::AccessFlagBits2::eShaderWrite;
+	download_barrier.dstStageMask    = vk::PipelineStageFlagBits2::eHost;
+	download_barrier.dstAccessMask   = vk::AccessFlagBits2::eHostRead;
+	download_barrier.buffer          = m_write_download.Handle();
+	download_barrier.offset          = offset;
+	download_barrier.size            = m_write_area_size;
+	dependency.pBufferMemoryBarriers = &download_barrier;
+	command.pipelineBarrier2(dependency);
+
+	const auto area = m_current_write_area;
+	m_scheduler.DeferOperation([this, mapped, offset, area, handler = std::move(handler)] {
+		m_write_download.Invalidate(offset, m_write_area_size);
+		const auto* entries = std::bit_cast<const uint64_t*>(mapped);
+		// The parser counts every set bit but stores only the entries the area holds; it leaves
+		// the others set for the next read.
+		const auto capacity = m_write_area_size / sizeof(uint64_t) - 1;
+		const auto count    = std::min<uint64_t>(static_cast<uint32_t>(entries[0]), capacity);
+		std::vector<uint64_t> pages;
+		pages.reserve(count);
+		for (uint64_t index = 1; index <= count; ++index) {
+			pages.push_back(BufferCache::GuestAddress(entries[index]));
+		}
+		if (!pages.empty()) {
+			handler(pages);
+		}
+		m_write_areas[area] = 0;
+	});
+
+	m_write_areas[m_current_write_area++] = m_scheduler.CurrentTick();
+	m_current_write_area %= MaxPendingFaults;
 }
 
 } // namespace Libs::Graphics

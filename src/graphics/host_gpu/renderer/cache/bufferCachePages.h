@@ -18,6 +18,12 @@ inline constexpr uint64_t kLowerAddressSize   = uint64_t {1} << 40u;
 inline constexpr uint64_t kExtendedMemoryBase = 0x080000000000ull;
 inline constexpr uint64_t kExtendedMemorySize = 512ull * 1024 * 1024 * 1024;
 inline constexpr uint64_t kNumPages           = (kLowerAddressSize + kExtendedMemorySize) >> kPageBits;
+// The fault buffer: the page-fault bitset, the shader trap record (32 bytes), then the bitset of
+// pages that stores through V#s read from a table wrote.
+inline constexpr uint64_t kFaultBitsetBytes   = kNumPages / 8;
+inline constexpr uint64_t kTrapRecordBytes    = 32;
+inline constexpr uint64_t kWriteBitmapOffset  = kFaultBitsetBytes + kTrapRecordBytes;
+inline constexpr uint64_t kFaultBufferBytes   = kWriteBitmapOffset + kFaultBitsetBytes;
 
 } // namespace Libs::Graphics::BufferCachePages
 

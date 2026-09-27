@@ -278,10 +278,7 @@ public:
 		if constexpr (source == DirtySource::Cpu) {
 			if constexpr (enable) {
 				m_cpu_written.SetRange(start, end);
-				m_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
-				s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
 			}
-			m_has_cpu_dirty.store(m_cpu_dirty.Any(), std::memory_order_release);
 			UpdateProtection<!enable, false>();
 		} else {
 			UpdateProtection<enable, true>();
@@ -351,6 +348,38 @@ public:
 			} else {
 				UpdateProtection<false, true>();
 			}
+		}
+		for (const auto [first, last]: mask) {
+			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+		}
+	}
+
+	// Calls func(address, size) for the runs of pages in the range that became CPU dirty since
+	// the previous call over them, or are still CPU dirty (further writes to a dirty page do not
+	// fault), and forgets the former. Callers hold the lock.
+	template <typename Func>
+	void ConsumeCpuWritten(uint64_t vaddr, uint64_t size, Func&& func) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		RegionBits mask(m_cpu_written, start, end);
+		mask |= RegionBits(m_cpu_dirty, start, end);
+		m_cpu_written.UnsetRange(start, end);
+		for (const auto [first, last]: mask) {
+			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+		}
+	}
+
+	// Marks the pages of the range GPU dirty unless they are CPU dirty, and calls func(address,
+	// size) for the runs it marked. Callers hold the lock.
+	template <typename Func>
+	void MarkGpuDirtyUnlessCpuDirty(uint64_t vaddr, uint64_t size, Func&& func) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		RegionBits mask(~m_cpu_dirty, start, end);
+		if (mask.None()) {
+			return;
+		}
+		for (const auto [first, last]: mask) {
+			ChangeState<DirtySource::Gpu, true>(m_cpu_addr + first * TRACKER_PAGE_SIZE,
+			                                    (last - first) * TRACKER_PAGE_SIZE);
 		}
 		for (const auto [first, last]: mask) {
 			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
