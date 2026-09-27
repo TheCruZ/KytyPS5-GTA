@@ -72,10 +72,16 @@ struct MemoryInfo {
 	bool                    coherent                                              = false;
 	bool                    planning_only                                         = false;
 
+	// Raw DWORD loads, or a formatted X load whose format the runtime V# supplies.
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
-		return !formatted && !typed && data_bits == 32u &&
-		       (opcode == ValueOpcode::LoadBufferU32x2 || opcode == ValueOpcode::LoadBufferU32x3 ||
-		        opcode == ValueOpcode::LoadBufferU32x4);
+		if (typed || data_bits != 32u) {
+			return false;
+		}
+		if (formatted) {
+			return opcode == ValueOpcode::LoadBufferU32;
+		}
+		return opcode == ValueOpcode::LoadBufferU32 || opcode == ValueOpcode::LoadBufferU32x2 ||
+		       opcode == ValueOpcode::LoadBufferU32x3 || opcode == ValueOpcode::LoadBufferU32x4;
 	}
 	// Raw DWORD stores through a V# selected at runtime from a descriptor table.
 	[[nodiscard]] bool SupportsIndirectBufferStore(ValueOpcode opcode) const {
