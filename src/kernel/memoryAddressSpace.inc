@@ -246,10 +246,12 @@ public:
 		RemoveMappingsUnlocked(vaddr, size);
 #endif
 		m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode});
+		BumpBackingEpoch();
 		return true;
 	}
 
 	bool Unmap(uint64_t vaddr, uint64_t size) {
+		BumpBackingEpoch();
 		const auto            end = vaddr + size;
 		std::vector<MapEntry> targets;
 		{
@@ -314,6 +316,23 @@ public:
 		}
 	}
 #endif
+
+	// Whether mapped views cover the whole range (IsBackingReadable).
+	bool Contains(uint64_t vaddr, uint64_t size) {
+		std::shared_lock lock(m_mutex);
+		const auto      end     = vaddr + size;
+		auto            current = vaddr;
+
+		while (current < end) {
+			const auto* entry = FindContainingUnlocked(current);
+			if (entry == nullptr) {
+				return false;
+			}
+			current = std::min(end, entry->vaddr + entry->size);
+		}
+
+		return true;
+	}
 
 private:
 	struct MapEntry {
@@ -599,6 +618,8 @@ public:
 		    });
 		return true;
 	}
+
+	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
 
 	bool Protect(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		std::lock_guard lock(m_mutex);
