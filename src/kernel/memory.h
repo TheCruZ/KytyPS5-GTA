@@ -201,6 +201,8 @@ MapCost MapCostSnapshot();
 void SetUnhandledFaultHook(void (*hook)(uint64_t vaddr));
 
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
+// Whether TryReadBacking or TryReadSparseBacking can read the whole range.
+bool                   IsBackingReadable(uint64_t vaddr, uint64_t size);
 // Changes whenever backing is mapped or unmapped, or a PRT aperture changes: an unchanged value
 // means IsBackingReadable still answers as before.
 [[nodiscard]] uint64_t BackingEpoch() noexcept;
@@ -211,7 +213,8 @@ bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t siz
 // mappings (what sceKernelVirtualQuery reports), without asking the host. An empty range is, and
 // so is every range before the kernel's memory is set up (unit tests).
 [[nodiscard]] bool     IsCommittedRange(uint64_t vaddr, uint64_t size);
-void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
+// Not noexcept: under a Common::SoftExitScope its failure throws to the scope's owner.
+void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 // For a fault in a guest range briefly unmapped while the emulator replaced its mapping (MAP_FIXED
 // over a mapping, or a Windows file view split by a partial unmap): waits until it is mapped again

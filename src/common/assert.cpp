@@ -101,6 +101,26 @@ std::string HostAddressName(const void* address) {
 #endif
 }
 
+static thread_local int g_soft_exit_depth = 0;
+
+SoftExitScope::SoftExitScope(bool enable): m_enable(enable) {
+	if (m_enable) {
+		g_soft_exit_depth++;
+	}
+}
+
+SoftExitScope::~SoftExitScope() {
+	if (m_enable) {
+		g_soft_exit_depth--;
+	}
+}
+
+static void ThrowIfSoft(std::string_view text, const char* file, int line) {
+	if (g_soft_exit_depth > 0) {
+		throw SoftExitError(fmt::format("{} ({}:{})", text, file, line));
+	}
+}
+
 static std::string BuildFatalReport(const char* title, std::string_view text, const char* file,
                                     int line) {
 	return fmt::format("--- Build ---\n{}\n{}\n{} in {}:{}\n{}", KYTY_BUILD_LABEL, title, text, file,

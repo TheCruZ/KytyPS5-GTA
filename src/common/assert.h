@@ -6,6 +6,7 @@
 
 #include <cstdlib>
 #include <string>
+#include <stdexcept>
 #include <string_view>
 
 namespace Common {
