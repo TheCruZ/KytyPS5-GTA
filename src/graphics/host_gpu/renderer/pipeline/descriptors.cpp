@@ -3306,7 +3306,11 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
+	// A null element (a null T# or a declined lookup) has no image to be stale.
 	const auto stale = [&](const TextureBinding& binding) {
+		if (!binding.image_id) {
+			return false;
+		}
 		const auto* image = texture_cache.m_slot_images.try_get(binding.image_id);
 		return image == nullptr || (!image->registered && !image->info.data.Empty()) ||
 		       image->binding.needs_rebind;
@@ -3421,6 +3425,10 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			texture = ResolveTableTexture(program.info.images.at(prepared.table_roots[k]),
 			                              prepared.table_sources[k]);
 			BindImage(texture.image_id, false);
+		}
+		if (!texture.image_id) {
+			// Bound as a null descriptor: nothing to acquire.
+			continue;
 		}
 		texture.image_view = texture_cache.FindTexture(texture.image_id, texture.desc);
 	}
