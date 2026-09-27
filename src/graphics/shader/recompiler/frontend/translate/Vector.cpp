@@ -441,7 +441,7 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_CEIL_F16: return Float16Unary(inst, IR::ValueOpcode::FPCeil32, false);
 		case O::V_TRUNC_F16: return Float16Unary(inst, IR::ValueOpcode::FPTrunc32, false);
 		case O::V_RNDNE_F16: return Float16Unary(inst, IR::ValueOpcode::FPRoundEven32, false);
-		case O::V_FRACT_F16: return Float16Unary(inst, IR::ValueOpcode::FPFract32, false);
+		case O::V_FRACT_F16: return V_FRACT(inst, true);
 		case O::V_SIN_F16: return Float16Trig(inst, IR::ValueOpcode::FPSin);
 		case O::V_COS_F16: return Float16Trig(inst, IR::ValueOpcode::FPCos);
 		case O::V_MIN3_F16: return Float16Ternary(inst, IR::ValueOpcode::FPMinTri32, false, false);
@@ -452,7 +452,7 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_RCP_F32: return FloatUnary(inst, IR::ValueOpcode::FPRecip32);
 		case O::V_RCP_F64: return FloatUnary(inst, IR::ValueOpcode::FPRecip64);
 		case O::V_RCP_IFLAG_F32: return FloatUnary(inst, IR::ValueOpcode::FPRecipIFlag32);
-		case O::V_FRACT_F32: return FloatUnary(inst, IR::ValueOpcode::FPFract32);
+		case O::V_FRACT_F32: return V_FRACT(inst, false);
 		case O::V_TRUNC_F32: return FloatUnary(inst, IR::ValueOpcode::FPTrunc32);
 		case O::V_CEIL_F32: return FloatUnary(inst, IR::ValueOpcode::FPCeil32);
 		case O::V_RNDNE_F32: return FloatUnary(inst, IR::ValueOpcode::FPRoundEven32);
