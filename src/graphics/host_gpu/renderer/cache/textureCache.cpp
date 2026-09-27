@@ -278,6 +278,11 @@ void TextureCache::UnregisterImage(ImageId id) {
 	            [this, epoch](uint64_t page) { m_image_page_epochs[page] = epoch; });
 }
 
+bool TextureCache::HasImagesInRegion(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	return FindImagesInRegion(address, size, false).size() != 0;
+}
+
 uint64_t TextureCache::ImageEpochInRegion(uint64_t address, uint64_t size) {
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
@@ -1198,26 +1203,39 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
-	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+	// A metadata range last written by a recorded uniform compute fill is known without a GPU
+	// drain.
+	uint32_t   known_value = 0;
+	const bool known_fill  = m_buffer_cache.KnownFill(range.address, range.size, known_value);
+	if (!known_fill && m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 	}
 	const auto slice_size = range.size / layers;
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t code = 0;
-		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
+		if (known_fill) {
+			code = static_cast<uint8_t>(known_value);
+		} else if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
 			EXIT("TextureCache: failed to read color metadata backing\n");
 		}
 		vk::ClearValue clear {};
 		if (!DecodeColorClear(desc, code, clear.color)) {
 			continue;
 		}
-		std::vector<uint8_t> bytes(slice_size);
-		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
-			EXIT("TextureCache: failed to read color metadata slice\n");
-		}
-		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
-			continue;
+		if (known_fill) {
+			if (known_value != 0x01010101u * code) {
+				continue;
+			}
+		} else {
+			std::vector<uint8_t> bytes(slice_size);
+			if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
+				EXIT("TextureCache: failed to read color metadata slice\n");
+			}
+			if (!std::all_of(bytes.begin(), bytes.end(),
+			                 [code](uint8_t byte) { return byte == code; })) {
+				continue;
+			}
 		}
 		{
 			std::scoped_lock lock {m_lock};
