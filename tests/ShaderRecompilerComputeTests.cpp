@@ -1978,6 +1978,103 @@ public:
     std::printf("[host]    %-32s ok\n", "DescriptorHeapLargeSet");
   }
 
+  // Rediscovering one stale binding can replace the image another, still current binding
+  // resolved to; RebindImages must settle both before acquiring views.
+  void CheckRebindImagesSettle() {
+    constexpr const char *name = "RebindImagesSettle";
+    constexpr uintptr_t base = 0x0000000207000000ull;
+    constexpr uint64_t allocation_size = 0x1000000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t image_address = base + 0x100000;
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      context.InitializeGpu(nullptr);
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &texture_cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+
+      // 64x64 RGBA8, 64 KiB-swizzled; both mips share one 64 KiB block.
+      const auto make_descriptor = [](uint32_t last_level) {
+        constexpr uint32_t side = 64;
+        ShaderRecompiler::IR::DescriptorValue value{};
+        value.dword_count = 8;
+        value.dwords = {
+            static_cast<uint32_t>(image_address >> 8u),
+            (static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8UNorm) << 20u) |
+                (((side - 1u) & 3u) << 30u),
+            ((side - 1u) >> 2u) | ((side - 1u) << 14u),
+            0x90900facu | (last_level << 16u),
+            0,
+            0x00700000u | (last_level << 4u),
+            0,
+            0};
+        return value;
+      };
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+
+      ShaderRecompiler::IR::CompiledShaderInfo program{};
+      program.stage = ShaderType::Compute;
+      program.info.images = {resource, resource};
+      ShaderRecompiler::IR::ResourceSnapshot snapshot{};
+      snapshot.images = {make_descriptor(0), make_descriptor(0)};
+      ShaderStageRuntime runtime{&program, &snapshot};
+
+      PreparedBindings prepared;
+      executor.PrepareBindings(runtime, prepared);
+      const auto shared_id = prepared.images[0].image_id;
+      Require(name, "shared discovery",
+              prepared.images.size() == 2 &&
+                  prepared.images[1].image_id == shared_id &&
+                  texture_cache.GetImage(shared_id).info.resources.levels == 1,
+              "both bindings did not discover the one-level image");
+
+      // Binding 1 goes stale and now describes both mips: its rediscovery replaces the
+      // one-level image that binding 0, already checked, still names.
+      prepared.images[1].image_id = {};
+      snapshot.images[1] = make_descriptor(1);
+      executor.RebindImages(prepared);
+      const auto *replaced = TextureCacheTestAccess::Owner(texture_cache, shared_id);
+      const auto &first = texture_cache.GetImage(prepared.images[0].image_id);
+      const auto &second = texture_cache.GetImage(prepared.images[1].image_id);
+      Require(name, "settled identities",
+              (replaced == nullptr || !replaced->registered) &&
+                  prepared.images[0].image_id != shared_id && first.registered &&
+                  second.registered && second.info.resources.levels == 2 &&
+                  prepared.images[0].image_view != nullptr &&
+                  prepared.images[1].image_view != nullptr,
+              "a binding kept an image replaced by another binding's rediscovery");
+      RenderExecutorTestAccess::ResetBindings(executor);
+      scheduler.Finish();
+    }
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckGraphicsPushConstantBank() {
     constexpr const char *name = "GraphicsPushConstantStages";
     EnsureRuntimeContext();
@@ -35802,6 +35899,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--descriptor-heap-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckDescriptorHeapLargeSet();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--rebind-settle-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRebindImagesSettle();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--push-constant-bank-only") == 0) {
