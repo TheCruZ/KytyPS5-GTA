@@ -45,6 +45,8 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              flattened_srt;
 	vk::DescriptorBufferInfo              shader_data_buffer;
 	std::vector<uint32_t>                 shader_data;
+	// Threads of the compute dispatch, bounding buffers whose NUM_RECORDS the shader computes.
+	uint64_t                              dispatch_threads = 0;
 };
 
 [[nodiscard]] vk::DescriptorType
