@@ -49716,6 +49716,11 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorIntegerOps());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--inline-f64-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ScalarVector64BitFloatInlineConstants());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--fract-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorFractClampsBelowOne());
