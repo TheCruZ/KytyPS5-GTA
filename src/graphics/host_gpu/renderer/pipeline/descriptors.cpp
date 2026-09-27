@@ -136,7 +136,9 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
 	if (resource.written) {
-		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
+		// A dynamic-records range is the host's bound of one record per dispatched thread, not
+		// what the shader writes; it can extend over live render targets.
+		context.GetTextureCache().InvalidateMemoryFromGPU(address, size, resource.dynamic_records);
 	}
 	return result;
 }
