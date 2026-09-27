@@ -153,6 +153,7 @@ void ValidateValueReferences(const Program& program, ShaderStageInputInfo input_
 						case StageInputKind::WorkgroupId:
 						case StageInputKind::LocalInvocationId:
 						case StageInputKind::GlobalInvocationId:
+						case StageInputKind::DispatchThreadLimit:
 							if (component >= 3u) {
 								return Fail("typed invocation builtin component is out of range");
 							}
@@ -319,7 +320,8 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 					AddInput(info, kind, 0, 3, "gl_GlobalInvocationID");
 					break;
 				case StageInputKind::PackedAncillary:
-				case StageInputKind::Parameter: break;
+				case StageInputKind::Parameter:
+				case StageInputKind::DispatchThreadLimit: break;
 			}
 		}
 	}

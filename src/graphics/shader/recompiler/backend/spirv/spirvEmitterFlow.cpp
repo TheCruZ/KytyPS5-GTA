@@ -23,6 +23,10 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 	if (kind == IR::StageInputKind::LocalInvocationIndex) {
 		return EmitLocalInvocationIndex(state);
 	}
+	if (kind == IR::StageInputKind::DispatchThreadLimit) {
+		return EmitShaderDataDwordLoad(
+		    state, state.program.bindings.DispatchThreadLimitDword() + component);
+	}
 	if (state.lane_count == 2 && (kind == IR::StageInputKind::LocalInvocationId ||
 	                              kind == IR::StageInputKind::GlobalInvocationId)) {
 		const auto* cs      = ShaderWorkgroupInput(state.program.stage, state.input_info);

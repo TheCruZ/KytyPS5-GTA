@@ -402,6 +402,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		m_context.PrepareBda();
 	}
 	RebindImages(bindings);
+	if (program.bindings.dispatch_thread_limit) {
+		for (uint32_t axis = 0; axis < 3u; axis++) {
+			bindings.shader_data[program.bindings.DispatchThreadLimitDword() + axis] =
+			    input_info.dispatch_threads_num[axis];
+		}
+	}
 	RebindBuffers(bindings);
 
 	auto              vk_buffer        = buffer.Handle();
