@@ -757,6 +757,52 @@ uint32_t EncodeFormattedStoreComponent(ValueEmitContext& ctx,
 		return info.type == Format::ComponentType::Float ? EmitPackHalf2x16(ctx.state, pair)
 		                                               : EmitPackSnorm2x16(ctx.state, pair);
 	}
+	// Other float-typed formats also convert the VGPR float to the memory encoding; only the
+	// low `bits` of the result are stored.
+	if (bits < 32u && (info.type == Format::ComponentType::Snorm ||
+	                   info.type == Format::ComponentType::Uscaled ||
+	                   info.type == Format::ComponentType::Sscaled)) {
+		const bool  is_signed = info.type != Format::ComponentType::Uscaled;
+		const float high      = static_cast<float>((1u << (bits - (is_signed ? 1u : 0u))) - 1u);
+		const float low       = info.type == Format::ComponentType::Snorm   ? -1.0f
+		                        : info.type == Format::ComponentType::Sscaled ? -high - 1.0f
+		                                                                      : 0.0f;
+		auto value = EmitBitCastF32U32(ctx.state, data);
+		value      = EmitFPMin32(ctx.state,
+		                         EmitFPMax32(ctx.state, value, ConstantF32Value(ctx.state, low)),
+		                         ConstantF32Value(ctx.state,
+		                                          info.type == Format::ComponentType::Snorm ? 1.0f
+		                                                                                    : high));
+		if (info.type == Format::ComponentType::Snorm) {
+			value = EmitFPMul32(ctx.state, value, ConstantF32Value(ctx.state, high));
+		}
+		value = EmitFPRoundEven32(ctx.state, value);
+		return is_signed
+		           ? Unary(ctx.state, spv::OpBitcast, TypeU32(ctx.state),
+		                   Unary(ctx.state, spv::OpConvertFToS, TypeI32(ctx.state), value))
+		           : Unary(ctx.state, spv::OpConvertFToU, TypeU32(ctx.state), value);
+	}
+	if ((bits == 11u || bits == 10u) && info.type == Format::ComponentType::Float) {
+		// Unsigned 11/10-bit floats share the half-float exponent: drop the sign and the low
+		// mantissa bits of the f16 encoding, clamping negatives to zero and keeping NaN a NaN.
+		const auto value = EmitBitCastF32U32(ctx.state, data);
+		const auto pair  = EmitCompositeConstructF32x2(ctx.state, value,
+		                                               ConstantF32Value(ctx.state, 0.0f));
+		const auto half  = EmitPackHalf2x16(ctx.state, pair);
+		const auto shift = ConstantU32(ctx.state, bits == 11u ? 4u : 5u);
+		const auto packed_small = Binary(ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state),
+		                          EmitAndConstant(ctx.state, half, 0x7fffu), shift);
+		const auto nan   = Binary(ctx.state, spv::OpUGreaterThan, TypeBool(ctx.state),
+		                          EmitAndConstant(ctx.state, half, 0x7fffu),
+		                          ConstantU32(ctx.state, 0x7c00u));
+		const auto negative = Binary(ctx.state, spv::OpINotEqual, TypeBool(ctx.state),
+		                             EmitAndConstant(ctx.state, half, 0x8000u),
+		                             ConstantU32(ctx.state, 0u));
+		const auto finite =
+		    Select(ctx.state, TypeU32(ctx.state), negative, ConstantU32(ctx.state, 0u), packed_small);
+		return Select(ctx.state, TypeU32(ctx.state), nan,
+		              ConstantU32(ctx.state, bits == 11u ? 0x7ffu : 0x3ffu), finite);
+	}
 	return data;
 }
 
