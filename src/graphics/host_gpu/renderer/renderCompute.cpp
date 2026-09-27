@@ -453,6 +453,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
+	bindings.dispatch_threads =
+	    use_thread_dimensions
+	        ? uint64_t {input_info.dispatch_threads_num[0]} * input_info.dispatch_threads_num[1] *
+	              input_info.dispatch_threads_num[2]
+	        : uint64_t {thread_group_x} * thread_group_y * thread_group_z *
+	              std::max(input_info.threads_num[0], 1u) * std::max(input_info.threads_num[1], 1u) *
+	              std::max(input_info.threads_num[2], 1u);
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
@@ -517,6 +524,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
+	bindings.dispatch_threads = 0;
 	FindBuffers(bindings);
 	const auto& program = *input_info.stage.program;
 	if (program.info.uses_dma) {
