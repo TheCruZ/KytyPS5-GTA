@@ -144,20 +144,35 @@ uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension) {
 	}
 }
 
-uint32_t LoadSampledImageDescriptor(EmitterState& state, uint32_t resource) {
+uint32_t LoadSampledImageDescriptor(EmitterState& state, uint32_t resource, uint32_t element) {
 	const auto& image_resource = state.program.info.images.at(resource);
 	EXIT_IF(image_resource.resource_class != IR::ImageResourceClass::Sampled);
 	const auto kind = IR::DescriptorBindingForImage(image_resource);
 	EXIT_IF(!kind.has_value());
-	const auto array_index  = ResourceForDescriptor(state, *kind, resource);
 	const auto variable     = state.image_variables[IR::ImageBindingIndex(*kind)];
 	const auto pointer_type = state.builder.Type(
 	    spv::OpTypePointer, spv::StorageClassUniformConstant, ImageType(state, image_resource));
-	const auto pointer =
-	    DescriptorElementPointer(state, pointer_type, variable, array_index, *kind, resource,
-	                             "sampled image descriptor array was not emitted");
+	uint32_t pointer = 0;
+	if (element != 0) {
+		if (variable == 0) {
+			ExitDescriptorBindingFailure(state, *kind, resource,
+			                             "sampled image descriptor array was not emitted");
+		}
+		pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer, variable, element);
+		state.builder.AddAnnotation(spv::OpDecorate, element, spv::DecorationNonUniform);
+		state.builder.AddAnnotation(spv::OpDecorate, pointer, spv::DecorationNonUniform);
+	} else {
+		const auto array_index = ResourceForDescriptor(state, *kind, resource);
+		pointer = DescriptorElementPointer(state, pointer_type, variable, array_index, *kind,
+		                                   resource,
+		                                   "sampled image descriptor array was not emitted");
+	}
 	const auto image = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, ImageType(state, image_resource), image, pointer);
+	if (element != 0) {
+		state.builder.AddAnnotation(spv::OpDecorate, image, spv::DecorationNonUniform);
+	}
 	return image;
 }
 
@@ -175,14 +190,18 @@ uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler) {
 	return sampler_id;
 }
 
-uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler) {
+uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler,
+                          uint32_t element) {
 	const auto& image_resource = state.program.info.images.at(resource);
-	const auto  image          = LoadSampledImageDescriptor(state, resource);
+	const auto  image          = LoadSampledImageDescriptor(state, resource, element);
 	const auto  sampler_id     = LoadSamplerDescriptor(state, sampler);
 	const auto  sampled_image = state.builder.AllocateId();
 	const auto  sampled_type =
 	    state.builder.Type(spv::OpTypeSampledImage, ImageType(state, image_resource));
 	state.builder.AddFunction(spv::OpSampledImage, sampled_type, sampled_image, image, sampler_id);
+	if (element != 0) {
+		state.builder.AddAnnotation(spv::OpDecorate, sampled_image, spv::DecorationNonUniform);
+	}
 	return sampled_image;
 }
 

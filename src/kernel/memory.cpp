@@ -169,6 +169,16 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 static uint32_t g_test_backing_store_unmaps_before_failure = UINT32_MAX;
 #endif
 
+static std::atomic<uint64_t> g_backing_epoch {0};
+
+static void BumpBackingEpoch() noexcept {
+	g_backing_epoch.fetch_add(1, std::memory_order_acq_rel);
+}
+
+uint64_t BackingEpoch() noexcept {
+	return g_backing_epoch.load(std::memory_order_acquire);
+}
+
 #include "memoryAddressSpace.inc"
 
 enum class VirtualRangeType {
@@ -244,11 +254,13 @@ public:
 		const auto index = static_cast<size_t>(position - m_ranges.begin());
 		m_ranges.insert(position, r);
 		MergeAroundUnlocked(index);
+		BumpBackingEpoch();
 		return true;
 	}
 
 	bool Remove(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		BumpBackingEpoch();
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
@@ -961,6 +973,22 @@ static bool IsInPrtAperture(uint64_t address, uint64_t size = 1) {
 	}
 
 	return false;
+}
+
+bool IsBackingReadable(uint64_t vaddr, uint64_t size) {
+	if (g_guest_address_space == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
+		return false;
+	}
+	if (g_guest_address_space->BackingContains(vaddr, size)) {
+		return true;
+	}
+	std::vector<VirtualRanges::Range> ranges;
+	return g_virtual_ranges != nullptr && IsInPrtAperture(vaddr, size) &&
+	       g_virtual_ranges->QuerySpan(vaddr, size, &ranges) &&
+	       std::all_of(ranges.begin(), ranges.end(), [](const auto& range) {
+		       return IsReservedRangeType(range.type) ||
+		              g_guest_address_space->BackingContains(range.start, range.size);
+	       });
 }
 
 bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -2434,6 +2462,7 @@ int KYTY_SYSV_ABI KernelSetPrtAperture(int index, void* addr, size_t len) {
 		g_prt_apertures[static_cast<size_t>(index)] =
 		    len == 0 ? PrtAperture {} : PrtAperture {address, static_cast<uint64_t>(len)};
 	}
+	BumpBackingEpoch();
 	if (len != 0) {
 		MapGpuRange(address, len);
 	}
