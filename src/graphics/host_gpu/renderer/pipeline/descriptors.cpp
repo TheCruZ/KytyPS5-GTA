@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/hackNotice.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -73,6 +74,27 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 		case BindingKind::Count: EXIT("invalid native descriptor binding kind");
 	}
 	EXIT("invalid native descriptor binding kind");
+}
+
+// Visits each bindless image table range once, with the first root image that samples it.
+template <typename Fn>
+void ForEachImageTable(const std::vector<ShaderRecompiler::IR::ImageResource>& images, Fn&& fn) {
+	for (uint32_t i = 0; i < images.size(); i++) {
+		const auto& image = images[i];
+		if (image.table_capacity == 0u) {
+			continue;
+		}
+		const auto kind  = *ShaderRecompiler::IR::DescriptorBindingForImage(image);
+		bool       first = true;
+		for (uint32_t j = 0; j < i && first; j++) {
+			first = images[j].table_capacity == 0u ||
+			        images[j].table_descriptor_base != image.table_descriptor_base ||
+			        ShaderRecompiler::IR::DescriptorBindingForImage(images[j]) != kind;
+		}
+		if (first) {
+			fn(i, kind);
+		}
+	}
 }
 
 vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture, uint32_t element) {
@@ -188,15 +210,33 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 	       descriptor.TileMode() == Prospero::TileMode::kDepth;
 }
 
+struct SampledDepthBindingSupport {
+	bool resource_ok = false;
+	bool encoding_ok = false;
+	bool view_ok     = false;
+
+	[[nodiscard]] bool Supported() const { return resource_ok && encoding_ok && view_ok; }
+};
+
+static SampledDepthBindingSupport
+CheckSampledDepthBinding(const ShaderRecompiler::IR::ImageResource& resource,
+                         const ShaderTextureResource& descriptor, const Image& image,
+                         vk::Format view_format) {
+	return {
+	    .resource_ok = IsSupportedSampledDepthResource(resource),
+	    // Comparison sampling changes the host format, not the guest metadata encoding.
+	    .encoding_ok = descriptor.TileMode() != Prospero::TileMode::kDepth ||
+	                   IsSupportedDepthTextureEncoding(descriptor, resource.r128),
+	    .view_ok =
+	        IsSupportedSampledDepthView(image.info.pixel_format, view_format, descriptor.DstSelXYZW()),
+	};
+}
+
 static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResource& resource,
                                         const ShaderTextureResource& descriptor, const Image& image,
                                         vk::Format view_format, uint64_t size) {
-	const bool resource_ok = IsSupportedSampledDepthResource(resource);
-	// Comparison sampling changes the host format, not the guest metadata encoding.
-	const bool encoding_ok = descriptor.TileMode() != Prospero::TileMode::kDepth ||
-	                         IsSupportedDepthTextureEncoding(descriptor, resource.r128);
-	const bool view_ok =
-	    IsSupportedSampledDepthView(image.info.pixel_format, view_format, descriptor.DstSelXYZW());
+	const auto [resource_ok, encoding_ok, view_ok] =
+	    CheckSampledDepthBinding(resource, descriptor, image, view_format);
 	if (resource_ok && encoding_ok && view_ok) {
 		return;
 	}
@@ -463,8 +503,21 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	return false;
 }
 
+// The image at a bindless table element's address cannot be viewed in the format its T# reads it
+// as: the element binds a null image instead of the memory PS5 would reinterpret.
+static TextureBinding DeclineTableView(TextureCache::ImageDesc& desc, vk::Format image_format,
+                                       vk::Format view_format) {
+	Common::HackNotice::Report(
+	    "bindless table texture bound as null image",
+	    "RenderExecutor::ResolveTexture (incompatible image view)", 0, 0,
+	    fmt::format("texture 0x{:016x} image format {} view format {}", desc.info.data.address,
+	                static_cast<int>(image_format), static_cast<int>(view_format)));
+	return {ImageId {}, nullptr, std::move(desc)};
+}
+
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                                              const ShaderRecompiler::IR::DescriptorValue& value) {
+                                              const ShaderRecompiler::IR::DescriptorValue& value,
+                                              bool table_candidate, GuestRange* examined) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
@@ -606,8 +659,40 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 	desc.heap = resource.heap;
 
-	auto id = texture_cache.FindImage(desc, shader_conversion);
+	if (examined != nullptr) {
+		*examined = desc.info.data;
+	}
+	// A bindless table keeps the T#s of the textures the game has unmapped since, as image heaps
+	// do (above), and PS5 never samples them: the GPU would fault on the unmapped pages. A
+	// GPU-written range needs no backing; unbacked PRT pages read as zero and count as readable.
+	if (table_candidate &&
+	    ((!texture_cache.IsRegionGpuModified(desc.info.data.address, desc.info.data.size) &&
+	      !Libs::LibKernel::Memory::IsBackingReadable(desc.info.data.address,
+	                                                  desc.info.data.size)) ||
+	     (desc.info.metadata.kind != ImageMetadataKind::None &&
+	      !Libs::LibKernel::Memory::IsBackingReadable(desc.info.metadata.range.address,
+	                                                  desc.info.metadata.range.size)))) {
+		return {.layout = vk::ImageLayout::eGeneral};
+	}
+	ImageId depth_source;
+	auto    id = table_candidate
+	                 ? texture_cache.FindImageSpeculative(desc, shader_conversion, &depth_source)
+	                 : texture_cache.FindImage(desc, shader_conversion);
+	if (!id && depth_source) {
+		// GTA V's ray hit shading (CS 0xc6c91cf1882cdc3b) compares against shadow maps the game
+		// writes as R16 or R32 float colors: the table element samples a depth copy of the color
+		// image instead of converting the image other passes write.
+		id = texture_cache.FindDepthCopy(depth_source, desc.info);
+	}
 	if (!id) {
+		if (table_candidate) {
+			// The speculative lookup declined to convert the image at the address between depth
+			// and color, and no depth copy can stand for it: the element binds a null image
+			// instead of the memory PS5 would read through this T#.
+			Common::HackNotice::Report("bindless table texture bound as null image",
+			                           "RenderExecutor::ResolveTexture (conversion declined)", 0, 0);
+			return {id, nullptr, std::move(desc)};
+		}
 		// Another extent at the address holds it; the heap retries once an image is created.
 		return {.desc = std::move(desc), .layout = vk::ImageLayout::eGeneral};
 	}
@@ -620,15 +705,125 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
+		if (table_candidate &&
+		    !CheckSampledDepthBinding(resource, descriptor, *image, pixel_format).Supported()) {
+			return DeclineTableView(desc, image->info.pixel_format, pixel_format);
+		}
 		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format,
 		                            desc.info.data.size);
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
+		if (table_candidate && !IsSupportedSampledColorView(image->info.pixel_format, pixel_format,
+		                                                    descriptor.DstSelXYZW())) {
+			return DeclineTableView(desc, image->info.pixel_format, pixel_format);
+		}
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 	}
 	return {id, nullptr, std::move(desc)};
+}
+
+// A bindless table holds every texture the game has loaded; bind a T# the shader's view cannot
+// read (other class, dimension or layout) as a null image, which the shader never selects for it.
+// ResolveTexture() binds a null image as well for an element whose guest memory is gone, and for
+// one the texture cache declines or cannot view as the T# reads it (announced there). An element
+// that compares against a color image samples a depth copy of it (TextureCache::FindDepthCopy).
+TextureBinding RenderExecutor::ResolveTableTexture(
+    const ShaderRecompiler::IR::ImageResource&   root,
+    const ShaderRecompiler::IR::DescriptorValue& value, GuestRange* examined) {
+	if (ShaderRecompiler::IR::ImageTableSlotCompatible(root, value)) {
+		auto texture = ResolveTexture(root, value, true, examined);
+		if (texture.image_id) {
+			return texture;
+		}
+	}
+	return ResolveTexture(root, ShaderRecompiler::IR::DescriptorValue {.dword_count = 8u});
+}
+
+size_t RenderExecutor::TableDescriptorHash::operator()(
+    const std::array<uint32_t, 8>& dwords) const noexcept {
+	uint64_t hash = 0xcbf29ce484222325ull;
+	for (const auto dword: dwords) {
+		hash = (hash ^ dword) * 0x100000001b3ull;
+		hash ^= hash >> 29u;
+	}
+	return static_cast<size_t>(hash);
+}
+
+RenderExecutor::TableResolution&
+RenderExecutor::FindTableResolution(const ShaderRecompiler::IR::ImageResource& root) {
+	constexpr size_t MaxTables   = 8;
+	constexpr size_t MaxElements = size_t {1} << 16u;
+	const auto       tick        = ++m_table_resolution_tick;
+	// A shader samples several roots from the same tables. Where a root reads its table and where
+	// the shader uses it do not affect how a T# resolves, so such roots share their elements.
+	auto view                 = root;
+	view.source               = 0;
+	view.first_use_pc         = 0;
+	view.table                = ShaderRecompiler::IR::ImageResource::NoImageTable;
+	view.table_capacity       = 0;
+	view.table_mapping_offset = 0;
+	view.table_entry_mask     = 0;
+	auto found = std::ranges::find_if(m_table_resolutions,
+	                                  [&](const TableResolution& entry) { return entry.root == view; });
+	if (found == m_table_resolutions.end()) {
+		if (m_table_resolutions.size() < MaxTables) {
+			found = m_table_resolutions.emplace(m_table_resolutions.end());
+		} else {
+			found = std::ranges::min_element(m_table_resolutions, {}, &TableResolution::last_use);
+		}
+		found->root = std::move(view);
+		found->elements.clear();
+	} else if (found->elements.size() > MaxElements) {
+		found->elements.clear();
+	}
+	found->last_use = tick;
+	return *found;
+}
+
+const TextureBinding&
+RenderExecutor::ResolveTableElement(TableResolution&                             table,
+                                    const ShaderRecompiler::IR::DescriptorValue& value) {
+	auto&      texture_cache = m_context.GetTextureCache();
+	const auto backing_epoch = Libs::LibKernel::Memory::BackingEpoch();
+	const auto [entry, inserted] = table.elements.try_emplace(value.dwords);
+	auto& element                = entry->second;
+	const auto set_epoch = texture_cache.ImageSetEpoch();
+	if (!inserted && !element.volatile_dcc) {
+		if (element.permanent ||
+		    (element.checked_epoch == set_epoch && element.backing_epoch == backing_epoch)) {
+			return element.texture;
+		}
+		const auto image_epoch =
+		    element.range.Valid()
+		        ? texture_cache.ImageEpochInRegion(element.range.address, element.range.size)
+		        : 0;
+		if (image_epoch <= element.image_epoch && element.backing_epoch == backing_epoch) {
+			element.checked_epoch = set_epoch;
+			return element.texture;
+		}
+	}
+	// Record the epoch before resolving: an image the lookup itself inserts makes the next use
+	// resolve again, after which the element is stable.
+	element               = {};
+	element.image_epoch   = set_epoch;
+	element.checked_epoch = set_epoch;
+	element.backing_epoch = backing_epoch;
+	GuestRange examined {};
+	element.texture  = ResolveTableTexture(table.root, value, &examined);
+	const auto& data = element.texture.desc.info.data;
+	if (!data.Empty()) {
+		element.range        = data;
+		element.volatile_dcc = element.texture.desc.info.metadata.kind == ImageMetadataKind::Dcc;
+	} else if (!ShaderRecompiler::IR::ImageTableSlotCompatible(table.root, value)) {
+		element.permanent = true;
+	} else {
+		// Declined by the texture cache lookup, or rejected before it from the T# and the
+		// backing alone (no range examined: only a backing change can alter the outcome).
+		element.range = examined;
+	}
+	return element.texture;
 }
 
 static vk::Sampler NativeSampler(RenderContext&                       context,
@@ -707,6 +902,31 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		binding.mip_views.clear();
 		prepared.images[i] = std::move(binding);
 	}
+	prepared.table_images.clear();
+	prepared.table_sources.clear();
+	prepared.table_roots.clear();
+	ForEachImageTable(program.info.images, [&](uint32_t root_index, auto /*kind*/) {
+		{
+			const auto& root  = program.info.images.at(root_index);
+			const auto& table = snapshot.image_tables.at(root.table);
+			const ShaderRecompiler::IR::DescriptorValue null_value {.dword_count = 8u};
+			auto&       resolution   = FindTableResolution(root);
+			const auto& null_texture = ResolveTableElement(resolution, null_value);
+			BindImage(null_texture.image_id, false);
+			for (uint32_t slot = 0; slot < root.table_capacity; slot++) {
+				const bool real = slot != 0u && slot < table.slots.size();
+				if (real) {
+					const auto& texture = ResolveTableElement(resolution, table.slots[slot]);
+					BindImage(texture.image_id, false);
+					prepared.table_images.push_back(texture);
+				} else {
+					prepared.table_images.push_back(null_texture);
+				}
+				prepared.table_sources.push_back(real ? table.slots[slot] : null_value);
+				prepared.table_roots.push_back(root_index);
+			}
+		}
+	});
 	prepared.samplers.reserve(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
 		prepared.samplers.push_back(NativeSampler(
@@ -826,6 +1046,21 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
+	// A null element (a null T# or a declined lookup) has no image to be stale.
+	const auto stale = [&](const TextureBinding& binding) {
+		if (!binding.image_id) {
+			return false;
+		}
+		const auto* image = texture_cache.m_slot_images.try_get(binding.image_id);
+		return image == nullptr || (!image->registered && !image->info.data.Empty()) ||
+		       image->binding.needs_rebind;
+	};
+	// Table elements may share images with each other and with the direct images: decide which
+	// are stale before any rebind clears an image's binding state.
+	std::vector<bool> stale_tables(prepared.table_images.size());
+	for (size_t k = 0; k < prepared.table_images.size(); k++) {
+		stale_tables[k] = stale(prepared.table_images[k]);
+	}
 	// Acquire each view before a later overlapping descriptor can replace its image.
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		if (!images[i].image_id) continue;
@@ -858,6 +1093,25 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
 		image.usage.storage |= storage;
+	}
+	for (size_t k = 0; k < prepared.table_images.size(); k++) {
+		auto& texture = prepared.table_images[k];
+		// A rediscovery above may have replaced (expanded, merged or recreated) the image this
+		// element resolved to.
+		if (stale_tables[k] || stale(texture)) {
+			if (auto* old_image = texture_cache.m_slot_images.try_get(texture.image_id)) {
+				old_image->binding = {};
+			}
+			texture = ResolveTableTexture(program.info.images.at(prepared.table_roots[k]),
+			                              prepared.table_sources[k]);
+			BindImage(texture.image_id, false);
+		}
+		if (!texture.image_id) {
+			// Bound as a null descriptor: nothing to acquire.
+			continue;
+		}
+		texture.image_view = texture_cache.FindTexture(texture.image_id, texture.desc);
+		texture_cache.GetImage(texture.image_id).usage.texture = true;
 	}
 }
 
@@ -995,9 +1249,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			    shader_stages, vk::DependencyFlags {}, 0, nullptr, 1, &barrier, 0, nullptr);
 		}
 
-		for (uint32_t i = 0; i < program.info.images.size(); i++) {
-			auto& binding = descriptors.images[i];
-			if (!binding.image_id) continue;
+		const auto transit = [&](TextureBinding& binding) {
+			if (!binding.image_id) return;
 			auto& image = m_context.GetTextureCache().GetImage(binding.image_id);
 			const auto&                 view = binding.desc.view_info;
 			const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
@@ -1034,6 +1287,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				image.Transit(image.ReadLayout(), vk::AccessFlagBits2::eShaderRead, range, vk_buffer);
 			}
 			binding.layout = image.backing.state.layout;
+		};
+		for (auto& binding: descriptors.images) {
+			transit(binding);
+		}
+		for (auto& binding: descriptors.table_images) {
+			transit(binding);
 		}
 
 		std::array<size_t, ShaderRecompiler::IR::ImageBindingCount> image_starts {};
@@ -1112,6 +1371,16 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				m_descriptor_images[start + mip] = MakeImageInfo(texture, mip);
 			}
 		}
+		size_t table_element = 0;
+		ForEachImageTable(program.info.images, [&](uint32_t root_index, BindingKind kind) {
+			const auto& root  = program.info.images[root_index];
+			const auto  start = image_starts[ShaderRecompiler::IR::ImageBindingIndex(kind)] +
+			                   root.table_descriptor_base;
+			for (uint32_t slot = 0; slot < root.table_capacity; slot++) {
+				m_descriptor_images[start + slot] =
+				    MakeImageInfo(descriptors.table_images.at(table_element++), 0u);
+			}
+		});
 
 		const auto shader_data_dwords = program.bindings.ShaderDataDwords();
 		EXIT_IF(prepared->shader_data.size() != shader_data_dwords);
