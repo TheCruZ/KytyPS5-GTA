@@ -912,6 +912,7 @@ private:
 				    a.selector_shift != b.selector_shift || a.selector_bits != b.selector_bits ||
 				    a.table_offset != b.table_offset || a.table_stride != b.table_stride ||
 				    a.workgroup_axis != b.workgroup_axis || a.sources != b.sources ||
+				    a.table_mask != b.table_mask || a.table_array != b.table_array ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_first.IsEmpty() != b.selector_first.IsEmpty() ||
 				    (!a.selector_first.IsEmpty() &&
@@ -1110,8 +1111,14 @@ private:
 		return axis;
 	}
 
-	bool MatchTableOffset(Value value, Value& key, uint32_t& offset, uint32_t& stride) const {
+	// Matches key * stride + offset. With a mask output it also accepts an outermost
+	// ((key * stride) & mask) + offset, as a shader clamps a key's bits before indexing.
+	bool MatchTableOffset(Value value, Value& key, uint32_t& offset, uint32_t& stride,
+	                      uint32_t* mask = nullptr) const {
 		offset = 0;
+		if (mask != nullptr) {
+			*mask = UINT32_MAX;
+		}
 		for (;;) {
 			const auto* inst = value.Resolve().TryInstruction();
 			if (inst == nullptr || inst->NumArgs() != 2u) {
@@ -1130,7 +1137,20 @@ private:
 				else return false;
 				return stride != 0u && key.GetType() == Type::U32;
 			}
-			if (inst->GetOpcode() != ValueOpcode::IAdd32) {
+			if (inst->GetOpcode() == ValueOpcode::BitwiseAnd32 && mask != nullptr &&
+			    *mask == UINT32_MAX) {
+				if (ImmediateU32(inst->Arg(1), immediate)) {
+					value = inst->Arg(0);
+				} else if (ImmediateU32(inst->Arg(0), immediate)) {
+					value = inst->Arg(1);
+				} else {
+					return false;
+				}
+				*mask = immediate;
+				continue;
+			}
+			// An addition inside the mask would be masked too.
+			if (inst->GetOpcode() != ValueOpcode::IAdd32 || (mask != nullptr && *mask != UINT32_MAX)) {
 				return false;
 			}
 			if (ImmediateU32(inst->Arg(0), immediate)) {
@@ -1671,7 +1691,7 @@ private:
 	bool MatchDescriptorTable(Inst& handle, const DescriptorSource& descriptor,
 	                          IndirectDescriptorPlan& plan,
 	                          DescriptorSource& table_source, Value& key, uint32_t& table_offset,
-	                          uint32_t& table_stride) {
+	                          uint32_t& table_stride, uint32_t* table_mask = nullptr) {
 		Inst* table_handle = nullptr;
 		for (uint32_t dword = 0; dword < handle.NumArgs(); ++dword) {
 			auto* read = descriptor.dwords[dword].Resolve().TryInstruction();
@@ -1688,6 +1708,7 @@ private:
 			Value current_key;
 			uint32_t offset = 0;
 			uint32_t stride = 0;
+			uint32_t mask   = UINT32_MAX;
 			if (current_handle == nullptr ||
 			    current_handle->GetOpcode() != (memory->kind == ResourceKind::ScalarAddress
 			                                      ? ValueOpcode::GetAddressResource
@@ -1695,8 +1716,10 @@ private:
 			    (memory->kind == ResourceKind::ScalarAddress && read->Parent() != handle.Parent()) ||
 			    (table_handle != nullptr &&
 			     !EquivalentValue(m_program, Value(table_handle), Value(current_handle))) ||
-			    !MatchTableOffset(read->Arg(1), current_key, offset, stride) ||
-			    memory->offset > UINT32_MAX - offset) {
+			    !MatchTableOffset(read->Arg(1), current_key, offset, stride,
+			                      table_mask != nullptr ? &mask : nullptr) ||
+			    memory->offset > UINT32_MAX - offset ||
+			    (dword != 0u && table_mask != nullptr && mask != *table_mask)) {
 				return false;
 			}
 			offset += memory->offset;
@@ -1704,6 +1727,7 @@ private:
 				key = current_key;
 				table_offset = offset;
 				table_stride = stride;
+				if (table_mask != nullptr) *table_mask = mask;
 			} else if (table_stride != stride || !EquivalentValue(m_program, key, current_key) ||
 			           static_cast<uint64_t>(table_offset) + dword * sizeof(uint32_t) != offset) {
 				return false;
@@ -1764,19 +1788,22 @@ private:
 		Value key;
 		uint32_t table_offset = 0;
 		uint32_t table_stride = 0;
+		uint32_t table_mask   = UINT32_MAX;
 		if (!MatchDescriptorTable(handle, descriptor, plan, table_source, key, table_offset,
-		                          table_stride)) return false;
+		                          table_stride, &table_mask)) return false;
 		DescriptorSource material_source;
 		DescriptorSource::IndirectDescriptor indirect;
 		indirect.table_offset = table_offset;
 		indirect.table_stride = table_stride;
+		indirect.table_mask   = table_mask;
 		indirect.workgroup_axis = WorkgroupAxis(key);
 		if (indirect.workgroup_axis != UINT32_MAX) {
+			if (table_mask != UINT32_MAX) return false;
 			// The descriptor also supplies dimensions to shader arithmetic. Keep its reads;
 			// only the image handle is projected onto the bounded workgroup key.
 			plan.reads.fill(nullptr);
 		} else if (table_source.dword_count == 2u) {
-			if (table_stride != 32u) return false;
+			if (table_stride != 32u || table_mask != UINT32_MAX) return false;
 			const auto* selector = key.Resolve().TryInstruction();
 			const bool bitscan = selector != nullptr && selector->GetOpcode() == ValueOpcode::FindILsb32 &&
 			    selector->NumArgs() == 1u && !m_shader_writes &&
@@ -1793,35 +1820,76 @@ private:
 			}
 			if ((table_offset & 3u) != 0u ||
 			    (bitscan && table_offset > UINT32_MAX - (32u * 32u - 1u))) return false;
-		} else if (!MatchUniformizedBufferKey(key, handle, indirect, material_source)) {
-			auto* material_read = MaterialKey(key, indirect).TryInstruction();
-			uint32_t material_memory_index = 0;
-			const auto* memory = material_read != nullptr
-			                         ? ScalarReadMemory(*material_read, material_memory_index) : nullptr;
-			if (memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
-			    memory->offset > INT32_MAX || !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
+		} else {
+			// A material word (optionally shifted and masked) read at probeable records is the
+			// material key.
+			const auto material_key = [&](bool derived) {
+				indirect.selector_shift = 0u;
+				indirect.selector_bits  = UINT32_MAX;
+				auto* material_read =
+				    (derived ? MaterialKey(key, indirect) : key.Resolve()).TryInstruction();
+				uint32_t material_memory_index = 0;
+				const auto* memory = material_read != nullptr
+				                         ? ScalarReadMemory(*material_read, material_memory_index) : nullptr;
+				if (table_mask != UINT32_MAX || memory == nullptr ||
+				    memory->kind != ResourceKind::ScalarBuffer || memory->offset > INT32_MAX ||
+				    !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
+					return false;
+				}
+				if (!MatchMaterialOffset(material_read->Arg(1), indirect.selector_stride,
+				                         indirect.selector_offset)) {
+					return false;
+				}
+				const auto step = std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u);
+				indirect.selector_offset =
+				    (static_cast<uint32_t>(indirect.selector_offset % step) & ~3u) + (memory->offset & ~3u);
+				const auto* material_handle = material_read->Arg(0).Resolve().TryInstruction();
+				if (material_handle == nullptr ||
+				    material_handle->GetOpcode() != ValueOpcode::GetBufferResource ||
+				    !MakeRuntimeTableSource(*material_read, material_source)) {
+					return false;
+				}
+				indirect.material_source = InternSource(material_source);
+				return true;
+			};
+			// Any other key, such as a bitfield of GPU-written material data: bind every T# of
+			// the table and let the shader map entry key & mask to its descriptor. This reads
+			// only the table, never the material data the GPU writes.
+			const auto* address = plan.reads[0] != nullptr
+			                          ? plan.reads[0]->Arg(1).Resolve().TryInstruction() : nullptr;
+			const auto* key_read = key.Resolve().TryInstruction();
+			uint32_t    key_memory_index = 0;
+			const auto* key_memory =
+			    key_read != nullptr ? ScalarReadMemory(*key_read, key_memory_index) : nullptr;
+			// A negative scalar immediate is a malformed material read, not an opaque key.
+			const bool table_array =
+			    table_stride == 32u && (key_memory == nullptr || key_memory->offset <= INT32_MAX) &&
+			    (table_offset & 31u) == 0u && address != nullptr &&
+			    std::ranges::all_of(address->Uses(), [&](const Use& use) {
+				    return std::ranges::find(plan.reads, use.user) != plan.reads.end();
+			    });
+			// The table path comes before the bounded material keys: GTA V's ray tracing shaders
+			// select among ~500 distinct material T#s, and a specialization with one image per
+			// key took the driver minutes to compile.
+			if (material_key(false)) {
+			} else if (table_array) {
+				material_source          = {};
+				indirect.material_source = UINT32_MAX;
+				indirect.selector_shift  = 0u;
+				indirect.selector_bits   = UINT32_MAX;
+				indirect.table_array     = true;
+			} else if (table_mask != UINT32_MAX ||
+			           (!MatchUniformizedBufferKey(key, handle, indirect, material_source) &&
+			            !material_key(true))) {
 				return false;
 			}
-			if (!MatchMaterialOffset(material_read->Arg(1), indirect.selector_stride,
-			                         indirect.selector_offset)) {
-				return false;
-			}
-			const auto step = std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u);
-			indirect.selector_offset =
-			    (static_cast<uint32_t>(indirect.selector_offset % step) & ~3u) + (memory->offset & ~3u);
-			const auto* material_handle = material_read->Arg(0).Resolve().TryInstruction();
-			if (material_handle == nullptr ||
-			    material_handle->GetOpcode() != ValueOpcode::GetBufferResource ||
-			    !MakeRuntimeTableSource(*material_read, material_source)) {
-				return false;
-			}
-			indirect.material_source = InternSource(material_source);
 		}
 		// This plan combines shader byte-offset additions with the scalar immediate.
 		// A nonzero combined offset is exact only when neither can cross U32 wrap.
 		const auto maximum_key = (UINT32_MAX >> indirect.selector_shift) & indirect.selector_bits;
-		if (indirect.workgroup_axis == UINT32_MAX && table_source.dword_count == 4u &&
-		    table_offset != 0u && uint64_t {maximum_key} * table_stride + table_offset + 28u > UINT32_MAX)
+		if (indirect.workgroup_axis == UINT32_MAX && !indirect.table_array &&
+		    table_source.dword_count == 4u && table_offset != 0u &&
+		    uint64_t {maximum_key} * table_stride + table_offset + 28u > UINT32_MAX)
 			return false;
 		indirect.table_source = InternSource(table_source);
 		DescriptorSource image_source;
