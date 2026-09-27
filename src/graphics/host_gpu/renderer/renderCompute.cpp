@@ -293,6 +293,30 @@ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::Descriptor
 	return true;
 }
 
+// Stores through V#s selected from a descriptor table write guest memory by device address.
+// Cache every target of the tables so the BDA page table covers them. Returns whether any table
+// names a target.
+static bool PrepareIndirectWriteTargets(RenderContext& context, const PreparedBindings& bindings) {
+	const auto& program = *bindings.runtime->program;
+	bool        prepared = false;
+	for (const auto& resource: program.info.buffers) {
+		// Buffer sources follow the bound resources, which leave out buffers the shader never
+		// accesses, not the shader's buffer list.
+		if (!resource.indirect_write_table || resource.descriptor_index == UINT32_MAX ||
+		    resource.descriptor_index >= bindings.buffer_sources.size()) {
+			continue;
+		}
+		const auto& table = bindings.buffer_sources[resource.descriptor_index];
+		if (table.address == 0 || table.size <= resource.indirect_table_offset) {
+			continue;
+		}
+		prepared |= context.GetIndirectWriteTables().Prepare(
+		    table.address + resource.indirect_table_offset,
+		    table.size - resource.indirect_table_offset);
+	}
+	return prepared;
+}
+
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
                                                 const CommandBuffer&          buffer) {
 	const auto& program   = *input.stage.program;
@@ -1052,6 +1076,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	PreparedBindings* descriptor_stage = &bindings;
 	FindBuffers(std::span {&descriptor_stage, 1u});
+	// New target buffers must exist before PrepareBda uploads the CPU writes of cached buffers.
+	const bool indirect_writes = PrepareIndirectWriteTargets(m_context, bindings);
 	if (program.info.uses_dma) {
 		KYTY_PROFILER_BLOCK("Dispatch::PrepareBda");
 		m_context.CacheDmaBases(input_info.stage);
@@ -1134,7 +1160,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		               std::span {&descriptor_stage, 1u});
 		KYTY_PROFILER_BLOCK("Dispatch::Record");
 		bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
-		    HasShaderBufferWrites(input_info.stage);
+		    HasShaderBufferWrites(input_info.stage) || indirect_writes;
 		has_storage_writes =
 		    std::any_of(program.info.images.begin(), program.info.images.end(),
 		                [](const auto& image) {
@@ -1330,6 +1356,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	const auto& program = *input_info.stage.program;
 	NoteRunShader(cs_regs.cs_regs.data_addr, program.shader_hash);
+	// New target buffers must exist before PrepareBda uploads the CPU writes of cached buffers.
+	const bool indirect_writes = PrepareIndirectWriteTargets(m_context, bindings);
 	if (static const bool log_images = std::getenv("KYTY_LOG_CS_IMAGES") != nullptr; log_images) {
 		static std::unordered_set<uint64_t> seen;
 		const auto& resources = *input_info.stage.resources;
@@ -1419,6 +1447,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		const auto vk_buffer = buffer.Recorder();
 		const bool has_storage_writes =
 		    bindings.shared_memory.buffer != nullptr || HasShaderBufferWrites(input_info.stage) ||
+		    indirect_writes ||
 		    std::any_of(
 		        program.info.images.begin(), program.info.images.end(), [](const auto& image) {
 			        return image.written && image.resource_class ==
