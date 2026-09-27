@@ -142,6 +142,14 @@ public:
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
 	ImageId          depth_id {};
+	// Counts the transitions to a write access: every GPU or host write of the image takes one.
+	uint64_t         write_count        = 0;
+	// A depth copy (see TextureCache::FindDepthCopy()): the color image it copies, and the
+	// write_count of that image the copy holds. depth_copy_source is reset when the color image
+	// is deleted.
+	bool             is_depth_copy      = false;
+	ImageId          depth_copy_source {};
+	uint64_t         depth_copy_writes  = UINT64_MAX;
 	// Stencil associations that refer to this depth image.
 	std::vector<ImageId> stencil_ids;
 	// The current stencil plane's mapping into the depth image, also retained by its association.
@@ -150,6 +158,9 @@ public:
 	size_t           lru_id             = 0;
 	// Resident image heap elements that select this image.
 	std::atomic<uint32_t> heap_refs {0};
+	// Bindless table bindings that keep binding the image without looking it up again (see
+	// TextureCache::PinImage()).
+	uint32_t         table_pins         = 0;
 
 private:
 	friend struct ImageTestAccess;
