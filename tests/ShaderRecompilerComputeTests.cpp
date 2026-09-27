@@ -27944,7 +27944,9 @@ TestCase DsMiscVariants() {
   return test;
 }
 
-TestCase DsFloatMinMaxUsesSeparateCompareOperand() {
+// DS_MIN_F32/DS_MAX_F32 are one-data atomics: DATA1 must not act as a compare
+// operand (the RDNA2 pseudo-code says cmp = DATA2, but compilers leave DATA1 = v0).
+TestCase DsFloatMinMaxIgnoresData1() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
@@ -27972,16 +27974,67 @@ TestCase DsFloatMinMaxUsesSeparateCompareOperand() {
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "DsFloatMinMaxUsesSeparateCompareOperand";
+  test.name = "DsFloatMinMaxIgnoresData1";
   test.code = code;
   test.initial = std::vector<u32>(2, 0);
-  test.expected = {0x41100000u, 0x3f800000u};
+  // min(4, 9) and max(4, 1); DATA1 (2.0 / 3.0) is not a compare operand.
+  test.expected = {0x40800000u, 0x40800000u};
   test.opcodes = {O::V_MOV_B32,  O::DS_WRITE_B32, O::DS_MIN_F32,
                   O::DS_MAX_F32, O::DS_READ_B32,  O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.compute_info.threads_num[0] = 1;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+// Mirrors a GTA V bounds-reduction compute shader: LDS starts at +inf/-inf, every
+// lane issues ds_min_f32/ds_max_f32 with DATA1 = the address VGPR (v1 = 0).
+TestCase DsFloatMinMaxLaneReduction(u32 wave_size) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0);
+  AppendVMovLiteral(&code, 3, 0x7f800000u);
+  AppendVMovLiteral(&code, 4, 0xff800000u);
+  code.push_back(EncodeDs0(0x0d, 0));
+  code.push_back(EncodeDs1(0, 3, 1));
+  code.push_back(EncodeDs0(0x0d, 4));
+  code.push_back(EncodeDs1(0, 4, 1));
+  // v2 = float(lane) - 4.0: lanes span [-4, wave_size - 5].
+  code.push_back(EncodeVop1(0x06, 2, Vgpr(0)));
+  code.push_back(EncodeVop2(0x03, 2, 247u, 2));
+  code.push_back(EncodeDs0(0x12, 0));
+  code.push_back(EncodeDs1Ex(0, 1, 2, 1));
+  code.push_back(EncodeDs0(0x13, 4));
+  code.push_back(EncodeDs1Ex(0, 1, 2, 1));
+  code.push_back(EncodeDs0(0x36, 0));
+  code.push_back(EncodeDs1(5, 0, 1));
+  code.push_back(EncodeDs0(0x36, 4));
+  code.push_back(EncodeDs1(6, 0, 1));
+  AppendStoreVgpr(&code, 5, 0);
+  AppendStoreVgpr(&code, 6, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = wave_size == 64 ? "DsFloatMinMaxLaneReductionWave64"
+                              : "DsFloatMinMaxLaneReductionWave32";
+  test.code = code;
+  test.initial = std::vector<u32>(2, 0);
+  const float max_value = static_cast<float>(wave_size) - 5.0f;
+  u32 max_bits = 0;
+  std::memcpy(&max_bits, &max_value, sizeof(max_bits));
+  test.expected = {0xc0800000u, max_bits};
+  test.opcodes = {O::V_MOV_B32,     O::V_CVT_F32_U32, O::V_ADD_F32,
+                  O::DS_WRITE_B32,  O::DS_MIN_F32,    O::DS_MAX_F32,
+                  O::DS_READ_B32,   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.lds_size_dwords = 2;
   test.has_compute_info = true;
   return test;
 }
@@ -31229,7 +31282,9 @@ std::vector<TestCase> MakeCases() {
     }
   }
   AddCase(DsMiscVariants);
-  AddCase(DsFloatMinMaxUsesSeparateCompareOperand);
+  AddCase(DsFloatMinMaxIgnoresData1);
+  cases.push_back(DsFloatMinMaxLaneReduction(32));
+  cases.push_back(DsFloatMinMaxLaneReduction(64));
   AddCase(DsSwizzleInvalidSourceLaneZero);
   AddCase(DsBpermuteCapturedExecOffsetAndWrap);
   AddCase(DsBpermuteWave64UsesIndependentHalves);
@@ -36090,6 +36145,14 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferLoadDwordIdxenUsesDescriptorStride());
     RunCase(&vulkan, BufferStoreFormatXAddTidUsesLaneIndex());
     RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--ds-float-minmax-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, DsMiscVariants());
+    RunCase(&vulkan, DsFloatMinMaxIgnoresData1());
+    RunCase(&vulkan, DsFloatMinMaxLaneReduction(32));
+    RunCase(&vulkan, DsFloatMinMaxLaneReduction(64));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--wave64-only") == 0) {
