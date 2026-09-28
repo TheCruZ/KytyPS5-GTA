@@ -51,6 +51,11 @@ ResourcePlan ExtractResourcePlan(const Program& program);
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
+// The same refresh through SrtWalker alone, without the compiled plan; tests compare the two.
+bool MaterializeResourcesReference(const ResourcePlan& program, const SrtRuntime& runtime,
+                                   ResourceSnapshot& snapshot,
+                                   ResourceSpecialization& specialization);
+
 // Whether the host can bind a bindless table T# in the descriptor array of a specialized root.
 bool ImageTableSlotCompatible(const ImageResource& root, const DescriptorValue& descriptor);
 
