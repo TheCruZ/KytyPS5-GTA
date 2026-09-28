@@ -169,12 +169,8 @@ public:
 	[[nodiscard]] const HW::UserConfig& GetUserConfig() const noexcept { return *m_user_config; }
 	[[nodiscard]] const HW::Shader&     GetShaders() const noexcept { return *m_shaders; }
 
-	// Pipelines recorded outside the draws (the presentation overlay) replace the dynamic state
-	// the draws set.
-	void InvalidateDynamicState() const;
-
 private:
-	CommandBuffer(CommandScheduler& scheduler, CommandStream* stream);
+	explicit CommandBuffer(CommandScheduler& scheduler);
 	void Bind(const HW::Context& registers, const HW::UserConfig& user_config,
 	          const HW::Shader& shaders) noexcept {
 		m_registers   = &registers;
@@ -201,8 +197,8 @@ private:
 	uint32_t            m_debug_arg2      = 0;
 	uint32_t            m_debug_arg3      = 0;
 	uint64_t            m_debug_arg4      = 0;
-	mutable RenderState   m_render_state;
-	mutable bool          m_rendering = false;
+	mutable RenderState m_render_state;
+	mutable bool        m_rendering   = false;
 	const HW::Context*    m_registers   = nullptr;
 	const HW::UserConfig* m_user_config = nullptr;
 	const HW::Shader*     m_shaders     = nullptr;

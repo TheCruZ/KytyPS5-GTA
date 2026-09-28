@@ -42,11 +42,47 @@ inline std::chrono::nanoseconds SpinBudget() noexcept {
 	return budget;
 }
 
+// The clock a SpinWait reads, in ticks: the time-stamp counter on x86-64 (a few instructions; the
+// performance counter behind steady_clock::now() cost ~170 instructions a draw in the execution
+// thread's waits and runs in a call into the kernel's user-mode page), nanoseconds elsewhere.
+// The tick rate is measured once against steady_clock over a millisecond at the first wait.
+#if defined(_M_X64) || defined(__x86_64__)
+inline uint64_t SpinTicks() noexcept {
+	return __rdtsc();
+}
+inline uint64_t SpinBudgetTicks() noexcept {
+	static const uint64_t ticks = [] {
+		const auto time0  = std::chrono::steady_clock::now();
+		const auto ticks0 = __rdtsc();
+		auto       time1  = time0;
+		while (time1 - time0 < std::chrono::milliseconds(1)) {
+			time1 = std::chrono::steady_clock::now();
+		}
+		const auto   ticks1 = __rdtsc();
+		const double per_ns = static_cast<double>(ticks1 - ticks0) /
+		                      static_cast<double>(
+		                          std::chrono::duration_cast<std::chrono::nanoseconds>(time1 - time0)
+		                              .count());
+		return static_cast<uint64_t>(static_cast<double>(SpinBudget().count()) * per_ns);
+	}();
+	return ticks;
+}
+#else
+inline uint64_t SpinTicks() noexcept {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+inline uint64_t SpinBudgetTicks() noexcept {
+	return static_cast<uint64_t>(SpinBudget().count());
+}
+#endif
+
 // Busy-waiting with an exponential _mm_pause backoff (1, 2, 4 ... 64 pauses per round) that
 // gives up once the spin budget is spent. The clock is read every few rounds only.
 class SpinWait {
 public:
-	SpinWait() noexcept: m_budget(SpinBudget()) {}
+	SpinWait() noexcept: m_budget(SpinBudgetTicks()) {}
 
 	// Pauses once more; false once the budget is spent and the caller should sleep.
 	bool Spin() noexcept {
@@ -60,7 +96,7 @@ public:
 		if ((++m_rounds & ClockMask) != 0) {
 			return true;
 		}
-		const auto now = std::chrono::steady_clock::now();
+		const auto now = SpinTicks();
 		if (m_rounds == ClockMask + 1) {
 			m_start = now;
 			return true;
@@ -74,8 +110,8 @@ private:
 	static constexpr uint32_t MaxPauses = 64;
 	static constexpr uint32_t ClockMask = 15;
 
-	std::chrono::nanoseconds              m_budget;
-	std::chrono::steady_clock::time_point m_start {};
+	uint64_t                              m_budget;
+	uint64_t                              m_start      = 0;
 	uint32_t                              m_pauses     = 1;
 	uint32_t                              m_rounds     = 0;
 	uint64_t                              m_iterations = 0;

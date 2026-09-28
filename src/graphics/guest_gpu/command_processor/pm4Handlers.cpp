@@ -112,10 +112,32 @@ static void NoteGsSlotWrite(uint32_t source, const uint32_t* where, uint32_t val
 
 namespace {
 
-constexpr uint32_t RegisterSelectorMask = 0x70000000u;
+constexpr uint32_t GcrGl2MetadataInvalidate = 1u << 1u;
+constexpr uint32_t GcrGl0VectorInvalidate   = 1u << 2u;
+constexpr uint32_t GcrGl1Invalidate         = 1u << 3u;
+constexpr uint32_t GcrGl2Unshared           = 1u << 4u;
+constexpr uint32_t GcrGl2Invalidate         = 1u << 8u;
+constexpr uint32_t GcrGl2Writeback          = 1u << 9u;
+constexpr uint32_t GcrOrder012              = 1u << 10u;
+constexpr uint32_t GcrOrder210              = 2u << 10u;
+constexpr uint32_t GcrKnownMask             = GcrGl2MetadataInvalidate | GcrGl0VectorInvalidate |
+                                              GcrGl1Invalidate | GcrGl2Unshared | GcrGl2Invalidate |
+                                              GcrGl2Writeback | GcrOrder012 | GcrOrder210;
+constexpr uint32_t RegisterSelectorMask     = 0x70000000u;
 
 constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 	return raw_offset & ~RegisterSelectorMask;
+}
+
+uint32_t ReleaseMemCacheActionFromGcr(uint32_t gcr_cntl) {
+	return ((gcr_cntl & GcrGl2Writeback) != 0 ? 0x38u : 0x00u);
+}
+
+void LogUnknownReleaseMemGcr(uint32_t gcr_cntl) {
+	const uint32_t unknown = (gcr_cntl & ~GcrKnownMask);
+	if (unknown != 0) {
+		LOGF("\t warning: release_mem uses unknown GCR bits: 0x%04" PRIx32 "\n", unknown);
+	}
 }
 
 } // namespace
@@ -1106,8 +1128,9 @@ KYTY_HW_SH_PARSER(HwShSetCsUserSgpr) {
 	auto write_num = UserSgprWriteNum(slot, reg_num, 16u, "cs");
 
 	for (uint32_t i = 0; i < write_num; i++) {
-		cp.GetShCtx().SetCsUserSgpr(slot + i, buffer[i]);
+		cp.GetShCtx().SetCsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
 	}
+	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 
 	return reg_num;
 }
@@ -1122,8 +1145,9 @@ KYTY_HW_SH_PARSER(HwShSetPsUserSgpr) {
 	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "ps");
 
 	for (uint32_t i = 0; i < write_num; i++) {
-		cp.GetShCtx().SetPsUserSgpr(slot + i, buffer[i]);
+		cp.GetShCtx().SetPsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
 	}
+	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 
 	return reg_num;
 }
@@ -1167,8 +1191,9 @@ KYTY_HW_SH_PARSER(HwShSetGsUserSgpr) {
 		                buffer[static_cast<uint32_t>(traced) - slot], slot, write_num);
 	}
 	for (uint32_t i = 0; i < write_num; i++) {
-		cp.GetShCtx().SetGsUserSgpr(slot + i, buffer[i]);
+		cp.GetShCtx().SetGsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
 	}
+	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 
 	return reg_num;
 }
@@ -1183,8 +1208,9 @@ KYTY_HW_SH_PARSER(HwShSetHsUserSgpr) {
 	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "hs");
 
 	for (uint32_t i = 0; i < write_num; i++) {
-		cp.GetShCtx().SetHsUserSgpr(slot + i, buffer[i]);
+		cp.GetShCtx().SetHsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
 	}
+	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 
 	return reg_num;
 }
@@ -1330,7 +1356,6 @@ KYTY_HW_UC_PARSER(HwUcSetGdsOaRegisters) {
 
 KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
-	cp.NoteAcquireMem();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0055800 && cmd_id != 0xc0061050 && cmd_id != 0xc0065800);
 	// With KYTY_DISPATCH_SYNC=0 dispatches carry no barriers of their own, so the guest's
@@ -1469,8 +1494,7 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(addr == 0);
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
-	cp.GetRenderContext().GetBufferCache().WaitSharedWrites(addr, sizeof(uint32_t));
-	if (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {
+	if (cp.ReadDecisionValue<uint32_t>(reinterpret_cast<const volatile void*>(addr)) == 0) {
 		return payload_dw + exec_count;
 	}
 
@@ -1504,7 +1528,8 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(function > 6);
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
-	const bool take_then = TestWaitRegMemValue(cp.ReadLabel(compare_addr), reference, mask, function);
+	const bool take_then = TestWaitRegMemValue(cp.ReadDecisionValue<uint64_t>(compare_addr),
+	                                           reference, mask, function);
 	LOGF("\t branch: take=%u then=0x%016" PRIx64 "/%" PRIu32 " else=0x%016" PRIx64 "/%" PRIu32 "\n",
 	     take_then ? 1u : 0u, reinterpret_cast<uint64_t>(then_buffer), then_num_dw,
 	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
@@ -1793,6 +1818,24 @@ KYTY_CP_OP_PARSER(CpOpContextState) {
 	return packet_size_dw - 1u;
 }
 
+KYTY_CP_OP_PARSER(CpOpDumpConstRam) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0038300);
+
+	auto  offset = buffer[0];
+	auto  dw_num = buffer[1];
+	auto* dst = reinterpret_cast<uint32_t*>(buffer[2] | (static_cast<uint64_t>(buffer[3]) << 32u));
+
+	EXIT_NOT_IMPLEMENTED(dw_num >= 0x3000);
+	EXIT_NOT_IMPLEMENTED(offset > 0xbffc);
+	EXIT_NOT_IMPLEMENTED((offset & 0x3u) != 0);
+
+	cp.DumpConstRam(dst, offset, dw_num);
+
+	return 4;
+}
+
 KYTY_CP_OP_PARSER(CpOpEventWrite) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1813,14 +1856,88 @@ KYTY_CP_OP_PARSER(CpOpEventWrite) {
 	return packet_size_dw - 1u;
 }
 
+KYTY_CP_OP_PARSER(CpOpEventWriteEop) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0044700);
+
+	uint32_t cache_policy       = (buffer[0] >> 25u) & 0x3u;
+	uint32_t event_write_dest   = ((buffer[0] >> 23u) & 0x10u) | ((buffer[2] >> 16u) & 0x01u);
+	uint32_t eop_event_type     = (buffer[0]) & 0x3fu;
+	uint32_t cache_action       = (buffer[0] >> 12u) & 0x3fu;
+	uint32_t event_index        = (buffer[0] >> 8u) & 0x7u;
+	uint32_t event_write_source = ((buffer[2] >> 29u) & 0x7u);
+	uint32_t interrupt_selector = (buffer[2] >> 24u) & 0x7u;
+	auto*    dst_gpu_addr =
+	    reinterpret_cast<void*>(buffer[1] | (static_cast<uint64_t>(buffer[2] & 0xffffu) << 32u));
+	uint64_t value = (buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u));
+
+	cp.WriteAtEndOfPipe64(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
+	                      event_write_source, dst_gpu_addr, value, interrupt_selector);
+
+	return 5;
+}
+
+KYTY_CP_OP_PARSER(CpOpEventWriteEos) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0034802);
+
+	uint32_t cache_policy       = (buffer[0] >> 25u) & 0x3u;
+	uint32_t event_write_dest   = 0;
+	uint32_t eop_event_type     = (buffer[0]) & 0x3fu;
+	uint32_t cache_action       = (buffer[0] >> 12u) & 0x3fu;
+	uint32_t event_index        = (buffer[0] >> 8u) & 0x7u;
+	uint32_t event_write_source = ((buffer[2] >> 29u) & 0x7u);
+	uint32_t interrupt_selector = (buffer[2] >> 24u) & 0x7u;
+
+	auto* dst_gpu_addr =
+	    reinterpret_cast<void*>(buffer[1] | (static_cast<uint64_t>(buffer[2] & 0xffffu) << 32u));
+	uint32_t value = buffer[3];
+
+	cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
+	                      event_write_source, dst_gpu_addr, value, interrupt_selector);
+
+	return 4;
+}
+
 KYTY_CP_OP_PARSER(CpOpFlip) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc004105c);
 
-	cp.Flip(static_cast<int>(buffer[0]), static_cast<int>(buffer[1]), static_cast<int>(buffer[2]),
-	        static_cast<int64_t>(buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u)));
+	CommandProcessor::FlipInfo f;
+
+	f.handle    = static_cast<int>(buffer[0]);
+	f.index     = static_cast<int>(buffer[1]);
+	f.flip_mode = static_cast<int>(buffer[2]);
+	f.flip_arg  = static_cast<int64_t>(buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u));
+
+	cp.SetFlip(f);
+	cp.Flip();
 	return 5;
+}
+
+KYTY_CP_OP_PARSER(CpOpIncrementCeCounter) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0008400);
+	EXIT_NOT_IMPLEMENTED(buffer[0] != 1);
+
+	cp.IncrementCe();
+
+	return 1;
+}
+
+KYTY_CP_OP_PARSER(CpOpIncrementDeCounter) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0008500);
+	EXIT_NOT_IMPLEMENTED(buffer[0] != 0);
+
+	cp.IncrementDe();
+
+	return 1;
 }
 
 KYTY_CP_OP_PARSER(CpOpIndexType) {
@@ -2106,12 +2223,50 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	return KYTY_PM4_LEN(cmd_id) - 1u;
 }
 
+KYTY_CP_OP_PARSER(CpOpMarker) {
+	KYTY_PROFILER_FUNCTION();
+
+	uint32_t len_dw = ((cmd_id >> 16u) & 0x3fffu);
+
+	switch (buffer[0]) {
+		case 0x68750004: cp.SetUserDataMarker(HW::UserSgprType::Vsharp); break;
+		case 0x6875000d: cp.SetUserDataMarker(HW::UserSgprType::Region); break;
+		case 0x68750777: {
+			cp.Flip();
+			break;
+		}
+		case 0x68750778: {
+			auto* addr =
+			    reinterpret_cast<void*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
+			uint32_t value = buffer[3];
+			cp.Flip(addr, value);
+			break;
+		}
+		case 0x68750781: {
+			auto* addr =
+			    reinterpret_cast<void*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
+			uint32_t value          = buffer[3];
+			uint32_t eop_event_type = buffer[4];
+			uint32_t cache_action   = buffer[5];
+			cp.FlipWithInterrupt(eop_event_type, cache_action, addr, value);
+			break;
+		}
+		// NOP payloads are caller-owned data; only complete known marker tags execute.
+		default: break;
+	}
+
+	return len_dw + 1;
+}
+
 KYTY_CP_OP_PARSER(CpOpNop) {
 	KYTY_PROFILER_FUNCTION();
 
 	auto r = KYTY_PM4_R(cmd_id);
 
 	if (r == Pm4::R_ZERO) {
+		if ((buffer[0] & 0xffff0000u) == 0x68750000u) {
+			return CpOpMarker(cp, cmd_id, buffer, dw, num_dw);
+		}
 		return KYTY_PM4_LEN(cmd_id) - 1;
 	}
 
@@ -2167,7 +2322,7 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0064900);
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0061060);
 
 	uint32_t cache_policy       = (buffer[0] >> 25u) & 0x3u;
 	uint32_t eop_event_type     = buffer[0] & 0x3fu;
@@ -2227,20 +2382,17 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
-		if (interrupt_selector == 0x00 || interrupt_selector == 0x03) {
-			// WriteAtEndOfPipe already performed the guest-visible write synchronously above (no
-			// interrupt callback was scheduled for these selectors), so nothing depends on when
-			// the accumulated command buffer actually reaches the GPU -- safe to batch instead of
-			// paying a host vkQueueSubmit for every single fence update.
-			cp.CompleteReleaseMemWrite();
-		} else {
-			// interrupt_selector 0x01/0x02 route through WriteAtEndOfPipe's interrupt path, which
-			// schedules a callback gated on this submission's tick actually completing on the
-			// GPU -- flush now so a guest thread that may be blocked waiting on it isn't stalled
-			// behind a batching window.
+		if (interrupt_selector == 0x01 || interrupt_selector == 0x02) {
+			// WriteAtEndOfPipe's interrupt path schedules a callback gated on this submission's
+			// tick actually completing on the GPU -- flush now so a guest thread that may be
+			// blocked waiting on it isn't stalled behind a batching window.
 			KYTY_PROFILER_BLOCK("CpOpReleaseMem: BufferFlush");
-			SetSubmitReason("release-mem with interrupt");
-			cp.BufferFlush();
+			cp.BufferFlush("release-mem with interrupt");
+		} else {
+			// The label is written when the operation executes, so nothing depends on when the
+			// accumulated command buffer reaches the GPU: batch instead of paying a host
+			// vkQueueSubmit for every fence update; long batches still start the GPU early.
+			cp.BufferFlushIfBatchReady();
 		}
 
 		return 7;
@@ -2260,8 +2412,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		                      interrupt_selector, interrupt_context_id);
 		if (interrupt_selector == 0x01) {
 			KYTY_PROFILER_BLOCK("CpOpReleaseMem: BufferFlush");
-			SetSubmitReason("release-mem timestamp with interrupt");
-			cp.BufferFlush();
+			cp.BufferFlush("release-mem timestamp with interrupt");
 		}
 
 		return 7;
@@ -2287,21 +2438,6 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	                      data_sel, dst_gpu_addr, value, interrupt_selector, interrupt_context_id);
 
 	return 7;
-}
-
-KYTY_CP_OP_PARSER(CpOpMemSemaphore) {
-	KYTY_PROFILER_FUNCTION();
-
-	const auto control = buffer[2];
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0023900 || (control & ~0xe0110000u) != 0 ||
-	                     (control >> 29u) < 6u);
-
-	auto* counter = reinterpret_cast<uint64_t*>(
-	    (buffer[0] & ~0x7u) | (static_cast<uint64_t>(buffer[1] & 0x3ffffu) << 32u));
-	// A signal updates the counter before the next packet, so its mailbox stall never waits.
-	cp.MemSemaphore(counter, (control >> 29u) == 6u, ((control >> 20u) & 0x1u) != 0);
-
-	return 3;
 }
 
 KYTY_CP_OP_PARSER(CpOpSetContextReg) {
@@ -2520,6 +2656,42 @@ KYTY_CP_OP_PARSER(CpOpWaitRegMem64) {
 	KYTY_PROFILER_FUNCTION();
 
 	return CpOpWaitRegMemSized<uint64_t>(cp, cmd_id, buffer);
+}
+
+KYTY_CP_OP_PARSER(CpOpWaitOnCeCounter) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0008600);
+	EXIT_NOT_IMPLEMENTED(buffer[0] != 1);
+
+	cp.WaitCe();
+
+	return 1;
+}
+
+KYTY_CP_OP_PARSER(CpOpWaitOnDeCounterDiff) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0008800);
+
+	cp.WaitDeDiff(buffer[0]);
+
+	return 1;
+}
+
+KYTY_CP_OP_PARSER(CpOpWriteConstRam) {
+	KYTY_PROFILER_FUNCTION();
+
+	auto dw_num = (cmd_id >> 16u) & 0x3fffu;
+	auto offset = buffer[0];
+
+	EXIT_NOT_IMPLEMENTED(dw_num >= 0x3000);
+	EXIT_NOT_IMPLEMENTED(offset > 0xbffc);
+	EXIT_NOT_IMPLEMENTED((offset & 0x3u) != 0);
+
+	cp.WriteConstRam(offset, buffer + 1, dw_num);
+
+	return 1 + dw_num;
 }
 
 KYTY_CP_OP_PARSER(CpOpWriteData) {
@@ -3481,7 +3653,9 @@ void GraphicsInitJmpTablesShIndirect() {
 
 	for (uint32_t slot = 0; slot < 16; slot++) {
 		g_hw_sh_indirect_func[Pm4::COMPUTE_USER_DATA_0 + slot] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-			cp.GetShCtx().SetCsUserSgpr(cmd_offset - Pm4::COMPUTE_USER_DATA_0, value);
+			auto sgpr = cmd_offset - Pm4::COMPUTE_USER_DATA_0;
+			cp.GetShCtx().SetCsUserSgpr(sgpr, value, cp.GetUserDataMarker());
+			cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 		};
 	}
 	for (uint32_t slot = 0; slot < 4; slot++) {
@@ -3492,7 +3666,9 @@ void GraphicsInitJmpTablesShIndirect() {
 	for (uint32_t slot = 0; slot < 32; slot++) {
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_PS_0 + slot] =
 		    [](KYTY_HW_SH_INDIRECT_ARGS) {
-			    cp.GetShCtx().SetPsUserSgpr(cmd_offset - Pm4::SPI_SHADER_USER_DATA_PS_0, value);
+			    auto sgpr = cmd_offset - Pm4::SPI_SHADER_USER_DATA_PS_0;
+			    cp.GetShCtx().SetPsUserSgpr(sgpr, value, cp.GetUserDataMarker());
+			    cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 		    };
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_GS_0 + slot] =
 		    [](KYTY_HW_SH_INDIRECT_ARGS) {
@@ -3520,7 +3696,9 @@ void GraphicsInitJmpTablesShIndirect() {
 		    };
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_HS_0 + slot] =
 		    [](KYTY_HW_SH_INDIRECT_ARGS) {
-			    cp.GetShCtx().SetHsUserSgpr(cmd_offset - Pm4::SPI_SHADER_USER_DATA_HS_0, value);
+			    auto sgpr = cmd_offset - Pm4::SPI_SHADER_USER_DATA_HS_0;
+			    cp.GetShCtx().SetHsUserSgpr(sgpr, value, cp.GetUserDataMarker());
+			    cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 		    };
 	}
 	for (uint32_t slot = 0; slot < 4; slot++) {

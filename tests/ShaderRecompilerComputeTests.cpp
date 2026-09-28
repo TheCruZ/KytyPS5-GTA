@@ -1049,8 +1049,6 @@ void EnsureConfigInitialized() {
     options.printf_direction = Config::LogDirection::Silent;
     // The checks drive the renderer and inspect its Vulkan command buffers synchronously.
     options.gpu_pipeline_stages = 0;
-    // ... and expect every draw to run, also those whose pipeline is new.
-    options.async_pipelines_enabled = false;
     Config::Load(options);
     subsystems.Initialize<Log::Lifecycle>();
     subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
@@ -17401,9 +17399,7 @@ public:
       for (const auto [sync_raw, formatted] :
            {std::pair{false, false}, {true, false}, {false, true}, {true, true}}) {
         // The checks drive the renderer synchronously (see EnsureConfigInitialized).
-        Config::Load({.sync_raw_image_buffers  = sync_raw,
-                      .async_pipelines_enabled = false,
-                      .gpu_pipeline_stages     = 0});
+        Config::Load({.sync_raw_image_buffers = sync_raw, .gpu_pipeline_stages = 0});
         const bool sync_image = sync_raw || formatted;
         const uint32_t before = 0x13579bd0u | (uint32_t(sync_raw) << 1u) | uint32_t(formatted);
         constexpr uint32_t guard = 0x2468ace0u;
@@ -17498,7 +17494,7 @@ public:
                 "attachment rendering lost its new color or changed the untouched array layer");
         RenderExecutorTestAccess::ResetBindings(executor);
       }
-      Config::Load({.async_pipelines_enabled = false, .gpu_pipeline_stages = 0});
+      Config::Load({.gpu_pipeline_stages = 0});
 
       auto colliding_msaa_texture = array_texture;
       colliding_msaa_texture.fields[3] =

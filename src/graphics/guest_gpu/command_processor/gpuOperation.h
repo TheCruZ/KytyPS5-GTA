@@ -21,9 +21,6 @@ struct GpuRegisterState {
 	const HW::Context*    context     = nullptr;
 	const HW::UserConfig* user_config = nullptr;
 	const HW::Shader*     shaders     = nullptr;
-	// Unique per snapshot of the context registers (0: live registers, not a snapshot):
-	// operations with the same id see the same context registers.
-	uint64_t context_id = 0;
 };
 
 // NUM_INSTANCES as the command processor last set it. Indirect draws also set the persistent
@@ -39,6 +36,8 @@ struct IndirectDrawRegisters {
 	uint32_t vertex_offset;
 	uint32_t instance_offset;
 	uint32_t index_offset;
+	// DRAW_INDIRECT_MULTI: the SH register that receives the draw's index within the packet
+	// (starts at zero for each packet); Pm4::SH_NOP for none.
 	uint32_t draw_index;
 };
 
@@ -55,6 +54,9 @@ struct GpuDrawIndirectArgs {
 	bool                     indexed           = false;
 	bool                     multi             = false;
 	IndirectDrawRegisters    registers {};
+	// Where the packet sits in its command buffer, for the look-ahead of mesh argument runs.
+	const uint32_t* run_packet = nullptr;
+	const uint32_t* run_end    = nullptr;
 };
 
 struct GpuDispatchArgs {
@@ -63,6 +65,11 @@ struct GpuDispatchArgs {
 	uint32_t thread_group_z = 0;
 	uint32_t mode           = 0;
 	uint64_t args_addr      = 0; // Indirect dispatches.
+	// Where the packet sits in its command buffer and the base of the indirect arguments in force,
+	// for the look-ahead of dispatch runs.
+	const uint32_t* run_packet    = nullptr;
+	const uint32_t* run_end       = nullptr;
+	uint64_t        indirect_base = 0;
 };
 
 // Callbacks of queued operations live in the operation itself; the largest ones capture about
@@ -90,14 +97,6 @@ struct GpuOperation {
 	uint64_t          sequence  = 0;
 	GpuRegisterState  state;
 	GpuNumInstances   num_instances;
-	// Draws: the shader programs the resolve thread resolved ahead, if any.
-	RenderExecutor::ResolvedDraw* resolved = nullptr;
-	// The command processor processed a WAIT_REG_MEM since the previous operation: the guest may
-	// have written memory the operations before it read.
-	bool after_wait = false;
-	// The guest ordered the operation after the earlier work of its queue (ACQUIRE_MEM or
-	// WAIT_REG_MEM since the operation before).
-	bool guest_sync = true;
 	union {
 		DrawIndexArgs       draw_index;
 		DrawAutoArgs        draw_auto;
