@@ -30,7 +30,8 @@ public:
 	~CommandScheduler();
 	KYTY_CLASS_NO_COPY(CommandScheduler);
 
-	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
+	void           Begin(const HW::Context& registers, const HW::UserConfig& user_config,
+	                     const HW::Shader& shaders);
 	void           BeginRendering(const RenderState& state);
 	void           EndRendering(std::source_location site = std::source_location::current());
 	void           Flush();

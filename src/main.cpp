@@ -323,6 +323,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			return false;
 		}
 
+		if (arg == "--gpu-pipeline") {
+			options.config.gpu_pipeline_stages = Config::ParseGpuPipelineStages(value.c_str());
+			continue;
+		}
+
 		if (arg == "--game") {
 			if (!options.app0_dir.empty()) {
 				::printf("--game can only be specified once\n");

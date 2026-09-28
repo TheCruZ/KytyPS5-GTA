@@ -2,16 +2,20 @@
 #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_COMMAND_PROCESSOR_H
 
 #include "common/assert.h"
+#include "graphics/guest_gpu/command_processor/gpuOperation.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <cstdint>
 #include <source_location>
+#include <memory>
 #include <span>
 #include <vector>
 
 namespace Libs::Graphics {
+
+class GuestGpu;
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
 
@@ -22,15 +26,6 @@ enum class ContextStateOperation : uint32_t {
 	Push      = 1,
 	Pop       = 2,
 	PushClear = 3,
-};
-
-struct IndirectDrawRegisters {
-	uint32_t vertex_offset;
-	uint32_t instance_offset;
-	uint32_t index_offset;
-	// DRAW_INDIRECT_MULTI: the SH register that receives the draw's index within the packet
-	// (starts at zero for each packet); Pm4::SH_NOP for none.
-	uint32_t draw_index;
 };
 
 class Pm4Execution {
@@ -84,20 +79,36 @@ public:
 	void Reset();
 	void ApplyContextStateOperation(ContextStateOperation operation);
 
-	void            BufferInit();
-	void            BufferFlush();
-	void            BufferWait();
+	// Operations of a pipelined GPU go to its execution thread; without one they execute
+	// when they are emitted.
+	void AttachPipeline(GuestGpu* gpu) { m_pipeline = gpu; }
+
+	void BufferInit();
+	// `reason` names why the submission is flushed (a debugging aid of the scheduler).
+	void BufferFlush(const char* reason = nullptr);
+	void BufferFlushIfBatchReady();
+	void BufferWait();
 	// See CommandScheduler::CompleteReleaseMemWrite -- only safe for a RELEASE_MEM that already
 	// wrote its guest-visible value synchronously and scheduled no interrupt callback.
-	void            CompleteReleaseMemWrite();
+	void CompleteReleaseMemWrite();
 	// See CommandScheduler::CompleteReleaseMemInterrupt -- for a RELEASE_MEM that DOES request a
 	// guest interrupt/event; uses a smaller batch bound as a hedge against delaying it.
-	void            CompleteReleaseMemInterrupt();
+	void CompleteReleaseMemInterrupt();
 	// See CommandScheduler::CompleteDraw -- called after every DrawIndex/DrawAuto.
-	void            CompleteDraw();
-	HW::Context&    GetCtx() { return m_ctx; }
-	HW::UserConfig& GetUcfg() { return m_ucfg; }
-	HW::Shader&     GetShCtx() { return m_sh_ctx; }
+	void CompleteDraw();
+	// Register writes go through these; queued operations keep snapshots of the old values.
+	HW::Context& GetCtx() {
+		m_ctx_dirty = true;
+		return m_ctx;
+	}
+	HW::UserConfig& GetUcfg() {
+		m_ucfg_dirty = true;
+		return m_ucfg;
+	}
+	HW::Shader& GetShCtx() {
+		m_sh_ctx_dirty = true;
+		return m_sh_ctx;
+	}
 
 	void SetIndexType(uint32_t index_type_and_size);
 	void SetIndexBaseAddress(uint64_t index_base_addr);
@@ -135,11 +146,28 @@ public:
 	void SynchronizeGpu();
 	void EmitGlobalBarrier(std::source_location site = std::source_location::current());
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
+	void DeferEopInterrupt(uint32_t interrupt_context_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);
 	void DispatchIndirect(uint64_t args_addr, uint32_t mode);
 	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
+	void WriteLodStats(void* dst, uint32_t size);
+	void RunGarbageCollector();
+	// Runs a host command in operation order.
+	void EmitHostCommand(Common::UniqueFunction<void>&& command);
+	// Reads guest memory the CP decides on (WAIT_REG_MEM, COND_EXEC, predication, branches) as a
+	// serial GPU would: after the earlier operations that write it.
+	void ReadDecisionMemory(const volatile void* address, void* value, size_t size);
+	template <typename T>
+	[[nodiscard]] T ReadDecisionValue(const volatile void* address) {
+		T value {};
+		ReadDecisionMemory(address, &value, sizeof(T));
+		return value;
+	}
+
+	// Executes an operation this command processor produced.
+	void Execute(GpuOperation& operation);
 
 	void SetUserDataMarker(HW::UserSgprType type) { m_user_data_marker = type; }
 	[[nodiscard]] HW::UserSgprType GetUserDataMarker() const { return m_user_data_marker; }
@@ -195,13 +223,68 @@ private:
 	// the dispatch is not attempted.
 	[[nodiscard]] bool BeginDispatchDefer();
 	void               EndDispatchDefer();
-	uint32_t            NumInstances();
-	const void*         IndexAddress(uint32_t first_index) const;
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 
-	RenderContext&   m_renderer;
-	HW::Context      m_ctx;
+	// Producer side: operations carry the register state and the CP state they need.
+	[[nodiscard]] GpuOperation MakeOperation(GpuOperationKind kind);
+	[[nodiscard]] GpuRegisterState SnapshotState(uint64_t sequence);
+	// Both return the sequence of a pipelined operation, 0 once it executed.
+	uint64_t                   Emit(GpuOperation&& operation);
+	uint64_t                   EmitCallback(GpuCallback&& callback);
+	void NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size,
+	                    const void* value = nullptr);
+
+	// Execution side, in operation order. Only these touch the renderer.
+	void BindState(const GpuRegisterState& state);
+	void NoteRecordedWork();
+	[[nodiscard]] uint32_t ResolveNumInstances(const GpuOperation& operation) const;
+	// The packet being processed and the end of its command buffer, for execution-side scans.
+	static void CaptureStreamPosition(const uint32_t*& packet, const uint32_t*& end);
+	void ExecuteDrawIndex(const GpuOperation& operation, DrawIndexArgs args);
+	void ExecuteDrawAuto(const GpuOperation& operation, DrawAutoArgs args);
+	void ExecuteDrawIndirect(const GpuOperation& operation);
+	bool PatchIndirectDrawOffsets(const GpuOperation& operation, uint32_t vertex_offset,
+	                              uint32_t instance_offset, uint32_t first_index,
+	                              uint32_t draw_index);
+	void ExecuteDispatchDirect(const GpuOperation& operation, uint32_t thread_group_x,
+	                           uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
+	void ExecuteDispatchIndirect(const GpuOperation& operation);
+	template <typename T>
+	void ExecuteWriteAtEndOfPipe(uint64_t submit_id, uint32_t eop_event_type,
+	                             uint32_t cache_action, uint32_t event_index,
+	                             uint32_t event_write_source, void* dst_gpu_addr, T value,
+	                             uint32_t interrupt_selector, uint32_t interrupt_context_id);
+	void ExecuteGlobalBarrier(std::source_location site = std::source_location::current());
+	void ExecuteTriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address);
+	void ExecuteDmaData(bool dst_gds, uint64_t dst_address_or_offset, uint8_t src_sel,
+	                    bool src_gds, uint64_t src_address_or_offset_or_immediate,
+	                    uint32_t num_bytes);
+
+	// Copies of the register state for operations a pipelined GPU has not executed yet. A slot
+	// is overwritten only after the last operation that uses it executed. Slots start on cache
+	// lines of their own and the command processor keeps the last uses apart, so it writes no
+	// line the execution thread reads.
+	template <typename T>
+	struct SnapshotRing {
+		static constexpr size_t Size = 512;
+		struct alignas(64) Slot {
+			T value;
+		};
+		std::unique_ptr<Slot[]>     slots;
+		std::unique_ptr<uint64_t[]> last_use;
+		size_t                      current = Size;
+		size_t                      next    = 0;
+	};
+	template <typename T>
+	const T* Snapshot(SnapshotRing<T>& ring, const T& live, bool& dirty, uint64_t sequence);
+
+	RenderContext& m_renderer;
+	GuestGpu*      m_pipeline = nullptr;
+	const int      m_interrupt_event_id;
+
+	// Command processor state, written by the command processor thread.
+	alignas(64) HW::Context m_ctx;
 	HW::Context      m_saved_ctx;
 	bool             m_context_state_pushed = false;
 	HW::UserConfig   m_ucfg;
@@ -212,10 +295,8 @@ private:
 	uint64_t         m_index_base_addr                  = 0;
 	uint64_t         m_draw_indirect_args_base_addr     = 0;
 	uint64_t         m_dispatch_indirect_args_base_addr = 0;
-	// Persistent draw state. Indirect draws leave the address of their last instance count,
-	// read only when a later draw inherits it.
-	uint32_t m_num_instances      = 1;
-	uint64_t m_num_instances_addr = 0;
+	// Persistent draw state: indirect draws update it for subsequent draws when they execute.
+	GpuNumInstances m_num_instances;
 
 	uint32_t m_de_count    = 0;
 	uint32_t m_ce_count    = 0;
@@ -223,11 +304,34 @@ private:
 
 	uint32_t m_const_ram[0x3000] = {0};
 
-	FlipInfo  m_flip;
-	const int m_interrupt_event_id;
-	uint64_t  m_submit_id                   = 0;
-	uint64_t  m_synthetic_occlusion_counter = 0;
-	bool      m_predicate_skip              = false;
+	bool                         m_ctx_dirty    = true;
+	bool                         m_ucfg_dirty   = true;
+	bool                         m_sh_ctx_dirty = true;
+	SnapshotRing<HW::Context>    m_ctx_snapshots;
+	SnapshotRing<HW::UserConfig> m_ucfg_snapshots;
+	SnapshotRing<HW::Shader>     m_sh_ctx_snapshots;
+
+	FlipInfo m_flip;
+	uint64_t m_submit_id      = 0;
+	bool     m_predicate_skip = false;
+
+	// State of the execution side, on cache lines of its own.
+	alignas(64) uint64_t m_synthetic_occlusion_counter = 0;
+	// Draws and dispatches recorded into the command buffer of m_batch_tick.
+	uint64_t m_batch_tick = 0;
+	uint32_t m_batch_work = 0;
+	// The instance count of the last executed indirect draw, and the NUM_INSTANCES sequence it
+	// followed.
+	uint32_t m_indirect_instances         = 0;
+	// Address of the arguments of a DRAW_INDIRECT whose instance count the GPU reads (0: the CPU
+	// read it into m_indirect_instances).
+	uint64_t m_indirect_args_address      = 0;
+	uint64_t m_indirect_instances_sequence = 0;
+	bool     m_has_indirect_instances      = false;
+	// The shader registers of a pipelined indirect draw with its offsets written to user SGPRs.
+	std::unique_ptr<HW::Shader> m_indirect_shaders;
+	// Keeps later allocations off the last line of the execution-side state.
+	alignas(64) uint8_t m_end_padding = 0;
 };
 
 } // namespace Libs::Graphics

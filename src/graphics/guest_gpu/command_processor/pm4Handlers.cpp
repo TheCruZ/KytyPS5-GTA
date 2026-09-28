@@ -1409,12 +1409,7 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	                                                 (static_cast<uint64_t>(buffer[2]) << 32u));
 
 	if (dst != nullptr && buffer_size != 0) {
-		memset(dst, 0, buffer_size);
-		// Hack?
-		if (buffer_size >= sizeof(uint32_t)) {
-			auto* label = static_cast<uint32_t*>(dst);
-			*label      = 1;
-		}
+		cp.WriteLodStats(dst, buffer_size);
 	}
 
 	return 4;
@@ -1499,8 +1494,7 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(addr == 0);
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
-	cp.GetRenderContext().GetBufferCache().WaitSharedWrites(addr, sizeof(uint32_t));
-	if (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {
+	if (cp.ReadDecisionValue<uint32_t>(reinterpret_cast<const volatile void*>(addr)) == 0) {
 		return payload_dw + exec_count;
 	}
 
@@ -1534,7 +1528,8 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(function > 6);
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
-	const bool take_then = TestWaitRegMemValue(cp.ReadLabel(compare_addr), reference, mask, function);
+	const bool take_then = TestWaitRegMemValue(cp.ReadDecisionValue<uint64_t>(compare_addr),
+	                                           reference, mask, function);
 	LOGF("\t branch: take=%u then=0x%016" PRIx64 "/%" PRIu32 " else=0x%016" PRIx64 "/%" PRIu32 "\n",
 	     take_then ? 1u : 0u, reinterpret_cast<uint64_t>(then_buffer), then_num_dw,
 	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
@@ -2387,20 +2382,17 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
-		if (interrupt_selector == 0x00 || interrupt_selector == 0x03) {
-			// WriteAtEndOfPipe already performed the guest-visible write synchronously above (no
-			// interrupt callback was scheduled for these selectors), so nothing depends on when
-			// the accumulated command buffer actually reaches the GPU -- safe to batch instead of
-			// paying a host vkQueueSubmit for every single fence update.
-			cp.CompleteReleaseMemWrite();
-		} else {
-			// interrupt_selector 0x01/0x02 route through WriteAtEndOfPipe's interrupt path, which
-			// schedules a callback gated on this submission's tick actually completing on the
-			// GPU -- flush now so a guest thread that may be blocked waiting on it isn't stalled
-			// behind a batching window.
+		if (interrupt_selector == 0x01 || interrupt_selector == 0x02) {
+			// WriteAtEndOfPipe's interrupt path schedules a callback gated on this submission's
+			// tick actually completing on the GPU -- flush now so a guest thread that may be
+			// blocked waiting on it isn't stalled behind a batching window.
 			KYTY_PROFILER_BLOCK("CpOpReleaseMem: BufferFlush");
-			SetSubmitReason("release-mem with interrupt");
-			cp.BufferFlush();
+			cp.BufferFlush("release-mem with interrupt");
+		} else {
+			// The label is written when the operation executes, so nothing depends on when the
+			// accumulated command buffer reaches the GPU: batch instead of paying a host
+			// vkQueueSubmit for every fence update; long batches still start the GPU early.
+			cp.BufferFlushIfBatchReady();
 		}
 
 		return 7;
@@ -2420,8 +2412,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		                      interrupt_selector, interrupt_context_id);
 		if (interrupt_selector == 0x01) {
 			KYTY_PROFILER_BLOCK("CpOpReleaseMem: BufferFlush");
-			SetSubmitReason("release-mem timestamp with interrupt");
-			cp.BufferFlush();
+			cp.BufferFlush("release-mem timestamp with interrupt");
 		}
 
 		return 7;

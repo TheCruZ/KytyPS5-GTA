@@ -287,17 +287,20 @@ void CommandScheduler::Shutdown() {
 	m_operation_available.notify_all();
 }
 
-void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config,
-                             HW::Shader& shaders) {
+void CommandScheduler::Begin(const HW::Context& registers, const HW::UserConfig& user_config,
+                             const HW::Shader& shaders) {
+	// Every GPU operation binds its register state. A shutdown submits the open command buffer
+	// before it closes the scheduler, so an open command buffer means an open scheduler.
+	if (!m_command.IsInvalid()) {
+		m_command.Bind(registers, user_config, shaders);
+		return;
+	}
 	{
 		std::lock_guard lock(m_operation_mutex);
 		EXIT_IF(m_operation_state != OperationState::Open);
 	}
 	m_command.Bind(registers, user_config, shaders);
-
-	if (m_command.IsInvalid()) {
-		BeginNext();
-	}
+	BeginNext();
 }
 
 void CommandScheduler::BeginRendering(const RenderState& state) {
