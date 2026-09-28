@@ -293,7 +293,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	AddFlag(args, info.profiler_enabled, "--profile");
 	AddFlag(args, info.amd_cpu_enabled, "--amd-cpu");
 #if defined(_WIN32)
-	AddFlag(args, info.red_zone_protection_enabled, "--redzone");
+	AddFlag(args, !info.red_zone_protection_enabled, "--no-redzone");
 #endif
 	for (const auto& binding: info.host_input_mapping) {
 		args << "--keymap" << binding;
