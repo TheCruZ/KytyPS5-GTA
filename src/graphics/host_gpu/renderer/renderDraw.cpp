@@ -41,8 +41,10 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <span>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -433,6 +435,50 @@ static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
 
 	const auto& vs = sh_ctx.GetVs();
 	return vs.es_regs.data_addr != 0;
+}
+
+struct RenderExecutor::DrawRenderStorage {
+	DrawRenderState state {};
+	// Only tessellation draws write the input infos of the second and third vertex stages.
+	bool tessellation_stages_written = false;
+};
+static_assert(std::is_trivially_destructible_v<DrawRenderState>);
+
+template <typename T>
+static void ValueInitialize(T& object) {
+	::new (static_cast<void*>(std::addressof(object))) T {};
+}
+
+// A draw state is 36 KB, 30 KB of it the input infos of the three vertex stages, and
+// value-initializing one on the stack took ~0.6 us per draw. Reuse one state and restore its
+// value-initialized contents, skipping the tessellation stages when no draw wrote them. Keep it
+// in sync with the members of DrawRenderState.
+DrawRenderState& RenderExecutor::AcquireDrawRenderState(bool tessellation) {
+	if (m_draw_state == nullptr) {
+		m_draw_state = {new DrawRenderStorage {},
+		                [](DrawRenderStorage* storage) { delete storage; }};
+	} else {
+		auto& state = m_draw_state->state;
+		ValueInitialize(state.depth_info);
+		for (auto& color: state.color_info) {
+			ValueInitialize(color);
+		}
+		state.color_count              = 0;
+		state.mrt_mask                 = 0;
+		state.topology                 = vk::PrimitiveTopology::ePointList;
+		state.primitive_restart_enable = false;
+		state.ps_active                = false;
+		ValueInitialize(state.vertex_info[0]);
+		if (m_draw_state->tessellation_stages_written) {
+			ValueInitialize(state.vertex_info[1]);
+			ValueInitialize(state.vertex_info[2]);
+		}
+		ValueInitialize(state.ps_input_info);
+		state.indirect_offsets = {};
+		state.indirect_draw    = false;
+	}
+	m_draw_state->tessellation_stages_written = tessellation;
+	return m_draw_state->state;
 }
 
 struct DrawCallInfo {
@@ -906,7 +952,7 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 	return prepared;
 }
 
-static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
+static void CommitVertexBuffers(CommandRecorder              vk_buffer,
                                 const PreparedVertexBuffers& prepared) {
 	if (prepared.count != 0) {
 		// Guest descriptor bounds must survive allocation merging in the cache.
@@ -915,7 +961,7 @@ static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
 	}
 }
 
-static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBuffer& prepared) {
+static void CommitIndexBuffer(CommandRecorder vk_buffer, const PreparedIndexBuffer& prepared) {
 	if (prepared.buffer == nullptr) {
 		return;
 	}
@@ -941,7 +987,7 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 	                  draw.index_count, index_addr);
 }
 
-static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
+static void EmitDrawPrimitives(const HW::UserConfig& ucfg, CommandRecorder vk_buffer,
                                const DrawCallInfo& draw, const DrawEmitInfo& emit) {
 	switch (ucfg.GetPrimType()) {
 		case Prospero::PrimitiveType::kPointList:
@@ -1298,8 +1344,9 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 
 	hw_check(buffer);
 
-	DrawRenderState state {.indirect_offsets = args.indirect.offsets,
-	                       .indirect_draw    = args.indirect.address != 0};
+	auto& state = AcquireDrawRenderState(ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch);
+	state.indirect_offsets = args.indirect.offsets;
+	state.indirect_draw    = args.indirect.address != 0;
 	if (!GetDrawTopology(ucfg, state.topology)) {
 		return true;
 	}
@@ -1388,8 +1435,9 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 
 	const DrawCallInfo draw {false, args.vertex_count, args.instance_count};
 
-	DrawRenderState state {.indirect_offsets = args.indirect.offsets,
-	                       .indirect_draw    = args.indirect.address != 0};
+	auto& state = AcquireDrawRenderState(ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch);
+	state.indirect_offsets = args.indirect.offsets;
+	state.indirect_draw    = args.indirect.address != 0;
 	if (!GetDrawTopology(ucfg, state.topology)) {
 		ResetBindings();
 		return true;
