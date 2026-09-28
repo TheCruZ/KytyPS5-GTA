@@ -111,7 +111,8 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
-bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                       Common::UniqueFunction<void>* publish) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -166,14 +167,19 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([this, mapped, offset, total_size, buffer_address,
-	                                    copies = std::move(copies)] {
+	Common::UniqueFunction<void> operation = [this, mapped, offset, total_size, buffer_address,
+	                                          copies = std::move(copies)] {
 		m_download_buffer.Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
 			                                      mapped + (copy.dstOffset - offset), copy.size);
 		}
-	});
+	};
+	if (publish != nullptr) {
+		*publish = std::move(operation);
+	} else {
+		m_scheduler.DeferPriorityOperation(std::move(operation));
+	}
 	return true;
 }
 
@@ -287,10 +293,14 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		const auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
 		const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
 
-		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
+		Common::UniqueFunction<void> publish;
+		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin, &publish)) {
 			const auto tick = m_scheduler.CurrentTick();
 			m_scheduler.Wait(tick);
+			// Earlier queued publications may cover the same bytes with older data; let them
+			// finish, then publish this download here instead of waking the priority runner.
 			m_scheduler.WaitPriorityOperations(tick);
+			publish();
 			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
 		}
 		if (is_write) {
