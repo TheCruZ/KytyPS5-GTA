@@ -1,396 +1,244 @@
-# KytyPS5
+# KytyPS5-GTA
 
-[![Build KytyPS5 (Windows)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28Windows%29&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
-[![Build KytyPS5 (Linux)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28Linux%29&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
-[![Build KytyPS5 (macOS)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28macOS%29&label=Build%20KytyPS5%20%28macOS%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
-[![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20x64%20%7C%20macOS%20x86__64-0078D4.svg)](#system-requirements)
-[![Status](https://img.shields.io/badge/status-active%20development-orange.svg)](#current-status)
-[![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
+A fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5) focused on running
+**Grand Theft Auto V (PS5, PPSA04263)**.
 
-**[Weekly updates](https://github.com/KytyPS5/KytyPS5/discussions/862)** — game progress, recent fixes and ongoing development.
+This fork is always the latest upstream `main` plus a small set of fixes on top, one commit per
+fix. Fixes that are useful beyond GTA V are proposed upstream as pull requests.
 
-**[Development on Discord](https://discord.gg/UNrkMqGaBg)** — KytyPS5 development.
+For everything about the emulator itself (features, system requirements, building, usage,
+licensing), read the **[original KytyPS5 README](https://github.com/KytyPS5/KytyPS5#readme)**.
 
-KytyPS5 is a free and open-source PlayStation 5 emulator written in C++ for Windows and Linux,
-with experimental macOS support. It is based on a heavily modified version of
-[Kyty](https://github.com/InoriRus/Kyty). The project is in active development, and behavior
-can change significantly between builds.
+Builds of this fork for Windows, macOS and Linux are published on the
+**[Releases](https://github.com/TheCruZ/KytyPS5-GTA/releases)** page (v1, v2, ...).
 
 > [!IMPORTANT]
-> KytyPS5 is not affiliated with Sony Interactive Entertainment or PlayStation. The project does
-> not distribute games or copyrighted system software. Use only game files that you have obtained
-> legally.
+> KytyPS5 is not affiliated with Sony Interactive Entertainment, PlayStation or Rockstar Games.
+> The project does not distribute games or copyrighted system software. Use only game files that
+> you have obtained legally.
 
-## Current Status
+## Status
 
-KytyPS5 can boot 2D games and a selection of 3D games, including titles built with Unreal Engine
-4/5, Unity, and custom engines. External low-level emulation modules are neither required nor
-planned.
+- Boots to the main menu and plays the prologue in Performance, Performance RT and Fidelity modes.
+- The prologue can be completed and the game continues into Los Santos (Franklin and Lamar).
+- Performance on an RTX 3090 / Ryzen 9 5900X in Performance mode, moving around Los Santos on foot,
+  driving or flying: about 35 fps in the densest areas (occasional dips to about 27 fps in
+  particular situations) and 45 fps or more everywhere else, at a steady 60 fps in much of it.
+  It was about 12-13 fps before the GPU optimizations below.
+- **Red zone protection** is enabled by default in this fork (disable it with `--no-redzone` or
+  the "Windows SysV red zone crash protection" launcher option). Without it the game crashes in
+  its streaming thread.
 
-Development is currently focused on expanding game compatibility and improving boot reliability.
+## Fork status
 
-Windows and Linux are the primary platforms and receive the most testing.
+- 48 commits on top of upstream `main` (synced 2026-10-05).
+- 🎉 11 fixes from this fork (three of them partly) are now part of upstream KytyPS5; 4 more were fixed
+  there independently (see [Fixed upstream since the fork started](#fixed-upstream-since-the-fork-started)).
 
-macOS support is experimental. The emulator is built for x86-64 and runs on Apple Silicon under
-Rosetta 2, with Vulkan provided by MoltenVK. A small number of titles have been verified in-game
-on Apple Silicon hardware; see [Building on macOS](#building-on-macos).
+## Fixed bugs and crashes
 
-Community game test results are available in the
-[KytyPS5 Compatibility List](https://kytyps5.github.io/).
+Each item is one commit on top of upstream `main`.
 
-## Bugs and Issues
+### Crashes and unsupported shaders
 
-Compatibility, stability, and performance can vary between versions. You may encounter crashes
-or graphical glitches, so please include the version you tested when reporting an issue.
+- **Skinning compute shaders**: stores through buffer descriptors (V#) picked from a descriptor
+  table on the GPU.
+- **Ray-tracing buffers whose record count the shader computes** are bound instead of rejected
+  (fallback for the counts upstream cannot read on the host).
+- **V# bases selected by a scalar branch** in shaders that write memory.
+- **Ray-hit shading shader (Fidelity/RT)**: GPU-indexed texture (T#) tables are bound as
+  bindless sampled-image arrays (upstream now has the bounded material keys).
+- **Fidelity mode exit "scalar resource reads overlap a shader buffer write"**: the BVH build
+  shaders read a header word before they write it; such reads are accepted when they provably
+  precede the dispatch's own writes (written compute descriptors are now read normally upstream).
+- **"texture requires rediscovery before final acquisition"**: bindless table elements whose image
+  an earlier rebind replaced are rediscovered before their views are acquired.
+- **Crash when a gamepad is remapped** by SDL.
+- **Missing letters in the boot legal notice and other text**: the compute shader that copies
+  glyphs into the font atlas reads the CPU-rasterized bitmaps through DMA; memory without a cached
+  buffer read as zero, so glyphs on those pages stayed blank. DMA base registers are now cached
+  before the shader runs.
+- **Crash at the car dealership (Franklin and Lamar)**: pixel shader `0xf6b18542ea0e938a` builds
+  its sampler's border color word from lane data; the untrackable bits are now dropped (border
+  color only) instead of failing the shader.
+- **Streaming crash late in the prologue** ("[RAGE] HDD Streamer" in zlib `inflate_fast`): zlib
+  keeps locals in the SysV red zone, which Windows overwrites when it delivers the exceptions the
+  emulator's memory tracking raises. Red zone protection is now enabled by default.
+- **Intermittent streaming crash** ("[RAGE] HDD Streamer" in zlib `inflate`/`inflate_fast`, about
+  once every 100 sessions): the game maps the same direct-memory page again with `MAP_FIXED`
+  while the streamer decompresses into it. The emulator replaces a mapping by unmapping and
+  mapping it again, so for a moment the page was gone; guest accesses in that window now wait for
+  the mapping and are retried.
+- **"depth attachment feedback loop is not supported by the host"** (seen on a Radeon RX 9060 XT):
+  draws that sample the depth target they also write need two Vulkan extensions that some drivers
+  lack. Without them the draw now samples a copy of the depth target taken just before it; GPUs
+  with the extensions keep the previous path.
+
+### Shader instruction accuracy
+
+- `V_CVT_PK_U16_U32` / `V_CVT_PK_I16_I32` saturate to 16 bits.
+- `V_FRACT_F32` / `V_FRACT_F16` / `V_FRACT_F64` results stay below 1.0.
+- All 64-bit integer `V_CMP` / `V_CMPX` compares (PR #1 by At0mC3, for PPSA04264).
+- Float inline constants read by 64-bit operands use their double-precision encoding.
+- Texel offsets of `IMAGE_SAMPLE*_O` are applied.
+- Formatted stores convert to the unsigned 11/10-bit float formats.
+
+### Rendering
+
+- Render targets are no longer replaced with stale data after dispatches that may write through
+  descriptor tables (the table's 41 MiB view covered the render-target pool).
+- Stencil and depth-bias dynamic state is set for every draw (Vulkan validation errors).
+- Page faults on pages that cache tracking protects outside the GPU-mapped ranges are resolved
+  instead of reported as guest crashes.
+- **Vehicle damage**: cars no longer deform wildly in collisions (wheels pushed outside the body,
+  car unable to drive) and snap back later. The CPU reads the damage textures the GPU renders;
+  GPU-written linear images are now read back to guest memory by default.
+- **Ray tracing (Fidelity and Performance RT)**: GTA V's ray tracing dispatches run (BVH
+  intersections are emulated in shaders on the GPU's regular shader cores) instead of being
+  skipped, so ray-traced reflections and shadows are drawn (the scalar reads through GPU-selected
+  V#s are now upstream).
+- **Occlusion queries**: the game's occlusion counters come from real Vulkan occlusion queries
+  instead of always reading visible (the sun's lens flare showed through trees and light glows
+  through walls). Counters reach the game by the next frame, so water reflections (Michael's pool)
+  no longer flicker.
+- **Black smoke and particles**: smoke (Michael's cigar in Father/Son) and small particles render
+  translucent instead of black. The game clears the particle depth target (R16 float) with a fast
+  register clear that was ignored, so depth of field blurred the particles dark (decoding the
+  16-bit clear values is now upstream).
+- **Disappearing trees**: the trunks of nearby trees are drawn. GTA V tessellates them up close;
+  its tessellation shaders now translate and tessellation is enabled by default (disable it with
+  `--no-tessellation` or the launcher option).
+
+### Performance
+
+- Bindless tables: resolved elements are cached between dispatches and only re-resolved when
+  their memory changes.
+- Buffer device address synchronization only visits CPU-dirty pages and is skipped when nothing
+  changed.
+- Render-target fast clears whose metadata a compute shader filled no longer read the metadata
+  back from the GPU.
+- The Vulkan pipeline cache is kept across emulator builds and written periodically, so a crash
+  does not lose it.
+- RELEASE_MEM label writes no longer submit a command buffer each (about 200 submits per frame
+  down to about 20).
+- The per-draw render state is reused instead of zeroing 36 KiB per draw.
+- Guest memory reads and range clamps on the GPU thread resolve their mapping without the global
+  memory lock (per-thread caches validated by a mapping generation).
+- Buffer device address synchronization only visits tracking regions dirtied since the last one.
+- Shader resource tables are evaluated through a compiled node graph per resource plan (about
+  3.8x faster than interpreting the IR on every draw).
+- Shader stage lookup keys are built without per-word vector work.
+- The emulated GPU runs as a pipeline of dedicated threads pinned to their own cores (command
+  processor, draw resolution, execution and Vulkan recording) instead of one thread.
+- Shader programs, resource tables and vertex fetch tables are resolved ahead of execution, and
+  the shaders of a new area compile on six worker threads.
+- Unmapping memory drains the GPU only when the range holds GPU data or a guest-memory
+  completion is pending (it drained about 12 times per frame while streaming).
+- Streaming no longer stalls frames for 80-280 ms: unmaps run ahead of the emulated GPU's
+  backlog, and the guest memory map is updated and queried without linear scans or lock
+  contention.
+- Per-draw texture, render-target and image lookups are cached; deleted Vulkan images are
+  recycled instead of reallocated.
+- Indirect draws and indirect dispatches whose arguments the GPU writes (grass and foliage
+  culling, ray tracing) run from those arguments on the host GPU instead of reading them back:
+  the scene near the mountain went from about 34 to 60 fps.
+- Reads and command-processor writes next to GPU-written data no longer drain the GPU, and
+  GPU-written bytes are read back on a transfer queue that waits only for their last writer
+  (Fidelity mode: about 5 to 8-9 fps).
+- The Vulkan pipelines of earlier sessions are created on background threads while the game
+  loads, so a new build no longer stalls on every new pipeline.
+- **No more stutter the first time something is drawn**: the driver needs up to half a second
+  to compile each new pipeline, and the game used to stop while it did (places seen for the
+  first time dropped to about 18 fps). New pipelines are now compiled in the background and the
+  draws that need them are skipped meanwhile, so an object may appear a moment late the first
+  time it is seen while the game keeps running at 40-60 fps. Draws whose results the game reads
+  back (memory writes, occlusion queries, vehicle damage) still wait. Disable it with
+  `--no-async-pipelines` or the launcher option.
+- **Less slowdown in long sessions**: cached GPU buffers were only released under memory pressure,
+  so they piled up (from ~350 to ~14,000 in 25 minutes) and every frame kept uploading and
+  write-protecting memory the game had reused. Buffers that neither the emulator nor any shader
+  used for about 30 seconds are now released (shaders mark the pages they reach through device
+  addresses). In a fixed scene after 25 minutes: about 46 fps before, about 52 fps after, the same
+  as at the start. Deleting a depth image no longer scans every cached image, and the game's
+  sequential writes to protected memory take one fault per 64 KB instead of one per page.
+- **Fidelity mode**: indirect dispatches resolve their programs ahead of execution,
+  command-processor writes over GPU-written images no longer drain the GPU, bindless texture
+  table elements are reused instead of rebuilt, and readback copies are submitted only after the
+  work they wait for (this also fixes a driver hang). About 9.3 to 10.7 fps.
+
+## Fixed upstream since the fork started
+
+These problems no longer need a fork commit: KytyPS5 fixed them in its own `main`.
+
+### Taken from this fork 🎉
+
+Upstream commits co-authored by TheCruZ.
+
+| Fix | Upstream commit |
+|---|---|
+| Fidelity mode device loss in the ray-tracing BVH build (the extra threads of a partial dispatch group stay inactive) | e4aca7a6, 0258bd61 |
+| Unsupported `v_bfrev_b32` with an SDWA source (BVH build shaders) | d890bb19 |
+| Ray-tracing buffers whose record count the shader computes | 8b05b673 |
+| Single-DWORD and `FORMAT_X` loads through GPU-selected V#s | a55a2838, 5f01308b |
+| Samplers built with `s_brev_b32` (constant-folded bit reverse) | 139b564c |
+| `V_ALIGNBYTE_B32` uses only `S2[1:0]` as the byte offset | f18679e0 |
+| Scalar reads through GPU-selected V#s (ray tracing) | b4d32394 |
+| Written compute descriptors read without an alias proof | ec3e48cd |
+| Partly: bounded material keys for the ray-hit material table | 843b5778, 1f6be3d5 |
+| Partly: 16-bit color fast-clear values (black cigar smoke in Father/Son) | 57c97ebd |
+| Partly: dynamic depth bounds, so deferred lights reuse their pipelines | 98401022 |
+
+### Fixed by other upstream authors
+
+| Fix | Upstream commit |
+|---|---|
+| Invalid depth upload on shadow cube maps (partial depth views) | 068d7621 |
+| `DS_MIN_F32` / `DS_MAX_F32` operands | e85279ea |
+| Formatted stores to SNORM and USCALED/SSCALED | de9c15fa |
+| Synchronous CPU readbacks published on the waiting thread | 39e23ac9 |
+
+## Known bugs and crashes
+
+- **Occasional crash after switching to Fidelity mid-game**: changing the graphics mode in
+  Settings from Performance to Fidelity sometimes exits with "MaterializeResources" shortly after.
+  Loading a save that is already in Fidelity mode works.
+- **First Fidelity session waits for shader compilation**: the first time ray tracing starts,
+  the driver compiles its large ray tracing shaders (about 3-7 s each, 15-25 s in total). Later
+  sessions create these pipelines while the game loads.
+- **Ray tracing is slow**: Fidelity and Performance RT run at about 10-11 fps. The game issues
+  about 1,140 compute dispatches per frame with ray tracing (about 45 without), and the emulated
+  GPU's execution thread is the limit, not the host GPU.
+- **Performance**: about 32 fps in the densest areas in Performance mode, with occasional dips to
+  about 24 fps and short hitches while the game streams new areas. The execution thread of the
+  emulated GPU is still the bottleneck (about 3,000-5,000 draws per frame).
+- **Performance still degrades somewhat during long sessions**: the cached buffers that caused most
+  of it are now released (see Performance above), but after a couple of missions some places are
+  still slower than right after loading the game. Something else still accumulates.
+- **Flickering character models after switching from Fidelity to Performance**: the player's and
+  NPCs' models sometimes keep flickering between brightness levels after the graphics mode is
+  changed from Fidelity to Performance mid-game. Hard to reproduce.
+- **Wet ground reflections in Performance mode look wrong**: looking one way the puddles show no
+  reflections and the scene looks normal; turning the camera 180 degrees, the same water shows
+  reflections with odd bright highlights.
 
 ## Screenshots
 
-<table align="center">
-  <tr>
-    <td align="center">
-      <strong>Astro Bot</strong><br>
-      <img src="docs/screenshots/ps5-01.png" width="300" alt="Astro Bot running in KytyPS5">
-    </td>
-    <td align="center">
-      <strong>Dreaming Sarah</strong><br>
-      <img src="docs/screenshots/ps5-03.png" width="300" alt="Dreaming Sarah running in KytyPS5">
-    </td>
-  </tr>
-  <tr>
-    <td align="center">
-      <strong>Neptunia ReVerse</strong><br>
-      <img src="docs/screenshots/ps5-04.png" width="300" alt="Neptunia ReVerse running in KytyPS5">
-    </td>
-    <td align="center">
-      <strong>SILENT HILL: The Short Message</strong><br>
-      <img src="docs/screenshots/ps5-05.png" width="300" alt="SILENT HILL: The Short Message running in KytyPS5">
-    </td>
-  </tr>
-  <tr>
-    <td align="center">
-      <strong>Demon's Souls</strong><br>
-      <img src="docs/screenshots/ps5-02.png" width="300" alt="Demon's Souls running in KytyPS5">
-    </td>
-    <td align="center">
-      <strong>UFC 6</strong><br>
-      <img src="docs/screenshots/ps5-06.jpg" width="300" alt="UFC 6 running in KytyPS5">
-    </td>
-  </tr>
-</table>
+![Boot legal notice](ForkImgs/1.png)
 
-<p align="center"><em>And many more...</em></p>
+![Franklin in Los Santos](ForkImgs/2.png)
 
-## Contributing
+## New prologue video with pipeline cache **empty** at 60 fps!!
 
-Testing games and submitting detailed bug reports are useful ways to contribute. Search existing
-issues first, then use the **Game Emulation Status Report** template and attach the complete log file.
+- v6 compiles the shaders in background without freeze the image and show the models when they are ready, the game is running in 2k resolution
 
-Code contributions should be focused, build successfully on the platforms they touch, and include
-relevant tests where practical. Windows is the primary target, so a change that alters shared code
-should not regress it; changes confined to a platform's own code paths only need to build there. Because KytyPS5 is still evolving quickly, consider opening an issue before
-starting a large change.
+[![Video](https://img.youtube.com/vi/AXGfUv167Gs/maxresdefault.jpg)](https://www.youtube.com/watch?v=AXGfUv167Gs)
 
-### Formatting
+## 30 min gameplay video
 
-Set up the clang-format hook after cloning:
+[![Video](https://img.youtube.com/vi/hwtZW7ewHNM/maxresdefault.jpg)](https://www.youtube.com/watch?v=hwtZW7ewHNM)
 
-Install `pre-commit` using the method appropriate for your platform:
+## Reporting a problem
 
-- **Arch Linux / CachyOS:** `sudo pacman -S pre-commit`
-- **Other Linux / macOS / Windows:** `python -m pip install pre-commit`
-
-Then install the Git hook:
-
-```bash
-python -m pre_commit install --install-hooks
-```
-
-It formats staged `.cpp`, `.h`, and `.inc` files in `src`.
-
-## Developer Information
-
-The PS5 graphics architecture is based on AMD RDNA 2. Use AMD's
-[RDNA 2 Instruction Set Architecture Reference Guide (document 70648)](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
-as the primary instruction-encoding reference when working on shader decoding and recompilation.
-
-Important areas of the codebase:
-
-- [`src/graphics/shader/recompiler`](src/graphics/shader/recompiler) — instruction decoding,
-  intermediate representation, control flow, resource tracking, and SPIR-V emission
-- [`src/graphics/guest_gpu`](src/graphics/guest_gpu) — PS5 (Prospero) GPU formats and command processing
-- [`src/graphics/host_gpu`](src/graphics/host_gpu) — Vulkan host backend and resource management
-- [`tests`](tests) — focused memory, shader, and resource-tracking regression tests
-
-The renderer targets Vulkan 1.3. Keep shader changes aligned with both the RDNA 2 ISA semantics and
-the Vulkan/SPIR-V validation rules.
-
-## Building
-
-### System requirements
-
-- Windows 10 version 1803, a current Linux distribution, or macOS on Apple Silicon
-- A 64-bit x86 processor (on macOS, an Apple Silicon processor with Rosetta 2)
-- A Vulkan 1.3-capable GPU with current drivers (on macOS, Vulkan is provided by the bundled
-  MoltenVK)
-
-### Build requirements (Windows)
-
-- Git
-- CMake 3.22.1 or newer
-- Ninja
-- Visual Studio 2022 or Build Tools 2022 with the **Desktop development with C++** workload and
-  **C++ Clang tools for Windows** component
-- Qt 6 for MSVC 2022 64-bit, including Concurrent, Network, and Widgets
-- [glslang](https://github.com/KhronosGroup/glslang/releases) (`glslangValidator`) on `PATH`
-
-The Microsoft C++ compiler (`cl.exe`) is not supported; use `clang-cl`.
-
-Open an **x64 Native Tools Command Prompt for Visual Studio 2022** (or the equivalent Developer
-PowerShell), change to the repository root, and initialize the dependencies:
-
-```powershell
-git submodule update --init --recursive
-```
-
-Configure the project. Replace the Qt path with the version installed on your system:
-
-```powershell
-cmake -S . -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_PREFIX_PATH="C:/Qt/6.x.x/msvc2022_64"
-```
-
-Build the launcher and stage a runnable installation:
-
-```powershell
-cmake --build _Build/windows --target launcher
-cmake --install _Build/windows --prefix _Build/windows/install
-```
-
-The finished application and its runtime dependencies will be placed in
-`_Build/windows/install`.
-
-### Building on Linux
-
-Install the toolchain and the libraries the bundled SDL3 needs. Without the audio, Wayland and
-udev development packages SDL3 quietly configures itself without those backends, and the resulting
-build has no working sound and no gamepad hotplug:
-
-```bash
-sudo apt-get install --no-install-recommends \
-  clang lld ninja-build cmake git glslang-tools pkg-config \
-  libgl1-mesa-dev libx11-dev libxcursor-dev libxext-dev libxfixes-dev \
-  libxi-dev libxrandr-dev libxss-dev libxtst-dev libxkbcommon-dev \
-  libasound2-dev libpulse-dev libudev-dev libdbus-1-dev libwayland-dev wayland-protocols
-```
-
-Qt 6 (Concurrent, Network, Widgets) is required for the launcher — either the distribution packages
-(`qt6-base-dev`) or an official Qt installation.
-
-```bash
-git submodule update --init --recursive
-
-cmake -S . -B _Build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-  -DCMAKE_PREFIX_PATH="$Qt6_DIR"
-
-cmake --build _Build/linux --target launcher --parallel
-cmake --install _Build/linux --prefix _Build/linux/install
-```
-
-The install step copies the Qt libraries and plugins next to the binaries, so
-`_Build/linux/install` runs without a matching system Qt. FFmpeg is linked statically
-from the pinned [KytyPS5 FFmpeg core](https://github.com/KytyPS5/ext-ffmpeg-core)
-release, including VP9 and WebM support. System FFmpeg packages are not required.
-
-To build `kyty_emulator` and the `kyty_tests` target without Qt, use a separate build directory:
-
-```bash
-git submodule update --init --recursive
-
-cmake -S . -B _Build/linux-no-qt -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-  -DKYTY_BUILD_LAUNCHER=OFF
-
-cmake --build _Build/linux-no-qt --target kyty_emulator kyty_tests --parallel
-```
-
-As on Windows, the MSVC compiler is not used; Clang is required. `cl.exe` is rejected at configure
-time.
-
-The CMake source root is the repository root.
-
-### Building on NixOS
-
-A development shell provides Clang, CMake, Ninja, Qt 6, the Vulkan headers, and the SDL3 backend
-libraries. Enter it and configure exactly as on other Linux distributions; the shell exports
-`CMAKE_PREFIX_PATH` and `QT_PLUGIN_PATH`, so the `-DCMAKE_PREFIX_PATH="$Qt6_DIR"` argument is not
-needed:
-
-```bash
-nix-shell # or: nix develop
-git submodule update --init --recursive
-
-cmake -S . -B _Build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
-
-cmake --build _Build/linux --target launcher --parallel
-cmake --install _Build/linux --prefix _Build/linux/install
-```
-
-The configure step downloads the FFmpeg prebuilts and the `xbyak`, `zydis`, `zstd`, and ZArchive
-sources, so it needs network access; a fully sandboxed `nix build` would require vendoring those
-inputs. A Vulkan 1.3 driver must be available at runtime (on NixOS,
-`hardware.graphics.enable = true`).
-
-### Building on macOS
-
-macOS builds target x86-64 and run under Rosetta 2 on Apple Silicon, so the PS5's x86-64 game
-code executes through the same translation layer as the emulator itself. Prebuilt archives are
-attached to releases; the steps below are for building from source.
-
-Requirements:
-
-- An Apple Silicon Mac with Rosetta 2 installed (`softwareupdate --install-rosetta`)
-- Xcode (or the Command Line Tools)
-- Homebrew packages: `brew install cmake ninja glslang`
-- Qt 6 (Concurrent, Network, Widgets) with x86-64 support. The official Qt installation is
-  universal and works; Homebrew's Qt is arm64-only and will not link
-
-```bash
-git submodule update --init --recursive
-
-cmake -S . -B _Build/macos -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_OSX_ARCHITECTURES=x86_64 \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-  -DCMAKE_PREFIX_PATH="$Qt6_DIR"
-
-cmake --build _Build/macos --target launcher --parallel
-cmake --install _Build/macos --prefix _Build/macos/install
-```
-
-The build re-signs `kyty_emulator` with the JIT entitlements it needs to execute translated
-guest code; no manual signing step is required. When the launcher is built, the install
-also produces `_Build/macos/install/KytyPS5.app` — double-click to launch the GUI.
-A flat `kyty_emulator` is kept for CLI usage.
-
-Vulkan comes from MoltenVK. Download `MoltenVK-macos.tar` from the
-[MoltenVK releases](https://github.com/KhronosGroup/MoltenVK/releases), then copy
-`MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib` next to the flat `kyty_emulator`
-(and, for the bundle, into `KytyPS5.app/Contents/Frameworks/`) and ad-hoc sign it:
-
-```bash
-codesign --force --sign - _Build/macos/install/libMoltenVK.dylib
-# For the bundle (if present):
-codesign --force --sign - _Build/macos/install/KytyPS5.app/Contents/Frameworks/libMoltenVK.dylib
-codesign --force --sign - _Build/macos/install/KytyPS5.app
-```
-
-Release archives already include a signed `libMoltenVK.dylib` (both flat and inside the bundle).
-
-### Regression tests
-
-Build every regression executable and run the registered tests with:
-
-```powershell
-cmake --build _Build/windows --target kyty_tests
-ctest --test-dir _Build/windows --output-on-failure
-```
-
-Use `_Build/linux` instead of `_Build/windows` for a Linux build.
-
-### Visual Studio Code
-
-A ready-made Visual Studio Code setup is included in [`.vscode`](.vscode). It configures CMake
-Tools to build the project with Ninja and `clang-cl` and provides launch profiles for both
-`launcher.exe` and `kyty_emulator.exe`. It is Windows-only: VS Code settings cannot select a
-compiler per platform, so on Linux configure from the command line as shown above.
-
-Before using it:
-
-1. Install the **CMake Tools** and **C/C++** extensions in Visual Studio Code.
-2. Update `CMAKE_PREFIX_PATH` in [`.vscode/settings.json`](.vscode/settings.json) to point to your
-   Qt 6 MSVC installation.
-3. Update the `--game` path in [`.vscode/launch.json`](.vscode/launch.json) for the
-   **Debug kyty_emulator** profile.
-4. Open the repository in an x64 Visual Studio developer environment, configure the CMake project,
-   and select a launch profile from **Run and Debug**.
-
-## Running
-
-Update your graphics driver before reporting rendering problems.
-
-To use the graphical launcher:
-
-```powershell
-.\_Build\windows\install\launcher.exe
-```
-
-```bash
-./_Build/linux/install/launcher
-```
-
-```bash
-open _Build/macos/install/KytyPS5.app  # or double-click in Finder
-```
-
-On first launch, add one or more game folders in the global settings. The launcher searches those
-folders recursively for game directories containing `eboot.bin` and ZArchive (`.zar`) game dumps
-whose archive root contains `eboot.bin`. Select a detected game and run it from the game list.
-ZArchive dumps are mounted read-only and streamed directly; they do not need to be extracted first.
-
-The emulator can also be started directly with a legally obtained game directory, ELF file, or
-ZArchive dump:
-
-```powershell
-.\_Build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame"
-.\_Build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame.zar"
-```
-
-```bash
-./_Build/linux/install/kyty_emulator --game "/games/ExampleGame"
-./_Build/linux/install/kyty_emulator --game "/games/ExampleGame.zar"
-```
-
-On macOS, the adjacent flat or app-bundled `libMoltenVK.dylib` is found automatically; no
-environment variable is required:
-
-```bash
-./_Build/macos/install/kyty_emulator --game "/games/ExampleGame"
-```
-
-To override the Vulkan loader, set `SDL_VULKAN_LIBRARY`:
-
-```bash
-SDL_VULKAN_LIBRARY=/path/to/libMoltenVK.dylib ./kyty_emulator --game "/games/ExampleGame"
-```
-
-Run `kyty_emulator --help` to see the available graphics, logging, validation, profiling, and
-debugging options.
-
-### AI Use
-
-AI tools may be used for research, reverse engineering, and development assistance. Contributors
-must fully understand, review, and test all code they submit and remain responsible for its
-correctness. Repository communication, including pull-request descriptions, code comments, and
-issue comments, must come from the human contributor rather than an autonomous AI agent.
-
-Pull requests that include AI-assisted or AI-generated work should disclose the scope of the AI
-involvement and describe the human review and testing performed before submission. Unverified or
-untested generated changes may be closed without review.
-
-## License
-
-KytyPS5 is licensed under the [GNU General Public License version 2](LICENSE)
-(`GPL-2.0-only`).
-
-This project is based on the original [Kyty](https://github.com/InoriRus/Kyty), which was released
-under the MIT License. Kyty's original copyright and license notice are preserved in
-[`LICENSES/Kyty-MIT.txt`](LICENSES/Kyty-MIT.txt). Third-party components remain subject to the
-licenses included with those components.
-
-## Special Thanks
-
-- [InoriRus/Kyty](https://github.com/InoriRus/Kyty) — KytyPS5 is based on a heavily modified version
-  of the original Kyty project.
-- [shadps4-emu/shadPS4](https://github.com/shadps4-emu/shadPS4) — reference for understanding PS4
-  memory behavior, GPU resource aliasing and cache coherency,
-  and the AVPlayer implementation.
+Open an issue with the crash message, the game mode (Performance, Performance RT or Fidelity) and
+where in the game it happened. Crash reports from the emulator include the faulting thread,
+registers and stack, which are usually enough to locate the problem.
