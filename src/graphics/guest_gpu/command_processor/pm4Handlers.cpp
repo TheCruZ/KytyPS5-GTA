@@ -1289,12 +1289,7 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	                                                 (static_cast<uint64_t>(buffer[2]) << 32u));
 
 	if (dst != nullptr && buffer_size != 0) {
-		memset(dst, 0, buffer_size);
-		// Hack?
-		if (buffer_size >= sizeof(uint32_t)) {
-			auto* label = static_cast<uint32_t*>(dst);
-			*label      = 1;
-		}
+		cp.WriteLodStats(dst, buffer_size);
 	}
 
 	return 4;
@@ -1379,7 +1374,7 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(addr == 0);
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
-	if (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {
+	if (cp.ReadDecisionValue<uint32_t>(reinterpret_cast<const volatile void*>(addr)) == 0) {
 		return payload_dw + exec_count;
 	}
 
@@ -1413,7 +1408,8 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(function > 6);
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
-	const bool take_then = TestWaitRegMemValue(*compare_addr, reference, mask, function);
+	const bool take_then = TestWaitRegMemValue(cp.ReadDecisionValue<uint64_t>(compare_addr),
+	                                           reference, mask, function);
 	LOGF("\t branch: take=%u then=0x%016" PRIx64 "/%" PRIu32 " else=0x%016" PRIx64 "/%" PRIu32 "\n",
 	     take_then ? 1u : 0u, reinterpret_cast<uint64_t>(then_buffer), then_num_dw,
 	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
@@ -2056,6 +2052,10 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	    (buffer[1] >> 29u) & 0x7u, (buffer[1] >> 24u) & 0x7u,
 	    reinterpret_cast<void*>((buffer[2] & ~0x3u) | (static_cast<uint64_t>(buffer[3]) << 32u)),
 	    buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u), buffer[6] & 0x07ffffffu);
+	if (((buffer[1] >> 24u) & 0x7u) == 0 || ((buffer[1] >> 24u) & 0x7u) == 3) {
+		// A label-only release keeps batching; long batches still start the GPU early.
+		cp.BufferFlushIfBatchReady();
+	}
 
 	return 7;
 }
