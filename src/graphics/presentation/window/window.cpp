@@ -287,7 +287,10 @@ static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
 }
 
 static void GameEventController([[maybe_unused]] const EventController& f) {
-	EXIT_NOT_IMPLEMENTED(f.remapped);
+	// A new mapping changes how SDL translates the device; buttons and axes stay logical.
+	if (f.remapped) {
+		return;
+	}
 
 #ifdef KYTY_DBG_INPUT
 	if (f.added || f.removed) {
