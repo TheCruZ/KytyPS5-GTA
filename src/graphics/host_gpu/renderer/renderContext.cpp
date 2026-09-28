@@ -120,10 +120,6 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 			return false;
 		}
 	}
-	if (access == PageFaultAccess::Write && GuestGpu::IsGpuThread()) {
-		// A write of the command stream: device-address readers after it must see it.
-		m_bda_generation++;
-	}
 	if (access == PageFaultAccess::Write) {
 		// Diagnostics: KYTY_TRACE_WRITERS=<hex address>:<hex size>: guest CPU write faults in that
 		// range ([cpu-write], first 200), with whether the page holds GPU-written bytes.
