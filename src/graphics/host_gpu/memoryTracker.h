@@ -24,6 +24,22 @@ public:
 
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// Whether a page of the tracking regions the range touches may be GPU dirty, without taking
+	// their locks: false means the range can be read directly.
+	[[nodiscard]] bool MayBeGpuModified(uint64_t vaddr, uint64_t size) const {
+		if (size == 0 || size > TRACKER_ADDRESS_SIZE || vaddr > TRACKER_ADDRESS_SIZE - size) {
+			return true;
+		}
+		const auto last = (vaddr + size - 1) / TRACKER_REGION_SIZE;
+		for (auto index = vaddr / TRACKER_REGION_SIZE; index <= last && index < REGION_COUNT;
+		     index++) {
+			const auto* manager = m_regions[index].load(std::memory_order_acquire);
+			if (manager != nullptr && manager->HasGpuDirty()) {
+				return true;
+			}
+		}
+		return false;
+	}
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	// Removes protection from a range and flushes GPU-owned data when required.
@@ -173,6 +189,11 @@ public:
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			// A read-only use of a region without CPU-dirty pages has nothing to upload (a CPU
+			// write racing with this check is one that lands after the synchronization).
+			if (!is_written && !manager->HasCpuDirty()) {
+				return;
+			}
 			manager->lock.lock();
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(offset, bytes, range_func);
 			if (!is_written) {
