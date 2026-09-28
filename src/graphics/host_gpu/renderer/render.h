@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -11,6 +12,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <optional>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -97,21 +99,24 @@ public:
 
 	KYTY_CLASS_NO_COPY(CommandBuffer);
 
-	[[nodiscard]] bool IsInvalid() const noexcept { return m_buffer == nullptr; }
+	[[nodiscard]] bool IsInvalid() const noexcept {
+		return m_stream != nullptr ? !m_open : m_buffer == nullptr;
+	}
 
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
-	[[nodiscard]] vk::CommandBuffer Handle() const noexcept { return m_buffer; }
+	[[nodiscard]] CommandRecorder Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
-	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
-	[[nodiscard]] HW::UserConfig&   GetUserConfig() const noexcept { return *m_user_config; }
-	[[nodiscard]] HW::Shader&       GetShaders() const noexcept { return *m_shaders; }
+	[[nodiscard]] const HW::Context&    GetRegisters() const noexcept { return *m_registers; }
+	[[nodiscard]] const HW::UserConfig& GetUserConfig() const noexcept { return *m_user_config; }
+	[[nodiscard]] const HW::Shader&     GetShaders() const noexcept { return *m_shaders; }
 
 private:
-	explicit CommandBuffer(CommandScheduler& scheduler);
-	void Bind(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders) noexcept {
+	CommandBuffer(CommandScheduler& scheduler, CommandStream* stream);
+	void Bind(const HW::Context& registers, const HW::UserConfig& user_config,
+	          const HW::Shader& shaders) noexcept {
 		m_registers   = &registers;
 		m_user_config = &user_config;
 		m_shaders     = &shaders;
@@ -122,12 +127,15 @@ private:
 
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
+	// Direct recording writes m_buffer; deferred recording appends to m_stream while m_open.
 	vk::CommandBuffer   m_buffer = nullptr;
+	CommandStream*      m_stream = nullptr;
+	bool                m_open   = false;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
-	HW::Context*        m_registers   = nullptr;
-	HW::UserConfig*     m_user_config = nullptr;
-	HW::Shader*         m_shaders     = nullptr;
+	const HW::Context*    m_registers   = nullptr;
+	const HW::UserConfig* m_user_config = nullptr;
+	const HW::Shader*     m_shaders     = nullptr;
 
 	friend class CommandScheduler;
 };
@@ -219,6 +227,8 @@ private:
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
 	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                   const DrawEmitInfo& emit, DrawRenderState& state);
+	struct DrawRenderStorage;
+	[[nodiscard]] DrawRenderState& AcquireDrawRenderState(bool tessellation);
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                          DrawRenderState& state);
 	void                      ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -260,6 +270,9 @@ private:
 	std::array<MipStatsCounter, 256>      m_mip_stats {};
 	std::vector<TableResolution>          m_table_resolutions;
 	uint64_t                              m_table_resolution_tick = 0;
+	// Reused by every draw; see AcquireDrawRenderState().
+	std::unique_ptr<DrawRenderStorage, void (*)(DrawRenderStorage*)> m_draw_state {nullptr,
+	                                                                               nullptr};
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

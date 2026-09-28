@@ -99,6 +99,8 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
+	// Whether storage readback is on (constant while the GPU runs; the command processor reads it).
+	[[nodiscard]] bool StorageReadbackEnabled() const { return m_readback_storage_images; }
 	// With storage readback, a GL2 writeback makes GPU-written images visible to the CPU; returns
 	// whether a download was recorded.
 	[[nodiscard]] bool WriteBackImages();
@@ -197,7 +199,7 @@ private:
 	// render area.
 	vk::Rect2D BeginColorRendering(Image& image, vk::Format format, uint32_t level,
 	                               uint32_t layer, uint32_t layers, const vk::ClearValue* clear,
-	                               vk::CommandBuffer command);
+	                               const CommandRecorder& command);
 	void RefreshCopySource(ImageId id);
 	// Caller holds m_lock.
 	void RefreshDepthCopy(ImageId copy_id);
