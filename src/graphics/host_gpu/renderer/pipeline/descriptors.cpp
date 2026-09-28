@@ -1037,19 +1037,24 @@ bool RenderExecutor::ResolveStaleImages(PreparedBindings& prepared) {
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
+	// Every draw checks its stages at least once and nearly always finds nothing stale: answer
+	// that before allocating the per-binding flags.
+	const auto is_stale = [this](const TextureBinding& binding) {
+		return IsStaleImageBinding(binding);
+	};
+	if (std::ranges::none_of(images, is_stale) &&
+	    std::ranges::none_of(prepared.table_images, is_stale)) {
+		return false;
+	}
 	// Bindings may share images: decide which are stale before any rebind clears an image's
 	// binding state.
 	std::vector<bool> stale_images(images.size());
 	std::vector<bool> stale_tables(prepared.table_images.size());
-	bool              any = false;
 	for (size_t i = 0; i < images.size(); i++) {
-		any |= stale_images[i] = IsStaleImageBinding(images[i]);
+		stale_images[i] = IsStaleImageBinding(images[i]);
 	}
 	for (size_t k = 0; k < prepared.table_images.size(); k++) {
-		any |= stale_tables[k] = IsStaleImageBinding(prepared.table_images[k]);
-	}
-	if (!any) {
-		return false;
+		stale_tables[k] = IsStaleImageBinding(prepared.table_images[k]);
 	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		if (!stale_images[i]) {
