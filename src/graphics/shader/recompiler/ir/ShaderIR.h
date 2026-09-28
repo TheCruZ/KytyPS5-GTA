@@ -587,6 +587,8 @@ struct UniformFillPlan {
 	std::array<Value, 4> values;
 };
 
+struct CompiledSrtPlan;
+
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
 struct ResourcePlan {
@@ -622,6 +624,11 @@ struct ResourcePlan {
 	bool                                capture_specialization_reads = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
+	// Flattened evaluation program, built on the first refresh (null: SrtWalker evaluates).
+	// The plan's values must not change after that refresh. Kept next to the flags that
+	// every refresh reads.
+	mutable bool                                   compiled_srt_built = false;
+	mutable std::shared_ptr<const CompiledSrtPlan> compiled_srt;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.

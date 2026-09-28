@@ -229,6 +229,7 @@ public:
 	bool Add(uint64_t start, uint64_t size, uint64_t offset, int protection, int memory_type,
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		RangesChangedLocked();
 
 		if (start == 0 || size == 0) {
 			return false;
@@ -260,6 +261,7 @@ public:
 
 	bool Remove(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		RangesChangedLocked();
 		BumpBackingEpoch();
 
 		auto position = LowerBound(start);
@@ -292,6 +294,7 @@ public:
 
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		RangesChangedLocked();
 
 		for (size_t index = 0; index < m_ranges.size(); index++) {
 			auto& r = m_ranges[index];
@@ -307,6 +310,7 @@ public:
 	                 uint64_t offset, int protection, int memory_type, VirtualRangeType type,
 	                 const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		RangesChangedLocked();
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -354,6 +358,7 @@ public:
 
 	void Rename(uint64_t start, uint64_t size, const char* name) {
 		Common::LockGuard lock(m_mutex);
+		RangesChangedLocked();
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
@@ -366,12 +371,14 @@ public:
 
 	void Protect(uint64_t start, uint64_t size, int protection) {
 		Common::LockGuard lock(m_mutex);
+		RangesChangedLocked();
 
 		EditUnlocked(start, size, [protection](Range* r) { r->protection = protection; });
 	}
 
 	void SetMemoryType(uint64_t start, uint64_t size, int memory_type) {
 		Common::LockGuard lock(m_mutex);
+		RangesChangedLocked();
 
 		EditUnlocked(start, size, [memory_type](Range* r) { r->memory_type = memory_type; });
 	}
@@ -437,11 +444,25 @@ public:
 	}
 
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
-
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
 			return 0;
 		}
+		// The GPU thread clamps every buffer it binds, mostly inside the few ranges it clamped
+		// last: answer those without the lock. The cached ranges and the generation were read
+		// together under m_mutex, and every change of m_ranges advances the generation under
+		// m_mutex before it happens, so observing it unchanged (acquire) means the ranges are
+		// still committed. A change racing with this query orders as if it followed it.
+		auto& cached = ThreadCommittedCache();
+		if (cached.owner == this &&
+		    cached.generation == s_generation.load(std::memory_order_acquire)) {
+			for (const auto& [start, end]: cached.ranges) {
+				if (virtual_addr >= start && virtual_addr < end && size <= end - virtual_addr) {
+					return size;
+				}
+			}
+		}
+
+		Common::LockGuard lock(m_mutex);
 
 		auto vma = std::upper_bound(
 		    m_ranges.begin(), m_ranges.end(), virtual_addr,
@@ -456,6 +477,11 @@ public:
 		    !IsCommittedRangeType(vma->type)) {
 			return 0;
 		}
+		const auto generation = s_generation.load(std::memory_order_relaxed);
+		if (cached.owner != this || cached.generation != generation) {
+			cached = {this, generation};
+		}
+		cached.ranges[cached.next++ % cached.ranges.size()] = {vma->start, vma_end};
 
 		uint64_t clamped_size = std::min(size, vma_end - virtual_addr);
 		uint64_t expected     = virtual_addr + clamped_size;
@@ -498,6 +524,24 @@ public:
 	}
 
 private:
+	struct CommittedCache {
+		const VirtualRanges*                         owner      = nullptr;
+		uint64_t                                     generation = 0;
+		uint32_t                                     next       = 0;
+		std::array<std::pair<uint64_t, uint64_t>, 4> ranges {}; // [start, end)
+	};
+
+	static CommittedCache& ThreadCommittedCache() noexcept {
+		thread_local CommittedCache cache;
+		return cache;
+	}
+
+	// Called under m_mutex before m_ranges changes. The generation is shared by all instances,
+	// so an instance created at the address of a destroyed one never matches a stale cache.
+	static void RangesChangedLocked() noexcept {
+		s_generation.fetch_add(1, std::memory_order_acq_rel);
+	}
+
 	static uint64_t End(uint64_t start, uint64_t size) {
 		return (UINT64_MAX - start < size ? UINT64_MAX : start + size);
 	}
@@ -662,6 +706,8 @@ private:
 
 	std::vector<Range> m_ranges;
 	Common::Mutex      m_mutex;
+
+	inline static std::atomic<uint64_t> s_generation {0};
 };
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
