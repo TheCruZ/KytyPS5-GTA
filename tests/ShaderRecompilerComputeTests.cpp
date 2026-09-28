@@ -952,6 +952,8 @@ void EnsureConfigInitialized() {
     subsystems.Initialize<Config::Lifecycle>();
     Config::ConfigOptions options;
     options.printf_direction = Config::LogDirection::Silent;
+    // The checks drive the renderer and inspect its Vulkan command buffers synchronously.
+    options.gpu_pipeline_stages = 0;
     Config::Load(options);
     subsystems.Initialize<Log::Lifecycle>();
     subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
@@ -2254,14 +2256,14 @@ public:
     scheduler.Begin(registers, user_config, shaders);
 
     auto *command = &scheduler.Current();
-    const auto original_handle = command->Handle();
+    const auto original_handle = command->Handle().Direct();
     HW::Context next_registers{};
     HW::UserConfig next_user_config{};
     HW::Shader next_shaders{};
     scheduler.Begin(next_registers, next_user_config, next_shaders);
     Require("SchedulerTimeline", "guest context rebind",
             &scheduler.Current() == command &&
-                command->Handle() == original_handle &&
+                command->Handle().Direct() == original_handle &&
                 &command->GetRegisters() == &next_registers &&
                 &command->GetUserConfig() == &next_user_config &&
                 &command->GetShaders() == &next_shaders,
@@ -2338,7 +2340,7 @@ public:
     constexpr size_t blocked_submission_count = 6;
     std::array<vk::CommandBuffer, blocked_submission_count> blocked_handles{};
     for (size_t i = 0; i < blocked_submission_count; ++i) {
-      blocked_handles[i] = scheduler.Current().Handle();
+      blocked_handles[i] = scheduler.Current().Handle().Direct();
       if (i == 0) {
         scheduler.Flush(external_wait);
       } else {
@@ -2372,7 +2374,7 @@ public:
     scheduler.Flush();
     Require(
         "SchedulerTimeline", "timeline pool reuse",
-        std::ranges::find(blocked_handles, scheduler.Current().Handle()) !=
+        std::ranges::find(blocked_handles, scheduler.Current().Handle().Direct()) !=
             blocked_handles.end(),
         "completed command buffers were not reused after timeline progress");
     scheduler.Shutdown();
@@ -9214,7 +9216,7 @@ public:
       clear.float32[3] = 4.0f;
       const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0,
                                             1, 0, 1};
-      scheduler.Current().Handle().clearColorImage(
+      scheduler.Current().Handle().Direct().clearColorImage(
           image.backing.image, vk::ImageLayout::eTransferDstOptimal, clear,
           range);
       cache.MarkGpuWritten(id);
@@ -14235,7 +14237,7 @@ public:
         clear_attachment.clearValue.color.uint32[0] = after;
         const vk::ClearRect clear_rect{{{0, 0}, {128, 128}}, 0, 1};
         scheduler.BeginRendering(rendering);
-        scheduler.Current().Handle().clearAttachments(1, &clear_attachment, 1, &clear_rect);
+        scheduler.Current().Handle().Direct().clearAttachments(1, &clear_attachment, 1, &clear_rect);
         scheduler.EndRendering();
         scheduler.Finish();
         Require(name, "formatted alias observes prior GPU contents",
@@ -16055,7 +16057,7 @@ public:
       rendering.color_attachments[0].is_clear = true;
       rendering.color_attachments[0].clear_value = clear_value;
       command.BeginRendering(rendering);
-      auto cmd = command.Handle();
+      auto cmd = command.Handle().Direct();
       cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, selected.pipeline);
       const vk::Viewport viewport{0, 0, static_cast<float>(extent),
                                   static_cast<float>(extent), 0, 1};

@@ -16,21 +16,25 @@
 #include <cstring>
 namespace Libs::Graphics {
 
-CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
-    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
+CommandBuffer::CommandBuffer(CommandScheduler& scheduler, CommandStream* stream)
+    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()), m_stream(stream) {}
 
 bool CommandBuffer::IsInvalid() const {
-	return m_buffer == nullptr;
+	return m_stream != nullptr ? !m_open : m_buffer == nullptr;
 }
 
-vk::CommandBuffer CommandBuffer::Handle() const {
+CommandRecorder CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
-	return m_buffer;
+	return m_stream != nullptr ? CommandRecorder(m_stream) : CommandRecorder(m_buffer);
 }
 
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
-	auto buffer = Handle();
+	if (m_stream != nullptr) {
+		// The recording thread begins its Vulkan command buffer when it replays commands.
+		return;
+	}
+	auto buffer = m_buffer;
 
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
@@ -42,7 +46,10 @@ void CommandBuffer::Begin() {
 
 void CommandBuffer::End() const {
 	EndRendering();
-	auto buffer = Handle();
+	if (m_stream != nullptr) {
+		return;
+	}
+	auto buffer = m_buffer;
 
 	auto result = buffer.end();
 

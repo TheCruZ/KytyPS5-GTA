@@ -87,6 +87,9 @@ static void PrintUsage() {
 	::printf(
 	    "  --trophy-notifications <true|false>   Show trophy unlock toasts and play their sound.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
+	::printf("  --gpu-pipeline <0|1|mask>            Emulated GPU stages on their own threads.\n"
+	         "                                       0: all inline, 1: all (default). The\n"
+	         "                                       KYTY_GPU_PIPELINE variable overrides it.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone (default).\n");
 	::printf("  --no-redzone                         Do not protect the guest SysV red zone.\n");
@@ -259,6 +262,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		if (!NextArg(argc, argv, i, value)) {
 			::printf("missing value for %s\n", arg.c_str());
 			return false;
+		}
+
+		if (arg == "--gpu-pipeline") {
+			options.config.gpu_pipeline_stages = Config::ParseGpuPipelineStages(value.c_str());
+			continue;
 		}
 
 		if (arg == "--game") {
