@@ -311,8 +311,9 @@ bool CanReadIndexedSelector(const ShaderBufferResource& material, uint32_t offse
 	           uint64_t {UINT32_MAX} + 1u;
 }
 
+template <typename Walker>
 bool EvaluateIndirectCount(const DescriptorSource::IndirectDescriptor& indirect,
-                           const SrtRuntime& runtime, SrtWalker& clean, uint32_t& count) {
+                           const SrtRuntime& runtime, Walker& clean, uint32_t& count) {
 	if (indirect.workgroup_axis != UINT32_MAX) {
 		if (runtime.workgroup_counts.size() != 3u || indirect.workgroup_axis >= 3u) return false;
 		count = std::ranges::find(runtime.workgroup_counts, 0u) != runtime.workgroup_counts.end()
@@ -324,9 +325,10 @@ bool EvaluateIndirectCount(const DescriptorSource::IndirectDescriptor& indirect,
 	return true;
 }
 
+template <typename Walker>
 bool ResolveSelectorKeys(const DescriptorSource::IndirectDescriptor& indirect,
                          const DescriptorValue& material_value, const SrtRuntime& runtime,
-                         SrtWalker& clean, std::vector<uint32_t>& keys) {
+                         Walker& clean, std::vector<uint32_t>& keys) {
 	const auto* selector = &*indirect.selector;
 	keys.clear();
 	const auto read_selector = [&](uint64_t base, uint64_t size, uint64_t offset,
@@ -539,11 +541,11 @@ bool ResolveSelectorKeys(const DescriptorSource::IndirectDescriptor& indirect,
 	return true;
 }
 
-template <typename Specialization, typename Normalize>
+template <typename Specialization, typename Normalize, typename Walker>
 bool MaterializeIndirectDescriptor(const ResourcePlan&                         program,
                                    uint32_t source_index,
                                    uint32_t resource_index, uint32_t dword_count, uint32_t read_dwords,
-                                   const SrtRuntime& runtime, SrtWalker& clean,
+                                   const SrtRuntime& runtime, Walker& clean,
                                    ResourceSnapshot&             snapshot,
                                    std::vector<DescriptorValue>& descriptors,
                                    std::vector<Specialization>&  specializations,
@@ -1664,8 +1666,9 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
-bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+template <typename Walker>
+static bool MaterializeWith(const ResourcePlan& program, const SrtRuntime& runtime,
+                            ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	for (auto& keys: program.selector_keys) keys.resolved = false;
 	if (!program.resource_tracking_complete ||
 	    ((program.requires_specialization_memory || !program.source_reads.empty()) &&
@@ -1682,8 +1685,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	reads = program.source_reads;
 	SrtReadCapture capture {runtime, reads};
 	auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
-	SrtWalker clean(program, CleanRuntime(observed));
-	SrtWalker walker(program, observed,
+	Walker clean(program, CleanRuntime(observed));
+	Walker walker(program, observed,
 	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
 		return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
@@ -1888,6 +1891,20 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	return BuildResourceSpecialization(program, snapshot, specialization);
+}
+
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	if (CompileSrtPlan(program) != nullptr) {
+		return MaterializeWith<CompiledSrtWalker>(program, runtime, snapshot, specialization);
+	}
+	return MaterializeWith<SrtWalker>(program, runtime, snapshot, specialization);
+}
+
+bool MaterializeResourcesReference(const ResourcePlan& program, const SrtRuntime& runtime,
+                                   ResourceSnapshot& snapshot,
+                                   ResourceSpecialization& specialization) {
+	return MaterializeWith<SrtWalker>(program, runtime, snapshot, specialization);
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
