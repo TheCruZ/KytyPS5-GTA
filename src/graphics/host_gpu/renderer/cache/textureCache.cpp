@@ -1736,7 +1736,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 vk::Rect2D TextureCache::BeginColorRendering(Image& image, vk::Format format, uint32_t level,
                                              uint32_t layer, uint32_t layers,
                                              const vk::ClearValue* clear,
-                                             vk::CommandBuffer     command) {
+                                             const CommandRecorder& command) {
 	ImageViewInfo view {};
 	view.format      = format;
 	view.type        = layers == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;

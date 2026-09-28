@@ -173,7 +173,7 @@ private:
 	// render area.
 	vk::Rect2D BeginColorRendering(Image& image, vk::Format format, uint32_t level,
 	                               uint32_t layer, uint32_t layers, const vk::ClearValue* clear,
-	                               vk::CommandBuffer command);
+	                               const CommandRecorder& command);
 	void PrepareImageCopy(Image& image);
 	void RefreshCopySource(ImageId id);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
