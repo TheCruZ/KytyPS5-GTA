@@ -41,8 +41,10 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <span>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -312,7 +314,7 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 	}
 }
 
-static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuffer vk_buffer,
+static void SetGraphicsDynamicParams(const CommandBuffer& buffer, CommandRecorder vk_buffer,
                                      const ShaderVertexInputInfo& vs_input_info,
                                      const RenderDepthInfo& depth, const RenderState& rendering) {
 	KYTY_PROFILER_FUNCTION();
@@ -444,6 +446,7 @@ static bool PixelShaderHasDepthOrCoverageSideEffects(const HW::ShaderRegisters& 
 	       db.shader_dual_export_enable || db.shader_execute_on_noop;
 }
 
+// RenderExecutor::AcquireDrawRenderState() restores each member: keep it in sync.
 struct DrawRenderState {
 	RenderDepthInfo       depth_info;
 	RenderColorInfo       color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
@@ -453,6 +456,45 @@ struct DrawRenderState {
 	ShaderPixelInputInfo  ps_input_info;
 	PipelineCache::GraphicsPrograms programs;
 };
+static_assert(std::is_trivially_destructible_v<DrawRenderState>);
+
+struct RenderExecutor::DrawRenderStorage {
+	DrawRenderState state {};
+	// Only tessellation draws write the input infos of the second and third vertex stages.
+	bool tessellation_stages_written = false;
+};
+
+template <typename T>
+static void ValueInitialize(T& object) {
+	::new (static_cast<void*>(std::addressof(object))) T {};
+}
+
+// A draw state is 36 KB, 30 KB of it the input infos of the three vertex stages, and
+// value-initializing one on the stack took ~0.6 us per draw. Reuse one state and restore its
+// value-initialized contents, skipping the tessellation stages when no draw wrote them.
+DrawRenderState& RenderExecutor::AcquireDrawRenderState(bool tessellation) {
+	if (m_draw_state == nullptr) {
+		m_draw_state = {new DrawRenderStorage {},
+		                [](DrawRenderStorage* storage) { delete storage; }};
+	} else {
+		auto& state = m_draw_state->state;
+		ValueInitialize(state.depth_info);
+		for (auto& color: state.color_info) {
+			ValueInitialize(color);
+		}
+		state.color_count = 0;
+		state.ps_active   = true;
+		ValueInitialize(state.vertex_info[0]);
+		if (m_draw_state->tessellation_stages_written) {
+			ValueInitialize(state.vertex_info[1]);
+			ValueInitialize(state.vertex_info[2]);
+		}
+		ValueInitialize(state.ps_input_info);
+		ValueInitialize(state.programs);
+	}
+	m_draw_state->tessellation_stages_written = tessellation;
+	return m_draw_state->state;
+}
 
 struct DrawCallInfo {
 	CommandBufferDebugOp debug_op       = CommandBufferDebugOp::DrawIndex;
@@ -955,7 +997,7 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 	return prepared;
 }
 
-static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
+static void CommitVertexBuffers(CommandRecorder              vk_buffer,
                                 const PreparedVertexBuffers& prepared) {
 	for (uint32_t i = 0; i < prepared.count; i++) {
 		EXIT_IF(prepared.buffers[i] == nullptr);
@@ -967,7 +1009,7 @@ static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
 	}
 }
 
-static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBuffer& prepared) {
+static void CommitIndexBuffer(CommandRecorder vk_buffer, const PreparedIndexBuffer& prepared) {
 	if (prepared.buffer == nullptr) {
 		return;
 	}
@@ -993,7 +1035,7 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 	                  draw.index_count, index_addr);
 }
 
-static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
+static void EmitDrawPrimitives(const HW::UserConfig& ucfg, CommandRecorder vk_buffer,
                                const DrawCallInfo& draw, const DrawEmitInfo& emit) {
 	switch (ucfg.GetPrimType()) {
 		case Prospero::PrimitiveType::kPointList:
@@ -1266,7 +1308,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance};
-	DrawRenderState state {};
+	auto& state =
+	    AcquireDrawRenderState(ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch);
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return;
@@ -1343,7 +1386,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		ResetBindings();
 		return;
 	}
-	DrawRenderState state {};
+	auto& state =
+	    AcquireDrawRenderState(ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch);
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return;
