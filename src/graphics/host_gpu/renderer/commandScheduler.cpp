@@ -2,11 +2,15 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/emulatorConfig.h"
+#include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <limits>
 #include <optional>
+#include <tuple>
 
 namespace Libs::Graphics {
 
@@ -60,11 +64,26 @@ size_t CommandScheduler::CommandPool::Grow() {
 }
 
 vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
+	return m_buffers[Acquire(m_master.CurrentTick())];
+}
+
+std::pair<vk::CommandBuffer, size_t> CommandScheduler::CommandPool::CommitDeferred() {
+	const auto index = Acquire(std::numeric_limits<uint64_t>::max());
+	return {m_buffers[index], index};
+}
+
+void CommandScheduler::CommandPool::Retire(size_t index, uint64_t tick) {
+	EXIT_IF(index >= m_ticks.size() || m_ticks[index] != std::numeric_limits<uint64_t>::max());
+	m_ticks[index] = tick;
+}
+
+size_t CommandScheduler::CommandPool::Acquire(uint64_t busy_until) {
 	auto       gpu_tick = m_master.KnownGpuTick();
-	const auto search   = [this, &gpu_tick](size_t begin, size_t end) -> std::optional<size_t> {
+	const auto search   = [this, &gpu_tick, busy_until](size_t begin,
+	                                                  size_t end) -> std::optional<size_t> {
 		for (size_t index = begin; index < end; ++index) {
 			if (gpu_tick >= m_ticks[index]) {
-				m_ticks[index] = m_master.CurrentTick();
+				m_ticks[index] = busy_until;
 				return index;
 			}
 		}
@@ -82,21 +101,27 @@ vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
 	}
 	if (!found) {
 		found           = Grow();
-		m_ticks[*found] = m_master.CurrentTick();
+		m_ticks[*found] = busy_until;
 	}
 
 	m_hint = (*found + 1) % m_ticks.size();
-	return m_buffers[*found];
+	return *found;
 }
 
 bool CommandScheduler::InDeferredOperation() noexcept {
 	return g_deferred_callback_scheduler != nullptr;
 }
 
-CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
+CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics,
+                                   bool deferred_recording)
     : m_master(graphics), m_context(context), m_graphics(graphics),
-      m_command_pool(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+      m_command_pool(graphics, m_master), m_deferred(deferred_recording),
+      m_stream(&m_chunk_queue), m_command(*this, deferred_recording ? &m_stream : nullptr),
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
+	if (m_deferred) {
+		m_recording_thread = std::jthread([this] { RecordingThread(); });
+	}
+}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
@@ -126,6 +151,11 @@ void CommandScheduler::Shutdown() {
 		Submit();
 	}
 	m_master.Wait(CurrentTick() - 1);
+	if (m_recording_thread.joinable()) {
+		// Every recorded submission has completed.
+		m_chunk_queue.Stop();
+		m_recording_thread.join();
+	}
 	PopPendingOperations();
 	DrainPriorityOperations();
 	m_priority_thread.request_stop();
@@ -142,17 +172,20 @@ void CommandScheduler::Shutdown() {
 	m_operation_available.notify_all();
 }
 
-void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config,
-                             HW::Shader& shaders) {
+void CommandScheduler::Begin(const HW::Context& registers, const HW::UserConfig& user_config,
+                             const HW::Shader& shaders) {
+	// Every GPU operation binds its register state. A shutdown submits the open command buffer
+	// before it closes the scheduler, so an open command buffer means an open scheduler.
+	if (!m_command.IsInvalid()) {
+		m_command.Bind(registers, user_config, shaders);
+		return;
+	}
 	{
 		std::lock_guard lock(m_operation_mutex);
 		EXIT_IF(m_operation_state != OperationState::Open);
 	}
 	m_command.Bind(registers, user_config, shaders);
-
-	if (m_command.IsInvalid()) {
-		BeginNext();
-	}
+	BeginNext();
 }
 
 void CommandScheduler::BeginRendering(const RenderState& state) {
@@ -208,14 +241,25 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
-	m_master.Refresh();
+	// Every draw and dispatch comes here: only query the timeline semaphore (a driver call) when
+	// the oldest operation is not already known to be free.
+	bool refreshed = false;
 	for (;;) {
 		PendingOperation operation;
 		{
 			std::lock_guard lock(m_operation_mutex);
-			if (m_pending_operations.empty() ||
-			    !m_master.IsFree(m_pending_operations.front().tick)) {
+			if (m_pending_operations.empty()) {
 				return;
+			}
+			if (!m_master.IsFree(m_pending_operations.front().tick)) {
+				if (refreshed) {
+					return;
+				}
+				m_master.Refresh();
+				refreshed = true;
+				if (!m_master.IsFree(m_pending_operations.front().tick)) {
+					return;
+				}
 			}
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
@@ -338,7 +382,11 @@ CommandBuffer& CommandScheduler::Current() {
 
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
-	m_command.m_buffer = m_command_pool.Commit();
+	if (m_deferred) {
+		m_command.m_open = true;
+	} else {
+		m_command.m_buffer = m_command_pool.Commit();
+	}
 	m_command.Begin();
 	return m_command;
 }
@@ -349,46 +397,111 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
 	m_command.End();
-	const auto buffer   = m_command.m_buffer;
-	auto&      graphics = m_graphics;
+	// Only this scheduler's owner allocates its ticks, in submission order.
+	const auto     tick = m_master.NextTick();
+	RecordedSubmit debug {};
+	debug.debug_op        = m_command.m_debug_op;
+	debug.debug_submit_id = m_command.m_debug_submit_id;
+	debug.debug_arg0      = m_command.m_debug_arg0;
+	debug.debug_arg1      = m_command.m_debug_arg1;
+	debug.debug_arg2      = m_command.m_debug_arg2;
+	debug.debug_arg3      = m_command.m_debug_arg3;
+	debug.debug_arg4      = m_command.m_debug_arg4;
+	if (m_deferred) {
+		// Waiting for the tick waits for the recording thread too: the timeline semaphore only
+		// reaches it after the thread submitted the commands recorded until now.
+		auto* recorded = m_stream.RecordSpecial<RecordedSubmit>(CommandStream::RecordKind::Submit);
+		*recorded      = debug;
+		recorded->info = submit;
+		recorded->tick = tick;
+		m_stream.Publish();
+		m_command.m_open = false;
+		return tick;
+	}
+
+	QueueSubmit(m_command.m_buffer, submit, tick, debug);
+	m_command.m_buffer = nullptr;
+	return tick;
+}
+
+void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit, uint64_t tick,
+                                   const RecordedSubmit& debug) {
+	auto& graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
+	submit.AddSignal(m_master.Handle(), tick);
+
+	vk::TimelineSemaphoreSubmitInfo timeline_info {};
+	timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
+	timeline_info.pWaitSemaphoreValues      = submit.wait_ticks.data();
+	timeline_info.signalSemaphoreValueCount = submit.num_signal_semaphores;
+	timeline_info.pSignalSemaphoreValues    = submit.signal_ticks.data();
+
+	vk::SubmitInfo submit_info {};
+	submit_info.pNext                = &timeline_info;
+	submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
+	submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
+	submit_info.pWaitDstStageMask    = submit.wait_stages.data();
+	submit_info.commandBufferCount   = buffer != nullptr ? 1 : 0;
+	submit_info.pCommandBuffers      = buffer != nullptr ? &buffer : nullptr;
+	submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
+	submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
 	vk::Result result;
-	uint64_t   tick;
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
-		tick = m_master.NextTick();
-		submit.AddSignal(m_master.Handle(), tick);
-
-		vk::TimelineSemaphoreSubmitInfo timeline_info {};
-		timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
-		timeline_info.pWaitSemaphoreValues      = submit.wait_ticks.data();
-		timeline_info.signalSemaphoreValueCount = submit.num_signal_semaphores;
-		timeline_info.pSignalSemaphoreValues    = submit.signal_ticks.data();
-
-		vk::SubmitInfo submit_info {};
-		submit_info.pNext                = &timeline_info;
-		submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
-		submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
-		submit_info.pWaitDstStageMask    = submit.wait_stages.data();
-		submit_info.commandBufferCount   = 1;
-		submit_info.pCommandBuffers      = &buffer;
-		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
-		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
-
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
 
 	if (result != vk::Result::eSuccess) {
-		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
-		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
-		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
-		                  m_command.m_debug_arg4);
+		ReportVulkanFatal("vkQueueSubmit", result, tick, debug.debug_op, debug.debug_submit_id,
+		                  debug.debug_arg0, debug.debug_arg1, debug.debug_arg2, debug.debug_arg3,
+		                  debug.debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+}
 
-	m_command.m_buffer = nullptr;
-	return tick;
+void CommandScheduler::RecordingThread() {
+	KYTY_PROFILER_THREAD("Thread_GpuRecord");
+	Config::ConfigureGpuStageThread(Config::GpuStageThread::Recording);
+	vk::CommandBuffer buffer       = nullptr;
+	size_t            buffer_index = 0;
+	const auto        acquire      = [this, &buffer, &buffer_index] {
+		if (buffer == nullptr) {
+			std::tie(buffer, buffer_index) = m_command_pool.CommitDeferred();
+			vk::CommandBufferBeginInfo begin_info {};
+			begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+			EXIT_NOT_IMPLEMENTED(buffer.begin(&begin_info) != vk::Result::eSuccess);
+		}
+		return buffer;
+	};
+	for (;;) {
+		auto chunk = m_chunk_queue.Pop();
+		if (chunk == nullptr) {
+			break;
+		}
+		CommandStream::Replay(*chunk, acquire, [&](const CommandStream::Entry& entry) {
+			EXIT_IF(entry.kind != CommandStream::RecordKind::Submit);
+			SubmitRecorded(buffer, buffer_index,
+			               *static_cast<const RecordedSubmit*>(entry.Payload()));
+		});
+		m_chunk_queue.Recycle(std::move(chunk));
+	}
+	// A scheduler only stops after its last submission.
+	EXIT_IF(buffer != nullptr);
+}
+
+void CommandScheduler::SubmitRecorded(vk::CommandBuffer& buffer, size_t buffer_index,
+                                      const RecordedSubmit& recorded) {
+	if (buffer != nullptr) {
+		EXIT_NOT_IMPLEMENTED(buffer.end() != vk::Result::eSuccess);
+	}
+	// A submission without commands still signals its tick.
+	auto submit = recorded.info;
+	QueueSubmit(buffer, submit, recorded.tick, recorded);
+	if (buffer != nullptr) {
+		m_command_pool.Retire(buffer_index, recorded.tick);
+		buffer = nullptr;
+	}
 }
 
 void CommandScheduler::BeginNext() {
