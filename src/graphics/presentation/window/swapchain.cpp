@@ -39,7 +39,7 @@ struct Presenter::Frame {
 	bool          blank        = false;
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
-	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
+	void Transit(CommandRecorder command, vk::ImageLayout layout, vk::AccessFlags2 access);
 	void CopyFrom(CommandBuffer& command, Image& source);
 	void Clear(CommandBuffer& command, const vk::ClearColorValue& color);
 };
@@ -199,7 +199,7 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 	}
 }
 
-void Presenter::Frame::Transit(vk::CommandBuffer command, vk::ImageLayout layout,
+void Presenter::Frame::Transit(CommandRecorder command, vk::ImageLayout layout,
                                vk::AccessFlags2 access) {
 	const auto     stage  = access == vk::AccessFlagBits2::eTransferRead ||
 	                                access == vk::AccessFlagBits2::eTransferWrite
@@ -900,19 +900,19 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 			                           &to_present);
 		};
 		if (convert_source) {
-			DrawLayer(vk_command, {source, 0, false}, game_rect);
+			DrawLayer(vk_command.Direct(), {source, 0, false}, game_rect);
 			if (draw_overlay || draw_system_overlay) {
 				attachment_barrier();
 			}
 		}
 		if (draw_overlay) {
-			DrawLayer(vk_command, overlay, game_rect);
+			DrawLayer(vk_command.Direct(), overlay, game_rect);
 			if (draw_system_overlay) {
 				attachment_barrier();
 			}
 		}
 		if (draw_system_overlay) {
-			m_system_overlay->Record(vk_command, m_image_views[m_image_index]);
+			m_system_overlay->Record(vk_command.Direct(), m_image_views[m_image_index]);
 		}
 		to_present.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
 		to_present.newLayout     = vk::ImageLayout::ePresentSrcKHR;
