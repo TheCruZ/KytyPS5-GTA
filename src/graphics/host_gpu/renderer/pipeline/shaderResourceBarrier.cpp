@@ -108,14 +108,14 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 	return has_writes;
 }
 
-void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
+void ShaderAccessBarrier(CommandRecorder vk_buffer, vk::PipelineStageFlags source_stages) {
 	EXIT_IF(vk_buffer == nullptr || !source_stages);
 	const auto barrier = MakeShaderAccessDependency();
 	vk_buffer.pipelineBarrier(source_stages, vk::PipelineStageFlagBits::eAllCommands,
 	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
-void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
+void ShaderWriteHazardBarrier(CommandRecorder        vk_buffer,
                               vk::PipelineStageFlags destination_stages) {
 	EXIT_IF(vk_buffer == nullptr || !destination_stages);
 	const auto barrier = MakeShaderWriteHazardDependency();
@@ -123,7 +123,7 @@ void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
 	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
-void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
+void ShaderWriteBarrier(CommandRecorder vk_buffer, vk::PipelineStageFlags source_stages) {
 	EXIT_IF(vk_buffer == nullptr || !source_stages);
 	const auto barrier = MakeShaderWriteDependency();
 	vk_buffer.pipelineBarrier(source_stages,
