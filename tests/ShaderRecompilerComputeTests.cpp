@@ -27565,7 +27565,7 @@ TestCase Vop3CvtPkI16I32Captured() {
   TestCase test;
   test.name = "Vop3CvtPkI16I32Captured";
   test.code = std::move(code);
-  // Each half saturates: 98305 -> 0x7fff, -98306 -> 0x8000.
+  // i32_to_i16 saturates: 98305 -> 0x7fff and -98306 -> 0x8000.
   test.initial = {0x00018001u, 0xfffe7ffeu, 0};
   test.expected = {0x00018001u, 0xfffe7ffeu, 0x80007fffu};
   test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_MOV_B32, O::V_CVT_PK_I16_I32,
@@ -27576,11 +27576,11 @@ TestCase Vop3CvtPkI16I32Captured() {
   return test;
 }
 
-// V_CVT_PK_U16_U32 / V_CVT_PK_I16_I32 saturate each half: Min(src.u, 0xffff) and
-// Clamp(src.s, -0x8000, 0x7fff).
 TestCase Vop3CvtPk16Saturates() {
   using O = ShaderOpcode;
 
+  // V_CVT_PK_U16_U32 / V_CVT_PK_I16_I32 apply u32_to_u16 / i32_to_i16, which clamp to
+  // the destination range (Mesa relies on this for 16-bit integer MRT exports).
   TestCase test;
   test.name = "Vop3CvtPk16Saturates";
   test.initial = {0x00001234u, 0x0000ffffu, 0x00010000u, 0x80000000u,
@@ -27598,7 +27598,10 @@ TestCase Vop3CvtPk16Saturates() {
   AppendVop3(&code, 0x36a, 11, Vgpr(2), Vgpr(3)); // both clamp to 0xffff
   AppendVop3(&code, 0x36b, 12, Vgpr(4), Vgpr(5)); // in range
   AppendVop3(&code, 0x36b, 13, Vgpr(6), Vgpr(7)); // clamp to 0x7fff / 0x8000
-  for (u32 i = 0; i < 4u; i++) AppendStoreVgpr(&code, 10u + i, 8u + i);
+  AppendStoreVgpr(&code, 10, 8);
+  AppendStoreVgpr(&code, 11, 9);
+  AppendStoreVgpr(&code, 12, 10);
+  AppendStoreVgpr(&code, 13, 11);
   AppendEnd(&code);
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_CVT_PK_U16_U32,
                   O::V_CVT_PK_I16_I32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
@@ -54776,16 +54779,17 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorIntegerOps());
     return 0;
   }
-  if (argc == 2 && std::strcmp(argv[1], "--inline-f64-only") == 0) {
+  if (argc == 2 && std::strcmp(argv[1], "--cvt-pk-sat-only") == 0) {
     VulkanHarness vulkan;
-    RunCase(&vulkan, ScalarVector64BitFloatInlineConstants());
+    RunCase(&vulkan, Vop3CvtPk16Saturates());
+    RunCase(&vulkan, Vop3CvtPkI16I32Captured());
+    RunCase(&vulkan, VectorLaneAndPackedOps());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cvt-pk-i16-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3CvtPkI16I32Captured());
     RunCase(&vulkan, Vop3CvtPk16Saturates());
-    RunCase(&vulkan, VectorLaneAndPackedOps());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--med3-i16-only") == 0) {
