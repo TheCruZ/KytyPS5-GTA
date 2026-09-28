@@ -20238,27 +20238,45 @@ TestCase VectorBfeI32SignExtendsField() {
   return test;
 }
 
-TestCase VectorAlignByteUsesFiveBitByteOffset() {
+TestCase VectorAlignByteUsesTwoBitByteOffset() {
   using O = ShaderOpcode;
 
+  // The byte offset is S2[1:0]. GTA V's BVH compute shaders rely on this by indexing a
+  // byte table with a raw node word: v_alignbyte_b32 v6, 0, 0x3024240c, v5 where
+  // v5 = index << 3 | type.
   std::vector<u32> code;
+  AppendVMovU32(&code, 30, 8u * 4u);
+  AppendBufferLoadDword(&code, 3, 30);
+  AppendVMovU32(&code, 30, 10u * 4u);
+  AppendBufferLoadDword(&code, 4, 30);
+  AppendVop3(&code, 0x14f, 20, InlineU32(0), 255u, Vgpr(3));
+  code.push_back(0x3024240cu);
+  AppendVop3(&code, 0x14f, 21, InlineU32(0), 255u, Vgpr(4));
+  code.push_back(0x3024240cu);
+
   AppendVMovLiteral(&code, 0, 0x11223344u);
   AppendVMovLiteral(&code, 1, 0x55667788u);
-  constexpr u32 offsets[] = {0, 1, 3, 4, 5, 7, 8, 31};
-  for (u32 i = 0; i < static_cast<u32>(std::size(offsets)); i++) {
-    AppendVMovU32(&code, 2, offsets[i]);
+  constexpr u32 offset_count = 10u;
+  for (u32 i = 0; i < offset_count; i++) {
+    AppendVMovU32(&code, 30, i * 4u);
+    AppendBufferLoadDword(&code, 2, 30);
     AppendVop3(&code, 0x14f, 10u + i, Vgpr(0), Vgpr(1), Vgpr(2));
     AppendStoreVgpr(&code, 10u + i, i);
   }
+  AppendStoreVgpr(&code, 20, 10);
+  AppendStoreVgpr(&code, 21, 11);
   AppendEnd(&code);
 
-  return {
-      "VectorAlignByteUsesFiveBitByteOffset",
-      code,
-      {},
-      {0x55667788u, 0x44556677u, 0x22334455u, 0x11223344u, 0x00112233u,
-       0x00000011u, 0u, 0u},
-      {O::V_MOV_B32, O::V_ALIGNBYTE_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  TestCase test;
+  test.name = "VectorAlignByteUsesTwoBitByteOffset";
+  test.code = std::move(code);
+  test.initial = {0u, 1u, 3u, 4u, 5u, 7u, 8u, 31u, 0x1au, 0xfffffffdu, 0x0bu, 0u};
+  test.expected = {0x55667788u, 0x44556677u, 0x22334455u, 0x55667788u,
+                   0x44556677u, 0x22334455u, 0x55667788u, 0x22334455u,
+                   0x33445566u, 0x44556677u, 0x00003024u, 0x00000030u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_ALIGNBYTE_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
 }
 
 TestCase VectorCarryAndBitCountOps() {
@@ -30375,7 +30393,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3LshlrevB64Captured);
   AddCase(VectorVop3IntegerOps);
   AddCase(VectorBfeI32SignExtendsField);
-  AddCase(VectorAlignByteUsesFiveBitByteOffset);
+  AddCase(VectorAlignByteUsesTwoBitByteOffset);
   AddCase(VectorCarryAndBitCountOps);
   AddCase(VectorMbcntUsesThreadMask);
   AddCase(VectorAddcWritesPerLaneCarryOut);
@@ -35611,7 +35629,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--alignbyte-only") == 0) {
     VulkanHarness vulkan;
-    RunCase(&vulkan, VectorAlignByteUsesFiveBitByteOffset());
+    RunCase(&vulkan, VectorAlignByteUsesTwoBitByteOffset());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--zero-shift-only") == 0) {
