@@ -393,6 +393,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// New target buffers must exist before PrepareBda uploads the CPU writes of cached buffers.
 	const bool indirect_writes = PrepareIndirectWriteTargets(m_context, bindings);
 	if (program.info.uses_dma) {
+		m_context.CacheDmaBases(input_info.stage);
 		m_context.PrepareBda();
 	}
 	RebindImages(bindings);
@@ -527,6 +528,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	// New target buffers must exist before PrepareBda uploads the CPU writes of cached buffers.
 	const bool indirect_writes = PrepareIndirectWriteTargets(m_context, bindings);
 	if (program.info.uses_dma) {
+		m_context.CacheDmaBases(input_info.stage);
 		m_context.PrepareBda();
 	}
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
