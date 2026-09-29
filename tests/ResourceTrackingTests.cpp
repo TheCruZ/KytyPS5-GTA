@@ -2770,6 +2770,48 @@ void TestDynamicFlatAddressesUseDma() {
         "dynamic FLAT address did not enable DMA");
 }
 
+void TestDmaBaseRegisters() {
+  // PPSA04263 glyph upload (cs e9e4f0b919d80844): v_add_co_u32 v1, s12, v6;
+  // v_add_co_ci_u32 v2, 0, s13 addresses a FLAT_LOAD_UBYTE.
+  Fixture fixture;
+  const auto lane = fixture.Emit(ValueOpcode::UndefU32);
+  const auto offset = fixture.Emit(
+      ValueOpcode::IMul32, {fixture.UserData(10), fixture.UserData(11)});
+  const auto index = fixture.Emit(ValueOpcode::IAdd32, {lane, offset});
+  const auto sum =
+      fixture.Emit(ValueOpcode::IAddCarry32, {fixture.UserData(12), index});
+  const auto low =
+      fixture.Emit(ValueOpcode::CompositeExtractU32x2, {sum, Value(0u)});
+  const auto carry =
+      fixture.Emit(ValueOpcode::CompositeExtractU32x2, {sum, Value(1u)});
+  const auto high =
+      fixture.Emit(ValueOpcode::IAdd32, {fixture.UserData(13), carry});
+  const auto address = fixture.Address(low, high, 0xa0);
+  MemoryInfo flat;
+  flat.kind = ResourceKind::Flat;
+  flat.address_is_full = true;
+  fixture.Emit(ValueOpcode::LoadAddressU8, {address, low, high, Value(true)},
+               fixture.AddMemory(flat, 0xa0));
+
+  // A global access with a scalar base pair and a vector offset.
+  const auto based =
+      fixture.Address(fixture.UserData(4), fixture.UserData(5), 0xb0);
+  MemoryInfo global;
+  global.kind = ResourceKind::Global;
+  fixture.Emit(ValueOpcode::LoadAddressU32,
+               {based, lane, Value(0u), Value(true)},
+               fixture.AddMemory(global, 0xb0));
+  fixture.PlanAndTrack();
+
+  Check(fixture.program.info.uses_dma, "address operations did not use DMA");
+  auto registers = fixture.program.info.dma_base_registers;
+  std::sort(registers.begin(), registers.end());
+  // Registers 10 and 11 feed the offset, and through the carry the high
+  // dword, but a base high dword never feeds the low dword.
+  Check(registers == std::vector<uint32_t>{4u, 12u},
+        "DMA base registers were not recorded");
+}
+
 void TestBufferSwizzleSpecialization() {
   Fixture fixture;
   const auto handle = fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
@@ -3614,6 +3656,7 @@ int main() {
     Run("invariant loop phi", TestInvariantLoopPhi);
     Run("DMA address materialization", TestDmaAddressMaterialization);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
+    Run("DMA base registers", TestDmaBaseRegisters);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
     Run("conditional buffer materialization", TestConditionalBufferMaterialization);
     Run("written scalar-branch buffer", TestWrittenScalarBranchBuffer);
