@@ -306,7 +306,7 @@ void RenderContext::UnmapMemoryRanges(std::span<const std::pair<uint64_t, uint64
 }
 
 void RenderContext::CacheDmaBases(const ShaderStageRuntime& runtime) {
-	const auto&      program   = runtime.module->info;
+	const auto&      program   = *runtime.program;
 	const auto&      user_data = runtime.resources->user_data;
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	for (const auto reg: program.info.dma_base_registers) {
@@ -330,88 +330,7 @@ void RenderContext::CacheDmaBases(const ShaderStageRuntime& runtime) {
 	}
 }
 
-bool RenderContext::SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* const> stages) {
-	// Larger V# ranges are no buffers a draw reads (see FindBuffers()).
-	constexpr uint64_t MaxBufferBytes = uint64_t {256} * 1024 * 1024;
-	// An index offset or thread ID added to a V# record stays within a wave of records past it.
-	constexpr uint64_t WaveRecords = 64;
-	m_dma_spans.clear();
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	const auto add = [&](uint64_t address, uint64_t size) {
-		if (size != 0 && address <= UINT64_MAX - size) {
-			m_mapped_ranges.ForEachInRange(address, size, [&](uint64_t start, uint64_t end) {
-				m_dma_spans.emplace_back(start, end);
-			});
-		}
-	};
-	for (const auto* stage: stages) {
-		const auto& program = stage->module->info;
-		if (!program.info.uses_dma) {
-			continue;
-		}
-		if (!program.info.dma_bounded) {
-			return false;
-		}
-		const auto& user_data = stage->resources->user_data;
-		const auto  base_of   = [&](uint32_t reg, uint64_t& base) {
-			const auto index = static_cast<uint64_t>(reg) - program.user_data_base;
-			if (reg < program.user_data_base || index + 1u >= user_data.size()) {
-				return false;
-			}
-			base = user_data[index] | (static_cast<uint64_t>(user_data[index + 1u]) << 32u);
-			return true;
-		};
-		for (const auto& window: program.info.dma_windows) {
-			uint64_t base = 0;
-			if (!base_of(window.base_register, base)) {
-				return false;
-			}
-			// Scalar address reads clear the low two bits of the base.
-			const auto before = static_cast<uint64_t>(-window.first) + 4u;
-			const auto start  = base > before ? base - before : 0;
-			add(start, std::min(base, UINT64_MAX - window.last) + window.last - start);
-		}
-		for (const auto& table: program.info.dma_tables) {
-			uint64_t base = 0;
-			if (!base_of(table.base_register, base)) {
-				return false;
-			}
-			const auto entries = (base & ~uint64_t {3}) + static_cast<uint64_t>(table.immediate);
-			Common::HackNotice::Report("DMA upload assumes V# indices stay within 64 records",
-			                           "RenderContext::SynchronizeDmaFootprint",
-			                           program.shader_hash, table.base_register);
-			for (uint32_t offset = table.offset_bits;; offset = (offset - 1u) & table.offset_bits) {
-				// The V# the shader would read, from guest memory that the GPU did not write.
-				const auto address = entries + offset;
-				if (!m_mapped_ranges.Contains(address, 12) ||
-				    m_buffer_cache.IsRegionGpuModified(address, 12)) {
-					return false;
-				}
-				ShaderBufferResource descriptor;
-				std::memcpy(descriptor.fields, reinterpret_cast<const void*>(address), 12);
-				const auto stride = uint64_t {descriptor.Stride()};
-				if (descriptor.Base48() != 0 && descriptor.NumRecords() != 0) {
-					const auto wanted =
-					    descriptor.GetSize() + std::max<uint64_t>(stride, 4u) * WaveRecords;
-					if (wanted > MaxBufferBytes) {
-						Common::HackNotice::Report("DMA upload of a V# range clipped to 256 MiB",
-						                           "RenderContext::SynchronizeDmaFootprint",
-						                           program.shader_hash, table.base_register);
-					}
-					add(descriptor.Base48(), std::min(wanted, MaxBufferBytes));
-				}
-				if (offset == 0) {
-					break;
-				}
-			}
-		}
-	}
-	lock.unlock();
-	m_buffer_cache.SynchronizeBuffersInSpans(m_dma_spans);
-	return true;
-}
-
-void RenderContext::PrepareBda(bool may_write, bool full_sync) {
+void RenderContext::PrepareBda() {
 	if (!m_bda_logged) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;

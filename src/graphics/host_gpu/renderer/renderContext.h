@@ -77,6 +77,7 @@ public:
 	void ResyncHostProtection(uint64_t vaddr, uint64_t size) {
 		m_page_manager.ResyncHostProtection(vaddr, size);
 	}
+	void               CacheDmaBases(const ShaderStageRuntime& runtime);
 	void               PrepareBda();
 	void               RunGarbageCollector();
 

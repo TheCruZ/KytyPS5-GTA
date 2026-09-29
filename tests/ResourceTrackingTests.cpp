@@ -8720,12 +8720,12 @@ void TestDmaBaseRegisters() {
   const auto index = fixture.Emit(ValueOpcode::IAdd32, {lane, offset});
   const auto low =
       fixture.Emit(ValueOpcode::IAdd32, {fixture.UserData(12), index});
-  const auto carry =
+  const auto wrapped =
       fixture.Emit(ValueOpcode::ULessThan32, {low, fixture.UserData(12)});
-  const auto high = fixture.Emit(
-      ValueOpcode::IAdd32,
-      {fixture.UserData(13),
-       fixture.Emit(ValueOpcode::SelectU32, {carry, Value(1u), Value(0u)})});
+  const auto carry = fixture.Emit(
+      ValueOpcode::SelectU32, {wrapped, Value(1u), Value(0u)});
+  const auto high =
+      fixture.Emit(ValueOpcode::IAdd32, {fixture.UserData(13), carry});
   const auto address = fixture.Address(low, high, 0xa0);
   MemoryInfo flat;
   flat.kind = ResourceKind::Flat;

@@ -3397,13 +3397,10 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		            return stage->runtime->module->info.info.uses_dma;
 	            }));
 	for (auto* stage: stages) {
-		if (stage->runtime->module->info.info.uses_dma) {
+		if (stage->runtime->program->info.uses_dma) {
 			m_context.CacheDmaBases(*stage->runtime);
-			dma_write |= stage->runtime->module->info.has_address_writes;
-			EXIT_IF(dma_stage_count == dma_stages.size());
-			dma_stages[dma_stage_count++] = stage->runtime;
+			uses_dma = true;
 		}
-		uses_image_heap |= stage->runtime->module->info.info.uses_image_heap;
 	}
 	if (dma_stage_count != 0) {
 		// Only operations whose device-address reach is unknown upload all cached memory.

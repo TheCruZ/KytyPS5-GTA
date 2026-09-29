@@ -482,9 +482,6 @@ public:
 		m_info.sampled_pairs.clear();
 		m_info.uses_dma = false;
 		m_info.dma_base_registers.clear();
-		m_info.dma_windows.clear();
-		m_info.dma_tables.clear();
-		m_info.dma_bounded = false;
 		m_shader_writes = HasShaderMemoryWrites(program);
 	}
 
@@ -5008,6 +5005,25 @@ private:
 		return RegIndex(high->Arg(0).ScalarRegister()) == reg + 1u;
 	}
 
+	// A DMA address is usually a 64-bit base from a user-data register pair plus a per-lane
+	// offset: the low dword derives from register N and the high dword from register N + 1 (and,
+	// through the carry, from everything the low dword does). Record N so the host can cache the
+	// memory at the base before the shader runs; an access to memory without a cached buffer only
+	// records a fault and reads zero.
+	void CollectDmaBase(const Inst& handle) {
+		const auto low      = AddressUserDataSources(handle.Arg(0));
+		const auto high     = AddressUserDataSources(handle.Arg(1));
+		const auto contains = [](const std::vector<uint32_t>& registers, uint32_t reg) {
+			return std::ranges::find(registers, reg) != registers.end();
+		};
+		for (const auto reg: low) {
+			if (contains(high, reg + 1u) && !contains(low, reg + 1u) &&
+			    !contains(m_info.dma_base_registers, reg)) {
+				m_info.dma_base_registers.push_back(reg);
+			}
+		}
+	}
+
 	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, const Inst& inst, uint32_t pc) {
 		for (uint32_t i = 0; i < m_info.buffers.size(); i++) {
 			if (m_info.buffers[i].source == source) {
@@ -5293,11 +5309,6 @@ private:
 			}
 			m_info.uses_dma = true;
 			CollectDmaBase(*inst.Arg(0).Resolve().TryInstruction());
-			if (address_info.access == AddressAccess::Read) {
-				NoteDmaWindow(inst, memory);
-			} else {
-				m_dma_unbounded = true;
-			}
 			return;
 		}
 
