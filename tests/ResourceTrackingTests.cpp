@@ -5531,13 +5531,20 @@ void TestSampleAdjustSamplerScratch() {
                   {rejected_image, rejected_sampler, rejected.ImageAddress(), Value(true)},
                   rejected.AddMemory(rejected_memory, 0x200));
 
-    CheckFatal([&] { rejected.PlanAndTrack(); },
-               "not a valid runtime value", message);
+    // Lane-dependent bits in the border word are dropped instead of failing the shader; the
+    // user-data part of the word stays.
+    rejected.PlanAndTrack();
+    const auto *kept = rejected.program
+                           .descriptor_sources[rejected.program.info.samplers[0].source]
+                           .dwords[3]
+                           .Resolve()
+                           .TryInstruction();
+    Check(kept != nullptr && kept->GetOpcode() == ValueOpcode::GetUserData, message);
   };
   CheckRejected(0u, 12u,
-                "ordinary sampling accepted SampleAdjust reserved scratch");
+                "ordinary sampling lost the runtime part of a scratch-ORed border word");
   CheckRejected(Decoder::ImageSampleFlagAdjust, 30u,
-                "SampleAdjust canonicalization discarded border-mode bits");
+                "SampleAdjust sampling lost the runtime part of a lane-ORed border word");
 }
 
 void TestFmaskLoadSpecialization() {
@@ -9051,6 +9058,7 @@ int main() {
     Run("compute buffer fill", TestComputeBufferFill);
     Run("bounded buffer writes", TestBoundedBufferWrites);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
+    Run("untrackable sampler border word", TestUntrackableSamplerBorderWord);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
     Run("independent image/sampler pairs", TestIndependentImageSamplerPairs);
