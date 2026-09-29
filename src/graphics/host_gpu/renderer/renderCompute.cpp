@@ -1050,6 +1050,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	if (program.info.uses_dma) {
 		KYTY_PROFILER_BLOCK("Dispatch::PrepareBda");
+		m_context.CacheDmaBases(input_info.stage);
 		m_context.PrepareBda();
 	}
 	RebindImages(bindings);
@@ -1342,6 +1343,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 	if (program.info.uses_dma) {
+		m_context.CacheDmaBases(input_info.stage);
 		m_context.PrepareBda();
 	}
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
