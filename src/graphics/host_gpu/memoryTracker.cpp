@@ -69,6 +69,10 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		// A region without CPU-dirty pages answers without its lock (see HasCpuDirty()).
+		if (!manager->HasCpuDirty()) {
+			return false;
+		}
 		std::scoped_lock lock(manager->lock);
 		return manager->IsModified<DirtySource::Cpu>(offset, bytes);
 	});
@@ -76,6 +80,13 @@ bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 
 bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
+	// Most queries touch regions without GPU-dirty pages: answer those without the locks. The
+	// flag changes under the region lock, so this is the answer the lock would give at some
+	// point during the call.
+	if (!MayBeGpuModified(vaddr, size)) {
+		ValidateRange(vaddr, size);
+		return false;
+	}
 	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		return manager->IsModified<DirtySource::Gpu>(offset, bytes);

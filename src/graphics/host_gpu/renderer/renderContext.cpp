@@ -79,6 +79,20 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	return true;
 }
 
+void RenderContext::PrepareGpuWrite(const void* destination, uint64_t size) noexcept {
+	const auto vaddr     = reinterpret_cast<uint64_t>(destination);
+	const auto page_size = m_page_manager.GetPageSize();
+	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	// A watched page is protected: the write would fault into HandleFault().
+	for (auto page = vaddr & ~(page_size - 1); page < vaddr + size; page += page_size) {
+		if (m_page_manager.IsWatched(page)) {
+			(void)HandleFault(PageFaultAccess::Write, std::max(page, vaddr));
+		}
+	}
+}
+
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
 		return false;
@@ -115,12 +129,19 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
-		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
-		// access a range with no cached data, so they must finish before it is unmapped.
-		if (m_command_scheduler.Active() &&
-		    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
-		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
-		     m_command_scheduler.HasPendingPriorityOperations())) {
+		// Finishing the GPU protects GPU writes to the range and completions that may write guest
+		// memory there (downloads, write scans). Queued GPU work only reads cached copies and
+		// host-only completions (cache bookkeeping, flips, interrupts) never touch the range, so
+		// without GPU-owned pages, images or pending guest completions writing the range the
+		// unmap needs no drain.
+		if (m_command_scheduler.Active()) {
+			m_command_scheduler.PopPendingOperations();
+		}
+		const bool drain = m_command_scheduler.Active() &&
+		                   (m_buffer_cache.IsRegionGpuModified(vaddr, size) ||
+		                    m_texture_cache.IsRegionRegistered(vaddr, size) ||
+		                    m_command_scheduler.HasPendingGuestOperations(vaddr, size));
+		if (drain) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
@@ -138,7 +159,36 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		unmap();
 		return;
 	}
-	m_gpu->SendCommandSync(unmap);
+	// The guest unmaps memory once the GPU work that used it executed: it waits on labels the
+	// execution thread writes after the operations before them. The operations queued since do not
+	// use the range, so the unmap runs before them instead of making the guest wait for them;
+	// streaming games unmap many times per frame, holding their own locks.
+	m_gpu->SendUrgentCommandSync(unmap);
+}
+
+void RenderContext::CacheDmaBases(const ShaderStageRuntime& runtime) {
+	const auto&      program   = runtime.module->info;
+	const auto&      user_data = runtime.resources->user_data;
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	for (const auto reg: program.info.dma_base_registers) {
+		const auto index = static_cast<uint64_t>(reg) - program.user_data_base;
+		if (reg < program.user_data_base || index + 1u >= user_data.size()) {
+			continue;
+		}
+		const auto base = user_data[index] | (static_cast<uint64_t>(user_data[index + 1u]) << 32u);
+		// The registers of an access that never runs may hold stale data. Mapped memory never
+		// reaches the top of the address space, so a window that would overflow is skipped.
+		if (base > UINT64_MAX - BufferCache::CACHING_PAGESIZE) {
+			continue;
+		}
+		// DMA reaches only memory with a cached buffer; any other access records a fault and
+		// reads zero, and the buffer arrives after the shader has run. That loses data the guest
+		// writes for a single dispatch, such as the glyph bitmaps GTA V copies into its font atlas.
+		m_mapped_ranges.ForEachInRange(base, BufferCache::CACHING_PAGESIZE,
+		                               [this](uint64_t start, uint64_t end) {
+			                               (void)m_buffer_cache.FindBuffer(start, end - start);
+		                               });
+	}
 }
 
 void RenderContext::PrepareBda() {

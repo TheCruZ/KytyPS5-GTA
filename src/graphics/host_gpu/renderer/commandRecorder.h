@@ -461,20 +461,6 @@ public:
 		}
 		m_stream->Record([=](vk::CommandBuffer c) { c.setDepthCompareOp(op); });
 	}
-	void setDepthBoundsTestEnable(vk::Bool32 enable) const {
-		if (m_stream == nullptr) {
-			m_direct.setDepthBoundsTestEnable(enable);
-			return;
-		}
-		m_stream->Record([=](vk::CommandBuffer c) { c.setDepthBoundsTestEnable(enable); });
-	}
-	void setDepthBounds(float min, float max) const {
-		if (m_stream == nullptr) {
-			m_direct.setDepthBounds(min, max);
-			return;
-		}
-		m_stream->Record([=](vk::CommandBuffer c) { c.setDepthBounds(min, max); });
-	}
 	void setDepthBiasEnable(vk::Bool32 enable) const {
 		if (m_stream == nullptr) {
 			m_direct.setDepthBiasEnable(enable);
@@ -502,6 +488,20 @@ public:
 			return;
 		}
 		m_stream->Record([=](vk::CommandBuffer c) { c.setFrontFace(face); });
+	}
+	void setDepthBoundsTestEnable(vk::Bool32 enable) const {
+		if (m_stream == nullptr) {
+			m_direct.setDepthBoundsTestEnable(enable);
+			return;
+		}
+		m_stream->Record([=](vk::CommandBuffer c) { c.setDepthBoundsTestEnable(enable); });
+	}
+	void setDepthBounds(float min_bounds, float max_bounds) const {
+		if (m_stream == nullptr) {
+			m_direct.setDepthBounds(min_bounds, max_bounds);
+			return;
+		}
+		m_stream->Record([=](vk::CommandBuffer c) { c.setDepthBounds(min_bounds, max_bounds); });
 	}
 	void setStencilTestEnable(vk::Bool32 enable) const {
 		if (m_stream == nullptr) {

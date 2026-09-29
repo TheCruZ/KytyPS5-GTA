@@ -790,6 +790,8 @@ void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& lay
 void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
                                       const Presenter::Layer& overlay, bool draw_system_overlay) {
 	EXIT_IF(m_image_index >= m_images.size());
+	// The overlay pipeline replaces any dynamic state draws set in this command buffer.
+	command.InvalidateDynamicState();
 	auto       vk_command      = command.Handle();
 	const bool convert_source  = source != nullptr && source->hdr && !m_hdr_active;
 	const bool blit_source     = source != nullptr && !convert_source;
