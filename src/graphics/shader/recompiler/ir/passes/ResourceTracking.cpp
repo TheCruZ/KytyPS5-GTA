@@ -45,6 +45,41 @@ uint32_t PossibleU32Bits(Value value) {
 	}
 }
 
+// The user-data registers an address dword derives from, within a bounded walk of its
+// operands. Lane masks and conditions (U1 operands) select between values rather than compute
+// them, and memory results are data, so the walk does not follow them.
+std::vector<uint32_t> AddressUserDataSources(Value root) {
+	constexpr size_t         MaxVisited = 256;
+	std::vector<uint32_t>    registers;
+	std::vector<const Inst*> visited;
+	if (const auto* inst = root.Resolve().TryInstruction()) {
+		visited.push_back(inst);
+	}
+	for (size_t next = 0; next < visited.size() && visited.size() < MaxVisited; next++) {
+		const auto* inst = visited[next];
+		const auto  op   = inst->GetOpcode();
+		if (op == ValueOpcode::GetUserData) {
+			if (inst->Arg(0).GetType() == Type::ScalarReg) {
+				registers.push_back(RegIndex(inst->Arg(0).ScalarRegister()));
+			}
+			continue;
+		}
+		if (BufferAccessOf(op) != BufferAccess::None ||
+		    AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+		    ImageOpcodeInfoOf(op).access != ImageAccess::None) {
+			continue;
+		}
+		for (size_t i = 0; i < inst->NumArgs(); i++) {
+			const auto* arg = inst->Arg(i).Resolve().TryInstruction();
+			if (arg != nullptr && arg->GetType() != Type::U1 &&
+			    std::ranges::find(visited, arg) == visited.end()) {
+				visited.push_back(arg);
+			}
+		}
+	}
+	return registers;
+}
+
 Value CanonicalizeSampleAdjustDword3(Value value) {
 	for (;;) {
 		value            = value.Resolve();
@@ -260,6 +295,7 @@ public:
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
 		m_info.uses_dma = false;
+		m_info.dma_base_registers.clear();
 		m_shader_writes = HasShaderMemoryWrites(program);
 	}
 
@@ -1854,6 +1890,25 @@ private:
 		}
 	}
 
+	// A DMA address is usually a 64-bit base from a user-data register pair plus a per-lane
+	// offset: the low dword derives from register N and the high dword from register N + 1 (and,
+	// through the carry, from everything the low dword does). Record N so the host can cache the
+	// memory at the base before the shader runs; an access to memory without a cached buffer only
+	// records a fault and reads zero.
+	void CollectDmaBase(const Inst& handle) {
+		const auto low      = AddressUserDataSources(handle.Arg(0));
+		const auto high     = AddressUserDataSources(handle.Arg(1));
+		const auto contains = [](const std::vector<uint32_t>& registers, uint32_t reg) {
+			return std::ranges::find(registers, reg) != registers.end();
+		};
+		for (const auto reg: low) {
+			if (contains(high, reg + 1u) && !contains(low, reg + 1u) &&
+			    !contains(m_info.dma_base_registers, reg)) {
+				m_info.dma_base_registers.push_back(reg);
+			}
+		}
+	}
+
 	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
 		for (uint32_t i = 0; i < m_info.buffers.size(); i++) {
 			if (m_info.buffers[i].source == source) {
@@ -2074,6 +2129,7 @@ private:
 				m_program.has_address_writes = true;
 			}
 			m_info.uses_dma = true;
+			CollectDmaBase(*inst.Arg(0).Resolve().TryInstruction());
 			return;
 		}
 
