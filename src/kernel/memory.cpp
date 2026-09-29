@@ -222,6 +222,131 @@ static bool IsPrivateCommittedRangeType(VirtualRangeType type) {
 static bool g_test_fail_next_range_replace = false;
 #endif
 
+// One bit per committed 4 KiB page of the GPU-visible address windows ([0, 1 TiB) and the
+// extended window), so that the GPU threads clamp the buffers they bind without a lock: a
+// streaming game changes its mappings many times per frame. Pages change under the owner's lock;
+// leaves are allocated on first use and live as long as the map. A query racing with a change
+// orders as if it preceded or followed it.
+class CommittedPageMap {
+public:
+	static constexpr uint64_t Unknown = UINT64_MAX;
+
+	CommittedPageMap() = default;
+	~CommittedPageMap() {
+		for (auto& leaf: m_leaves) {
+			delete[] leaf.load(std::memory_order_relaxed);
+		}
+	}
+	KYTY_CLASS_NO_COPY(CommittedPageMap);
+
+	// Owner's lock held.
+	void Set(uint64_t start, uint64_t size, bool committed) {
+		if (size == 0) {
+			return;
+		}
+		uint64_t first = 0;
+		uint64_t end   = 0;
+		if (((start | size) & PageMask) != 0 || !PageSpan(start, size, &first, &end)) {
+			// Not page aligned, or outside the windows: such queries take the slow path.
+			if (((start | size) & PageMask) != 0) {
+				m_imprecise.store(true, std::memory_order_relaxed);
+			}
+			return;
+		}
+		for (auto page = first; page < end;) {
+			const auto leaf_end = std::min(end, (page / LeafPages + 1) * LeafPages);
+			auto*      words    = Leaf(page / LeafPages, committed);
+			for (; words != nullptr && page < leaf_end;) {
+				const auto bit   = page % 64u;
+				const auto count = std::min<uint64_t>(64u - bit, leaf_end - page);
+				const auto mask  = (count == 64u ? ~uint64_t {0} : ((uint64_t {1} << count) - 1u))
+				                   << bit;
+				auto&      word  = words[(page % LeafPages) / 64u];
+				if (committed) {
+					word.fetch_or(mask, std::memory_order_release);
+				} else {
+					word.fetch_and(~mask, std::memory_order_release);
+				}
+				page += count;
+			}
+			page = leaf_end;
+		}
+	}
+
+	// How many bytes from `address` (at most `size`) lie in contiguous committed pages, or
+	// Unknown when the map cannot tell.
+	[[nodiscard]] uint64_t CommittedRun(uint64_t address, uint64_t size) const {
+		uint64_t first = 0;
+		uint64_t end   = 0;
+		if (m_imprecise.load(std::memory_order_relaxed) || size == 0 || size > LowerSize ||
+		    !PageSpan(address & ~PageMask, ((address & PageMask) + size + PageMask) & ~PageMask,
+		              &first, &end)) {
+			return Unknown;
+		}
+		for (auto page = first; page < end;) {
+			const auto* words = m_leaves[page / LeafPages].load(std::memory_order_acquire);
+			const auto  bit   = page % 64u;
+			const auto  count = std::min<uint64_t>(64u - bit, end - page);
+			const auto word = words == nullptr
+			                      ? 0
+			                      : words[(page % LeafPages) / 64u].load(std::memory_order_acquire);
+			// The first page of the run that is not committed.
+			const auto missing =
+			    ~(word >> bit) & (count == 64u ? ~uint64_t {0} : ((uint64_t {1} << count) - 1u));
+			if (missing != 0) {
+				const auto run_end = (page + static_cast<uint64_t>(std::countr_zero(missing)))
+				                     << PageBits;
+				const auto base    = WindowBase(address);
+				return run_end + base <= address ? 0 : run_end + base - address;
+			}
+			page += count;
+		}
+		return size;
+	}
+
+private:
+	static constexpr uint64_t PageBits       = 12;
+	static constexpr uint64_t PageMask       = (uint64_t {1} << PageBits) - 1u;
+	static constexpr uint64_t LowerSize      = uint64_t {1} << 40u;
+	static constexpr uint64_t LeafPages      = uint64_t {1} << 19u; // 2 GiB, 64 KiB of bits
+	static constexpr uint64_t LowerLeaves    = (LowerSize >> PageBits) / LeafPages;
+	static constexpr uint64_t ExtendedLeaves = (kExtendedMemorySize >> PageBits) / LeafPages;
+
+	// Window-relative pages: the extended window follows the lower one.
+	static uint64_t WindowBase(uint64_t address) {
+		return address < LowerSize ? 0 : kExtendedMemoryBase - LowerSize;
+	}
+	static bool PageSpan(uint64_t start, uint64_t size, uint64_t* first, uint64_t* end) {
+		if (size > UINT64_MAX - start) {
+			return false;
+		}
+		const auto finish = start + size;
+		if (finish <= LowerSize) {
+			*first = start >> PageBits;
+			*end   = finish >> PageBits;
+			return true;
+		}
+		if (start >= kExtendedMemoryBase && finish <= kExtendedMemoryBase + kExtendedMemorySize) {
+			*first = (start - kExtendedMemoryBase + LowerSize) >> PageBits;
+			*end   = (finish - kExtendedMemoryBase + LowerSize) >> PageBits;
+			return true;
+		}
+		return false;
+	}
+
+	std::atomic<uint64_t>* Leaf(uint64_t index, bool create) {
+		auto* leaf = m_leaves[index].load(std::memory_order_relaxed);
+		if (leaf == nullptr && create) {
+			leaf = new std::atomic<uint64_t>[LeafPages / 64u] {};
+			m_leaves[index].store(leaf, std::memory_order_release);
+		}
+		return leaf;
+	}
+
+	std::array<std::atomic<std::atomic<uint64_t>*>, LowerLeaves + ExtendedLeaves> m_leaves {};
+	std::atomic_bool m_imprecise {false};
+};
+
 class VirtualRanges {
 public:
 	struct Range {
@@ -263,12 +388,16 @@ public:
 		auto inserted = m_ranges.emplace_hint(position, start, r);
 		UpdatePageTableEntries(inserted->second, true);
 		MergeAroundUnlocked(inserted);
+		if (IsCommittedRangeType(type)) {
+			m_committed.Set(start, size, true);
+		}
 		BumpBackingEpoch();
 		return true;
 	}
 
 	bool Remove(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		m_committed.Set(start, size, false);
 		BumpBackingEpoch();
 
 		auto position = m_ranges.find(start);
@@ -353,6 +482,7 @@ public:
 		first->second = replacement;
 		UpdatePageTableEntries(first->second, true);
 		MergeAroundUnlocked(first);
+		m_committed.Set(start, size, IsCommittedRangeType(type));
 		return true;
 	}
 
@@ -431,11 +561,17 @@ public:
 	}
 
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
-
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
 			return 0;
 		}
+		// The GPU threads clamp every buffer they bind: answer from the page map, without the
+		// lock, whenever it covers the range.
+		if (const auto run = m_committed.CommittedRun(virtual_addr, size);
+		    run != CommittedPageMap::Unknown) {
+			return run;
+		}
+
+		Common::LockGuard lock(m_mutex);
 
 		auto vma = FindContaining(virtual_addr);
 		if (vma == m_ranges.end() || !IsCommittedRangeType(vma->second.type)) {
@@ -638,6 +774,7 @@ private:
 	Common::Mutex m_mutex;
 	uint64_t      m_cpu_page_table_entries = 0;
 	uint64_t      m_gpu_page_table_entries = 0;
+	CommittedPageMap m_committed;
 };
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -869,6 +1006,22 @@ bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryReadBacking(vaddr, data, size);
+}
+
+const void* FindBackingPointer(uint64_t vaddr, uint64_t size) {
+	return g_guest_address_space != nullptr ? g_guest_address_space->FindBackingPointer(vaddr, size)
+	                                        : nullptr;
+}
+
+bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
+		if (!Graphics::GuestGpu::IsGpuThread() ||
+		    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
+		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+			return false;
+		}
+	}
+	return TryReadBacking(vaddr, data, size);
 }
 
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
