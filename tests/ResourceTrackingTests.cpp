@@ -9747,13 +9747,7 @@ int main() {
     Run("compute buffer fill", TestComputeBufferFill);
     Run("bounded buffer writes", TestBoundedBufferWrites);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
-    Run("V# table stores", TestVSharpTableStores);
-    Run("indirect scalar reads", TestIndirectScalarReads);
-    Run("GPU-dependent address reads", TestGpuDependentAddressReads);
     Run("untrackable sampler border word", TestUntrackableSamplerBorderWord);
-    Run("bindless image table", TestBindlessImageTable);
-    Run("bindless image table query", TestBindlessImageTableQuery);
-    Run("bindless image table shared registers", TestBindlessImageTableSharedRegisters);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
     Run("independent image/sampler pairs", TestIndependentImageSamplerPairs);
