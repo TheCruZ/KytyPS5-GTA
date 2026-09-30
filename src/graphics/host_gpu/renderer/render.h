@@ -161,6 +161,8 @@ public:
 	// The raw command buffer. With the recording thread (CommandScheduler::EnableRecordingThread)
 	// this first waits until the thread has run everything queued; hot paths use Recorder().
 	[[nodiscard]] vk::CommandBuffer Handle() const;
+	// A pipeline outside the draws (the present overlay) replaced the dynamic state they set.
+	void InvalidateDynamicState() const;
 	// Records directly, or through the recording thread.
 	[[nodiscard]] CommandRecorder Recorder() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
