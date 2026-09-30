@@ -492,7 +492,6 @@ void CommandScheduler::Wait(uint64_t tick) {
 void CommandScheduler::PopPendingOperations() {
 	// Every draw and dispatch comes here: only query the timeline semaphore (a driver call) when
 	// the oldest operation is not already known to be free.
-	bool refreshed = false;
 	// Without the lock: nothing pending, or the oldest operation is not done and the timeline
 	// was queried a few calls ago. Pending operations only free resources and complete host
 	// work, so finding them some microseconds later costs nothing, while a query per draw is a
@@ -511,7 +510,6 @@ void CommandScheduler::PopPendingOperations() {
 		}
 		m_pending_skips.store(0, std::memory_order_relaxed);
 		m_master.Refresh();
-		refreshed = true;
 		if (!m_master.IsFree(front)) {
 			return;
 		}
@@ -601,10 +599,15 @@ void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, 
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
-		m_pending_operations.push({std::move(operation), CurrentTick()});
-		if (m_pending_operations.size() == 1) {
+		auto& queue = priority ? m_priority_operations : m_pending_operations;
+		queue.push({std::move(operation), CurrentTick()});
+		if (!priority && m_pending_operations.size() == 1) {
 			m_pending_front_tick.store(m_pending_operations.front().tick,
 			                           std::memory_order_release);
+		}
+		lock.unlock();
+		if (priority) {
+			m_operation_available.notify_one();
 		}
 		return;
 	}

@@ -14,6 +14,8 @@
 #include <cstddef>
 #include <cstring>
 #include <deque>
+#include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -275,7 +277,6 @@ private:
 	// The tick of the oldest pending operation (UINT64_MAX without any), written under
 	// m_operation_mutex: draws check it without the lock.
 	std::atomic<uint64_t>        m_pending_front_tick {UINT64_MAX};
-	std::atomic<uint64_t>        m_submitted_tick {0};
 	// Calls since draws last queried the GPU timeline for pending operations.
 	std::atomic<uint32_t>        m_pending_skips {0};
 	std::queue<PendingOperation> m_priority_operations;
