@@ -427,6 +427,50 @@ static bool CopySubmissions() {
 	return enabled;
 }
 
+// Runs `command` on the execution thread before the operations queued since, and waits for it.
+// The guest unmaps memory, and reads memory the GPU wrote, only after a label the execution
+// thread writes once the work before it executed: the operations queued since cannot be what it
+// needs, so it does not wait for them. KYTY_URGENT_UNMAP=0 runs these as ordinary commands.
+void GuestGpu::SendUrgentCommandSync(Common::UniqueFunction<void>&& command) {
+	EXIT_IF(!command);
+	static const bool urgent = [] {
+		const char* value = std::getenv("KYTY_URGENT_UNMAP");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!urgent || !m_pipelined || IsGpuThread() || g_cp_thread) {
+		SendCommandSync(std::move(command));
+		return;
+	}
+	std::binary_semaphore done {0};
+	{
+		std::lock_guard lock(m_urgent_mutex);
+		m_urgent_commands.push_back([operation = std::move(command), &done]() mutable {
+			operation();
+			done.release();
+		});
+		m_urgent_pending.fetch_add(1, std::memory_order_release);
+	}
+	// A busy execution thread runs the command before its next operation; an idle one waits for
+	// operations, so queue one that runs it too.
+	SendCommand([this] { RunUrgentCommands(); });
+	done.acquire();
+}
+
+void GuestGpu::RunUrgentCommands() {
+	if (m_urgent_pending.load(std::memory_order_acquire) == 0) {
+		return;
+	}
+	std::vector<Common::UniqueFunction<void>> commands;
+	{
+		std::lock_guard lock(m_urgent_mutex);
+		commands.swap(m_urgent_commands);
+		m_urgent_pending.store(0, std::memory_order_relaxed);
+	}
+	for (auto& command: commands) {
+		command();
+	}
+}
+
 void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
                       std::span<const uint32_t> constant_commands) {
 	if (draw_commands.empty()) {
@@ -583,6 +627,9 @@ void GuestGpu::ExecutionThread() {
 	uint32_t           unnotified     = 0;
 	auto&              operations     = m_resolving ? m_resolved : m_operations;
 	for (;;) {
+		if (m_urgent_pending.load(std::memory_order_relaxed) != 0) {
+			RunUrgentCommands();
+		}
 		auto operation = operations.TryPop();
 		if (!operation) {
 			m_executed.Notify();
