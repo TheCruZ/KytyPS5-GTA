@@ -21,6 +21,9 @@ struct GpuRegisterState {
 	const HW::Context*    context     = nullptr;
 	const HW::UserConfig* user_config = nullptr;
 	const HW::Shader*     shaders     = nullptr;
+	// Unique per snapshot of the context registers (0: live registers, not a snapshot):
+	// operations with the same id see the same context registers.
+	uint64_t context_id = 0;
 };
 
 // NUM_INSTANCES as the command processor last set it. Indirect draws also set the persistent
@@ -86,6 +89,11 @@ struct GpuOperation {
 	uint64_t          sequence  = 0;
 	GpuRegisterState  state;
 	GpuNumInstances   num_instances;
+	// Draws: the shader programs the resolve thread resolved ahead, if any.
+	RenderExecutor::ResolvedDraw* resolved = nullptr;
+	// The command processor processed a WAIT_REG_MEM since the previous operation: the guest may
+	// have written memory the operations before it read.
+	bool after_wait = false;
 	union {
 		DrawIndexArgs       draw_index;
 		DrawAutoArgs        draw_auto;

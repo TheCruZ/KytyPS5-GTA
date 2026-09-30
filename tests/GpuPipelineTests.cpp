@@ -1,6 +1,8 @@
 #include "common/inlineFunction.h"
 #include "common/spscQueue.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/host_gpu/renderer/hostCopyQueue.h"
+#include "graphics/host_gpu/renderer/pipeline/programStore.h"
 
 #include <array>
 #include <atomic>
@@ -8,6 +10,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -319,15 +324,152 @@ void TestInlineFunction() {
 	Check(destroyed == 1, "the small callable is destroyed once");
 }
 
+// Copies complete in order, in full and partial batches; WaitFor() and Drain() see their bytes,
+// also after the copy thread slept on an empty queue, and a waiter on another thread (the
+// recording thread) sees the copies counted before its target.
+void TestHostCopyQueue() {
+	constexpr size_t           Copies = 20000;
+	constexpr size_t           Bytes  = 300;
+	std::vector<uint8_t>       sources(Copies * Bytes);
+	std::vector<uint8_t>       targets(Copies * Bytes, 0);
+	for (size_t i = 0; i < sources.size(); i++) {
+		sources[i] = static_cast<uint8_t>(i * 7 + i / 251);
+	}
+	Libs::Graphics::HostCopyQueue queue;
+	std::atomic_uint64_t          published {0};
+	std::atomic_bool              stop {false};
+	bool                          seen = true;
+	std::jthread                  waiter([&] {
+		// Like the recording thread: waits for the copies counted before a submission.
+		while (!stop.load(std::memory_order_acquire)) {
+			const auto target = published.load(std::memory_order_acquire);
+			queue.WaitFor(target);
+			for (uint64_t i = target >= 8 ? target - 8 : 0; i < target; i++) {
+				seen &= targets[i * Bytes + Bytes - 1] == sources[i * Bytes + Bytes - 1];
+			}
+		}
+	});
+	bool drained = true;
+	for (size_t i = 0; i < Copies; i++) {
+		queue.Copy(targets.data() + i * Bytes, sources.data() + i * Bytes, Bytes);
+		// Flushes every few copies, as the execution thread does after each draw; Copy() hands
+		// over full batches itself.
+		if (i % 3 == 0) {
+			published.store(queue.Flush(), std::memory_order_release);
+		}
+		if (i % 997 == 0) {
+			queue.Drain();
+			drained &= std::memcmp(targets.data(), sources.data(), (i + 1) * Bytes) == 0;
+		}
+		if (i % 5000 == 0) {
+			Stall(std::chrono::milliseconds(3));
+		}
+	}
+	queue.Drain();
+	stop.store(true, std::memory_order_release);
+	waiter.join();
+	Check(queue.Flush() == Copies, "every copy is counted");
+	Check(drained, "Drain() waits for every queued copy");
+	Check(seen, "WaitFor() on another thread sees the copies before its target");
+	Check(targets == sources, "every copy lands");
+}
+
 } // namespace
 
+
+Libs::Graphics::StoredProgram MakeStoredProgram(uint32_t seed) {
+	Libs::Graphics::StoredProgram program;
+	program.stage           = seed % 2 == 0 ? Libs::Graphics::ShaderType::Pixel
+	                                        : Libs::Graphics::ShaderType::Vertex;
+	program.hash            = 0x1234567800000000ull + seed;
+	program.code            = {seed, seed + 1, seed + 2, 0xbf810000u};
+	program.code_size       = static_cast<uint32_t>(program.code.size());
+	program.user_data_count = 3;
+	program.user_data[1]    = seed * 7;
+	program.static_state    = {seed, 42};
+	program.input_info.assign(64, static_cast<uint8_t>(seed));
+	program.push_data_cursor = seed % 5;
+	program.specialization.buffers.resize(2);
+	program.specialization.buffers[1].packed_stride = seed;
+	program.specialization.images.resize(1);
+	program.specialization.images[0].mip_count = seed + 1;
+	return program;
+}
+
+bool SameStoredProgram(const Libs::Graphics::StoredProgram& a,
+                       const Libs::Graphics::StoredProgram& b) {
+	return a.stage == b.stage && a.hash == b.hash && a.user_data_count == b.user_data_count &&
+	       a.code_size == b.code_size && a.static_state == b.static_state && a.code == b.code &&
+	       a.back_code == b.back_code && a.user_data == b.user_data &&
+	       a.input_info == b.input_info && a.push_data_cursor == b.push_data_cursor &&
+	       a.specialization == b.specialization;
+}
+
+void TestProgramStore() {
+	const auto dir  = std::filesystem::temp_directory_path() / "kyty_program_store_test";
+	const auto path = dir / "test.programs";
+	std::error_code error;
+	std::filesystem::remove_all(dir, error);
+	{
+		Libs::Graphics::ProgramStore store;
+		Check(store.Open(path).empty(), "a new store is empty");
+		store.Append(MakeStoredProgram(1));
+		store.Append(MakeStoredProgram(2));
+		store.Append(MakeStoredProgram(1));
+	}
+	const auto valid_size = std::filesystem::file_size(path);
+	{
+		Libs::Graphics::ProgramStore store;
+		const auto programs = store.Open(path);
+		Check(programs.size() == 2, "records load once each");
+		Check(SameStoredProgram(programs[0], MakeStoredProgram(1)) &&
+		          SameStoredProgram(programs[1], MakeStoredProgram(2)),
+		      "records round-trip");
+	}
+	{
+		// A record torn by a crash ends the file.
+		std::ofstream file(path, std::ios::binary | std::ios::app);
+		const char torn[] = {0x40, 0x00, 0x00, 0x00, 0x01, 0x02};
+		file.write(torn, sizeof(torn));
+	}
+	{
+		Libs::Graphics::ProgramStore store;
+		Check(store.Open(path).size() == 2, "a torn record is ignored");
+		store.Append(MakeStoredProgram(3));
+	}
+	Check(std::filesystem::file_size(path) > valid_size, "appends after dropping a torn record");
+	{
+		Libs::Graphics::ProgramStore store;
+		Check(store.Open(path).size() == 3, "records after a dropped torn record load");
+	}
+	{
+		// Another layout: the store starts over.
+		std::ofstream file(path, std::ios::binary | std::ios::trunc);
+		file << "KytyPrograms0:1:2:3:4:5" << '\n';
+	}
+	{
+		Libs::Graphics::ProgramStore store;
+		Check(store.Open(path).empty(), "a store of another layout is dropped");
+		store.Append(MakeStoredProgram(4));
+	}
+	{
+		Libs::Graphics::ProgramStore store;
+		const auto programs = store.Open(path);
+		Check(programs.size() == 1 && SameStoredProgram(programs[0], MakeStoredProgram(4)),
+		      "a restarted store keeps new records");
+	}
+	std::filesystem::remove_all(dir, error);
+}
+
 int main() {
+	TestProgramStore();
 	TestCommandStreamOrder();
 	TestCommandStreamArraysStayInChunk();
 	TestCommandChunkQueueThreads();
 	TestSpscQueue();
 	TestProgressCounter();
 	TestInlineFunction();
+	TestHostCopyQueue();
 	std::printf("GpuPipelineTests: all tests passed\n");
 	return 0;
 }
