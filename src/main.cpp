@@ -78,8 +78,8 @@ static void PrintUsage() {
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
 	::printf("  --profile                            Enable the Tracy profiler.\n");
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
-	::printf(
-	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
+	::printf("  --readback-linear-images <true|false> Read back writable linear images on submit\n"
+	         "                                       (default: true).\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 	::printf("  --gpu-pipeline <0|1|mask>            Emulated GPU stages on their own threads.\n"
 	         "                                       0: all inline, 1: all (default). The\n"
