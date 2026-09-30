@@ -15,8 +15,8 @@
 #include <array>
 #include <atomic>
 #include <bit>
-#include <cinttypes>
 #include <chrono>
+#include <cinttypes>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -28,7 +28,12 @@
 #include <mutex>
 #include <string>
 #include <shared_mutex>
+#include <thread>
 #include <vector>
+
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
@@ -1541,6 +1546,36 @@ bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noex
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
 }
 
+uint64_t WaitForTransientUnmap(uint64_t fault_vaddr) noexcept {
+	return TransientUnmapWindows::Wait(fault_vaddr);
+}
+
+// The host replaces a mapping with an unmap followed by a map, which a guest access can fall
+// between; a remap is atomic to the guest on the console, so the access is retried until the new
+// mapping is in place.
+bool RetryTransientUnmapFault(uint64_t fault_vaddr, uint64_t window) noexcept {
+	// A page that keeps faulting after it was mapped again is a real access violation.
+	constexpr uint32_t    MaxRetries  = 16;
+	thread_local uint64_t last_page   = 0;
+	thread_local uint64_t last_window = 0;
+	thread_local uint32_t retries     = 0;
+	const auto            page        = fault_vaddr & ~uint64_t {0x3fff};
+	retries     = (page == last_page && window == last_window ? retries + 1 : 1);
+	last_page   = page;
+	last_window = window;
+	if (retries > MaxRetries) {
+		return false;
+	}
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+		std::printf("Memory: retried a guest access to 0x%016" PRIx64
+		            " made while its mapping was being replaced\n",
+		            fault_vaddr);
+		std::fflush(stdout);
+	}
+	return true;
+}
+
 struct PrtAperture {
 	uint64_t address = 0;
 	uint64_t size    = 0;
@@ -2921,6 +2956,10 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 		EXIT("unknown prot: %d\n", prot);
 	}
 
+	// Guest threads may use a mapping that MAP_FIXED replaces: until the new one is in place,
+	// their faults wait and are retried.
+	std::optional<TransientUnmapWindows::Scope> replacing;
+
 	auto     in_addr         = reinterpret_cast<uint64_t>(*addr_in_out);
 	uint64_t out_addr        = 0;
 	bool     reserved_target = false;
@@ -2941,6 +2980,9 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 			UnmapGpuRange(in_addr, len);
 			reserved_target = true;
 			out_addr        = in_addr;
+		}
+		if (!reserved_target) {
+			replacing.emplace(in_addr, in_addr + len);
 		}
 		if (!reserved_target && ReplaceFixedRangeWithReserved(in_addr, len)) {
 			reserved_target = true;
@@ -3675,6 +3717,10 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		return KERNEL_ERROR_ENOMEM;
 	}
 
+	// Guest threads may use a mapping that MAP_FIXED replaces: until the new one is in place,
+	// their faults wait and are retried.
+	std::optional<TransientUnmapWindows::Scope> replacing;
+
 	auto     in_addr         = reinterpret_cast<uint64_t>(*addr);
 	uint64_t out_addr        = 0;
 	bool     shared_backing  = false;
@@ -3772,6 +3818,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 				reserved_target = true;
 			}
 			if (!reserved_target) {
+				replacing.emplace(in_addr, in_addr + len);
 				const auto begin = CostNowNs();
 				reserved_target  = ReplaceFixedRangeWithReserved(in_addr, len);
 				t_replace_ns += CostNowNs() - begin;

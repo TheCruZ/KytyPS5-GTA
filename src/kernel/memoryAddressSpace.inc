@@ -657,6 +657,12 @@ public:
 				t_splits++;
 			}
 		} split_cost {split_begin, left_size + right_size};
+		// The parts that stay mapped vanish until they are mapped again (see
+		// TransientUnmapWindows), and come back with the view's protection: give them back their
+		// own (guest mprotect, GPU write and read tracking) before faults there are retried.
+		const auto                   kept_protections = SnapshotProtections(old, vaddr, size);
+		const uint64_t               old_end          = old.vaddr + old.size;
+		TransientUnmapWindows::Scope transient(old.vaddr, old_end);
 		if (UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
 			bool ok = true;
 			if (left_size != 0 && left_size != old.size) {
@@ -681,6 +687,7 @@ public:
 				ok = mapped && ok;
 			}
 			if (ok) {
+				RestoreProtections(kept_protections);
 				if (placeholder_preserved != nullptr) {
 					*placeholder_preserved = true;
 				}
@@ -697,6 +704,7 @@ public:
 			                    MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) == 0);
 			EXIT_IF(!MapFixed(old.vaddr, old.size, old.backing_offset, old.mode));
 			g_remapped_views.emplace_back(old.vaddr, old.size);
+			RestoreProtections(kept_protections);
 			return false;
 		}
 		DiagLockGuard lock(m_mutex, __func__);
@@ -916,6 +924,53 @@ private:
 	static bool ApplyProtection(void* ptr, uint64_t size, VirtualMemory::Mode mode) {
 		DWORD old_protect = 0;
 		return VirtualProtect(ptr, size, GetProtect(mode), &old_protect) != 0;
+	}
+
+	struct KeptProtection {
+		uint64_t vaddr   = 0;
+		uint64_t size    = 0;
+		DWORD    protect = 0;
+	};
+
+	// The protections, other than the view's own, of the parts of a view that stay mapped when
+	// [vaddr, vaddr + size) is unmapped from it.
+	static std::vector<KeptProtection> SnapshotProtections(const MapEntry& view, uint64_t vaddr,
+	                                                       uint64_t size) {
+		std::vector<KeptProtection> kept;
+		const auto                  view_protect = GetProtect(view.mode);
+		for (const auto& [start, end]:
+		     {std::pair {view.vaddr, vaddr}, std::pair {vaddr + size, view.vaddr + view.size}}) {
+			for (auto current = start; current < end;) {
+				MEMORY_BASIC_INFORMATION info {};
+				if (VirtualQuery(reinterpret_cast<const void*>(current), &info, sizeof(info)) == 0) {
+					break;
+				}
+				const auto region_end =
+				    std::min(end, reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize);
+				if (region_end <= current) {
+					break;
+				}
+				if (info.State == MEM_COMMIT && info.Protect != view_protect) {
+					kept.push_back({current, region_end - current, info.Protect});
+				}
+				current = region_end;
+			}
+		}
+		return kept;
+	}
+
+	static void RestoreProtections(const std::vector<KeptProtection>& kept) {
+		for (const auto& part: kept) {
+			DWORD old_protect = 0;
+			if (VirtualProtect(reinterpret_cast<void*>(part.vaddr), part.size, part.protect,
+			                   &old_protect) == 0) {
+				LOGF_COLOR(Log::Color::Red,
+				           "\t view split: protection 0x%lx of [0x%016" PRIx64 ", 0x%016" PRIx64
+				           ") not restored, error=0x%08" PRIx32 "\n",
+				           static_cast<unsigned long>(part.protect), part.vaddr,
+				           part.vaddr + part.size, static_cast<uint32_t>(GetLastError()));
+			}
+		}
 	}
 
 	static bool SplitPlaceholder(uint64_t vaddr, uint64_t size) {
