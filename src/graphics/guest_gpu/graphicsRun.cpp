@@ -736,6 +736,7 @@ GpuOperation CommandProcessor::MakeOperation(GpuOperationKind kind) {
 	operation.submit_id     = m_submit_id;
 	operation.num_instances = m_num_instances;
 	operation.queue         = DrawPrepQueue();
+	operation.after_wait    = std::exchange(m_wait_since_operation, false);
 	if (m_pipeline == nullptr) {
 		operation.state = {&m_ctx, &m_ucfg, &m_sh_ctx};
 	} else if (kind == GpuOperationKind::Callback) {
@@ -826,6 +827,13 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 		DrawPrep::SetCurrent(operation.prep_key);
 	} else if (operation.kind != GpuOperationKind::Callback) {
 		DrawPrep::ClearCurrent();
+	}
+	if (operation.after_wait || (operation.kind != GpuOperationKind::DrawIndex &&
+	                             operation.kind != GpuOperationKind::DrawAuto &&
+	                             operation.kind != GpuOperationKind::DrawIndirect)) {
+		// A label, interrupt, flip, wait or host command lets the guest overwrite what earlier
+		// draws read.
+		m_renderer.GetRenderExecutor().EndDrawWindow();
 	}
 	switch (operation.kind) {
 		case GpuOperationKind::DrawIndex: ExecuteDrawIndex(operation, operation.draw_index); break;
@@ -985,6 +993,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
+	m_wait_since_operation = true;
 	if (!TestWaitRegMemValue(ReadDecisionValue<T>(addr), ref, mask, func)) {
 		SuspendPm4();
 	}

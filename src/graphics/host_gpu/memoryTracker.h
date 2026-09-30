@@ -66,6 +66,15 @@ public:
 		}
 		return false;
 	}
+	// The CPU-dirty epoch of the tracking region `index` (address / TRACKER_REGION_SIZE), which
+	// advances whenever its pages become CPU dirty; 0 while the region is untracked.
+	[[nodiscard]] uint64_t RegionCpuDirtyEpoch(uint64_t index) const {
+		if (index >= REGION_COUNT) {
+			EXIT("invalid memory tracker region\n");
+		}
+		const auto* manager = m_regions[index].load(std::memory_order_acquire);
+		return manager != nullptr ? manager->RegionCpuDirtyEpoch() : 0;
+	}
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);

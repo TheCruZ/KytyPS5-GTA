@@ -148,19 +148,6 @@ public:
 		m_cpu_written.Fill();
 		m_writable.Fill();
 		m_readable.Fill();
-		s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
-	}
-
-	// Advances whenever pages of any region become CPU dirty: while it is unchanged, no page
-	// was dirtied since a synchronization that started after reading it.
-	[[nodiscard]] static uint64_t CpuDirtyEpoch() {
-		return s_cpu_dirty_epoch.load(std::memory_order_acquire);
-	}
-
-	// Advances, after the pages change under the lock, whenever pages of this region become CPU
-	// dirty; a new region starts dirty at 1.
-	[[nodiscard]] uint64_t RegionCpuDirtyEpoch() const {
-		return m_cpu_dirty_epoch.load(std::memory_order_acquire);
 	}
 
 	KYTY_CLASS_NO_COPY(RegionManager);
@@ -264,6 +251,7 @@ public:
 			bits.SetRange(start, end);
 			StoreSummary<source>(true);
 			if constexpr (source == DirtySource::Cpu) {
+				m_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
 				g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
 			}
 		} else {
@@ -343,7 +331,6 @@ public:
 				StoreSummary<source>(false);
 			}
 			if constexpr (source == DirtySource::Cpu) {
-				m_has_cpu_dirty.store(m_cpu_dirty.Any(), std::memory_order_release);
 				UpdateProtection<true, false>();
 			} else {
 				UpdateProtection<false, true>();
@@ -393,6 +380,19 @@ public:
 		m_cpu_summary_bit  = bit;
 	}
 
+	// Whether any page holds CPU writes not yet uploaded. Read without the lock: a concurrent
+	// CPU write that is not observed yet is equivalent to one that lands after the read.
+	[[nodiscard]] bool HasCpuDirty() const noexcept { return MaybeModified<DirtySource::Cpu>(); }
+
+	// Advances whenever pages of this region become CPU dirty; a new region starts dirty at 1.
+	[[nodiscard]] uint64_t RegionCpuDirtyEpoch() const {
+		return m_cpu_dirty_epoch.load(std::memory_order_acquire);
+	}
+
+	// Whether any page is GPU dirty, i.e. read protected. Read without the lock: a stale answer
+	// only chooses between a plain read and a checked one.
+	[[nodiscard]] bool HasGpuDirty() const noexcept { return MaybeModified<DirtySource::Gpu>(); }
+
 	TrackingSpinLock lock;
 
 private:
@@ -441,9 +441,6 @@ private:
 			return;
 		}
 		previous = protection;
-		if constexpr (is_read) {
-			m_has_gpu_dirty.store(m_gpu_dirty.Any(), std::memory_order_release);
-		}
 		m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, mask);
 	}
 
@@ -508,6 +505,9 @@ private:
 	RegionBits   m_readable;
 	RegionBits   m_read_lift;
 	std::unique_ptr<HotState> m_hot;
+	// Advances, after the pages change under the lock, whenever pages of this region become CPU
+	// dirty; a new region starts dirty at 1.
+	std::atomic<uint64_t> m_cpu_dirty_epoch {1};
 };
 
 } // namespace Libs::Graphics
