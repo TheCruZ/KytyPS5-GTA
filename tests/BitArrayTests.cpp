@@ -294,6 +294,20 @@ void TestTrackerSizedRandomizedDifferential() {
     }
     Check(expected == reference.size(),
           "tracker-sized randomized iterator omitted a run");
+
+    for (size_t query = 0; query < 16; query++) {
+      const auto begin = static_cast<size_t>(next_random() % reference.size());
+      const auto end = begin + static_cast<size_t>(
+                                   next_random() % (reference.size() - begin + 1));
+      bool any = false;
+      for (auto index = begin; index < end; index++) {
+        any |= reference[index];
+      }
+      Check(bits.AnyInRange(begin, end) == any,
+            "tracker-sized AnyInRange diverged");
+      Check(TrackerBits(bits, begin, end).Any() == any,
+            "tracker-sized masked copy diverged");
+    }
   }
 }
 

@@ -505,6 +505,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	if (rendering.color_count != 0) {
 		dynamic_states.push_back(vk::DynamicState::eColorWriteEnableEXT);
 	}
+	// Draws set the bounds: deferred lights test each light's depth range, which made a pipeline
+	// per light (nine in ten graphics pipelines GTA V created were such bound variants).
+	dynamic_states.push_back(vk::DynamicState::eDepthBounds);
 #endif
 	if (graphics.attachment_feedback_loop_enabled) {
 		dynamic_states.push_back(vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);

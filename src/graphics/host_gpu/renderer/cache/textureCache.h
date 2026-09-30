@@ -12,7 +12,9 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <array>
 #include <map>
+#include <memory>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -53,7 +55,9 @@ public:
 	                                               bool ensure_valid = true);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
-	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
+	// stencil (optional) receives the stencil association the target refreshed, if any.
+	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc,
+	                                            ImageId* stencil = nullptr);
 	[[nodiscard]] Image&        GetImage(ImageId id) {
 		auto& image = m_slot_images[id];
 		TouchImage(image);
@@ -176,7 +180,9 @@ private:
 	void               CopyImage(ImageId destination, ImageId source);
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
-	void ValidateImageDesc(const ImageDesc& desc) const;
+	// Validates the view and binding of a description; ImageOps::Validate() checks its image
+	// information.
+	void ValidateImageViewDesc(const ImageDesc& desc) const;
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
@@ -205,6 +211,21 @@ private:
 	mutable uint32_t m_image_query_epoch      = 0;
 	uint64_t         m_image_set_epoch        = 0;
 	bool             m_readback_linear_images = false;
+	// Lookups that found an existing image with the same backing, by description: while no image
+	// on the pages of the range was registered or unregistered since, the same lookup finds the
+	// same image.
+	struct ExactLookup {
+		ImageInfo info;
+		ImageId   id;
+		uint64_t  epoch        = 0;
+		bool      exact_format = false;
+		bool      valid        = false;
+	};
+	static constexpr size_t                                   ExactLookupWays = 1024;
+	std::unique_ptr<std::array<ExactLookup, ExactLookupWays>> m_exact_lookups =
+	    std::make_unique<std::array<ExactLookup, ExactLookupWays>>();
+	[[nodiscard]] static size_t ExactLookupSlot(const ImageInfo& info) noexcept;
+	[[nodiscard]] uint64_t      ImageEpochInRegionUnlocked(uint64_t address, uint64_t size) const;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

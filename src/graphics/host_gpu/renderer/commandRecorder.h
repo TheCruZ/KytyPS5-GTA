@@ -427,6 +427,13 @@ public:
 		}
 		m_stream->Record([=](vk::CommandBuffer c) { c.setDepthBias(constant, clamp, slope); });
 	}
+	void setDepthBounds(float min_bounds, float max_bounds) const {
+		if (m_stream == nullptr) {
+			m_direct.setDepthBounds(min_bounds, max_bounds);
+			return;
+		}
+		m_stream->Record([=](vk::CommandBuffer c) { c.setDepthBounds(min_bounds, max_bounds); });
+	}
 	void setStencilTestEnable(vk::Bool32 enable) const {
 		if (m_stream == nullptr) {
 			m_direct.setStencilTestEnable(enable);

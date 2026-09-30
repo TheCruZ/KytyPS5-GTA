@@ -1233,22 +1233,40 @@ bool FlipQueue::Flip(uint32_t micros) {
 	m_processing = true;
 	m_mutex.Unlock();
 
-	// Lock each port in bus order, then present and complete the whole group at one Vblank.
+	// Lock each port in bus order to decide, present the whole group at one Vblank without the
+	// port locks (the frames belong to the presenter, and a GPU flip of the execution thread
+	// waits for a port lock: presenting can take milliseconds), then lock the ports again to
+	// complete the group. A port closed meanwhile keeps its requests for Cancel, which waits for
+	// this flip.
 	std::sort(requests.begin(), requests.begin() + count,
 	          [](const auto& a, const auto& b) { return a.cfg->bus < b.cfg->bus; });
-	bool due = true;
+	const auto lock_ports = [&] {
+		bool current = true;
+		for (size_t i = 0; i < count; i++) {
+			auto& r = requests[i];
+			r.cfg->mutex.Lock();
+			current &= r.cfg->opened && !r.cfg->closing && r.cfg->generation == r.generation;
+		}
+		return current;
+	};
+	const auto unlock_ports = [&] {
+		for (size_t i = count; i != 0; i--) {
+			requests[i - 1].cfg->mutex.Unlock();
+		}
+	};
+	bool due = lock_ports();
 	std::array<Graphics::Presenter::Layer, VideoOutDriver::Impl::VIDEO_OUT_BUSES.size()> layers {};
 	for (size_t i = 0; i < count; i++) {
 		auto& r = requests[i];
-		r.cfg->mutex.Lock();
-		due &= r.cfg->opened && !r.cfg->closing && r.cfg->generation == r.generation;
 		if (r.id == group) {
 			due &= IsFlipDueLocked(*r.cfg, r.generation);
 		}
 		layers[i] = {r.frame, r.cfg->bus, r.premultiplied_alpha};
 	}
 	if (due) {
+		unlock_ports();
 		m_presenter.Present(std::span(layers.data(), count));
+		due = lock_ports();
 	}
 
 	m_mutex.Lock();
@@ -1277,9 +1295,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 	m_done_cond_var.SignalAll();
 	m_submit_slot_cond_var.SignalAll();
 	m_mutex.Unlock();
-	for (size_t i = count; i != 0; i--) {
-		requests[i - 1].cfg->mutex.Unlock();
-	}
+	unlock_ports();
 	if (due) {
 		Graphics::RenderDocOnGuestFlip(m_presenter.Renderer());
 		if (Config::GraphicsDebugDumpEnabled() &&

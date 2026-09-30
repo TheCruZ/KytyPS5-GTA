@@ -189,6 +189,24 @@ public:
 		    });
 	}
 
+	// The backing alias of a range that one mapping holds, or null. The alias stays mapped for
+	// the store's lifetime, so the pointer can be read later, even after the guest range changed.
+	const uint8_t* FindBackingPointer(uint64_t vaddr, uint64_t size) {
+		const uint8_t* result = nullptr;
+		bool           split  = false;
+		if (!TryTransferBacking(vaddr, size,
+		                        [&](uint8_t* backing, uint64_t data_offset, size_t bytes) {
+			                        if (data_offset == 0 && bytes == size) {
+				                        result = backing;
+			                        } else {
+				                        split = true;
+			                        }
+		                        })) {
+			return nullptr;
+		}
+		return split ? nullptr : result;
+	}
+
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
@@ -796,6 +814,10 @@ public:
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
+	}
+
+	const uint8_t* FindBackingPointer(uint64_t vaddr, uint64_t size) {
+		return m_backing->FindBackingPointer(vaddr, size);
 	}
 
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {

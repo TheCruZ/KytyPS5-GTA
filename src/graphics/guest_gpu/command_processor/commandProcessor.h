@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -224,15 +225,19 @@ private:
 	struct SnapshotRing {
 		static constexpr size_t Size = 512;
 		struct alignas(64) Slot {
-			T value;
+			T        value;
+			uint64_t id = 0;
 		};
 		std::unique_ptr<Slot[]>     slots;
 		std::unique_ptr<uint64_t[]> last_use;
 		size_t                      current = Size;
 		size_t                      next    = 0;
 	};
+	// Numbers the snapshots of every ring of every processor: ids never repeat.
+	static inline std::atomic_uint64_t s_snapshot_ids {0};
 	template <typename T>
-	const T* Snapshot(SnapshotRing<T>& ring, const T& live, bool& dirty, uint64_t sequence);
+	const T* Snapshot(SnapshotRing<T>& ring, const T& live, bool& dirty, uint64_t sequence,
+	                  uint64_t* id = nullptr);
 
 	RenderContext& m_renderer;
 	GuestGpu*      m_pipeline = nullptr;
@@ -269,6 +274,8 @@ private:
 	FlipInfo m_flip;
 	uint64_t m_submit_id      = 0;
 	bool     m_predicate_skip = false;
+	// A WAIT_REG_MEM was processed since the last operation was made.
+	bool m_wait_since_operation = false;
 
 	// State of the execution side, on cache lines of its own.
 	alignas(64) uint64_t m_synthetic_occlusion_counter = 0;
