@@ -119,6 +119,8 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
       m_stream(&m_chunk_queue), m_command(*this, deferred_recording ? &m_stream : nullptr),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
 	if (m_deferred) {
+		m_host_copies = std::make_unique<HostCopyQueue>(
+		    [] { Config::ConfigureGpuStageThread(Config::GpuStageThread::HostCopy); });
 		m_recording_thread = std::jthread([this] { RecordingThread(); });
 	}
 }
@@ -244,6 +246,29 @@ void CommandScheduler::PopPendingOperations() {
 	// Every draw and dispatch comes here: only query the timeline semaphore (a driver call) when
 	// the oldest operation is not already known to be free.
 	bool refreshed = false;
+	// Without the lock: nothing pending, or the oldest operation is not done and the timeline
+	// was queried a few calls ago. Pending operations only free resources and complete host
+	// work, so finding them some microseconds later costs nothing, while a query per draw is a
+	// driver call per draw.
+	if (const auto front = m_pending_front_tick.load(std::memory_order_acquire);
+	    front == UINT64_MAX) {
+		return;
+	} else if (!m_master.IsFree(front)) {
+		constexpr uint32_t RefreshInterval = 8;
+		// Draws come from the execution thread: no locked instruction needed (a racing caller at
+		// worst queries once more or once less).
+		if (const auto skips = m_pending_skips.load(std::memory_order_relaxed) + 1;
+		    skips < RefreshInterval) {
+			m_pending_skips.store(skips, std::memory_order_relaxed);
+			return;
+		}
+		m_pending_skips.store(0, std::memory_order_relaxed);
+		m_master.Refresh();
+		refreshed = true;
+		if (!m_master.IsFree(front)) {
+			return;
+		}
+	}
 	for (;;) {
 		PendingOperation operation;
 		{
@@ -263,18 +288,75 @@ void CommandScheduler::PopPendingOperations() {
 			}
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
+			m_pending_front_tick.store(m_pending_operations.empty()
+			                               ? UINT64_MAX
+			                               : m_pending_operations.front().tick,
+			                           std::memory_order_release);
 		}
 		WaitPriorityOperations(operation.tick);
 		RunOperation(std::move(operation.callback));
 	}
 }
 
-void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) {
+void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation, uint64_t address,
+                                      uint64_t size) {
+	QueueOperation(TrackGuestOperation(std::move(operation), address, size));
+}
+
+void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation,
+                                              uint64_t address, uint64_t size) {
+	QueuePriorityOperation(TrackGuestOperation(std::move(operation), address, size));
+}
+
+void CommandScheduler::DeferHostOperation(Common::UniqueFunction<void>&& operation,
+                                          bool                           priority) {
+	if (priority) {
+		QueuePriorityOperation(std::move(operation));
+	} else {
+		QueueOperation(std::move(operation));
+	}
+}
+
+Common::UniqueFunction<void>
+CommandScheduler::TrackGuestOperation(Common::UniqueFunction<void>&& operation, uint64_t address,
+                                      uint64_t size) {
+	EXIT_IF(!operation);
+	uint64_t id = 0;
+	{
+		std::lock_guard lock(m_guest_writes_mutex);
+		id = ++m_next_guest_write;
+		m_guest_writes.push_back(
+		    {id, address, size > UINT64_MAX - address ? UINT64_MAX : address + size});
+	}
+	return [this, id, operation = std::move(operation)]() mutable {
+		operation();
+		std::lock_guard lock(m_guest_writes_mutex);
+		// Operations mostly complete in the order they were queued.
+		const auto it = std::find_if(m_guest_writes.begin(), m_guest_writes.end(),
+		                             [id](const GuestWrite& write) { return write.id == id; });
+		EXIT_IF(it == m_guest_writes.end());
+		m_guest_writes.erase(it);
+	};
+}
+
+bool CommandScheduler::HasPendingGuestOperations(uint64_t address, uint64_t size) {
+	const auto      end = size > UINT64_MAX - address ? UINT64_MAX : address + size;
+	std::lock_guard lock(m_guest_writes_mutex);
+	return std::any_of(m_guest_writes.begin(), m_guest_writes.end(), [&](const GuestWrite& write) {
+		return write.begin < end && address < write.end;
+	});
+}
+
+void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation) {
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
 		m_pending_operations.push({std::move(operation), CurrentTick()});
+		if (m_pending_operations.size() == 1) {
+			m_pending_front_tick.store(m_pending_operations.front().tick,
+			                           std::memory_order_release);
+		}
 		return;
 	}
 	if (g_deferred_callback_scheduler == this) {
@@ -288,7 +370,7 @@ void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) 
 	operation();
 }
 
-void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
+void CommandScheduler::QueuePriorityOperation(Common::UniqueFunction<void>&& operation) {
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
@@ -344,6 +426,7 @@ void CommandScheduler::DrainPriorityOperations() {
 	m_operation_available.wait(
 	    lock, [this] { return m_priority_operations.empty() && !m_priority_active; });
 }
+
 
 void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	EXIT_IF(g_deferred_callback_scheduler == this);
@@ -414,6 +497,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		*recorded      = debug;
 		recorded->info = submit;
 		recorded->tick = tick;
+		recorded->host_copies = m_host_copies != nullptr ? m_host_copies->Flush() : 0;
 		m_stream.Publish();
 		m_command.m_open = false;
 		return tick;
@@ -496,6 +580,10 @@ void CommandScheduler::SubmitRecorded(vk::CommandBuffer& buffer, size_t buffer_i
 		EXIT_NOT_IMPLEMENTED(buffer.end() != vk::Result::eSuccess);
 	}
 	// A submission without commands still signals its tick.
+	// The command buffer reads the stream data the execution thread's copies write.
+	if (m_host_copies != nullptr) {
+		m_host_copies->WaitFor(recorded.host_copies);
+	}
 	auto submit = recorded.info;
 	QueueSubmit(buffer, submit, recorded.tick, recorded);
 	if (buffer != nullptr) {

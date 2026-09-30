@@ -18,6 +18,17 @@ inline constexpr bool depth_htile_stencil_acceleration_compatible(bool has_stenc
 	return !has_stencil || htile_stencil_disabled || has_htile;
 }
 
+struct RenderDepthInfo;
+namespace HW {
+class Context;
+} // namespace HW
+
+// Whether the registers ask for a depth/stencil target at all.
+[[nodiscard]] bool DepthStencilTargetWanted(const HW::Context& hw);
+// The depth/stencil test state of a draw (dynamic state, not the target): test, write and compare
+// controls, depth bounds and stencil operations.
+void ApplyDepthStencilTestState(const HW::Context& hw, RenderDepthInfo& r);
+
 struct RenderDepthInfo {
 	// Discovery keeps guest image information but can remap the view into a larger cache image.
 	TextureCache::ImageDesc     desc;

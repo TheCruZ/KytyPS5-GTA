@@ -103,6 +103,9 @@ public:
 	                                                bool allow_wait = true);
 	void                                        Commit();
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
+	// Advances whenever Map() wraps around to the start: data committed in the current lap stays
+	// in place until it changes.
+	[[nodiscard]] uint64_t Lap() const noexcept { return m_lap; }
 
 private:
 	friend struct StreamBufferTestAccess;
@@ -121,6 +124,7 @@ private:
 
 	uint64_t              m_offset      = 0;
 	uint64_t              m_mapped_size = 0;
+	uint64_t              m_lap         = 0;
 	std::vector<Watch>    m_current_watches;
 	size_t                m_current_watch_cursor = 0;
 	std::optional<size_t> m_invalidation_mark;

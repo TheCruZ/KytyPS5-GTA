@@ -24,9 +24,11 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
@@ -957,16 +959,38 @@ void WindowContext::UpdateTitle() {
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
 
-	struct TitleUpdate {
-		SDL_Window*  window;
-		std::string* text;
-	} update {window, &text};
-	EXIT_IF(!SDL_RunOnMainThread(
-	    [](void* data) {
-		    auto& title = *static_cast<TitleUpdate*>(data);
-		    SDL_SetWindowTitle(title.window, title.text->c_str());
+	// The presentation thread must not wait for the main thread (it may be busy for a while):
+	// leave the newest title in a mailbox and post an update only when none is pending.
+	struct TitleMailbox {
+		std::mutex        mutex;
+		std::string       text;
+		SDL_Window*       window = nullptr;
+		std::atomic<bool> pending {false};
+	};
+	static TitleMailbox mailbox;
+	{
+		std::lock_guard lock(mailbox.mutex);
+		mailbox.text.swap(text);
+		mailbox.window = window;
+	}
+	if (mailbox.pending.exchange(true, std::memory_order_acq_rel)) {
+		return;
+	}
+	const bool posted = SDL_RunOnMainThread(
+	    [](void* /*data*/) {
+		    std::string title;
+		    SDL_Window* target = nullptr;
+		    {
+			    std::lock_guard lock(mailbox.mutex);
+			    // A newer title written after this point posts its own update.
+			    mailbox.pending.store(false, std::memory_order_release);
+			    title  = mailbox.text;
+			    target = mailbox.window;
+		    }
+		    SDL_SetWindowTitle(target, title.c_str());
 	    },
-	    &update, true));
+	    nullptr, false);
+	EXIT_IF(!posted);
 }
 
 } // namespace Libs::Graphics

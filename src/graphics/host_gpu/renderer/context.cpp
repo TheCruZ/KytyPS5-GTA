@@ -30,6 +30,8 @@ CommandRecorder CommandBuffer::Handle() const {
 
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
+	// A new Vulkan command buffer starts without dynamic state.
+	m_dynamic_state.valid = false;
 	if (m_stream != nullptr) {
 		// The recording thread begins its Vulkan command buffer when it replays commands.
 		return;
