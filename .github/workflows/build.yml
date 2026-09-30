@@ -4,6 +4,8 @@ on:
   workflow_dispatch:
   push:
     branches: [ main, master ]
+    # KytyPS5-GTA: pushing a v* tag (v1, v2, ...) publishes a fork release.
+    tags: [ 'v*' ]
   pull_request:
 
 concurrency:
@@ -27,7 +29,11 @@ jobs:
         id: release_tag
         shell: bash
         run: |
-          echo "value=KytyPS5-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REPOSITORY" != "KytyPS5/KytyPS5" && "$GITHUB_REF_TYPE" == "tag" ]]; then
+            echo "value=KytyPS5-GTA-$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=KytyPS5-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
 
   windows:
     name: Build KytyPS5 (Windows)
@@ -435,7 +441,8 @@ jobs:
     if: >-
       always() &&
       github.event_name == 'push' &&
-      github.repository == 'KytyPS5/KytyPS5' &&
+      ((github.repository == 'KytyPS5/KytyPS5' && github.ref_type == 'branch') ||
+       (github.repository != 'KytyPS5/KytyPS5' && startsWith(github.ref, 'refs/tags/v'))) &&
       (needs.windows.result == 'success' ||
        needs.macos.result == 'success' ||
        needs.linux.result == 'success')
@@ -445,6 +452,8 @@ jobs:
       contents: write
     env:
       RELEASE_NAME: ${{ needs.metadata.outputs.release_tag }}
+      # Fork releases attach to the pushed v* tag; official ones create a dated tag.
+      RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || needs.metadata.outputs.release_tag }}
 
     steps:
       - name: Download Windows build
@@ -514,12 +523,12 @@ jobs:
             fi
           done
           test "${#assets[@]}" -gt 0
-          if gh release view "$RELEASE_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release upload "$RELEASE_NAME" "${assets[@]}" \
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" \
               --clobber \
               --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$RELEASE_NAME" "${assets[@]}" \
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
               --generate-notes \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
