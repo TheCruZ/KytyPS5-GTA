@@ -237,6 +237,19 @@ public:
 		m_released_ranges.Clear();
 		m_record_released = true;
 	}
+	// Advances whenever recorded work may write cached buffers (written bindings, fills, copies,
+	// device-address stores).
+	[[nodiscard]] uint64_t GpuWriteGeneration() const noexcept { return m_gpu_write_generation; }
+	// Advances whenever a page of the range becomes CPU dirty (see
+	// MemoryTracker::RegionCpuDirtyEpoch); pages that stay CPU dirty do not advance it.
+	[[nodiscard]] uint64_t CpuDirtyEpoch(uint64_t vaddr, uint64_t size) const {
+		uint64_t epoch = 0;
+		for (auto index = vaddr / TRACKER_REGION_SIZE; index * TRACKER_REGION_SIZE < vaddr + size;
+		     index++) {
+			epoch += m_memory_tracker.RegionCpuDirtyEpoch(index);
+		}
+		return epoch;
+	}
 
 private:
 	// Shared buffers (KYTY_SHARED_BUFFERS=1): a small buffer the game threads keep reading back is
@@ -482,6 +495,34 @@ private:
 	StreamBuffer                                       m_device_buffer;
 	TextureCache&                                      m_texture_cache;
 	uint64_t                                           m_total_used_memory = 0;
+	uint64_t                                           m_gpu_write_generation = 0;
+	// Advances whenever a buffer is registered or unregistered.
+	uint64_t m_buffer_set_epoch = 0;
+	// The buffer a read-only binding of a range found, while no buffer was registered or
+	// unregistered and no page of the range became CPU dirty since (see ObtainBuffer()).
+	struct ObtainMemo {
+		uint64_t vaddr        = 0;
+		uint64_t size         = 0;
+		uint64_t buffer_epoch = 0;
+		uint64_t cpu_epoch    = 0;
+		uint64_t offset       = 0;
+		BufferId id;
+	};
+	// The stream copy a range got within the current draw window (see ObtainBuffer()).
+	struct StreamMemo {
+		uint64_t vaddr            = 0;
+		uint64_t size             = 0;
+		uint64_t window           = UINT64_MAX;
+		uint64_t lap              = 0;
+		uint64_t write_generation = 0;
+		uint64_t offset           = 0;
+	};
+	static constexpr size_t                                  StreamMemoSlots = 1024;
+	std::unique_ptr<std::array<StreamMemo, StreamMemoSlots>> m_stream_memo =
+	    std::make_unique<std::array<StreamMemo, StreamMemoSlots>>();
+	static constexpr size_t                                  ObtainMemoSlots = 4096;
+	std::unique_ptr<std::array<ObtainMemo, ObtainMemoSlots>> m_obtain_memo =
+	    std::make_unique<std::array<ObtainMemo, ObtainMemoSlots>>();
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;

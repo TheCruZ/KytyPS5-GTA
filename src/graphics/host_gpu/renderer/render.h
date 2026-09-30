@@ -183,6 +183,11 @@ private:
 class RenderExecutor {
 public:
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
+	// A draw window is the run of draws executed since the last other operation (a label,
+	// interrupt, flip, host command or a WAIT_REG_MEM): the guest cannot have overwritten what
+	// those draws read, as it learns the GPU consumed it only through such an operation.
+	[[nodiscard]] uint64_t DrawWindow() const noexcept { return m_draw_window; }
+	void                   EndDrawWindow() noexcept { m_draw_window++; }
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
@@ -348,6 +353,7 @@ private:
 	uint32_t                                m_mesh_indirect_next = 0;
 	std::vector<TableResolution>          m_table_resolutions;
 	uint64_t                              m_table_resolution_tick = 0;
+	uint64_t                              m_draw_window           = 0;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

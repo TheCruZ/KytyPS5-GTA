@@ -50,6 +50,31 @@ public:
 	[[nodiscard]] bool IsRangeCpuCleanHint(uint64_t vaddr, uint64_t size) const noexcept;
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// Whether a page of the tracking regions the range touches may be GPU dirty, without taking
+	// their locks: false means the range can be read directly.
+	[[nodiscard]] bool MayBeGpuModified(uint64_t vaddr, uint64_t size) const {
+		if (size == 0 || size > TRACKER_ADDRESS_SIZE || vaddr > TRACKER_ADDRESS_SIZE - size) {
+			return true;
+		}
+		const auto last = (vaddr + size - 1) / TRACKER_REGION_SIZE;
+		for (auto index = vaddr / TRACKER_REGION_SIZE; index <= last && index < REGION_COUNT;
+		     index++) {
+			const auto* manager = m_regions[index].load(std::memory_order_acquire);
+			if (manager != nullptr && manager->HasGpuDirty()) {
+				return true;
+			}
+		}
+		return false;
+	}
+	// The CPU-dirty epoch of the tracking region `index` (address / TRACKER_REGION_SIZE), which
+	// advances whenever its pages become CPU dirty; 0 while the region is untracked.
+	[[nodiscard]] uint64_t RegionCpuDirtyEpoch(uint64_t index) const {
+		if (index >= REGION_COUNT) {
+			EXIT("invalid memory tracker region\n");
+		}
+		const auto* manager = m_regions[index].load(std::memory_order_acquire);
+		return manager != nullptr ? manager->RegionCpuDirtyEpoch() : 0;
+	}
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);

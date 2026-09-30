@@ -136,6 +136,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		const auto [it, inserted] = m_buffers.emplace(buffer.CpuAddress(), id);
 		(void)it;
 		EXIT_IF(!inserted);
+		m_buffer_set_epoch++;
 		m_total_used_memory += buffer.Size();
 		g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
 		buffer.lru_id = m_lru_cache.Insert(id, LruClock());
@@ -151,6 +152,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		const auto found = m_buffers.find(buffer.CpuAddress());
 		EXIT_IF(found == m_buffers.end() || found->second != id);
 		m_buffers.erase(found);
+		m_buffer_set_epoch++;
 		EXIT_IF(buffer.Size() > m_total_used_memory);
 		m_total_used_memory -= buffer.Size();
 		m_lru_cache.Free(buffer.lru_id);
@@ -1739,6 +1741,17 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	return handle;
 }
 
+namespace {
+// Backing reads mostly hit the per-thread mapping cache; sparse ranges with holes or private
+// mappings take the full copy.
+void StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t size) {
+	if (!LibKernel::Memory::TryReadBacking(vaddr, destination, size) &&
+	    !LibKernel::Memory::CopySparseMemory(vaddr, destination, size)) {
+		EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+	}
+}
+} // namespace
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id, bool needs_device_address) {
@@ -1747,18 +1760,58 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
 
-	if (!is_written && size <= CACHING_PAGESIZE && !IsShared(vaddr, size) &&
-	    (!needs_device_address || m_stream_buffer.HasDeviceAddress()) &&
-	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+	// Draws stream the same small buffers (frame and pass constants) again and again. Within a
+	// draw window the guest cannot have written them since the last copy, so draws share it while
+	// it is in the stream buffer and no work wrote cached buffers. A copy made in the window
+	// answers before the CPU-dirty checks: it was made from CPU-dirty pages that the guest has not
+	// written since, and GPU writes advance the generation (or show in the GPU-dirty check).
+	const bool  small_read = !is_written && size <= CACHING_PAGESIZE && !IsShared(vaddr, size) &&
+	                        (!needs_device_address || m_stream_buffer.HasDeviceAddress());
+	StreamMemo* stream     = nullptr;
+	uint64_t    window     = 0;
+	if (small_read && !m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+		window = m_scheduler.Context().GetRenderExecutor().DrawWindow();
+		stream = &(*m_stream_memo)[((vaddr ^ (size << 40u)) * 0x9e3779b97f4a7c15ull >> 32u) %
+		                           StreamMemoSlots];
+		if (stream->vaddr == vaddr && stream->size == size && stream->window == window &&
+		    stream->lap == m_stream_buffer.Lap() &&
+		    stream->write_generation == m_gpu_write_generation) {
+			return {&m_stream_buffer, stream->offset};
+		}
+	}
+
+	// Draws bind the same read-only ranges over and over. While the range stays in the same
+	// buffer and none of its pages became CPU dirty since a lookup found it clean (or uploaded
+	// it), the lookup finds the same buffer and has nothing to upload. The epoch is read before
+	// the dirty check: a page dirtied after it advances it.
+	const bool  plain_read = !is_written && !is_texel_buffer;
+	ObtainMemo* memo       = nullptr;
+	uint64_t    cpu_epoch  = 0;
+	if (plain_read) {
+		const auto hash = (vaddr ^ (size << 40u)) * 0x9e3779b97f4a7c15ull;
+		memo            = &(*m_obtain_memo)[(hash >> 32u) % ObtainMemoSlots];
+		cpu_epoch       = CpuDirtyEpoch(vaddr, size);
+		if (memo->vaddr == vaddr && memo->size == size &&
+		    memo->buffer_epoch == m_buffer_set_epoch && memo->cpu_epoch == cpu_epoch) {
+			auto& buffer = m_slot_buffers[memo->id];
+			TouchBuffer(buffer);
+			return {&buffer, memo->offset};
+		}
+	}
+
+	if (stream != nullptr && m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		if (mapped != nullptr) {
-			if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
-				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
-			}
+			StreamGuestData(mapped, vaddr, size);
 			m_stream_buffer.Commit();
+			*stream = {.vaddr            = vaddr,
+			           .size             = size,
+			           .window           = window,
+			           .lap              = m_stream_buffer.Lap(),
+			           .write_generation = m_gpu_write_generation,
+			           .offset           = offset};
 			return {&m_stream_buffer, offset};
 		}
 	}
@@ -1770,6 +1823,14 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(buffer);
 	buffer.last_use_tick = m_scheduler.CurrentTick();
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+	if (plain_read) {
+		*memo = {.vaddr        = vaddr,
+		         .size         = size,
+		         .buffer_epoch = m_buffer_set_epoch,
+		         .cpu_epoch    = cpu_epoch,
+		         .offset       = buffer.Offset(vaddr),
+		         .id           = id};
+	}
 	if (is_written) {
 		MarkGpuWritten(vaddr, size);
 	}
@@ -2718,6 +2779,7 @@ static void WatchGpuWriteDiag(uint64_t vaddr, uint64_t size, bool shared) {
 
 void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 	KYTY_PROFILER_BLOCK("Obtain::MarkWritten");
+	m_gpu_write_generation++;
 	ForgetKnownFills(vaddr, size);
 	if (IsShared(vaddr, size) && m_shared_ranges.Contains(vaddr, size)) {
 		// GPU writes to a shared buffer land in guest memory: no download, no page protection.
@@ -2850,6 +2912,7 @@ void BufferCache::FillInternalMemory(uint64_t vaddr, uint64_t size, uint32_t val
 }
 
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
+	m_gpu_write_generation++;
 	if ((vaddr & 3u) != 0 || size == 0 || (size & 3u) != 0 || size > UINT64_MAX - vaddr) {
 		EXIT("BufferCache: fill range must be dword aligned\n");
 	}
@@ -2881,6 +2944,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
                              bool src_gds) {
+	m_gpu_write_generation++;
 	const bool dst_memory = !dst_gds;
 	const bool src_memory = !src_gds;
 	if ((dst_memory && dst_vaddr == 0) || (src_memory && src_vaddr == 0) || size == 0 ||
@@ -3433,6 +3497,7 @@ void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 }
 
 void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
+	m_gpu_write_generation++;
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid GPU write range\n");
 	}

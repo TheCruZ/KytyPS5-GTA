@@ -323,6 +323,8 @@ private:
 	FlipInfo m_flip;
 	uint64_t m_submit_id      = 0;
 	bool     m_predicate_skip = false;
+	// A WAIT_REG_MEM was processed since the last operation was made.
+	bool m_wait_since_operation = false;
 
 	// State of the execution side, on cache lines of its own.
 	alignas(64) uint64_t m_synthetic_occlusion_counter = 0;
