@@ -19,6 +19,7 @@
 #include <span>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -37,6 +38,10 @@ public:
 	// Like SendCommand, but false instead of exiting once the GPU no longer accepts commands.
 	bool               TrySendCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
+	// Runs a host command on the execution thread before the operations queued so far, and
+	// waits for it. Only for work that no queued operation depends on (memory the guest unmaps
+	// after the operations that used it executed).
+	void SendUrgentCommandSync(Common::UniqueFunction<void>&& command);
 
 	// End-of-pipe labels (RELEASE_MEM without an interrupt) become visible to the CPU once the
 	// host GPU has executed the work recorded before them, as on hardware, instead of when the
@@ -188,6 +193,11 @@ private:
 	size_t                        m_pending_first = 0;
 	size_t                        m_pending_count = 0;
 	void                          ForgetExecutedWrites();
+	// Commands that run before the next operation the execution thread takes.
+	void                                      RunUrgentCommands();
+	std::mutex                                m_urgent_mutex;
+	std::vector<Common::UniqueFunction<void>> m_urgent_commands;
+	std::atomic_uint32_t                      m_urgent_pending {0};
 	// Game and host threads bump it when they queue work, under m_queue_mutex; the command
 	// processor thread spins on it before it sleeps.
 	std::atomic_uint64_t m_work_epoch {0};

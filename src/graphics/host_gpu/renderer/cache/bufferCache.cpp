@@ -750,7 +750,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		rm_iters++;
 		const auto step_begin = std::chrono::steady_clock::now();
 		std::chrono::steady_clock::time_point exec_begin;
-		m_scheduler.Context().GetGpu().SendCommandSync(
+		// The guest reads (or writes) memory the GPU wrote only after a label the execution thread
+		// writes once the work before it executed: the operations queued since cannot be what the
+		// access needs, so the readback runs before them instead of after the whole backlog (a
+		// frame of draws, 100-200 ms while an area streams in).
+		m_scheduler.Context().GetGpu().SendUrgentCommandSync(
 		    [this, vaddr, size, is_write, from_gpu_thread, async, &wait_tick, &rm_reason,
 		     &exec_begin] {
 			    exec_begin  = std::chrono::steady_clock::now();

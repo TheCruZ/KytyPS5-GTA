@@ -237,10 +237,14 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		unmap();
 		return;
 	}
-	// KYTY_FPS_LOG: time the GPU-thread round trips of unmaps (each drains the GPU) every 5 s.
+	// The guest unmaps memory once the GPU work that used it executed: it waits on labels the
+	// execution thread writes after the operations before them. The operations queued since do not
+	// use the range, so the unmap runs before them instead of making the guest wait for them;
+	// streaming games unmap many times per frame, holding their own locks.
+	// KYTY_FPS_LOG: time the GPU-thread round trips of unmaps every 5 s.
 	static const bool stats = std::getenv("KYTY_FPS_LOG") != nullptr;
 	const auto        begin = std::chrono::steady_clock::now();
-	m_gpu->SendCommandSync(unmap);
+	m_gpu->SendUrgentCommandSync(unmap);
 	if (stats) {
 		static std::mutex mutex;
 		static double     total_ms = 0.0, max_ms = 0.0;
@@ -310,7 +314,7 @@ void RenderContext::UnmapMemoryRanges(std::span<const std::pair<uint64_t, uint64
 		unmap();
 		return;
 	}
-	m_gpu->SendCommandSync(unmap);
+	m_gpu->SendUrgentCommandSync(unmap);
 }
 
 void RenderContext::CacheDmaBases(const ShaderStageRuntime& runtime) {
