@@ -61,7 +61,9 @@ public:
 private:
 	static uint32_t CurrentThread() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		return GetCurrentThreadId();
+		// Cached: the lock is taken for most dirty-page queries of the GPU threads.
+		static thread_local const uint32_t tid = GetCurrentThreadId();
+		return tid;
 #elif defined(__APPLE__)
 		// mach thread port is a nonzero per-thread id (0 is the "no owner" sentinel).
 		static thread_local const uint32_t tid =
