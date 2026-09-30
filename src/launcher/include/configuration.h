@@ -93,7 +93,7 @@ public:
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
-	bool                   readback_linear_images      = false;
+	bool                   readback_linear_images      = true;
 	bool                   tessellation_enabled        = false;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;

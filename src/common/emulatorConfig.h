@@ -81,7 +81,7 @@ struct ConfigOptions {
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   gpu_assisted_validation_enabled = false;
 	bool                   renderdoc_enabled           = false;
-	bool                   readback_linear_images      = false;
+	bool                   readback_linear_images      = true;
 	bool                   tessellation_enabled        = false;
 	bool                   playgo_hack_enabled         = false;
 	uint32_t               gpu_pipeline_stages         = GPU_PIPELINE_ALL;
