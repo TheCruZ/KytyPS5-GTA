@@ -390,18 +390,30 @@ void TextureCache::UnregisterImage(ImageId id) {
 }
 
 uint64_t TextureCache::ImageEpochInRegion(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	return ImageEpochInRegionUnlocked(address, size);
+}
+
+uint64_t TextureCache::ImageEpochInRegionUnlocked(uint64_t address, uint64_t size) const {
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
 		return UINT64_MAX;
 	}
-	std::scoped_lock lock {m_lock};
-	uint64_t         epoch = 0;
+	uint64_t epoch = 0;
 	ForEachPage(address, size, [&](uint64_t page) {
 		if (const auto* page_epoch = m_image_page_epochs.Find(page)) {
 			epoch = std::max(epoch, *page_epoch);
 		}
 	});
 	return epoch;
+}
+
+size_t TextureCache::ExactLookupSlot(const ImageInfo& info) noexcept {
+	uint64_t hash = info.data.address * 0x9e3779b97f4a7c15ull;
+	hash ^= (info.data.size + static_cast<uint64_t>(info.pixel_format)) * 0xc2b2ae3d27d4eb4full;
+	hash ^= (static_cast<uint64_t>(info.extent.width) << 32u | info.extent.height) *
+	        0x165667b19e3779f9ull;
+	return static_cast<size_t>(hash >> 32u) % ExactLookupWays;
 }
 
 void TextureCache::DeleteImage(ImageId id) {
