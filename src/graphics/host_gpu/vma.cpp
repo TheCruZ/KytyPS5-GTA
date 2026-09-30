@@ -25,6 +25,8 @@
 #include <atomic>
 #include <cinttypes>
 #include <cstdlib>
+#include <mutex>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -324,29 +326,18 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
-	auto             result       = static_cast<vk::Result>(
-	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-	                   &alloc_info, &native_image, &image.allocation, nullptr));
-	if (result != vk::Result::eSuccess) {
-		// The device heap is full. The guest has a unified 16 GB pool, so the image is
-		// real; place it in host memory and pay in bandwidth rather than fail.
-		alloc_info.requiredFlags  = 0;
-		alloc_info.preferredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
-		result                    = static_cast<vk::Result>(vmaCreateImage(
-            allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-            &alloc_info, &native_image, &image.allocation, nullptr));
-		static std::atomic<uint32_t> spill_count {0};
-		if (const auto seen = spill_count.fetch_add(1, std::memory_order_relaxed); seen < 32) {
-			LOGF("Image spilled to host memory (%u): %ux%ux%u layers=%u levels=%u format=%d -> %s\n",
-			     seen + 1, image_info.extent.width, image_info.extent.height,
-			     image_info.extent.depth, image_info.arrayLayers, image_info.mipLevels,
-			     static_cast<int>(image_info.format), vk::to_string(result).c_str());
+	if (Recyclable(image_info)) {
+		std::lock_guard lock(g_recycled_mutex);
+		const auto      found =
+		    std::find_if(g_recycled.begin(), g_recycled.end(), [&](const auto& entry) {
+			    return SameCreateInfo(entry.create, image_info);
+		    });
+		if (found != g_recycled.end()) {
+			native_image     = found->image;
+			image.allocation = found->allocation;
+			g_recycled_bytes -= found->size;
+			g_recycled.erase(found);
 		}
-	}
-	image.image = native_image;
-	if (result != vk::Result::eSuccess) {
-		LogMemoryBudget();
-		return false;
 	}
 	if (native_image == VK_NULL_HANDLE) {
 		auto result = static_cast<vk::Result>(vmaCreateImage(
@@ -358,6 +349,23 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 			result = static_cast<vk::Result>(vmaCreateImage(
 			    allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
 			    &alloc_info, &native_image, &image.allocation, nullptr));
+		}
+		if (result != vk::Result::eSuccess) {
+			// The device heap is full. The guest has a unified 16 GB pool, so the image is
+			// real; place it in host memory and pay in bandwidth rather than fail.
+			alloc_info.requiredFlags  = 0;
+			alloc_info.preferredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+			result                    = static_cast<vk::Result>(vmaCreateImage(
+                allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
+                &alloc_info, &native_image, &image.allocation, nullptr));
+			static std::atomic<uint32_t> spill_count {0};
+			if (const auto seen = spill_count.fetch_add(1, std::memory_order_relaxed); seen < 32) {
+				LOGF("Image spilled to host memory (%u): %ux%ux%u layers=%u levels=%u format=%d -> "
+				     "%s\n",
+				     seen + 1, image_info.extent.width, image_info.extent.height,
+				     image_info.extent.depth, image_info.arrayLayers, image_info.mipLevels,
+				     static_cast<int>(image_info.format), vk::to_string(result).c_str());
+			}
 		}
 		if (result != vk::Result::eSuccess) {
 			image.image = native_image;
