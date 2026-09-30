@@ -446,7 +446,7 @@ add_executable(gpu_pipeline_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/GpuPipelineTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/commandRecorder.cpp"
 )
-target_link_libraries(gpu_pipeline_tests fmt::fmt common Vulkan::Headers)
+target_link_libraries(gpu_pipeline_tests fmt::fmt common Vulkan::Headers xxhash)
 target_include_directories(gpu_pipeline_tests PRIVATE ${inc_headers})
 
 add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL

@@ -3,10 +3,13 @@
 
 #include "common/common.h"
 #include "common/uniqueFunction.h"
+#include "graphics/host_gpu/renderer/hostCopyQueue.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 
 #include <queue>
@@ -42,11 +45,18 @@ public:
 	void                      Wait(uint64_t tick);
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
-	void                      WaitPriorityOperations(uint64_t tick);
-	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
-	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
-	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
-	[[nodiscard]] bool        HasPendingPriorityOperations();
+	// Whether a deferred or priority operation that may write guest memory in
+	// [address, address + size) is queued or running.
+	[[nodiscard]] bool HasPendingGuestOperations(uint64_t address, uint64_t size);
+	void               WaitPriorityOperations(uint64_t tick);
+	// Completions that may act on guest memory: an unmap of memory one may write drains the GPU
+	// while it is pending. They write at most [address, address + size), by default anywhere.
+	void DeferOperation(Common::UniqueFunction<void>&& operation, uint64_t address = 0,
+	                    uint64_t size = UINT64_MAX);
+	void DeferPriorityOperation(Common::UniqueFunction<void>&& operation, uint64_t address = 0,
+	                            uint64_t size = UINT64_MAX);
+	// Completions that only act on host state (cache bookkeeping, releases, flips, interrupts).
+	void DeferHostOperation(Common::UniqueFunction<void>&& operation, bool priority = false);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
@@ -57,8 +67,17 @@ public:
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
+	// Copies of guest data into the stream buffer that the execution thread hands off, with
+	// deferred recording (null otherwise). Submissions wait for the copies recorded before them;
+	// the owner of the scheduler drains them before any guest-visible effect.
+	[[nodiscard]] HostCopyQueue* HostCopies() noexcept { return m_host_copies.get(); }
 
 private:
+	void QueueOperation(Common::UniqueFunction<void>&& operation);
+	void QueuePriorityOperation(Common::UniqueFunction<void>&& operation);
+	Common::UniqueFunction<void> TrackGuestOperation(Common::UniqueFunction<void>&& operation,
+	                                                 uint64_t address, uint64_t size);
+
 	class CommandPool {
 	public:
 		CommandPool(GraphicContext& graphics, MasterSemaphore& master);
@@ -97,6 +116,8 @@ private:
 	struct RecordedSubmit {
 		SubmitInfo info;
 		uint64_t   tick            = 0;
+		// Host copies queued before the submission.
+		uint64_t   host_copies     = 0;
 		uint64_t   debug_submit_id = 0;
 		uint64_t   debug_arg4      = 0;
 		uint32_t   debug_op        = 0;
@@ -113,7 +134,6 @@ private:
 	void QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit, uint64_t tick,
 	                 const RecordedSubmit& debug);
 	void PriorityOperationsThread(std::stop_token stop);
-	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 
 	MasterSemaphore              m_master;
@@ -125,13 +145,28 @@ private:
 	CommandStream                m_stream;
 	CommandBuffer                m_command;
 	std::queue<PendingOperation> m_pending_operations;
+	// The tick of the oldest pending operation (UINT64_MAX without any), written under
+	// m_operation_mutex: draws check it without the lock.
+	std::atomic<uint64_t>        m_pending_front_tick {UINT64_MAX};
+	// Calls since draws last queried the GPU timeline for pending operations.
+	std::atomic<uint32_t>        m_pending_skips {0};
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
+	// Guest memory that queued or running guest operations may write, [begin, end) by id.
+	struct GuestWrite {
+		uint64_t id    = 0;
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+	};
+	std::mutex                   m_guest_writes_mutex;
+	std::vector<GuestWrite>      m_guest_writes;
+	uint64_t                     m_next_guest_write     = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	std::unique_ptr<HostCopyQueue> m_host_copies;
 	// Replays m_stream when recording is deferred; declared last so it stops first.
 	std::jthread m_recording_thread;
 };

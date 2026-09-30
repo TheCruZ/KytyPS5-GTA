@@ -7,8 +7,10 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <filesystem>
@@ -17,8 +19,56 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
+
+// Guest memory that a resolution ahead of execution read. The execution thread repeats the reads
+// before it uses the resolution: guest memory may have changed in between (operations that
+// execute before the draw write it), and ahead of execution GPU-owned bytes cannot be read.
+class GuestReadLog {
+public:
+	void Clear() {
+		m_entries.clear();
+		m_bytes.clear();
+		m_failed = false;
+	}
+	// Reads the backing store without faulting. Strict reads are checked the way specialization
+	// memory is read (GPU-owned bytes fail), the others as plain loads.
+	bool               Read(uint64_t address, void* data, uint64_t size, bool strict);
+	void               Fail() { m_failed = true; }
+	[[nodiscard]] bool Failed() const { return m_failed; }
+	// Execution thread: whether every read still gives the recorded bytes.
+	[[nodiscard]] bool StillValid() const;
+
+private:
+	static constexpr uint64_t StrictCheckBytes = 64;
+	struct Entry {
+		uint64_t address = 0;
+		uint32_t size    = 0;
+		uint32_t offset  = 0;
+		bool     strict  = false;
+	};
+	std::vector<Entry>   m_entries;
+	std::vector<uint8_t> m_bytes;
+	bool                 m_failed = false;
+};
+
+// Storage of the shader programs a draw resolved ahead of its execution: the resource snapshots
+// and specializations its stages point to, and the guest memory they read.
+struct ProgramResolution {
+	static constexpr uint32_t MaxStages = 4;
+
+	std::array<ShaderRecompiler::IR::ResourceSnapshot, MaxStages>       resources;
+	std::array<ShaderRecompiler::IR::ResourceSpecialization, MaxStages> specializations;
+	GuestReadLog                                                        reads;
+	uint32_t                                                            stages = 0;
+
+	void Reset() {
+		reads.Clear();
+		stages = 0;
+	}
+};
 
 struct GraphicContext;
 struct RenderColorInfo;
@@ -130,7 +180,7 @@ public:
 	                    const HW::Context& context, const HW::UserConfig& user_config,
 	                    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
 	                    bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
-	                    ShaderPixelInputInfo& pixel_info);
+	                    ShaderPixelInputInfo& pixel_info, ProgramResolution* ahead = nullptr);
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
@@ -174,6 +224,9 @@ private:
 
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;
+	// Draws resolve their programs on the resolve thread and, when a resolution is not usable,
+	// on the execution thread, which also resolves dispatches.
+	std::atomic_flag              m_program_lock;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	// Pipelines created since the driver cache was last written; a background thread writes
@@ -184,6 +237,9 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	// The pipeline the last lookup found; pipelines are never removed while the cache lives.
+	GraphicsPipelineKey m_last_graphics_key {};
+	Pipeline*           m_last_graphics_pipeline = nullptr;
 
 	void InitializeDriverCache();
 	// Writes the driver cache data to m_driver_cache_path; the cache must stay alive meanwhile.
