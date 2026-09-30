@@ -484,7 +484,30 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
-	m_master.Refresh();
+	// Every draw and dispatch comes here: only query the timeline semaphore (a driver call) when
+	// the oldest operation is not already known to be free.
+	// Without the lock: nothing pending, or the oldest operation is not done and the timeline
+	// was queried a few calls ago. Pending operations only free resources and complete host
+	// work, so finding them some microseconds later costs nothing, while a query per draw is a
+	// driver call per draw.
+	if (const auto front = m_pending_front_tick.load(std::memory_order_acquire);
+	    front == UINT64_MAX) {
+		return;
+	} else if (!m_master.IsFree(front)) {
+		constexpr uint32_t RefreshInterval = 8;
+		// Draws come from the execution thread: no locked instruction needed (a racing caller at
+		// worst queries once more or once less).
+		if (const auto skips = m_pending_skips.load(std::memory_order_relaxed) + 1;
+		    skips < RefreshInterval) {
+			m_pending_skips.store(skips, std::memory_order_relaxed);
+			return;
+		}
+		m_pending_skips.store(0, std::memory_order_relaxed);
+		m_master.Refresh();
+		if (!m_master.IsFree(front)) {
+			return;
+		}
+	}
 	for (;;) {
 		PendingOperation operation;
 		{
@@ -495,6 +518,10 @@ void CommandScheduler::PopPendingOperations() {
 			}
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
+			m_pending_front_tick.store(m_pending_operations.empty()
+			                               ? UINT64_MAX
+			                               : m_pending_operations.front().tick,
+			                           std::memory_order_release);
 		}
 		WaitPriorityOperations(operation.tick);
 		RunOperation(std::move(operation.callback));
@@ -559,6 +586,10 @@ void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, 
 	if (m_operation_state == OperationState::Open) {
 		auto& queue = priority ? m_priority_operations : m_pending_operations;
 		queue.push({std::move(operation), CurrentTick()});
+		if (!priority && m_pending_operations.size() == 1) {
+			m_pending_front_tick.store(m_pending_operations.front().tick,
+			                           std::memory_order_release);
+		}
 		lock.unlock();
 		if (priority) {
 			m_operation_available.notify_one();

@@ -13,6 +13,8 @@
 #include <cstddef>
 #include <cstring>
 #include <deque>
+#include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -247,6 +249,11 @@ private:
 	uint32_t                     m_recorded_draws                  = 0;
 	DynamicState                 m_dynamic_state;
 	std::queue<PendingOperation> m_pending_operations;
+	// The tick of the oldest pending operation (UINT64_MAX without any), written under
+	// m_operation_mutex: draws check it without the lock.
+	std::atomic<uint64_t>        m_pending_front_tick {UINT64_MAX};
+	// Calls since draws last queried the GPU timeline for pending operations.
+	std::atomic<uint32_t>        m_pending_skips {0};
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
