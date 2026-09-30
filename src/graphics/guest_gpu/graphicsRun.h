@@ -92,6 +92,7 @@ private:
 	void              Enqueue(Submission submission);
 	void              ProcessCommands();
 	void              ExecutionThread();
+	void              ResolveThread();
 	void              StopExecution();
 	// Command processor thread of a pipelined GPU: runs a command on the execution thread and
 	// waits for it.
@@ -134,7 +135,11 @@ private:
 	};
 
 	const bool                      m_pipelined;
+	// With a resolve stage, the command processor queues operations for the resolve thread,
+	// which forwards them to the execution thread.
+	const bool                      m_resolving;
 	Common::SpscQueue<GpuOperation> m_operations;
+	Common::SpscQueue<GpuOperation> m_resolved;
 	Common::ProgressCounter         m_executed;
 	uint64_t                        m_emitted = 0;
 	// Command processor thread: a ring of the writes of operations that may not have executed
@@ -152,6 +157,7 @@ private:
 	HW::Shader                      m_neutral_shaders;
 	GpuRegisterState                m_neutral_state;
 	std::jthread                    m_executor;
+	std::jthread                    m_resolver;
 
 	std::jthread m_thread;
 

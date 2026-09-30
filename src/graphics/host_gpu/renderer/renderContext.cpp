@@ -112,7 +112,18 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
+		// Finishing the GPU protects GPU writes to the range and completions that may act on guest
+		// memory (downloads, write scans). Queued GPU work only reads cached copies and host-only
+		// completions (cache bookkeeping, flips, interrupts) never touch the range, so without
+		// GPU-owned pages, images or pending guest completions the unmap needs no drain.
 		if (m_command_scheduler.Active()) {
+			m_command_scheduler.PopPendingOperations();
+		}
+		const bool drain = m_command_scheduler.Active() &&
+		                   (m_buffer_cache.IsRegionGpuModified(vaddr, size) ||
+		                    m_texture_cache.HasImagesInRegion(vaddr, size) ||
+		                    m_command_scheduler.HasPendingGuestOperations());
+		if (drain) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);

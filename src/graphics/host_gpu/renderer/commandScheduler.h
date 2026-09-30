@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 
@@ -42,9 +43,16 @@ public:
 	void                      Wait(uint64_t tick);
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
-	void                      WaitPriorityOperations(uint64_t tick);
-	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
-	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
+	// Whether a deferred or priority operation that may act on guest memory is queued or running.
+	[[nodiscard]] bool HasPendingGuestOperations() const noexcept {
+		return m_guest_operations.load(std::memory_order_acquire) != 0;
+	}
+	void WaitPriorityOperations(uint64_t tick);
+	// Completions that may act on guest memory: unmaps drain the GPU while one is pending.
+	void DeferOperation(Common::UniqueFunction<void>&& operation);
+	void DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
+	// Completions that only act on host state (cache bookkeeping, releases, flips, interrupts).
+	void DeferHostOperation(Common::UniqueFunction<void>&& operation, bool priority = false);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
@@ -57,6 +65,10 @@ public:
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
 
 private:
+	void QueueOperation(Common::UniqueFunction<void>&& operation);
+	void QueuePriorityOperation(Common::UniqueFunction<void>&& operation);
+	Common::UniqueFunction<void> TrackGuestOperation(Common::UniqueFunction<void>&& operation);
+
 	class CommandPool {
 	public:
 		CommandPool(GraphicContext& graphics, MasterSemaphore& master);
@@ -128,6 +140,7 @@ private:
 	std::jthread                 m_priority_thread;
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
+	std::atomic<uint32_t>        m_guest_operations {0};
 	OperationState               m_operation_state      = OperationState::Open;
 	// Replays m_stream when recording is deferred; declared last so it stops first.
 	std::jthread m_recording_thread;

@@ -270,6 +270,33 @@ void CommandScheduler::PopPendingOperations() {
 }
 
 void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) {
+	QueueOperation(TrackGuestOperation(std::move(operation)));
+}
+
+void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
+	QueuePriorityOperation(TrackGuestOperation(std::move(operation)));
+}
+
+void CommandScheduler::DeferHostOperation(Common::UniqueFunction<void>&& operation,
+                                          bool                           priority) {
+	if (priority) {
+		QueuePriorityOperation(std::move(operation));
+	} else {
+		QueueOperation(std::move(operation));
+	}
+}
+
+Common::UniqueFunction<void>
+CommandScheduler::TrackGuestOperation(Common::UniqueFunction<void>&& operation) {
+	EXIT_IF(!operation);
+	m_guest_operations.fetch_add(1, std::memory_order_acq_rel);
+	return [this, operation = std::move(operation)]() mutable {
+		operation();
+		m_guest_operations.fetch_sub(1, std::memory_order_acq_rel);
+	};
+}
+
+void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation) {
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
@@ -288,7 +315,7 @@ void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) 
 	operation();
 }
 
-void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
+void CommandScheduler::QueuePriorityOperation(Common::UniqueFunction<void>&& operation) {
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
@@ -344,6 +371,7 @@ void CommandScheduler::DrainPriorityOperations() {
 	m_operation_available.wait(
 	    lock, [this] { return m_priority_operations.empty() && !m_priority_active; });
 }
+
 
 void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	EXIT_IF(g_deferred_callback_scheduler == this);

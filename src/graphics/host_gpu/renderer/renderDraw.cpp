@@ -6,6 +6,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/spscQueue.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -44,8 +45,10 @@
 #include <new>
 #include <optional>
 #include <span>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -472,25 +475,57 @@ static void ValueInitialize(T& object) {
 // A draw state is 36 KB, 30 KB of it the input infos of the three vertex stages, and
 // value-initializing one on the stack took ~0.6 us per draw. Reuse one state and restore its
 // value-initialized contents, skipping the tessellation stages when no draw wrote them.
-DrawRenderState& RenderExecutor::AcquireDrawRenderState(bool tessellation) {
+// A resolution ahead of execution (see ResolveDrawAhead): the draw state with its shader
+// programs, the storage their stages point to, and whether the execution thread still uses it.
+struct RenderExecutor::ResolvedDraw {
+	DrawRenderStorage storage;
+	ProgramResolution programs;
+	std::atomic_bool  busy {false};
+};
+
+// More resolutions than operations can wait between the resolve and execution threads, so the
+// resolve thread only ever waits for room in that queue.
+struct RenderExecutor::ResolvedDrawRing {
+	static constexpr size_t Size = 320;
+
+	std::array<ResolvedDraw, Size> draws;
+	size_t                         next = 0;
+};
+
+void RenderExecutor::ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept {
+	resolved->busy.store(false, std::memory_order_release);
+}
+
+static void ResetDrawRenderState(DrawRenderState& state, bool tessellation_stages) {
+	ValueInitialize(state.depth_info);
+	for (auto& color: state.color_info) {
+		ValueInitialize(color);
+	}
+	state.color_count = 0;
+	state.ps_active   = true;
+	ValueInitialize(state.vertex_info[0]);
+	if (tessellation_stages) {
+		ValueInitialize(state.vertex_info[1]);
+		ValueInitialize(state.vertex_info[2]);
+	}
+	ValueInitialize(state.ps_input_info);
+	ValueInitialize(state.programs);
+}
+
+DrawRenderState& RenderExecutor::AcquireDrawRenderState(bool tessellation, bool& shaders_resolved) {
+	// The operations before this draw executed: the resolution holds when the guest memory it
+	// read still has the same bytes.
+	auto* resolved = std::exchange(m_resolved_draw, nullptr);
+	shaders_resolved =
+	    resolved != nullptr && !tessellation && resolved->programs.reads.StillValid();
+	if (shaders_resolved) {
+		return resolved->storage.state;
+	}
 	if (m_draw_state == nullptr) {
 		m_draw_state = {new DrawRenderStorage {},
 		                [](DrawRenderStorage* storage) { delete storage; }};
 	} else {
-		auto& state = m_draw_state->state;
-		ValueInitialize(state.depth_info);
-		for (auto& color: state.color_info) {
-			ValueInitialize(color);
-		}
-		state.color_count = 0;
-		state.ps_active   = true;
-		ValueInitialize(state.vertex_info[0]);
-		if (m_draw_state->tessellation_stages_written) {
-			ValueInitialize(state.vertex_info[1]);
-			ValueInitialize(state.vertex_info[2]);
-		}
-		ValueInitialize(state.ps_input_info);
-		ValueInitialize(state.programs);
+		ResetDrawRenderState(m_draw_state->state, m_draw_state->tessellation_stages_written);
 	}
 	m_draw_state->tessellation_stages_written = tessellation;
 	return m_draw_state->state;
@@ -902,11 +937,10 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
-static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
-                           uint32_t color_output_mask, DrawRenderState& state) {
-	auto& ctx    = buffer.GetRegisters();
-	auto& sh_ctx = buffer.GetShaders();
-
+static void RefreshShaderPrograms(PipelineCache& pipeline_cache, const HW::Context& ctx,
+                                  const HW::Shader& sh_ctx, const HW::UserConfig& user_config,
+                                  uint32_t color_output_mask, DrawRenderState& state,
+                                  ProgramResolution* ahead) {
 	const auto& vertex_shader_info = sh_ctx.GetVs();
 	const auto& pixel_shader_info  = sh_ctx.GetPs();
 	const auto& shader_regs        = ctx.GetShaderRegisters();
@@ -924,24 +958,71 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 			        .export_mapping;
 		}
 	}
-	auto& pipeline_cache = buffer.GetContext().GetPipelineCache();
+	state.programs = pipeline_cache.GetGraphicsPrograms(
+	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, user_config, target_export_mapping,
+	    state.ps_active, state.vertex_info, state.ps_input_info, ahead);
+}
+
+static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
+                           uint32_t color_output_mask, DrawRenderState& state) {
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
 	}
-	state.programs = pipeline_cache.GetGraphicsPrograms(
-	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
-	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
+	RefreshShaderPrograms(buffer.GetContext().GetPipelineCache(), buffer.GetRegisters(),
+	                      buffer.GetShaders(), buffer.GetUserConfig(), color_output_mask, state,
+	                      nullptr);
 }
 
-bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
+static bool PixelShaderActive(const HW::Context& ctx, const HW::Shader& shaders,
+                              uint32_t color_output_mask) {
+	return shaders.GetPs().ps_regs.data_addr != 0 &&
+	       (color_output_mask != 0 ||
+	        PixelShaderHasDepthOrCoverageSideEffects(ctx.GetShaderRegisters()));
+}
+
+RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(const HW::Context&    context,
+                                                               const HW::UserConfig& user_config,
+                                                               const HW::Shader&     shaders) {
+	if (user_config.GetPrimType() == Prospero::PrimitiveType::kPatch) {
+		return nullptr;
+	}
+	if (m_resolved_ring == nullptr) {
+		m_resolved_ring = {new ResolvedDrawRing {}, [](ResolvedDrawRing* ring) { delete ring; }};
+	}
+	auto& ring = *m_resolved_ring;
+	auto& draw = ring.draws[ring.next];
+	// The execution thread releases resolutions in order.
+	for (Common::SpinWait wait; draw.busy.load(std::memory_order_acquire);) {
+		if (!wait.Spin()) {
+			std::this_thread::yield();
+		}
+	}
+	ring.next   = (ring.next + 1) % ResolvedDrawRing::Size;
+	auto& state = draw.storage.state;
+	ResetDrawRenderState(state, false);
+	draw.programs.Reset();
+	const auto color_output_mask = DrawColorOutputMask(context);
+	state.ps_active              = PixelShaderActive(context, shaders, color_output_mask);
+	RefreshShaderPrograms(m_context.GetPipelineCache(), context, shaders, user_config,
+	                      color_output_mask, state, &draw.programs);
+	if (draw.programs.reads.Failed()) {
+		return nullptr;
+	}
+	// Published to the execution thread with the operation that carries it.
+	draw.busy.store(true, std::memory_order_relaxed);
+	return &draw;
+}
+
+bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_resolved,
+                                            const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
-	                                        DrawRenderState& state) {
-	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
-	const auto  color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
-	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
-	                  (color_output_mask != 0 ||
-	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
-	RefreshShaders(buffer, draw, color_output_mask, state);
+                                            DrawRenderState&    state) {
+	const auto color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
+	if (!shaders_resolved) {
+		state.ps_active =
+		    PixelShaderActive(buffer.GetRegisters(), buffer.GetShaders(), color_output_mask);
+		RefreshShaders(buffer, draw, color_output_mask, state);
+	}
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
@@ -1307,9 +1388,11 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance};
-	auto& state =
-	    AcquireDrawRenderState(ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch);
-	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+	bool               shaders_resolved = false;
+	auto& state = AcquireDrawRenderState(ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch,
+	                                     shaders_resolved);
+	if (!PrepareDrawRenderState(buffer, shaders_resolved, draw, args.render_target_slice_offset,
+	                            state)) {
 		ResetBindings();
 		return;
 	}
@@ -1385,9 +1468,11 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		ResetBindings();
 		return;
 	}
-	auto& state =
-	    AcquireDrawRenderState(ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch);
-	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+	bool  shaders_resolved = false;
+	auto& state = AcquireDrawRenderState(ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch,
+	                                     shaders_resolved);
+	if (!PrepareDrawRenderState(buffer, shaders_resolved, draw, args.render_target_slice_offset,
+	                            state)) {
 		ResetBindings();
 		return;
 	}

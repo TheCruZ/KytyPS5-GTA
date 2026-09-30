@@ -45,6 +45,8 @@ static thread_local GuestGpu*         g_gpu_state         = nullptr;
 
 // Operations a pipelined command processor may queue ahead of their execution.
 constexpr size_t OperationQueueSize = 4096;
+// Resolved operations queued for the execution thread; see RenderExecutor::ResolvedDrawRing.
+constexpr size_t ResolvedQueueSize = 256;
 // How long a command processor whose queues all wait spins before it retries them.
 constexpr auto BlockedRetryInterval = std::chrono::microseconds(20);
 
@@ -97,7 +99,8 @@ static bool GraphicsRunDebugDumpEnabled() {
 GuestGpu::GuestGpu(RenderContext& renderer)
     : m_renderer(renderer),
       m_pipelined((Config::GpuPipelineStages() & Config::GPU_PIPELINE_COMMAND_PROCESSOR) != 0),
-      m_operations(OperationQueueSize),
+      m_resolving(m_pipelined && (Config::GpuPipelineStages() & Config::GPU_PIPELINE_RESOLVE) != 0),
+      m_operations(OperationQueueSize), m_resolved(ResolvedQueueSize),
       m_neutral_state {&m_neutral_context, &m_neutral_user_config, &m_neutral_shaders} {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
@@ -107,6 +110,9 @@ GuestGpu::GuestGpu(RenderContext& renderer)
 		m_pending_writes = std::make_unique<GuestWrite[]>(PendingWriteCapacity);
 		m_gfx_cp->AttachPipeline(this);
 		m_executor = std::jthread([this] { ExecutionThread(); });
+		if (m_resolving) {
+			m_resolver = std::jthread([this] { ResolveThread(); });
+		}
 	}
 	m_thread = std::jthread(ThreadRun, this);
 }
@@ -329,12 +335,13 @@ void GuestGpu::ExecutionThread() {
 	// waiter now and then and before sleeping.
 	constexpr uint32_t NotifyInterval = 16;
 	uint32_t           unnotified     = 0;
+	auto&              operations     = m_resolving ? m_resolved : m_operations;
 	for (;;) {
-		auto operation = m_operations.TryPop();
+		auto operation = operations.TryPop();
 		if (!operation) {
 			m_executed.Notify();
 			unnotified = 0;
-			operation  = m_operations.Pop();
+			operation  = operations.Pop();
 			if (!operation) {
 				break;
 			}
@@ -353,9 +360,36 @@ void GuestGpu::ExecutionThread() {
 	g_gpu_thread = false;
 }
 
+void GuestGpu::ResolveThread() {
+	KYTY_PROFILER_THREAD("Thread_GpuResolve");
+	Config::ConfigureGpuStageThread(Config::GpuStageThread::Resolve);
+	auto& executor = m_renderer.GetRenderExecutor();
+	for (;;) {
+		auto operation = m_operations.TryPop();
+		if (!operation) {
+			operation = m_operations.Pop();
+			if (!operation) {
+				break;
+			}
+		}
+		if (operation->kind == GpuOperationKind::DrawIndex ||
+		    operation->kind == GpuOperationKind::DrawAuto) {
+			// The register snapshots stay valid until the operation executed.
+			operation->resolved =
+			    executor.ResolveDrawAhead(*operation->state.context, *operation->state.user_config,
+			                              *operation->state.shaders);
+		}
+		m_resolved.Push(std::move(*operation));
+	}
+	m_resolved.Stop();
+}
+
 void GuestGpu::StopExecution() {
 	WaitForExecution();
 	m_operations.Stop();
+	if (m_resolver.joinable()) {
+		m_resolver.join();
+	}
 	if (m_executor.joinable()) {
 		m_executor.join();
 	}
@@ -495,8 +529,21 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 	EXIT_IF(operation.processor != this);
 	BindState(operation.state);
 	switch (operation.kind) {
-		case GpuOperationKind::DrawIndex: ExecuteDrawIndex(operation, operation.draw_index); break;
-		case GpuOperationKind::DrawAuto: ExecuteDrawAuto(operation, operation.draw_auto); break;
+		case GpuOperationKind::DrawIndex:
+		case GpuOperationKind::DrawAuto: {
+			auto& executor = m_renderer.GetRenderExecutor();
+			executor.UseResolvedDraw(operation.resolved);
+			if (operation.kind == GpuOperationKind::DrawIndex) {
+				ExecuteDrawIndex(operation, operation.draw_index);
+			} else {
+				ExecuteDrawAuto(operation, operation.draw_auto);
+			}
+			executor.UseResolvedDraw(nullptr);
+			if (operation.resolved != nullptr) {
+				RenderExecutor::ReleaseResolvedDraw(operation.resolved);
+			}
+			break;
+		}
 		case GpuOperationKind::DrawIndirect: ExecuteDrawIndirect(operation); break;
 		case GpuOperationKind::DispatchDirect: {
 			const auto& dispatch = operation.dispatch;
@@ -1029,10 +1076,10 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::SuspendPoint:
 			cp.EmitGlobalBarrier();
 			// Registered at the operation's place in the stream: a pipelined command processor
-			// runs ahead of the recorded commands.
+			// runs ahead of the recorded commands. Releasing the slot only touches host state.
 			cp.EmitHostCommand([this, ready = m_suspend_point_ready] {
-				m_renderer.GetCommandScheduler().DeferPriorityOperation(
-				    [ready] { ready->release(); });
+				m_renderer.GetCommandScheduler().DeferHostOperation([ready] { ready->release(); },
+				                                                    true);
 			});
 			cp.BufferFlush();
 			cp.Reset();
@@ -1978,8 +2025,8 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 		ProcessorScope processor_scope(*this);
 
 		m_renderer.GetVideoOut().PrepareFlip(request_id, CurrentBuffer());
-		GetScheduler().DeferPriorityOperation(
-		    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
+		GetScheduler().DeferHostOperation(
+		    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); }, true);
 		GetScheduler().Flush();
 	});
 }

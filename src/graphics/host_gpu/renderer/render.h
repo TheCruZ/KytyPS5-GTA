@@ -39,6 +39,15 @@ class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
 
+// An image description derived from a T# and a shader's view of it (see ResolveTexture).
+struct TextureDescDerivation {
+	TextureCache::ImageDesc desc;
+	bool                    shader_conversion = false;
+	vk::Format              pixel_format      = vk::Format::eUndefined;
+	vk::Format              view_format       = vk::Format::eUndefined;
+	uint64_t                size              = 0;
+};
+
 enum class CommandBufferDebugOp : uint32_t {
 	DispatchDirect,
 	DrawIndex,
@@ -168,6 +177,21 @@ public:
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode);
 
+	// Shader programs and resources of a draw resolved ahead of its execution.
+	struct ResolvedDraw;
+	// Resolve thread: resolves the shader programs of a draw with the given registers ahead of
+	// its execution; null when the draw resolves them itself (tessellation, programs that are not
+	// compiled yet, guest memory that cannot be read ahead). Waits while every resolution is in
+	// use: the execution thread releases them in order.
+	[[nodiscard]] ResolvedDraw* ResolveDrawAhead(const HW::Context&    context,
+	                                             const HW::UserConfig& user_config,
+	                                             const HW::Shader&     shaders);
+	// Execution thread: the next draw uses `resolved` when the guest memory it read still holds
+	// the same bytes.
+	void UseResolvedDraw(ResolvedDraw* resolved) noexcept { m_resolved_draw = resolved; }
+	// Execution thread: the operation that carried `resolved` executed.
+	static void ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept;
+
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void                           FindBuffers(PreparedBindings& bindings);
 	void                           RebindBuffers(PreparedBindings& bindings);
@@ -215,6 +239,18 @@ private:
 	ResolveTableElement(TableResolution& table, const ShaderRecompiler::IR::DescriptorValue& value);
 	[[nodiscard]] TableResolution& FindTableResolution(const ShaderRecompiler::IR::ImageResource& root);
 
+	// ResolveTexture's image descriptions by T# and shader view (see DeriveTextureDesc).
+	struct TextureDescKey {
+		std::array<uint32_t, 8> dwords {};
+		std::array<uint32_t, 5> view {};
+		bool                    operator==(const TextureDescKey&) const = default;
+	};
+	struct TextureDescKeyHash {
+		size_t operator()(const TextureDescKey& key) const noexcept;
+	};
+	static constexpr size_t MaxTextureDescs = size_t {1} << 16u;
+	std::unordered_map<TextureDescKey, TextureDescDerivation, TextureDescKeyHash> m_texture_descs;
+
 	// table_candidate rejects (EXIT) a texture whose guest memory cannot be read, for tables
 	// that keep T#s of freed textures, and declines depth/color conversions. examined receives
 	// the guest range before the lookup depends on the texture cache: a failure without it
@@ -240,11 +276,16 @@ private:
 	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
 	struct DrawRenderStorage;
-	[[nodiscard]] DrawRenderState& AcquireDrawRenderState(bool tessellation);
-	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer,
+	struct ColorTargetMemo;
+	struct ResolvedDrawRing;
+	// The draw state of the executing draw: the one its resolution prepared when that is still
+	// valid (shaders_resolved), otherwise the reused state.
+	[[nodiscard]] DrawRenderState& AcquireDrawRenderState(bool  tessellation,
+	                                                      bool& shaders_resolved);
+	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_resolved,
 	                                          const DrawCallInfo& draw,
 	                                          uint32_t            render_target_slice_offset,
-	                                          DrawRenderState& state);
+	                                          DrawRenderState&    state);
 	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
@@ -277,6 +318,13 @@ private:
 	// Reused by every draw; see AcquireDrawRenderState().
 	std::unique_ptr<DrawRenderStorage, void (*)(DrawRenderStorage*)> m_draw_state {nullptr,
 	                                                                               nullptr};
+	// Resolutions ahead of execution; see ResolveDrawAhead().
+	std::unique_ptr<ResolvedDrawRing, void (*)(ResolvedDrawRing*)> m_resolved_ring {nullptr,
+	                                                                                nullptr};
+	ResolvedDraw*                                                  m_resolved_draw = nullptr;
+	// The last color-target descriptions per slot; see ResolveRenderColorTarget().
+	std::unique_ptr<ColorTargetMemo, void (*)(ColorTargetMemo*)> m_color_target_memo {nullptr,
+	                                                                                  nullptr};
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

@@ -78,6 +78,8 @@ struct GpuOperation {
 	uint64_t          sequence  = 0;
 	GpuRegisterState  state;
 	GpuNumInstances   num_instances;
+	// Draws: the shader programs the resolve thread resolved ahead, if any.
+	RenderExecutor::ResolvedDraw* resolved = nullptr;
 	union {
 		DrawIndexArgs       draw_index;
 		DrawAutoArgs        draw_auto;
