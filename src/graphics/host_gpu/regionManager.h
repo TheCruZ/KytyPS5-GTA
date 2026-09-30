@@ -162,7 +162,8 @@ public:
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
-		return GetBits<source>().FirstRangeFrom(start).first < end;
+		const auto& bits        = GetBits<source>();
+		return bits.AnyInRange(start, end);
 	}
 
 	// Under the lock, before ChangeState<Cpu, true> for a CPU write (a fault or an invalidation):
@@ -234,12 +235,12 @@ public:
 		}
 		const auto [start, end] = GetPageRange(vaddr, size);
 		if constexpr (source == DirtySource::Cpu && enable) {
-			if (RegionBits(m_gpu_dirty, start, end).Any()) {
+			if (m_gpu_dirty.AnyInRange(start, end)) {
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
 			}
 		}
 		if constexpr (source == DirtySource::Gpu && enable) {
-			if (RegionBits(m_cpu_dirty, start, end).Any()) {
+			if (m_cpu_dirty.AnyInRange(start, end)) {
 				EXIT("GPU dirty state conflicts with CPU dirty state\n");
 			}
 		}
