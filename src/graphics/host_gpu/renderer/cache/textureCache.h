@@ -104,6 +104,9 @@ public:
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
+	// Whether an image is registered on pages of the range (a guest unmap of such memory may race
+	// with GPU work that uses the image).
+	[[nodiscard]] bool HasImagesInRegion(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
 	// Advances whenever an image is registered or unregistered.
 	[[nodiscard]] uint64_t ImageSetEpoch() const { return m_image_set_epoch; }

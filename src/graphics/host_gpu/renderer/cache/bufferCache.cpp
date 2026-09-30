@@ -466,7 +466,8 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 		     publish_tick > seen &&
 		     !m_download_publish_tick.compare_exchange_weak(seen, publish_tick, std::memory_order_relaxed);) {
 		}
-		m_scheduler.DeferPriorityOperation(std::move(publish));
+		m_scheduler.DeferPriorityOperation(std::move(publish), written_begin,
+		                                   written_end - written_begin);
 	} else {
 		const auto tick = m_scheduler.CurrentTick();
 		m_scheduler.Wait(tick);

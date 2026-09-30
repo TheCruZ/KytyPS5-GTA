@@ -1761,11 +1761,11 @@ bool GuestGpu::Process(Submission& submission) {
 			cp.RunGarbageCollector();
 			cp.EmitGlobalBarrier();
 			// Registered at the operation's place in the stream: a pipelined command processor
-			// runs ahead of the recorded commands.
+			// runs ahead of the recorded commands. Releasing the slot only touches host state.
 			cp.EmitHostCommand([this, ready = m_suspend_point_ready] {
 				SetSubmitReason("suspend point");
-				m_renderer.GetCommandScheduler().DeferPriorityOperation(
-				    [ready] { ready->release(); });
+				m_renderer.GetCommandScheduler().DeferHostOperation([ready] { ready->release(); },
+				                                                    true);
 			});
 			cp.BufferFlush();
 			cp.Reset();
@@ -3266,48 +3266,6 @@ void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id)
 
 void CommandProcessor::DeferEopInterrupt(uint32_t interrupt_context_id) {
 	(void)CurrentBuffer().Handle();
-
-	// A label beside GPU-written bytes goes to the backing store, so they are not downloaded.
-	// Other labels go through the guest mapping: its fault keeps a clean cached copy current and
-	// downloads GPU-written bytes under the label before the store.
-	const auto write_label = [this, address](const void* value, uint64_t size) {
-		const auto vaddr   = reinterpret_cast<uint64_t>(address);
-		auto&      buffers = m_renderer.GetBufferCache();
-		if (!GuestRange {vaddr, size}.Valid() || !buffers.IsRegionGpuModified(vaddr, size) ||
-		    buffers.HasGpuDirtyBytes(vaddr, size) ||
-		    !LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
-			m_renderer.PrepareGpuWrite(address, size);
-			std::memcpy(address, value, size);
-		}
-	};
-	// EndOfPipeData: kNone, kImmediate32b, kImmediate64b, kRefClk; 5 reads GDS.
-	switch (data_sel) {
-		case 0: break;
-		case 1: {
-			const auto value = static_cast<uint32_t>(data);
-			write_label(&value, sizeof(value));
-			break;
-		}
-		case 3: data = Sync::ReadReferenceClock(); [[fallthrough]];
-		case 2: write_label(&data, sizeof(data)); break;
-		case 5: {
-			GetScheduler().Finish();
-			const auto gds = static_cast<uint32_t>(data);
-			Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(),
-			              static_cast<uint32_t*>(address), gds & 0xffffu, gds >> 16u);
-			break;
-		}
-		default: EXIT("unknown release_mem data selector: %" PRIu32 "\n", data_sel);
-	}
-
-	// GuestGpu::Process's end-of-slice flush submits the work this interrupt waits on.
-	if (interrupt) {
-		DeferEopInterrupt(interrupt_context_id);
-	}
-}
-
-void CommandProcessor::DeferEopInterrupt(uint32_t interrupt_context_id) {
-	(void)CurrentBuffer().Handle();
 	GetScheduler().DeferHostOperation(
 	    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
 		    renderer.TriggerInterrupt(event_id, interrupt_context_id);
@@ -3447,8 +3405,9 @@ void CommandProcessor::Flip() {
 		auto  request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
 		                                          flip.flip_mode, flip.flip_arg);
 		(void)command.Handle();
-		GetScheduler().DeferPriorityOperation(
-		    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
+		GetScheduler().DeferHostOperation(
+		    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); },
+		    true);
 		(KYTY_SUBMIT_REASON(), GetScheduler().Flush());
 	});
 }
@@ -3468,8 +3427,9 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 		auto request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
 		                                         flip.flip_mode, flip.flip_arg);
 		(void)command.Handle();
-		GetScheduler().DeferPriorityOperation(
-		    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
+		GetScheduler().DeferHostOperation(
+		    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); },
+		    true);
 		(KYTY_SUBMIT_REASON(), GetScheduler().Flush());
 	});
 	NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(value), &value);
@@ -3496,11 +3456,12 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 		auto request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
 		                                         flip.flip_mode, flip.flip_arg);
 		(void)command.Handle();
-		GetScheduler().DeferPriorityOperation(
+		GetScheduler().DeferHostOperation(
 		    [&renderer = m_renderer, event_id = m_interrupt_event_id, request] {
 			    renderer.GetVideoOut().CompleteFlip(request);
 			    renderer.TriggerInterrupt(event_id, 0);
-		    });
+		    },
+		    true);
 		(KYTY_SUBMIT_REASON(), GetScheduler().Flush());
 	});
 	NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(value), &value);
@@ -3520,8 +3481,8 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 		ProcessorScope processor_scope(*this);
 
 		m_renderer.GetVideoOut().PrepareFlip(request_id, CurrentBuffer());
-		GetScheduler().DeferPriorityOperation(
-		    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
+		GetScheduler().DeferHostOperation(
+		    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); }, true);
 		(KYTY_SUBMIT_REASON(), GetScheduler().Flush());
 	});
 }

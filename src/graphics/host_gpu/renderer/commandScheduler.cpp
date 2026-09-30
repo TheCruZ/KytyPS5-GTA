@@ -545,18 +545,56 @@ void CommandScheduler::PopPendingOperations() {
 	}
 }
 
-void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) {
+void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation, uint64_t address,
+                                      uint64_t size) {
 	CheckActive();
-	QueueOperation(std::move(operation), false);
+	QueueOperation(TrackGuestOperation(std::move(operation), address, size), false);
 }
 
 void CommandScheduler::DeferRelease(Common::UniqueFunction<void>&& operation) {
 	QueueOperation(std::move(operation), false);
 }
 
-void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
+void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation,
+                                              uint64_t address, uint64_t size) {
 	CheckActive();
-	QueueOperation(std::move(operation), true);
+	QueueOperation(TrackGuestOperation(std::move(operation), address, size), true);
+}
+
+void CommandScheduler::DeferHostOperation(Common::UniqueFunction<void>&& operation,
+                                          bool                           priority) {
+	CheckActive();
+	QueueOperation(std::move(operation), priority);
+}
+
+Common::UniqueFunction<void>
+CommandScheduler::TrackGuestOperation(Common::UniqueFunction<void>&& operation, uint64_t address,
+                                      uint64_t size) {
+	EXIT_IF(!operation);
+	uint64_t id = 0;
+	{
+		std::lock_guard lock(m_guest_writes_mutex);
+		id = ++m_next_guest_write;
+		m_guest_writes.push_back(
+		    {id, address, size > UINT64_MAX - address ? UINT64_MAX : address + size});
+	}
+	return [this, id, operation = std::move(operation)]() mutable {
+		operation();
+		std::lock_guard lock(m_guest_writes_mutex);
+		// Operations mostly complete in the order they were queued.
+		const auto it = std::find_if(m_guest_writes.begin(), m_guest_writes.end(),
+		                             [id](const GuestWrite& write) { return write.id == id; });
+		EXIT_IF(it == m_guest_writes.end());
+		m_guest_writes.erase(it);
+	};
+}
+
+bool CommandScheduler::HasPendingGuestOperations(uint64_t address, uint64_t size) {
+	const auto      end = size > UINT64_MAX - address ? UINT64_MAX : address + size;
+	std::lock_guard lock(m_guest_writes_mutex);
+	return std::any_of(m_guest_writes.begin(), m_guest_writes.end(), [&](const GuestWrite& write) {
+		return write.begin < end && address < write.end;
+	});
 }
 
 void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority) {

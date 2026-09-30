@@ -74,13 +74,25 @@ public:
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
+	// Whether a deferred or priority operation that may write guest memory in
+	// [address, address + size) is queued or running.
+	[[nodiscard]] bool        HasPendingGuestOperations(uint64_t address, uint64_t size);
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
-	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
+	// A completion that may act on guest memory makes an unmap of memory it may write drain the
+	// GPU while it is pending. They write at most [address, address + size), by default anywhere.
+	void                      DeferOperation(Common::UniqueFunction<void>&& operation,
+	                                         uint64_t address = 0, uint64_t size = UINT64_MAX);
 	// As DeferOperation, also between guest command buffers (no active command buffer): runs
 	// once the GPU has finished the current tick, so work submitted earlier, still running, can
-	// keep using what the operation releases.
+	// keep using what the operation releases. Acts on host state only.
 	void                      DeferRelease(Common::UniqueFunction<void>&& operation);
-	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
+	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation,
+	                                                 uint64_t address = 0,
+	                                                 uint64_t size    = UINT64_MAX);
+	// Completions that only act on host state (cache bookkeeping, releases, flips, interrupts):
+	// they never make an unmap drain the GPU.
+	void                      DeferHostOperation(Common::UniqueFunction<void>&& operation,
+	                                             bool priority = false);
 	[[nodiscard]] bool        HasPendingPriorityOperations();
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 	// Hands later submissions to a dedicated queue thread, which submits them in tick order, so
@@ -160,8 +172,7 @@ public:
 	}
 
 private:
-	void QueueOperation(Common::UniqueFunction<void>&& operation);
-	void QueuePriorityOperation(Common::UniqueFunction<void>&& operation);
+	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	Common::UniqueFunction<void> TrackGuestOperation(Common::UniqueFunction<void>&& operation,
 	                                                 uint64_t address, uint64_t size);
 

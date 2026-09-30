@@ -282,7 +282,17 @@ void RenderContext::UnmapMemoryRanges(std::span<const std::pair<uint64_t, uint64
 		return;
 	}
 	const auto unmap = [this, &mapped] {
+		// As UnmapMemory: drain only for GPU-owned pages, images or pending guest completions.
+		bool drain = false;
 		if (m_command_scheduler.Active()) {
+			m_command_scheduler.PopPendingOperations();
+			for (const auto& [vaddr, size]: mapped) {
+				drain |= m_buffer_cache.IsRegionGpuModified(vaddr, size) ||
+				         m_texture_cache.HasImagesInRegion(vaddr, size) ||
+				         m_command_scheduler.HasPendingGuestOperations(vaddr, size);
+			}
+		}
+		if (drain) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			(KYTY_SUBMIT_REASON(), m_command_scheduler.Finish());
 			m_command_scheduler.WaitPriorityOperations(tick);
