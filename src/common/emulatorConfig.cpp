@@ -186,18 +186,22 @@ uint32_t ParseGpuPipelineStages(const char* value) {
 }
 
 void ConfigureGpuStageThread(GpuStageThread stage) {
-	// Three physical cores of the first CCD of a Ryzen 9 5900X (SMT siblings are adjacent), away
+	// Five physical cores of the first CCD of a Ryzen 9 5900X (SMT siblings are adjacent), away
 	// from core 0: the stages share its L3.
-	static const std::array<int, 3> cpus = [] {
-		std::array<int, 3> result {4, 6, 8};
+	static const std::array<int, 5> cpus = [] {
+		std::array<int, 5> result {4, 6, 8, 10, 2};
 		const char*        value = std::getenv("KYTY_GPU_THREAD_CPUS");
 		if (value == nullptr) {
 			return result;
 		}
 		if (std::string_view(value) == "off") {
-			return std::array<int, 3> {-1, -1, -1};
+			return std::array<int, 5> {-1, -1, -1, -1, -1};
 		}
+		// Stages without a listed CPU keep their default.
 		for (auto& cpu: result) {
+			if (*value == '\0') {
+				break;
+			}
 			char* end = nullptr;
 			cpu       = static_cast<int>(std::strtol(value, &end, 10));
 			if (end == value) {

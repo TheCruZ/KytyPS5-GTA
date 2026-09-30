@@ -17,7 +17,12 @@
 namespace Libs::Graphics {
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler, CommandStream* stream)
-    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()), m_stream(stream) {}
+    : m_scheduler(scheduler), m_context(scheduler.Context()), m_graphics(scheduler.Graphics()),
+      m_stream(stream) {}
+
+void CommandBuffer::InvalidateDynamicState() const {
+	m_scheduler.GetDynamicState().Invalidate();
+}
 
 bool CommandBuffer::IsInvalid() const {
 	return m_stream != nullptr ? !m_open : m_buffer == nullptr;

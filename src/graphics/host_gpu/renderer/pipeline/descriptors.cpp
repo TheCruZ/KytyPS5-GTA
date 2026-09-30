@@ -31,8 +31,10 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
+#include <cstring>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -521,26 +523,11 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	return false;
 }
 
-TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                                              const ShaderRecompiler::IR::DescriptorValue& value,
-                                              bool table_candidate, GuestRange* examined) {
-	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
-		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
-	}
-	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+// What ResolveTexture derives from a T# and the shader's view of it before any texture-cache
+// lookup: a pure function of both (EXITs on unsupported descriptors).
+static TextureDescDerivation DeriveTextureDesc(const ShaderRecompiler::IR::ImageResource& resource,
+                                               const ShaderTextureResource& descriptor) {
 	const bool storage = resource.written;
-	if (storage) {
-		ValidateStorageImageResource(resource);
-	}
-
-	auto& texture_cache = m_context.GetTextureCache();
-	if (descriptor.IsNull()) {
-		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
-		                                                    : TextureCache::BindingType::Texture);
-		const auto id   = texture_cache.FindImage(desc);
-		return {id, nullptr, std::move(desc)};
-	}
-
 	const auto address         = descriptor.Base40();
 	const auto width           = static_cast<uint32_t>(descriptor.Width5()) + 1u;
 	const auto height          = static_cast<uint32_t>(descriptor.Height5()) + 1u;
@@ -658,6 +645,133 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                                 view_levels, desc.info.resources.layers);
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
+	const auto data_size = desc.info.data.size;
+	return {std::move(desc), shader_conversion, pixel_format, view_format, data_size};
+}
+
+size_t RenderExecutor::TextureDescKeyHash::operator()(const TextureDescKey& key) const noexcept {
+	// Every draw hashes the key of each texture: independent multiplies of 64-bit lanes instead
+	// of a dependent chain per dword.
+	std::array<uint64_t, 7> lanes {};
+	static_assert(sizeof(key.dwords) + sizeof(key.view) <= sizeof(lanes));
+	std::memcpy(lanes.data(), key.dwords.data(), sizeof(key.dwords));
+	std::memcpy(reinterpret_cast<uint8_t*>(lanes.data()) + sizeof(key.dwords), key.view.data(),
+	            sizeof(key.view));
+	constexpr std::array<uint64_t, 7> Multipliers {
+	    0x9e3779b97f4a7c15ull, 0xc2b2ae3d27d4eb4full, 0x165667b19e3779f9ull, 0xd6e8feb86659fd93ull,
+	    0xff51afd7ed558ccdull, 0xc4ceb9fe1a85ec53ull, 0x94d049bb133111ebull};
+	uint64_t hash = 0;
+	for (size_t i = 0; i < lanes.size(); i++) {
+		const auto mixed = (lanes[i] ^ (lanes[i] >> 31u)) * Multipliers[i];
+		hash ^= (mixed << (i * 9u % 64u)) | (mixed >> ((64u - i * 9u % 64u) % 64u));
+	}
+	hash ^= hash >> 32u;
+	hash *= 0x9e3779b97f4a7c15ull;
+	return static_cast<size_t>(hash ^ (hash >> 29u));
+}
+
+RenderExecutor::TextureDescKey
+RenderExecutor::MakeTextureDescKey(const ShaderRecompiler::IR::ImageResource&   resource,
+                                   const ShaderRecompiler::IR::DescriptorValue& value) {
+	TextureDescKey key {};
+	key.dwords  = value.dwords;
+	key.view[0] = static_cast<uint32_t>(resource.resource_class) |
+	              (static_cast<uint32_t>(resource.numeric_class) << 8u) |
+	              (static_cast<uint32_t>(resource.dimension) << 16u) |
+	              (static_cast<uint32_t>(resource.mip_mode) << 24u);
+	key.view[1] = resource.mip_count;
+	key.view[2] = static_cast<uint32_t>(resource.conversion_format);
+	key.view[3] = resource.shader_swizzle;
+	key.view[4] =
+	    static_cast<uint32_t>(resource.read) | (static_cast<uint32_t>(resource.written) << 1u) |
+	    (static_cast<uint32_t>(resource.atomic) << 2u) |
+	    (static_cast<uint32_t>(resource.depth_compare) << 3u) |
+	    (static_cast<uint32_t>(resource.cube) << 4u) | (static_cast<uint32_t>(resource.r128) << 5u);
+	return key;
+}
+
+bool RenderExecutor::ReuseTextureLookup(TextureDescDerivation& derived, TextureBinding& binding) {
+	auto&       texture_cache = m_context.GetTextureCache();
+	auto&       found         = derived.found;
+	auto*       image         = texture_cache.m_slot_images.try_get(found.id);
+	const auto& range         = found.desc.info.data;
+	if (image == nullptr || !image->registered || image->binding.needs_rebind ||
+	    ImageLookupState::Of(found.id, *image) != found.state) {
+		found.valid = false;
+		return false;
+	}
+	if (const auto set_epoch = texture_cache.ImageSetEpoch(); found.image_set_epoch != set_epoch) {
+		if (texture_cache.ImageEpochInRegion(range.address, range.size) > found.image_set_epoch) {
+			found.valid = false;
+			return false;
+		}
+		// No image of the range changed until now: later draws compare with now instead of
+		// scanning the pages of the range again.
+		found.image_set_epoch = set_epoch;
+	}
+	// As the lookup and the acquisition would: the image stays in use.
+	image->tick_accessed_last = m_context.GetCommandScheduler().CurrentTick();
+	texture_cache.TouchImage(*image);
+	binding.image_id   = found.id;
+	binding.image_view = found.view;
+	binding.desc       = found.desc;
+	binding.layout     = vk::ImageLayout::eUndefined;
+	binding.mip_views.clear();
+	binding.lookup = &derived;
+	binding.reused = true;
+	return true;
+}
+
+TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                              const ShaderRecompiler::IR::DescriptorValue& value,
+                                              bool table_candidate, GuestRange* examined) {
+	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
+		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
+	}
+	auto       descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	const bool storage    = resource.written;
+	if (storage) {
+		ValidateStorageImageResource(resource);
+	}
+
+	auto& texture_cache = m_context.GetTextureCache();
+	if (descriptor.IsNull()) {
+		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                                    : TextureCache::BindingType::Texture);
+		const auto id   = texture_cache.FindImage(desc);
+		return {id, nullptr, std::move(desc)};
+	}
+
+	// The description is computed once per T# and view of it; images are looked up every time.
+	const auto key    = MakeTextureDescKey(resource, value);
+	auto       cached = m_texture_descs.find(key);
+	if (cached == m_texture_descs.end()) {
+		// Derived before insertion: a derivation that exits (softly, for table candidates) leaves
+		// nothing behind.
+		auto derived = DeriveTextureDesc(resource, descriptor);
+		if (m_texture_descs.size() >= MaxTextureDescs) {
+			m_clear_texture_descs = true;
+		}
+		cached = m_texture_descs.emplace(key, std::move(derived)).first;
+	}
+	auto& derived = cached->second;
+	// Sampled textures without metadata or stencil: the image and view the last lookup of this
+	// description found, when nothing they depend on changed (see TextureDescDerivation::Found).
+	// Lookups with metadata materialize fast clears and run every time.
+	const bool reusable = !table_candidate && !storage && examined == nullptr &&
+	                      resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic &&
+	                      derived.desc.info.metadata.kind == ImageMetadataKind::None &&
+	                      !derived.desc.info.HasStencil();
+	if (reusable && derived.found.valid) {
+		TextureBinding binding;
+		if (ReuseTextureLookup(derived, binding)) {
+			return binding;
+		}
+	}
+	auto        desc              = derived.desc;
+	const bool  shader_conversion = derived.shader_conversion;
+	const auto  pixel_format      = derived.pixel_format;
+	const auto  view_format       = derived.view_format;
 
 	if (examined != nullptr) {
 		*examined = desc.info.data;
@@ -695,7 +809,13 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 	}
-	return {id, nullptr, std::move(desc)};
+	TextureBinding binding {id, nullptr, std::move(desc)};
+	// Recorded once the view is acquired (AcquireImageViews()). Stencil associations and images
+	// with stencil refresh another image as well: they are looked up every time.
+	if (reusable && !stencil_association && !image->info.HasStencil()) {
+		binding.lookup = &derived;
+	}
+	return binding;
 }
 
 // A bindless table holds every texture the game has loaded; bind a T# the shader's view cannot
@@ -805,19 +925,32 @@ RenderExecutor::ResolveTableElement(TableResolution&                            
 	return element.texture;
 }
 
-static vk::Sampler NativeSampler(RenderContext&                       context,
-                                 const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                                 uint32_t index,
-                                 const ShaderRecompiler::IR::DescriptorValue& value) {
+vk::Sampler RenderExecutor::NativeSampler(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                          uint32_t                                        index,
+                                          const ShaderRecompiler::IR::DescriptorValue&    value) {
 	auto        descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
-	const auto& sampler = program.info.samplers[index];
+	const auto& sampler    = program.info.samplers[index];
 	if (!sampler.depth_compare) {
 		descriptor.fields[0] &= ~(0x7u << 12u);
 	}
 	if (sampler.force_point_filtering) {
 		descriptor.SetPointFiltering();
 	}
-	return context.GetSamplerCache().GetSampler(descriptor, sampler.integer_border);
+	// Samplers live as long as the sampler cache: remember recent ones without its lock.
+	uint64_t hash = sampler.integer_border ? 0x9e3779b97f4a7c15ull : 0;
+	for (const auto field: descriptor.fields) {
+		hash = (hash ^ field) * 0x100000001b3ull;
+	}
+	auto& entry = m_sampler_memo[(hash ^ (hash >> 32u)) % m_sampler_memo.size()];
+	if (entry.sampler != nullptr && entry.integer_border == sampler.integer_border &&
+	    std::memcmp(entry.fields.data(), descriptor.fields, sizeof(entry.fields)) == 0) {
+		return entry.sampler;
+	}
+	const auto native = m_context.GetSamplerCache().GetSampler(descriptor, sampler.integer_border);
+	std::memcpy(entry.fields.data(), descriptor.fields, sizeof(entry.fields));
+	entry.integer_border = sampler.integer_border;
+	entry.sampler        = native;
+	return native;
 }
 
 static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
@@ -856,6 +989,11 @@ void RenderExecutor::ResetBindings() {
 		}
 	}
 	m_bound_images.clear();
+	if (m_clear_texture_descs) {
+		m_clear_texture_descs = false;
+		m_texture_descs.clear();
+		m_texture_descs_generation++;
+	}
 }
 
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
@@ -870,14 +1008,41 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.shader_data_buffer = {};
 	prepared.shared_memory = {};
 	prepared.images.resize(program.info.images.size());
-	prepared.samplers.clear();
 	prepared.shader_data.clear();
+	const bool same_program = prepared.last_program == &program &&
+	                          prepared.last_descs_generation == m_texture_descs_generation;
+	const bool same_images  = same_program && prepared.last_images == snapshot.images;
+	if (!same_images) {
+		prepared.image_descs.assign(program.info.images.size(), nullptr);
+	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		// Sampled textures whose last lookup still holds are written in place.
+		const auto& resource = program.info.images[i];
+		if (!resource.written &&
+		    resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic) {
+			auto* derived = prepared.image_descs[i];
+			if (!same_images) {
+				const auto cached =
+				    m_texture_descs.find(MakeTextureDescKey(resource, snapshot.images[i]));
+				derived = cached != m_texture_descs.end() ? &cached->second : nullptr;
+			}
+			if (derived != nullptr && derived->found.valid &&
+			    ReuseTextureLookup(*derived, prepared.images[i])) {
+				prepared.image_descs[i] = derived;
+				BindImage(prepared.images[i].image_id, false);
+				continue;
+			}
+		}
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+		// The description whose lookups later draws reuse (see ResolveTexture()).
+		prepared.image_descs[i] = binding.lookup;
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		binding.mip_views.swap(prepared.images[i].mip_views);
 		binding.mip_views.clear();
 		prepared.images[i] = std::move(binding);
+	}
+	if (!same_images) {
+		prepared.last_images = snapshot.images;
 	}
 	prepared.table_images.clear();
 	prepared.table_sources.clear();
@@ -904,11 +1069,20 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			}
 		}
 	});
-	prepared.samplers.reserve(program.info.samplers.size());
-	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
-		prepared.samplers.push_back(NativeSampler(
-		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
+	// Samplers live as long as the sampler cache: the same S#s of the same program give the same
+	// samplers.
+	if (!same_program || prepared.samplers.size() != program.info.samplers.size() ||
+	    prepared.last_samplers != snapshot.samplers) {
+		prepared.samplers.clear();
+		prepared.samplers.reserve(program.info.samplers.size());
+		for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
+			prepared.samplers.push_back(NativeSampler(
+			    program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
+		}
+		prepared.last_samplers = snapshot.samplers;
 	}
+	prepared.last_program          = &program;
+	prepared.last_descs_generation = m_texture_descs_generation;
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
 	for (const auto reg: program.info.user_data_registers) {
 		prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
@@ -1049,13 +1223,25 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 				binding.mip_views.push_back(texture_cache.FindTexture(binding.image_id, desc));
 			}
 			binding.image_view = binding.mip_views.front();
-		} else {
+		} else if (!binding.reused) {
 			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
 		}
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
 		image.usage.storage |= storage;
 		image.usage.texture |= !storage;
+		if (binding.lookup != nullptr && !binding.reused) {
+			auto& found           = binding.lookup->found;
+			found.id              = binding.image_id;
+			found.desc            = binding.desc;
+			found.view            = binding.image_view;
+			found.image_set_epoch = texture_cache.ImageSetEpoch();
+			found.state           = ImageLookupState::Of(binding.image_id, image);
+			found.valid           = true;
+		}
+		// The binding no longer refers to the description, which may be cleared.
+		binding.lookup = nullptr;
+		binding.reused = false;
 	}
 	for (size_t k = 0; k < prepared.table_images.size(); k++) {
 		auto& texture = prepared.table_images[k];
@@ -1099,6 +1285,9 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 			if (old_image != nullptr) {
 				old_image->binding = {};
 			}
+			// A draw that reuses the targets of the draw before updates them in the render
+			// target memo, which no longer describes them.
+			InvalidateRenderTargetMemo();
 			target.desc.view_info.base_level = target.guest_mip_level;
 			target.desc.view_info.base_layer = target.guest_array_layer;
 			target.image_id = cache.FindImage(target.desc);

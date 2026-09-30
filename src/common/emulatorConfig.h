@@ -35,7 +35,11 @@ enum GpuPipelineStage : uint32_t {
 	GPU_PIPELINE_RECORDING = 1u << 0u, // Vulkan command recording and submission.
 	// The command processor runs ahead of the execution of the operations it produces.
 	GPU_PIPELINE_COMMAND_PROCESSOR = 1u << 1u,
-	GPU_PIPELINE_ALL               = GPU_PIPELINE_RECORDING | GPU_PIPELINE_COMMAND_PROCESSOR,
+	// Shader programs and resource tables of draws are resolved ahead of their execution
+	// (requires the command processor stage).
+	GPU_PIPELINE_RESOLVE = 1u << 2u,
+	GPU_PIPELINE_ALL =
+	    GPU_PIPELINE_RECORDING | GPU_PIPELINE_COMMAND_PROCESSOR | GPU_PIPELINE_RESOLVE,
 };
 
 constexpr uint32_t DEFAULT_CONSOLE_LANGUAGE = 1;
@@ -145,9 +149,15 @@ uint32_t GpuPipelineStages();
 uint32_t ParseGpuPipelineStages(const char* value);
 
 // Threads of a pipelined GPU. KYTY_GPU_THREAD_CPUS lists the logical processors the command
-// processor, execution and recording threads are pinned to ("off" leaves them unpinned);
-// KYTY_GPU_THREAD_PRIORITY=0 keeps their normal priority.
-enum class GpuStageThread : uint32_t { CommandProcessor = 0, Execution = 1, Recording = 2 };
+// processor, execution, recording, resolve and host copy threads are pinned to ("off" leaves
+// them unpinned); KYTY_GPU_THREAD_PRIORITY=0 keeps their normal priority.
+enum class GpuStageThread : uint32_t {
+	CommandProcessor = 0,
+	Execution        = 1,
+	Recording        = 2,
+	Resolve          = 3,
+	HostCopy         = 4
+};
 // Applies the priority and affinity of `stage` to the calling thread.
 void ConfigureGpuStageThread(GpuStageThread stage);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

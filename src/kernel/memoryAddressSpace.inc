@@ -263,6 +263,32 @@ public:
 		return true;
 	}
 
+	// The backing alias of a range that one mapping holds, or null. The alias stays mapped for
+	// the store's lifetime, so the pointer can be read later, even after the guest range changed.
+	const uint8_t* FindBackingPointer(uint64_t vaddr, uint64_t size) {
+		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
+			return nullptr;
+		}
+		const uint8_t* result = nullptr;
+		if (TryCachedTransfer(vaddr, size, [&](uint8_t* backing, size_t) { result = backing; })) {
+			return result;
+		}
+
+		std::shared_lock lock(m_mutex);
+		const auto       end     = vaddr + size;
+		auto             mapping = m_maps.upper_bound(vaddr);
+		if (mapping == m_maps.begin()) {
+			return nullptr;
+		}
+		const auto& entry = std::prev(mapping)->second;
+		if (vaddr < entry.vaddr || end > entry.vaddr + entry.size ||
+		    !RangeOk(entry.backing_offset + vaddr - entry.vaddr, size)) {
+			return nullptr;
+		}
+		RememberMapping(entry, end);
+		return m_backing_base + entry.backing_offset + (vaddr - entry.vaddr);
+	}
+
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
@@ -854,6 +880,10 @@ public:
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
+	}
+
+	const uint8_t* FindBackingPointer(uint64_t vaddr, uint64_t size) {
+		return m_backing->FindBackingPointer(vaddr, size);
 	}
 
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
