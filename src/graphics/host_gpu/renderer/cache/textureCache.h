@@ -20,6 +20,10 @@
 #include <map>
 #include <memory>
 #include <span>
+#include <array>
+#include <bitset>
+#include <map>
+#include <memory>
 #include <type_traits>
 #include <unordered_set>
 #include <vector>
@@ -231,7 +235,9 @@ private:
 	void               CopyImage(ImageId destination, ImageId source);
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
-	void ValidateImageDesc(const ImageDesc& desc) const;
+	// Validates the view and binding of a description; ImageOps::Validate() checks its image
+	// information.
+	void ValidateImageViewDesc(const ImageDesc& desc) const;
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	// Whether a cached image in the region holds bytes the GPU wrote that guest memory lacks.
