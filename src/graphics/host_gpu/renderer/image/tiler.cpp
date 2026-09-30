@@ -108,7 +108,7 @@ TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 
 void TileManager::DeferDestroy(Scratch scratch) {
 	auto allocator = m_graphics.allocator;
-	m_scheduler.DeferOperation(
+	m_scheduler.DeferHostOperation(
 	    [allocator, scratch] { vmaDestroyBuffer(allocator, scratch.buffer, scratch.allocation); });
 }
 

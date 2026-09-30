@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 
 namespace Libs::Graphics {
@@ -258,6 +259,18 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 	return desc;
 }
 
+// The last depth-target descriptions; see ResolveRenderDepthTarget().
+struct RenderExecutor::DepthTargetMemo {
+	struct Entry {
+		HW::DepthRenderTarget   registers {};
+		TextureCache::ImageDesc desc;
+		bool                    valid = false;
+	};
+	static constexpr uint32_t Ways = 2;
+	std::array<Entry, Ways>   entries {};
+	uint32_t                  next = 0;
+};
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& r) {
 	KYTY_PROFILER_FUNCTION();
@@ -306,7 +319,27 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	     z.stencil_write_base_addr != z.stencil_read_base_addr)) {
 		DepthFatal("unsupported depth register state");
 	}
-	r.desc = MakeDepthTargetDesc(buffer, z);
+	// The description is a pure function of the depth registers, which the draws of a pass keep.
+	if (m_depth_target_memo == nullptr) {
+		m_depth_target_memo = {new DepthTargetMemo {}, [](DepthTargetMemo* memo) { delete memo; }};
+	}
+	auto&                   memo  = *m_depth_target_memo;
+	DepthTargetMemo::Entry* entry = nullptr;
+	for (auto& candidate: memo.entries) {
+		if (candidate.valid && std::memcmp(&candidate.registers, &z, sizeof(z)) == 0) {
+			entry = &candidate;
+			break;
+		}
+	}
+	if (entry == nullptr) {
+		entry        = &memo.entries[memo.next];
+		memo.next    = (memo.next + 1u) % DepthTargetMemo::Ways;
+		entry->valid = false;
+		entry->desc  = MakeDepthTargetDesc(buffer, z);
+		std::memcpy(&entry->registers, &z, sizeof(z));
+		entry->valid = true;
+	}
+	r.desc                    = entry->desc;
 	r.depth_clear_enable      = rc.depth_clear_enable;
 	r.depth_load_clear_enable = r.depth_clear_enable;
 	r.depth_clear_value       = hw.GetDepthClearValue();

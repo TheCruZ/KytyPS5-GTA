@@ -112,7 +112,19 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
+		// Finishing the GPU protects GPU writes to the range and completions that may write guest
+		// memory there (downloads, write scans). Queued GPU work only reads cached copies and
+		// host-only completions (cache bookkeeping, flips, interrupts) never touch the range, so
+		// without GPU-owned pages, images or pending guest completions writing the range the
+		// unmap needs no drain.
 		if (m_command_scheduler.Active()) {
+			m_command_scheduler.PopPendingOperations();
+		}
+		const bool drain = m_command_scheduler.Active() &&
+		                   (m_buffer_cache.IsRegionGpuModified(vaddr, size) ||
+		                    m_texture_cache.HasImagesInRegion(vaddr, size) ||
+		                    m_command_scheduler.HasPendingGuestOperations(vaddr, size));
+		if (drain) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
@@ -129,7 +141,11 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		unmap();
 		return;
 	}
-	m_gpu->SendCommandSync(unmap);
+	// The guest unmaps memory once the GPU work that used it executed: it waits on labels the
+	// execution thread writes after the operations before them. The operations queued since do not
+	// use the range, so the unmap runs before them instead of making the guest wait for them;
+	// streaming games unmap many times per frame, holding their own locks.
+	m_gpu->SendUrgentCommandSync(unmap);
 }
 
 void RenderContext::CacheDmaBases(const ShaderStageRuntime& runtime) {

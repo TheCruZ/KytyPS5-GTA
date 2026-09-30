@@ -1,6 +1,7 @@
 #include "common/inlineFunction.h"
 #include "common/spscQueue.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/host_gpu/renderer/hostCopyQueue.h"
 
 #include <array>
 #include <atomic>
@@ -8,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -319,6 +321,56 @@ void TestInlineFunction() {
 	Check(destroyed == 1, "the small callable is destroyed once");
 }
 
+// Copies complete in order, in full and partial batches; WaitFor() and Drain() see their bytes,
+// also after the copy thread slept on an empty queue, and a waiter on another thread (the
+// recording thread) sees the copies counted before its target.
+void TestHostCopyQueue() {
+	constexpr size_t           Copies = 20000;
+	constexpr size_t           Bytes  = 300;
+	std::vector<uint8_t>       sources(Copies * Bytes);
+	std::vector<uint8_t>       targets(Copies * Bytes, 0);
+	for (size_t i = 0; i < sources.size(); i++) {
+		sources[i] = static_cast<uint8_t>(i * 7 + i / 251);
+	}
+	Libs::Graphics::HostCopyQueue queue;
+	std::atomic_uint64_t          published {0};
+	std::atomic_bool              stop {false};
+	bool                          seen = true;
+	std::jthread                  waiter([&] {
+		// Like the recording thread: waits for the copies counted before a submission.
+		while (!stop.load(std::memory_order_acquire)) {
+			const auto target = published.load(std::memory_order_acquire);
+			queue.WaitFor(target);
+			for (uint64_t i = target >= 8 ? target - 8 : 0; i < target; i++) {
+				seen &= targets[i * Bytes + Bytes - 1] == sources[i * Bytes + Bytes - 1];
+			}
+		}
+	});
+	bool drained = true;
+	for (size_t i = 0; i < Copies; i++) {
+		queue.Copy(targets.data() + i * Bytes, sources.data() + i * Bytes, Bytes);
+		// Flushes every few copies, as the execution thread does after each draw; Copy() hands
+		// over full batches itself.
+		if (i % 3 == 0) {
+			published.store(queue.Flush(), std::memory_order_release);
+		}
+		if (i % 997 == 0) {
+			queue.Drain();
+			drained &= std::memcmp(targets.data(), sources.data(), (i + 1) * Bytes) == 0;
+		}
+		if (i % 5000 == 0) {
+			Stall(std::chrono::milliseconds(3));
+		}
+	}
+	queue.Drain();
+	stop.store(true, std::memory_order_release);
+	waiter.join();
+	Check(queue.Flush() == Copies, "every copy is counted");
+	Check(drained, "Drain() waits for every queued copy");
+	Check(seen, "WaitFor() on another thread sees the copies before its target");
+	Check(targets == sources, "every copy lands");
+}
+
 } // namespace
 
 int main() {
@@ -328,6 +380,7 @@ int main() {
 	TestSpscQueue();
 	TestProgressCounter();
 	TestInlineFunction();
+	TestHostCopyQueue();
 	std::printf("GpuPipelineTests: all tests passed\n");
 	return 0;
 }

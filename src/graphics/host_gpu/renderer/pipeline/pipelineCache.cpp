@@ -24,13 +24,18 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fmt/format.h>
 #include <limits>
+#include <mutex>
+#include <optional>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -99,6 +104,111 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	return !values.empty() &&
 	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
 }
+
+bool ReadAheadPlain(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	return !values.empty() && static_cast<GuestReadLog*>(userdata)->Read(
+	                              address, values.data(), values.size_bytes(), false);
+}
+
+bool ReadAheadStrict(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	return !values.empty() && static_cast<GuestReadLog*>(userdata)->Read(address, values.data(),
+	                                                                     values.size_bytes(), true);
+}
+
+bool ReadAheadShaderState(void* userdata, uint64_t address, void* data, uint64_t size) {
+	return static_cast<GuestReadLog*>(userdata)->Read(address, data, size, false);
+}
+
+} // namespace
+
+bool GuestReadLog::Read(uint64_t address, void* data, uint64_t size, bool strict) {
+	if (size == 0 || size > UINT32_MAX ||
+	    !Libs::LibKernel::Memory::TryReadBacking(address, data, size)) {
+		m_failed = true;
+		return false;
+	}
+	const auto offset = static_cast<uint32_t>(m_bytes.size());
+	m_bytes.insert(m_bytes.end(), static_cast<const uint8_t*>(data),
+	               static_cast<const uint8_t*>(data) + size);
+	// Contiguous reads of the same kind are checked as one (strict reads up to the size the
+	// check reads at once).
+	if (!m_entries.empty()) {
+		auto& last = m_entries.back();
+		if (last.strict == strict && last.address + last.size == address &&
+		    last.offset + last.size == offset &&
+		    (!strict || last.size + size <= StrictCheckBytes)) {
+			last.size += static_cast<uint32_t>(size);
+			return true;
+		}
+	}
+	m_entries.push_back({address, static_cast<uint32_t>(size), offset, strict});
+	return true;
+}
+
+// Most logged reads are a few dwords: compare those without a call.
+static bool SameGuestBytes(const void* guest, const uint8_t* recorded, uint32_t size) {
+	const auto load = [](const void* address, uint32_t offset, auto value) {
+		std::memcpy(&value, static_cast<const uint8_t*>(address) + offset, sizeof(value));
+		return value;
+	};
+	switch (size) {
+		case 4: return load(guest, 0, uint32_t {}) == load(recorded, 0, uint32_t {});
+		case 8: return load(guest, 0, uint64_t {}) == load(recorded, 0, uint64_t {});
+		case 16:
+			return ((load(guest, 0, uint64_t {}) ^ load(recorded, 0, uint64_t {})) |
+			        (load(guest, 8, uint64_t {}) ^ load(recorded, 8, uint64_t {}))) == 0;
+		case 32:
+			return ((load(guest, 0, uint64_t {}) ^ load(recorded, 0, uint64_t {})) |
+			        (load(guest, 8, uint64_t {}) ^ load(recorded, 8, uint64_t {})) |
+			        (load(guest, 16, uint64_t {}) ^ load(recorded, 16, uint64_t {})) |
+			        (load(guest, 24, uint64_t {}) ^ load(recorded, 24, uint64_t {}))) == 0;
+		default: return std::memcmp(guest, recorded, size) == 0;
+	}
+}
+
+bool GuestReadLog::StillValid() const {
+	if (m_failed) {
+		return false;
+	}
+	std::array<uint8_t, StrictCheckBytes> buffer {};
+	for (const auto& entry: m_entries) {
+		const auto* recorded = m_bytes.data() + entry.offset;
+		if (entry.strict) {
+			// As specialization memory is read on the execution thread: GPU-owned bytes fail.
+			if (entry.size > buffer.size() ||
+			    !Libs::LibKernel::Memory::TryReadGpuCleanBacking(entry.address, buffer.data(),
+			                                                     entry.size) ||
+			    std::memcmp(buffer.data(), recorded, entry.size) != 0) {
+				return false;
+			}
+		} else if (!SameGuestBytes(reinterpret_cast<const void*>(entry.address), recorded,
+		                           entry.size)) {
+			// A plain load, as the execution thread's own resolution reads: GPU-owned pages
+			// fault and read the GPU's bytes back.
+			return false;
+		}
+	}
+	return true;
+}
+
+namespace {
+
+class ProgramLockGuard {
+public:
+	explicit ProgramLockGuard(std::atomic_flag& flag): m_flag(flag) {
+		while (m_flag.test_and_set(std::memory_order_acquire)) {
+			while (m_flag.test(std::memory_order_relaxed)) {
+				Common::SpinPause();
+			}
+		}
+	}
+	~ProgramLockGuard() { m_flag.clear(std::memory_order_release); }
+	ProgramLockGuard(const ProgramLockGuard&)            = delete;
+	ProgramLockGuard& operator=(const ProgramLockGuard&) = delete;
+
+private:
+	std::atomic_flag& m_flag;
+};
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
@@ -214,15 +324,15 @@ struct PipelineCache::ProgramCache {
 
 	struct SourceEntry {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
-		    : resource_plan(std::move(plan)) {
-			permutations.reserve(8);
-		}
+		    : resource_plan(std::move(plan)) {}
 
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<Permutation>                    permutations;
-		bool                                        skip_dispatch = false;
+		// A deque: resolutions ahead of execution keep pointers to programs while new
+		// permutations are added.
+		std::deque<Permutation> permutations;
+		bool                    skip_dispatch = false;
 	};
 
 	struct ProgramKeyHash {
@@ -266,8 +376,135 @@ struct PipelineCache::ProgramCache {
 		return {
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
-		    .handle         = {.id = ++next_shader_id, .module = module},
+		    .handle         = {.id = next_shader_id.fetch_add(1) + 1, .module = module},
 		};
+	}
+
+	template <typename InputInfo>
+	static std::pair<ShaderRecompiler::CompileOptions, const char*>
+	MakeCompileOptions(ShaderType stage, const ShaderParams& params, InputInfo& input_info) {
+		const auto           user_data = std::span(params.user_data).first(params.user_data_count);
+		ShaderStageInputInfo stage_input {};
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			stage_input.vertex = &input_info;
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			stage_input.pixel = &input_info;
+		} else {
+			stage_input.compute = &input_info;
+		}
+		const char* label      = nullptr;
+		const char* stage_name = nullptr;
+		switch (stage) {
+			case ShaderType::Vertex:
+				label      = "ShaderRecompiler VS";
+				stage_name = "vs";
+				break;
+			case ShaderType::Mesh:
+				label      = "ShaderRecompiler MS";
+				stage_name = "ms";
+				break;
+			case ShaderType::Local:
+				label      = "ShaderRecompiler LS";
+				stage_name = "ls";
+				break;
+			case ShaderType::TessellationControl:
+				label      = "ShaderRecompiler HS";
+				stage_name = "hs";
+				break;
+			case ShaderType::TessellationEvaluation:
+				label      = "ShaderRecompiler DS";
+				stage_name = "ds";
+				break;
+			case ShaderType::Pixel:
+				label      = "ShaderRecompiler PS";
+				stage_name = "ps";
+				break;
+			case ShaderType::Compute:
+				label      = "ShaderRecompiler CS";
+				stage_name = "cs";
+				break;
+			default: EXIT("invalid pipeline shader stage\n");
+		}
+		ShaderRecompiler::CompileOptions options;
+		options.stage       = stage;
+		options.shader_hash = params.hash;
+		options.user_data   = user_data;
+		options.back_code   = params.back_code;
+		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+		options.early_dump  = options.dump_ir;
+		options.dump_label  = label;
+		options.input_info  = stage_input;
+
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			options.user_data_base = 8;
+			options.wave_size      = input_info.wave_size;
+			if (stage == ShaderType::Mesh || stage == ShaderType::TessellationControl) {
+				options.user_data_base = 0;
+				options.wave_size = stage == ShaderType::Mesh ? input_info.mesh.wave_size : 64u;
+			}
+		} else {
+			options.wave_size = input_info.wave_size;
+		}
+		return {options, stage_name};
+	}
+
+	// Resolves a stage ahead of execution: only programs and permutations that exist, into the
+	// storage of the resolution, reading guest memory through its log.
+	template <typename InputInfo>
+	ShaderProgram GetAhead(const ShaderParams& params, InputInfo& input_info,
+	                       uint32_t& push_data_cursor, ProgramResolution& ahead) {
+		ShaderType stage;
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			stage = input_info.logical_stage;
+		} else {
+			static_assert(std::is_same_v<InputInfo, ShaderPixelInputInfo>);
+			stage = ShaderType::Pixel;
+		}
+		lookup_key.stage           = stage;
+		lookup_key.hash            = params.hash;
+		lookup_key.user_data_count = params.user_data_count;
+		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
+		BuildStageStaticKey(input_info, lookup_key.static_state);
+		const auto entry = programs.find(lookup_key);
+		if (entry == programs.end() && ahead.stages != ProgramResolution::MaxStages) {
+			QueueCompile(stage, params, input_info, push_data_cursor, nullptr);
+		}
+		if (entry == programs.end() || entry->second.skip_dispatch ||
+		    ahead.stages == ProgramResolution::MaxStages) {
+			ahead.reads.Fail();
+			return {};
+		}
+		const auto                             stage_index    = ahead.stages++;
+		auto&                                  resources      = ahead.resources[stage_index];
+		auto&                                  specialization = ahead.specializations[stage_index];
+		const ShaderRecompiler::IR::SrtRuntime runtime {
+		    .user_data                  = std::span(params.user_data).first(params.user_data_count),
+		    .shader_base                = params.Base(),
+		    .read_memory                = ReadAheadPlain,
+		    .userdata                   = &ahead.reads,
+		    .read_specialization_memory = ReadAheadStrict,
+		};
+		if (!ShaderRecompiler::IR::MaterializeResources(entry->second.resource_plan, runtime,
+		                                                resources, specialization)) {
+			ahead.reads.Fail();
+			return {};
+		}
+		const auto permutation =
+		    std::ranges::find_if(entry->second.permutations, [&](const Permutation& candidate) {
+			    const auto& layout = candidate.program.bindings;
+			    return layout.push_data_start_dword ==
+			               ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
+			                                                        layout.ShaderDataDwords()) &&
+			           candidate.specialization == specialization;
+		    });
+		if (permutation == entry->second.permutations.end()) {
+			QueueCompile(stage, params, input_info, push_data_cursor, &specialization);
+			ahead.reads.Fail();
+			return {};
+		}
+		input_info.stage = {.program = &permutation->program, .resources = &resources};
+		permutation->program.bindings.AdvancePushData(push_data_cursor);
+		return permutation->handle;
 	}
 
 	template <typename InputInfo>
@@ -318,46 +555,11 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
-		ShaderStageInputInfo stage_input {};
-		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-			stage_input.vertex = &input_info;
-		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
-			stage_input.pixel = &input_info;
-		} else {
-			stage_input.compute = &input_info;
+		// A worker may be compiling this program: use it once it is there.
+		if (WaitForCompile()) {
+			return Get(params, input_info, push_data_cursor);
 		}
-		const char* label = nullptr;
-		const char* stage_name = nullptr;
-		switch (stage) {
-			case ShaderType::Vertex: label = "ShaderRecompiler VS"; stage_name = "vs"; break;
-			case ShaderType::Mesh: label = "ShaderRecompiler MS"; stage_name = "ms"; break;
-			case ShaderType::Local: label = "ShaderRecompiler LS"; stage_name = "ls"; break;
-			case ShaderType::TessellationControl: label = "ShaderRecompiler HS"; stage_name = "hs"; break;
-			case ShaderType::TessellationEvaluation: label = "ShaderRecompiler DS"; stage_name = "ds"; break;
-			case ShaderType::Pixel: label = "ShaderRecompiler PS"; stage_name = "ps"; break;
-			case ShaderType::Compute: label = "ShaderRecompiler CS"; stage_name = "cs"; break;
-			default: EXIT("invalid pipeline shader stage\n");
-		}
-		ShaderRecompiler::CompileOptions options;
-		options.stage       = stage;
-		options.shader_hash = params.hash;
-		options.user_data   = user_data;
-		options.back_code      = params.back_code;
-		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
-		options.early_dump  = options.dump_ir;
-		options.dump_label  = label;
-		options.input_info  = stage_input;
-
-		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-			options.user_data_base = 8;
-			options.wave_size = input_info.wave_size;
-			if (stage == ShaderType::Mesh || stage == ShaderType::TessellationControl) {
-				options.user_data_base = 0;
-				options.wave_size = stage == ShaderType::Mesh ? input_info.mesh.wave_size : 64u;
-			}
-		} else {
-			options.wave_size = input_info.wave_size;
-		}
+		const auto [options, stage_name] = MakeCompileOptions(stage, params, input_info);
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		if (translated.skip_dispatch) {
@@ -398,6 +600,7 @@ struct PipelineCache::ProgramCache {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
+		StopWorkers();
 		for (const auto& [key, entry]: programs) {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {
@@ -409,12 +612,188 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
-	uint64_t                                                    next_shader_id = 0;
+	std::atomic_uint64_t                                        next_shader_id {0};
+
+	// Graphics programs compiled on worker threads: the resolve thread queues the programs and
+	// permutations its draws miss, so the shaders of a new area compile in parallel instead of
+	// one after another on the execution thread. Workers only add programs; the execution
+	// thread still resolves every draw itself and compiles what they did not add.
+	struct CompileJob {
+		ProgramKey                                                  key;
+		ShaderType                                                  stage = ShaderType::Vertex;
+		ShaderParams                                                params;
+		std::unique_ptr<ShaderVertexInputInfo>                      vertex;
+		std::unique_ptr<ShaderPixelInputInfo>                       pixel;
+		uint32_t                                                    push_data_cursor = 0;
+		std::optional<ShaderRecompiler::IR::ResourceSpecialization> specialization;
+	};
+	static constexpr uint32_t CompileWorkers = 6;
+
+	std::atomic_flag* program_lock = nullptr;
+	// Under the program lock: programs a worker is compiling.
+	std::unordered_set<ProgramKey, ProgramKeyHash> in_flight;
+	std::mutex                                     job_mutex;
+	std::condition_variable                        job_available;
+	std::deque<std::unique_ptr<CompileJob>>        jobs;
+	bool                                           stopping = false;
+	std::vector<std::jthread>                      workers;
+
+	void LockPrograms() {
+		while (program_lock->test_and_set(std::memory_order_acquire)) {
+			while (program_lock->test(std::memory_order_relaxed)) {
+				Common::SpinPause();
+			}
+		}
+	}
+	void UnlockPrograms() { program_lock->clear(std::memory_order_release); }
+
+	// Under the program lock (resolve thread).
+	template <typename InputInfo>
+	void QueueCompile(ShaderType stage, const ShaderParams& params, const InputInfo& input_info,
+	                  uint32_t                                            push_data_cursor,
+	                  const ShaderRecompiler::IR::ResourceSpecialization* specialization) {
+		if (in_flight.contains(lookup_key)) {
+			return;
+		}
+		auto job              = std::make_unique<CompileJob>();
+		job->key              = lookup_key;
+		job->stage            = stage;
+		job->params           = params;
+		job->push_data_cursor = push_data_cursor;
+		if (specialization != nullptr) {
+			job->specialization = *specialization;
+		}
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			job->vertex = std::make_unique<ShaderVertexInputInfo>(input_info);
+		} else {
+			job->pixel = std::make_unique<ShaderPixelInputInfo>(input_info);
+		}
+		in_flight.insert(lookup_key);
+		{
+			std::lock_guard lock(job_mutex);
+			jobs.push_back(std::move(job));
+		}
+		job_available.notify_one();
+	}
+
+	// Execution thread, under the program lock: waits without the lock until no worker compiles
+	// the program of lookup_key. False when none did.
+	bool WaitForCompile() {
+		if (!in_flight.contains(lookup_key)) {
+			return false;
+		}
+		const auto key = lookup_key;
+		do {
+			UnlockPrograms();
+			std::this_thread::yield();
+			LockPrograms();
+		} while (in_flight.contains(key));
+		return true;
+	}
+
+	template <typename InputInfo>
+	void RunCompileJob(CompileJob& job, InputInfo& input_info) {
+		std::optional<Permutation>                        permutation;
+		std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
+		try {
+			Common::SoftExitScope soft_exit(true);
+			const auto [options, stage_name] =
+			    MakeCompileOptions(job.stage, job.params, input_info);
+			auto translated = ShaderRecompiler::TranslateProgram(job.params.code, options);
+			if (!translated.skip_dispatch) {
+				plan                = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+				auto specialization = job.specialization;
+				if (!specialization) {
+					GuestReadLog                           reads;
+					ShaderRecompiler::IR::ResourceSnapshot resources;
+					specialization.emplace();
+					const ShaderRecompiler::IR::SrtRuntime runtime {
+					    .user_data =
+					        std::span(job.params.user_data).first(job.params.user_data_count),
+					    .shader_base                = job.params.Base(),
+					    .read_memory                = ReadAheadPlain,
+					    .userdata                   = &reads,
+					    .read_specialization_memory = ReadAheadStrict,
+					};
+					if (!ShaderRecompiler::IR::MaterializeResources(*plan, runtime, resources,
+					                                                *specialization)) {
+						specialization.reset();
+					}
+				}
+				if (specialization) {
+					permutation =
+					    CompilePermutation(stage_name, options, std::move(translated),
+					                       std::move(*specialization), job.push_data_cursor);
+				}
+			}
+		} catch (const Common::SoftExitError&) {
+			// The execution thread compiles the program itself and reports the error.
+			permutation.reset();
+		}
+		LockPrograms();
+		if (permutation) {
+			auto entry = programs.find(job.key);
+			if (entry == programs.end()) {
+				entry = programs.try_emplace(job.key, std::move(*plan)).first;
+			}
+			auto&       permutations = entry->second.permutations;
+			const auto& layout       = permutation->program.bindings;
+			const bool  known = std::ranges::any_of(permutations, [&](const Permutation& other) {
+				return other.specialization == permutation->specialization &&
+				       other.program.bindings.push_data_start_dword == layout.push_data_start_dword;
+			});
+			if (known || entry->second.skip_dispatch) {
+				device.destroyShaderModule(permutation->handle.module, nullptr);
+			} else {
+				permutations.push_back(std::move(*permutation));
+			}
+		}
+		in_flight.erase(job.key);
+		UnlockPrograms();
+	}
+
+	void CompileWorker(const std::stop_token& stop) {
+		KYTY_PROFILER_THREAD("Thread_ShaderCompile");
+		for (;;) {
+			std::unique_ptr<CompileJob> job;
+			{
+				std::unique_lock lock(job_mutex);
+				job_available.wait(lock, [&] { return stopping || !jobs.empty(); });
+				if (stopping) {
+					return;
+				}
+				job = std::move(jobs.front());
+				jobs.pop_front();
+			}
+			if (job->vertex != nullptr) {
+				RunCompileJob(*job, *job->vertex);
+			} else {
+				RunCompileJob(*job, *job->pixel);
+			}
+		}
+	}
+
+	void StartWorkers(std::atomic_flag* lock) {
+		program_lock = lock;
+		for (uint32_t i = 0; i < CompileWorkers; i++) {
+			workers.emplace_back([this](const std::stop_token& stop) { CompileWorker(stop); });
+		}
+	}
+
+	void StopWorkers() {
+		{
+			std::lock_guard lock(job_mutex);
+			stopping = true;
+		}
+		job_available.notify_all();
+		workers.clear();
+	}
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	m_program_cache->StartWorkers(&m_program_lock);
 	InitializeDriverCache();
 }
 
@@ -597,13 +976,24 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
-    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
+    ProgramResolution* ahead) {
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
+	if (ahead != nullptr && tess_active) {
+		ahead->reads.Fail();
+		return {};
+	}
+	// Ahead of execution, the vertex fetch tables are read through the resolution's log.
+	const ShaderGuestReaderScope reader(ahead != nullptr ? ReadAheadShaderState : nullptr,
+	                                    ahead != nullptr ? &ahead->reads : nullptr);
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
 		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
 	} else {
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
+	}
+	if (ahead != nullptr && ahead->reads.Failed()) {
+		return {};
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active) {
@@ -668,7 +1058,19 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	uint32_t          push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
-	GraphicsPrograms  result;
+	GraphicsPrograms       result;
+	const ProgramLockGuard lock(m_program_lock);
+	if (ahead != nullptr) {
+		if (pixel_active) {
+			result.pixel =
+			    m_program_cache->GetAhead(pixel_params, pixel_info, push_data_cursor, *ahead);
+		}
+		if (!ahead->reads.Failed()) {
+			result.vertex[0] = m_program_cache->GetAhead(vertex_params[0], vertex_info[0],
+			                                             push_data_cursor, *ahead);
+		}
+		return ahead->reads.Failed() ? GraphicsPrograms {} : result;
+	}
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 	}
@@ -684,6 +1086,7 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	uint32_t          push_data_cursor = 0;
+	const ProgramLockGuard lock(m_program_lock);
 	return m_program_cache->Get(params, input_info, push_data_cursor);
 }
 
@@ -843,7 +1246,13 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		}
 	}
 
+	// Consecutive draws mostly use the pipeline of the draw before.
+	if (m_last_graphics_pipeline != nullptr && key == m_last_graphics_key) {
+		return *m_last_graphics_pipeline;
+	}
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+		m_last_graphics_key      = key;
+		m_last_graphics_pipeline = iter->second.get();
 		return *iter->second;
 	}
 
