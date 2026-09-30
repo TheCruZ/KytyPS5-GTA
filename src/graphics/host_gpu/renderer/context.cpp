@@ -20,6 +20,10 @@ namespace Libs::Graphics {
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
     : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()), m_scheduler(scheduler) {}
 
+void CommandBuffer::InvalidateDynamicState() const {
+	m_scheduler.GetDynamicState().Invalidate();
+}
+
 bool CommandBuffer::IsInvalid() const {
 	return !m_open;
 }
