@@ -1114,18 +1114,19 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	// Completion labels can be reused immediately; memcpy may write a destination twice, so
 	// publish each word exactly once.
 	const auto sequence = EmitCallback([this, dst, src, dw_num, write_one_address] {
-		auto& cache = m_renderer.GetBufferCache();
-		if (write_one_address) {
-			if (cache.WriteClean(reinterpret_cast<uint64_t>(dst), &src[dw_num - 1],
-			                     sizeof(uint32_t))) {
-				return;
-			}
-		} else {
-			const auto bytes = static_cast<size_t>(dw_num) * sizeof(uint32_t);
-			if (cache.WriteClean(reinterpret_cast<uint64_t>(dst), src, bytes)) {
-				return;
-			}
+		// Labels often share a page with bytes the GPU wrote. A plain write then faults and
+		// downloads the page, draining the GPU; WriteClean writes both copies instead. Otherwise
+		// a tracked page is resolved as its write fault would, without raising the exception.
+		auto&      cache = m_renderer.GetBufferCache();
+		const auto bytes = write_one_address ? sizeof(uint32_t)
+		                                     : static_cast<size_t>(dw_num) * sizeof(uint32_t);
+		if (cache.WriteClean(reinterpret_cast<uint64_t>(dst),
+		                     write_one_address ? static_cast<const void*>(&src[dw_num - 1])
+		                                       : static_cast<const void*>(src),
+		                     bytes)) {
+			return;
 		}
+		m_renderer.PrepareGpuWrite(dst, bytes);
 		auto* output = static_cast<volatile uint32_t*>(dst);
 		for (uint32_t i = 0; i < dw_num; i++) {
 			*output = src[i];
@@ -3144,6 +3145,7 @@ void CommandProcessor::ExecuteWriteAtEndOfPipe(uint64_t submit_id, uint32_t eop_
 			m_renderer.GetGpu().DeferLabelWrite(reinterpret_cast<uint64_t>(dst), data,
 			                                    sizeof(data));
 		} else {
+			m_renderer.PrepareGpuWrite(dst, sizeof(data));
 			std::memcpy(dst, &data, sizeof(data));
 		}
 
@@ -3192,6 +3194,7 @@ void CommandProcessor::ExecuteWriteAtEndOfPipe(uint64_t submit_id, uint32_t eop_
 						m_renderer.GetGpu().DeferLabelWrite(reinterpret_cast<uint64_t>(dst),
 						                                    value, sizeof(value));
 					} else {
+						m_renderer.PrepareGpuWrite(dst, sizeof(value));
 						std::memcpy(dst, &value, sizeof(value));
 					}
 

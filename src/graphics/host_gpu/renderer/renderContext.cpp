@@ -154,6 +154,20 @@ bool RenderContext::CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
 	       m_buffer_cache.IsCleanForConcurrentRead(vaddr, size);
 }
 
+void RenderContext::PrepareGpuWrite(const void* destination, uint64_t size) noexcept {
+	const auto vaddr     = reinterpret_cast<uint64_t>(destination);
+	const auto page_size = m_page_manager.GetPageSize();
+	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	// A watched page is protected: the write would fault into HandleFault().
+	for (auto page = vaddr & ~(page_size - 1); page < vaddr + size; page += page_size) {
+		if (m_page_manager.IsWatched(page)) {
+			(void)HandleFault(PageFaultAccess::Write, std::max(page, vaddr));
+		}
+	}
+}
+
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
 		return false;
