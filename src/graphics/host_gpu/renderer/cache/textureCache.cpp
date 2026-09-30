@@ -389,6 +389,11 @@ void TextureCache::UnregisterImage(ImageId id) {
 	            [this, epoch](uint64_t page) { m_image_page_epochs[page] = epoch; });
 }
 
+bool TextureCache::HasImagesInRegion(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	return FindImagesInRegion(address, size, false).size() != 0;
+}
+
 uint64_t TextureCache::ImageEpochInRegion(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	return ImageEpochInRegionUnlocked(address, size);
@@ -2419,7 +2424,7 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool evicting,
 			return;
 		}
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
-	});
+	}, range.address, range.size);
 	return true;
 }
 

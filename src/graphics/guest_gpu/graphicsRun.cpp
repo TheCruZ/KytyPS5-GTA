@@ -1772,11 +1772,11 @@ bool GuestGpu::Process(Submission& submission) {
 			cp.RunGarbageCollector();
 			cp.EmitGlobalBarrier();
 			// Registered at the operation's place in the stream: a pipelined command processor
-			// runs ahead of the recorded commands.
+			// runs ahead of the recorded commands. Releasing the slot only touches host state.
 			cp.EmitHostCommand([this, ready = m_suspend_point_ready] {
 				SetSubmitReason("suspend point");
-				m_renderer.GetCommandScheduler().DeferPriorityOperation(
-				    [ready] { ready->release(); });
+				m_renderer.GetCommandScheduler().DeferHostOperation([ready] { ready->release(); },
+				                                                    true);
 			});
 			cp.BufferFlush();
 			cp.Reset();
@@ -3278,10 +3278,11 @@ void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id)
 
 void CommandProcessor::DeferEopInterrupt(uint32_t interrupt_context_id) {
 	(void)CurrentBuffer().Handle();
-	GetScheduler().DeferPriorityOperation(
+	GetScheduler().DeferHostOperation(
 	    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
 		    renderer.TriggerInterrupt(event_id, interrupt_context_id);
-	    });
+	    },
+	    true);
 }
 
 void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
@@ -3411,8 +3412,9 @@ void CommandProcessor::Flip() {
 		auto  request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
 		                                          flip.flip_mode, flip.flip_arg);
 		(void)command.Handle();
-		GetScheduler().DeferPriorityOperation(
-		    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
+		GetScheduler().DeferHostOperation(
+		    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); },
+		    true);
 		(KYTY_SUBMIT_REASON(), GetScheduler().Flush());
 	});
 }
@@ -3432,8 +3434,9 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 		auto request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
 		                                         flip.flip_mode, flip.flip_arg);
 		(void)command.Handle();
-		GetScheduler().DeferPriorityOperation(
-		    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
+		GetScheduler().DeferHostOperation(
+		    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); },
+		    true);
 		(KYTY_SUBMIT_REASON(), GetScheduler().Flush());
 	});
 	NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(value), &value);
@@ -3460,11 +3463,12 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 		auto request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
 		                                         flip.flip_mode, flip.flip_arg);
 		(void)command.Handle();
-		GetScheduler().DeferPriorityOperation(
+		GetScheduler().DeferHostOperation(
 		    [&renderer = m_renderer, event_id = m_interrupt_event_id, request] {
 			    renderer.GetVideoOut().CompleteFlip(request);
 			    renderer.TriggerInterrupt(event_id, 0);
-		    });
+		    },
+		    true);
 		(KYTY_SUBMIT_REASON(), GetScheduler().Flush());
 	});
 	NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(value), &value);
@@ -3484,8 +3488,8 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 		ProcessorScope processor_scope(*this);
 
 		m_renderer.GetVideoOut().PrepareFlip(request_id, CurrentBuffer());
-		GetScheduler().DeferPriorityOperation(
-		    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
+		GetScheduler().DeferHostOperation(
+		    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); }, true);
 		(KYTY_SUBMIT_REASON(), GetScheduler().Flush());
 	});
 }

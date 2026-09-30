@@ -1,3 +1,4 @@
+#include "common/hackNotice.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 
 #include "common/assert.h"
@@ -7,6 +8,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 
@@ -202,7 +204,9 @@ void FaultManager::ProcessFaultBufferImpl(ShaderFaultReport* report) {
 	// supplies the transfer-read -> transfer-write -> shader-access dependencies.
 	m_fault_buffer.Fill(PageFaultBitsetSize, sizeof(ShaderTrapRecord), 0);
 	const auto area = m_current_area;
-	m_scheduler.DeferOperation([this, mapped, offset, area, report] {
+	// The fault scan only caches pages still mapped; it never writes guest memory, so an unmap
+	// does not wait for it.
+	m_scheduler.DeferHostOperation([this, mapped, offset, area, report] {
 		m_download_buffer.Invalidate(offset, m_download_area_size);
 		ShaderTrapRecord trap;
 		std::memcpy(&trap, mapped + PageFaultAreaSize, sizeof(trap));
@@ -235,7 +239,15 @@ void FaultManager::ProcessFaultBufferImpl(ShaderFaultReport* report) {
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
-			(void)m_buffer_cache.FindBuffer(start, end - start);
+			// The guest may have unmapped the range since the GPU accessed it: an unmap does not
+			// wait for this completion.
+			if (m_scheduler.Context().IsMapped(start, end - start)) {
+				(void)m_buffer_cache.FindBuffer(start, end - start);
+			} else {
+				Common::HackNotice::Report(
+				    "device-address fault on memory the guest has unmapped ignored",
+				    "FaultManager::ProcessFaultBuffer", 0, 0, "the access is not cached");
+			}
 		});
 		if (report != nullptr) {
 			fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
@@ -316,6 +328,8 @@ void FaultManager::ProcessWriteBuffer(PagesHandler&& handler) {
 	command.pipelineBarrier2(dependency);
 
 	const auto area = m_current_write_area;
+	// The write scan marks the pages the GPU wrote as GPU-owned: an unmap waits for it, or a remap
+	// of the range would inherit the marks.
 	m_scheduler.DeferOperation([this, mapped, offset, area, handler = std::move(handler)] {
 		m_write_download.Invalidate(offset, m_write_area_size);
 		const auto* entries = std::bit_cast<const uint64_t*>(mapped);

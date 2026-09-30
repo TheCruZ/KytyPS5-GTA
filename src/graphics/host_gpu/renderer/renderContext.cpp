@@ -206,12 +206,19 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		}
 	}
 	const auto unmap = [this, vaddr, size] {
-		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
-		// access a range with no cached data, so they must finish before it is unmapped.
-		if (m_command_scheduler.Active() &&
-		    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
-		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
-		     m_command_scheduler.HasPendingPriorityOperations())) {
+		// Finishing the GPU protects GPU writes to the range and completions that may write guest
+		// memory there (downloads, write scans). Queued GPU work only reads cached copies and
+		// host-only completions (cache bookkeeping, flips, interrupts) never touch the range, so
+		// without GPU-owned pages, images or pending guest completions writing the range the
+		// unmap needs no drain.
+		if (m_command_scheduler.Active()) {
+			m_command_scheduler.PopPendingOperations();
+		}
+		const bool drain = m_command_scheduler.Active() &&
+		                   (m_buffer_cache.IsRegionGpuModified(vaddr, size) ||
+		                    m_texture_cache.HasImagesInRegion(vaddr, size) ||
+		                    m_command_scheduler.HasPendingGuestOperations(vaddr, size));
+		if (drain) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			(KYTY_SUBMIT_REASON(), m_command_scheduler.Finish());
 			m_command_scheduler.WaitPriorityOperations(tick);
@@ -273,7 +280,17 @@ void RenderContext::UnmapMemoryRanges(std::span<const std::pair<uint64_t, uint64
 		return;
 	}
 	const auto unmap = [this, &mapped] {
+		// As UnmapMemory: drain only for GPU-owned pages, images or pending guest completions.
+		bool drain = false;
 		if (m_command_scheduler.Active()) {
+			m_command_scheduler.PopPendingOperations();
+			for (const auto& [vaddr, size]: mapped) {
+				drain |= m_buffer_cache.IsRegionGpuModified(vaddr, size) ||
+				         m_texture_cache.HasImagesInRegion(vaddr, size) ||
+				         m_command_scheduler.HasPendingGuestOperations(vaddr, size);
+			}
+		}
+		if (drain) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			(KYTY_SUBMIT_REASON(), m_command_scheduler.Finish());
 			m_command_scheduler.WaitPriorityOperations(tick);

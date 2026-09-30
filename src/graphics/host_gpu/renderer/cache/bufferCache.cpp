@@ -62,7 +62,7 @@ std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandSched
 	write(temporary->Mapped().data(), 0);
 	temporary->Flush(0, size);
 	auto* buffer = temporary.get();
-	scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
+	scheduler.DeferHostOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
 	return {buffer, 0};
 }
 
@@ -431,6 +431,12 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
+	uint64_t written_begin = UINT64_MAX;
+	uint64_t written_end   = 0;
+	for (const auto& copy: copies) {
+		written_begin = std::min(written_begin, buffer_address + copy.srcOffset);
+		written_end   = std::max(written_end, buffer_address + copy.srcOffset + copy.size);
+	}
 	auto publish = [this, mapped, offset, total_size, buffer_address,
 	                copies = std::move(copies), owner = std::move(temporary)] {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
@@ -460,7 +466,8 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 		     publish_tick > seen &&
 		     !m_download_publish_tick.compare_exchange_weak(seen, publish_tick, std::memory_order_relaxed);) {
 		}
-		m_scheduler.DeferPriorityOperation(std::move(publish));
+		m_scheduler.DeferPriorityOperation(std::move(publish), written_begin,
+		                                   written_end - written_begin);
 	} else {
 		const auto tick = m_scheduler.CurrentTick();
 		m_scheduler.Wait(tick);

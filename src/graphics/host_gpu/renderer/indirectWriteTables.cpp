@@ -174,6 +174,13 @@ void IndirectWriteTables::NoteWrites(std::span<const uint64_t> pages) {
 	auto&      buffer_cache  = m_context.GetBufferCache();
 	auto&      texture_cache = m_context.GetTextureCache();
 	const auto note          = [&](uint64_t begin, uint64_t end) {
+		// An unmap does not wait for this completion when the range had no GPU-owned pages yet:
+		// writes to memory the guest unmapped meanwhile are dropped.
+		if (!m_context.IsMapped(begin, end - begin)) {
+			Common::HackNotice::Report("indirect write target over unmapped memory dropped",
+			                           "IndirectWriteTables::NoteWrites", 0, 0);
+			return;
+		}
 		buffer_cache.NoteGpuWrites(begin, end - begin);
 		// As for any other buffer store, images over the written bytes are stale.
 		texture_cache.InvalidateMemoryFromGPU(begin, end - begin);
