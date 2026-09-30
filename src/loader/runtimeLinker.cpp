@@ -1,7 +1,6 @@
 #include "loader/runtimeLinker.h"
 
 #include "common/assert.h"
-#include "common/hackNotice.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
@@ -16,7 +15,6 @@
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/pageManager.h"
-#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -790,17 +788,6 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}
 		if (transient != 0 && Libs::LibKernel::Memory::RetryTransientUnmapFault(
 		                          info->access_violation_vaddr, transient)) {
-			return true;
-		}
-		if (const auto length =
-		        Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address)) {
-			// Guest memory starts at 0x40000: a walker load below it goes through a null table
-			// pointer, which the walk follows when it cannot decide a branch.
-			if (info->access_violation_vaddr < 0x40000u) {
-				Common::HackNotice::Report("null SRT table read as zero", "SRT walker load", 0,
-				                           info->access_violation_vaddr);
-			}
-			Loader::X64InstructionEmulator::SkipLoad(info->native_context, length);
 			return true;
 		}
 	}
@@ -1764,8 +1751,6 @@ void RuntimeLinker::DeleteTls(Program* program, int thread_id) {
 	}
 }
 
-constexpr uint64_t GUEST_PAGE_SIZE = 0x4000;
-
 static uint64_t CalcBaseSize(const Elf64_Ehdr* ehdr, const Elf64_Phdr* phdr) {
 	uint64_t base_size = 0;
 	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
@@ -1777,20 +1762,6 @@ static uint64_t CalcBaseSize(const Elf64_Ehdr* ehdr, const Elf64_Phdr* phdr) {
 		}
 	}
 	return base_size;
-}
-
-// A module's E, R and RW LOAD segments use flexible memory in 16 KiB pages; GNU_RELRO adds none
-// since it lies inside an RW LOAD.
-uint64_t CalcFlexibleMemorySize(const Elf64_Phdr* phdr, Elf64_Half phnum) {
-	uint64_t size = 0;
-	for (Elf64_Half i = 0; i < phnum; i++) {
-		const auto flags = phdr[i].p_flags;
-		if (phdr[i].p_type == PT_LOAD &&
-		    (flags == PF_X || flags == PF_R || flags == (PF_R | PF_W))) {
-			size += AlignUp(phdr[i].p_memsz, GUEST_PAGE_SIZE);
-		}
-	}
-	return size;
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -1812,7 +1783,8 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 	EXIT_IF(phdr == nullptr || ehdr == nullptr);
 
-	program->base_size = CalcBaseSize(ehdr, phdr);
+	program->base_size                 = CalcBaseSize(ehdr, phdr);
+	constexpr uint64_t GUEST_PAGE_SIZE = 0x4000;
 	EXIT_IF(program->base_size > UINT64_MAX - (GUEST_PAGE_SIZE - 1));
 	program->base_size_aligned = AlignUp(program->base_size, GUEST_PAGE_SIZE);
 
@@ -1837,8 +1809,6 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	    g_desired_base_addr, program->mapped_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
 	    Common::PathToString(program->file_name.filename()).c_str());
 	EXIT_IF(program->base_vaddr == 0);
-	program->flexible_size = CalcFlexibleMemorySize(phdr, ehdr->e_phnum);
-	Libs::LibKernel::Memory::ChargeFlexibleMemory(program->flexible_size);
 
 	if (patch_guest_instructions) {
 		const auto trampoline_addr           = program->base_vaddr + program->base_size_aligned;
@@ -2024,7 +1994,6 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 		}
 		EXIT_IF(
 		    !Libs::LibKernel::Memory::FreeGuestMemory(program->base_vaddr, program->mapped_size));
-		Libs::LibKernel::Memory::ReleaseFlexibleMemory(program->flexible_size);
 	}
 }
 

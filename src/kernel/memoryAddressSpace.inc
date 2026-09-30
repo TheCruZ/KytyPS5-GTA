@@ -757,6 +757,12 @@ public:
 				t_splits++;
 			}
 		} split_cost {split_begin, left_size + right_size};
+		// The parts that stay mapped vanish until they are mapped again (see
+		// TransientUnmapWindows), and come back with the view's protection: give them back their
+		// own (guest mprotect, GPU write and read tracking) before faults there are retried.
+		const auto                   kept_protections = SnapshotProtections(old, vaddr, size);
+		const uint64_t               old_end          = old.vaddr + old.size;
+		TransientUnmapWindows::Scope transient(old.vaddr, old_end);
 		if (UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
 			bool ok = true;
 			if (left_size != 0 && left_size != old.size) {
@@ -798,6 +804,7 @@ public:
 			                    MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) == 0);
 			EXIT_IF(!MapFixed(old.vaddr, old.size, old.backing_offset, old.mode));
 			g_remapped_views.emplace_back(old.vaddr, old.size);
+			RestoreProtections(kept_protections);
 			return false;
 		}
 		DiagLockGuard lock(m_mutex, __func__);

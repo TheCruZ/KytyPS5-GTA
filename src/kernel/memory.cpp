@@ -17,8 +17,8 @@
 #include <array>
 #include <atomic>
 #include <bit>
-#include <cinttypes>
 #include <chrono>
+#include <cinttypes>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -1610,6 +1610,9 @@ uint64_t WaitForTransientUnmap(uint64_t fault_vaddr) noexcept {
 	return TransientUnmapWindows::Wait(fault_vaddr);
 }
 
+// The host replaces a mapping with an unmap followed by a map, which a guest access can fall
+// between; a remap is atomic to the guest on the console, so the access is retried until the new
+// mapping is in place.
 bool RetryTransientUnmapFault(uint64_t fault_vaddr, uint64_t window) noexcept {
 	// A page that keeps faulting after it was mapped again is a real access violation.
 	constexpr uint32_t    MaxRetries  = 16;
@@ -1630,8 +1633,6 @@ bool RetryTransientUnmapFault(uint64_t fault_vaddr, uint64_t window) noexcept {
 		            fault_vaddr);
 		std::fflush(stdout);
 	}
-	Common::HackNotice::Report("guest access retried while its mapping was being replaced",
-	                           "RetryTransientUnmapFault", 0, page);
 	return true;
 }
 
@@ -3854,6 +3855,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 				reserved_target = true;
 			}
 			if (!reserved_target) {
+				replacing.emplace(in_addr, in_addr + len);
 				const auto begin = CostNowNs();
 				reserved_target  = ReplaceFixedRangeWithReserved(in_addr, len);
 				t_replace_ns += CostNowNs() - begin;
