@@ -34,6 +34,7 @@
 #include <thread>
 #include <utility>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -47,6 +48,8 @@ static thread_local GuestGpu*         g_gpu_state         = nullptr;
 
 // Operations a pipelined command processor may queue ahead of their execution.
 constexpr size_t OperationQueueSize = 4096;
+// Resolved operations queued for the execution thread; see RenderExecutor::ResolvedDrawRing.
+constexpr size_t ResolvedQueueSize = 256;
 // How long a command processor whose queues all wait spins before it retries them.
 constexpr auto BlockedRetryInterval = std::chrono::microseconds(20);
 
@@ -84,7 +87,8 @@ static bool GraphicsRunDebugDumpEnabled() {
 GuestGpu::GuestGpu(RenderContext& renderer)
     : m_renderer(renderer),
       m_pipelined((Config::GpuPipelineStages() & Config::GPU_PIPELINE_COMMAND_PROCESSOR) != 0),
-      m_operations(OperationQueueSize),
+      m_resolving(m_pipelined && (Config::GpuPipelineStages() & Config::GPU_PIPELINE_RESOLVE) != 0),
+      m_operations(OperationQueueSize), m_resolved(ResolvedQueueSize),
       m_neutral_state {&m_neutral_context, &m_neutral_user_config, &m_neutral_shaders} {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
@@ -94,6 +98,9 @@ GuestGpu::GuestGpu(RenderContext& renderer)
 		m_pending_writes = std::make_unique<GuestWrite[]>(PendingWriteCapacity);
 		m_gfx_cp->AttachPipeline(this);
 		m_executor = std::jthread([this] { ExecutionThread(); });
+		if (m_resolving) {
+			m_resolver = std::jthread([this] { ResolveThread(); });
+		}
 	}
 	m_thread = std::jthread(ThreadRun, this);
 }
@@ -187,6 +194,47 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		done.release();
 	});
 	done.acquire();
+}
+
+void GuestGpu::SendUrgentCommandSync(Common::UniqueFunction<void>&& command) {
+	EXIT_IF(!command);
+	if (!m_pipelined || IsGpuThread() || g_cp_thread) {
+		SendCommandSync(std::move(command));
+		return;
+	}
+	std::binary_semaphore done {0};
+	{
+		std::lock_guard lock(m_urgent_mutex);
+		m_urgent_commands.push_back([operation = std::move(command), &done]() mutable {
+			operation();
+			done.release();
+		});
+		m_urgent_pending.fetch_add(1, std::memory_order_release);
+	}
+	// A busy execution thread runs the command before its next operation; an idle one waits for
+	// operations, so queue one that runs it too.
+	SendCommand([this] { RunUrgentCommands(); });
+	done.acquire();
+}
+
+void GuestGpu::RunUrgentCommands() {
+	if (m_urgent_pending.load(std::memory_order_acquire) == 0) {
+		return;
+	}
+	m_renderer.GetRenderExecutor().InvalidateRenderTargetMemo();
+	// Unmaps free memory that copies of executed draws may still read.
+	if (auto* copies = m_renderer.GetCommandScheduler().HostCopies(); copies != nullptr) {
+		copies->Drain();
+	}
+	std::vector<Common::UniqueFunction<void>> commands;
+	{
+		std::lock_guard lock(m_urgent_mutex);
+		commands.swap(m_urgent_commands);
+		m_urgent_pending.store(0, std::memory_order_relaxed);
+	}
+	for (auto& command: commands) {
+		command();
+	}
 }
 
 void GuestGpu::Submit(std::span<const uint32_t> commands) {
@@ -320,12 +368,16 @@ void GuestGpu::ExecutionThread() {
 	// waiter now and then and before sleeping.
 	constexpr uint32_t NotifyInterval = 16;
 	uint32_t           unnotified     = 0;
+	auto&              operations     = m_resolving ? m_resolved : m_operations;
 	for (;;) {
-		auto operation = m_operations.TryPop();
+		if (m_urgent_pending.load(std::memory_order_relaxed) != 0) {
+			RunUrgentCommands();
+		}
+		auto operation = operations.TryPop();
 		if (!operation) {
 			m_executed.Notify();
 			unnotified = 0;
-			operation  = m_operations.Pop();
+			operation  = operations.Pop();
 			if (!operation) {
 				break;
 			}
@@ -344,9 +396,36 @@ void GuestGpu::ExecutionThread() {
 	g_gpu_thread = false;
 }
 
+void GuestGpu::ResolveThread() {
+	KYTY_PROFILER_THREAD("Thread_GpuResolve");
+	Config::ConfigureGpuStageThread(Config::GpuStageThread::Resolve);
+	auto& executor = m_renderer.GetRenderExecutor();
+	for (;;) {
+		auto operation = m_operations.TryPop();
+		if (!operation) {
+			operation = m_operations.Pop();
+			if (!operation) {
+				break;
+			}
+		}
+		if (operation->kind == GpuOperationKind::DrawIndex ||
+		    operation->kind == GpuOperationKind::DrawAuto) {
+			// The register snapshots stay valid until the operation executed.
+			operation->resolved =
+			    executor.ResolveDrawAhead(*operation->state.context, *operation->state.user_config,
+			                              *operation->state.shaders);
+		}
+		m_resolved.Push(std::move(*operation));
+	}
+	m_resolved.Stop();
+}
+
 void GuestGpu::StopExecution() {
 	WaitForExecution();
 	m_operations.Stop();
+	if (m_resolver.joinable()) {
+		m_resolver.join();
+	}
 	if (m_executor.joinable()) {
 		m_executor.join();
 	}
@@ -402,6 +481,7 @@ GpuOperation CommandProcessor::MakeOperation(GpuOperationKind kind) {
 	operation.processor     = this;
 	operation.submit_id     = m_submit_id;
 	operation.num_instances = m_num_instances;
+	operation.after_wait    = std::exchange(m_wait_since_operation, false);
 	if (m_pipeline == nullptr) {
 		operation.state = {&m_ctx, &m_ucfg, &m_sh_ctx};
 	} else if (kind == GpuOperationKind::Callback) {
@@ -415,7 +495,7 @@ GpuOperation CommandProcessor::MakeOperation(GpuOperationKind kind) {
 
 template <typename T>
 const T* CommandProcessor::Snapshot(SnapshotRing<T>& ring, const T& live, bool& dirty,
-                                    uint64_t sequence) {
+                                    uint64_t sequence, uint64_t* id) {
 	static_assert(std::is_trivially_copyable_v<T>);
 	if (dirty || ring.current == SnapshotRing<T>::Size) {
 		if (ring.slots == nullptr) {
@@ -427,19 +507,25 @@ const T* CommandProcessor::Snapshot(SnapshotRing<T>& ring, const T& live, bool& 
 		// operation's snapshots; the wait acquires that.
 		m_pipeline->WaitForExecution(ring.last_use[ring.next]);
 		slot.value   = live;
+		slot.id      = s_snapshot_ids.fetch_add(1, std::memory_order_relaxed) + 1;
 		ring.current = ring.next;
 		ring.next    = (ring.next + 1) % SnapshotRing<T>::Size;
 		dirty        = false;
 	}
 	// The operation built from this state is the next one the command processor emits.
 	ring.last_use[ring.current] = sequence;
+	if (id != nullptr) {
+		*id = ring.slots[ring.current].id;
+	}
 	return &ring.slots[ring.current].value;
 }
 
 GpuRegisterState CommandProcessor::SnapshotState(uint64_t sequence) {
-	return {Snapshot(m_ctx_snapshots, m_ctx, m_ctx_dirty, sequence),
-	        Snapshot(m_ucfg_snapshots, m_ucfg, m_ucfg_dirty, sequence),
-	        Snapshot(m_sh_ctx_snapshots, m_sh_ctx, m_sh_ctx_dirty, sequence)};
+	GpuRegisterState state;
+	state.context     = Snapshot(m_ctx_snapshots, m_ctx, m_ctx_dirty, sequence, &state.context_id);
+	state.user_config = Snapshot(m_ucfg_snapshots, m_ucfg, m_ucfg_dirty, sequence);
+	state.shaders     = Snapshot(m_sh_ctx_snapshots, m_sh_ctx, m_sh_ctx_dirty, sequence);
+	return state;
 }
 
 uint64_t CommandProcessor::Emit(GpuOperation&& operation) {
@@ -482,9 +568,36 @@ uint64_t CommandProcessor::EmitCallback(GpuCallback&& callback) {
 void CommandProcessor::Execute(GpuOperation& operation) {
 	EXIT_IF(operation.processor != this);
 	BindState(operation.state);
+	auto& executor = m_renderer.GetRenderExecutor();
+	executor.UseContextId(operation.state.context_id);
+	if (operation.after_wait) {
+		executor.InvalidateRenderTargetMemo();
+	}
+	if (operation.kind != GpuOperationKind::DrawIndex &&
+	    operation.kind != GpuOperationKind::DrawAuto &&
+	    operation.kind != GpuOperationKind::DrawIndirect) {
+		executor.InvalidateRenderTargetMemo();
+		// Guest-visible effects (labels, interrupts, flips, host commands) let the guest overwrite
+		// what earlier draws read: their copies complete first.
+		if (auto* copies = GetScheduler().HostCopies(); copies != nullptr) {
+			copies->Drain();
+		}
+	}
 	switch (operation.kind) {
-		case GpuOperationKind::DrawIndex: ExecuteDrawIndex(operation, operation.draw_index); break;
-		case GpuOperationKind::DrawAuto: ExecuteDrawAuto(operation, operation.draw_auto); break;
+		case GpuOperationKind::DrawIndex:
+		case GpuOperationKind::DrawAuto: {
+			executor.UseResolvedDraw(operation.resolved);
+			if (operation.kind == GpuOperationKind::DrawIndex) {
+				ExecuteDrawIndex(operation, operation.draw_index);
+			} else {
+				ExecuteDrawAuto(operation, operation.draw_auto);
+			}
+			executor.UseResolvedDraw(nullptr);
+			if (operation.resolved != nullptr) {
+				RenderExecutor::ReleaseResolvedDraw(operation.resolved);
+			}
+			break;
+		}
 		case GpuOperationKind::DrawIndirect: ExecuteDrawIndirect(operation); break;
 		case GpuOperationKind::DispatchDirect: {
 			const auto& dispatch = operation.dispatch;
@@ -498,6 +611,10 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 				operation.callback();
 			}
 			break;
+	}
+	// Starts the copies of the operation while the next ones are prepared.
+	if (auto* copies = GetScheduler().HostCopies(); copies != nullptr) {
+		(void)copies->Flush();
 	}
 }
 
@@ -579,6 +696,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
+	m_wait_since_operation = true;
 	if (!TestWaitRegMemValue(ReadDecisionValue<T>(addr), ref, mask, func)) {
 		SuspendPm4();
 	}
@@ -620,7 +738,8 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	// later label.
 	// Completion labels can be reused immediately; memcpy may write a destination twice, so
 	// publish each word exactly once.
-	const auto sequence = EmitCallback([dst, src, dw_num, write_one_address] {
+	const auto sequence = EmitCallback([this, dst, src, dw_num, write_one_address] {
+		m_renderer.PrepareGpuWrite(dst, uint64_t {write_one_address ? 1u : dw_num} * sizeof(uint32_t));
 		auto* output = static_cast<volatile uint32_t*>(dst);
 		for (uint32_t i = 0; i < dw_num; i++) {
 			*output = src[i];
@@ -951,10 +1070,10 @@ bool GuestGpu::Process(Submission& submission) {
 			// Age caches at the frame boundary, not once per command list.
 			cp.RunGarbageCollector();
 			// Registered at the operation's place in the stream: a pipelined command processor
-			// runs ahead of the recorded commands.
+			// runs ahead of the recorded commands. Releasing the slot only touches host state.
 			cp.EmitHostCommand([this, ready = m_suspend_point_ready] {
-				m_renderer.GetCommandScheduler().DeferPriorityOperation(
-				    [ready] { ready->release(); });
+				m_renderer.GetCommandScheduler().DeferHostOperation([ready] { ready->release(); },
+				                                                    true);
 			});
 			cp.BufferFlush();
 			cp.Reset();
@@ -1315,7 +1434,8 @@ static bool PatchUserSgpr(HW::Shader& shaders, uint32_t location, uint32_t value
 // Writes the offsets of one draw of an indirect packet to the user SGPRs the packet names, as
 // the CP does before the draw. Without a pipeline the registers are the live ones. A pipelined
 // operation carries a register snapshot shared with other operations: a copy is patched and
-// bound for this draw. Returns whether the packet names any register.
+// bound for this draw, and the ahead resolution (made from the unpatched registers) is dropped
+// when a value changed. Returns whether the packet names any register.
 bool CommandProcessor::PatchIndirectDrawOffsets(const GpuOperation& operation,
                                                 uint32_t vertex_offset, uint32_t instance_offset,
                                                 uint32_t first_index, uint32_t draw_index) {
@@ -1343,10 +1463,14 @@ bool CommandProcessor::PatchIndirectDrawOffsets(const GpuOperation& operation,
 		m_indirect_shaders = std::make_unique<HW::Shader>();
 	}
 	*m_indirect_shaders = *operation.state.shaders;
+	bool changed        = false;
 	for (const auto& [location, value]: writes) {
 		if (location != Pm4::SH_NOP) {
-			PatchUserSgpr(*m_indirect_shaders, location, value);
+			changed |= PatchUserSgpr(*m_indirect_shaders, location, value);
 		}
+	}
+	if (changed) {
+		m_renderer.GetRenderExecutor().UseResolvedDraw(nullptr);
 	}
 	GetScheduler().Begin(*operation.state.context, *operation.state.user_config,
 	                     *m_indirect_shaders);
@@ -1605,6 +1729,7 @@ void CommandProcessor::ExecuteReleaseMem(uint32_t data_sel, bool interrupt, void
 		if (!GuestRange {vaddr, size}.Valid() || !buffers.IsRegionGpuModified(vaddr, size) ||
 		    buffers.HasGpuDirtyBytes(vaddr, size) ||
 		    !LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
+			m_renderer.PrepareGpuWrite(address, size);
 			std::memcpy(address, value, size);
 		}
 	};
@@ -1636,10 +1761,11 @@ void CommandProcessor::ExecuteReleaseMem(uint32_t data_sel, bool interrupt, void
 
 void CommandProcessor::DeferEopInterrupt(uint32_t interrupt_context_id) {
 	(void)CurrentBuffer().Handle();
-	GetScheduler().DeferPriorityOperation(
+	GetScheduler().DeferHostOperation(
 	    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
 		    renderer.TriggerInterrupt(event_id, interrupt_context_id);
-	    });
+	    },
+	    true);
 }
 
 void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
@@ -1752,8 +1878,9 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 		m_renderer.GetOcclusionQueries().Publish();
 		auto& command = CurrentBuffer();
 		auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);
-		GetScheduler().DeferPriorityOperation(
-		    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
+		GetScheduler().DeferHostOperation(
+		    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); },
+		    true);
 		GetScheduler().Flush();
 	});
 }
@@ -1772,8 +1899,8 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 		ProcessorScope processor_scope(*this);
 
 		m_renderer.GetVideoOut().PrepareFlip(request_id, CurrentBuffer());
-		GetScheduler().DeferPriorityOperation(
-		    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
+		GetScheduler().DeferHostOperation(
+		    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); }, true);
 		GetScheduler().Flush();
 	});
 }

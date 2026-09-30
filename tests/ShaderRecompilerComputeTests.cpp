@@ -3048,7 +3048,7 @@ public:
         gpu.SendCommandSync([&] {
           processor->BufferInit();
           const auto tick_before = gpu_scheduler.CurrentTick();
-          gpu_scheduler.DeferOperation([&] { host_resource_retired = true; });
+          gpu_scheduler.DeferHostOperation([&] { host_resource_retired = true; });
           constexpr uint64_t cpu_only_address = 0x0000000200400000ull;
           context.MapMemory(cpu_only_address, 0x4000);
           context.UnmapMemory(cpu_only_address, 0x4000);
@@ -4437,10 +4437,11 @@ public:
           "overlap");
       const auto clean_unmap_tick = scheduler.CurrentTick();
       resources.UnmapMemory(index_begin, index_page);
-      Require(name, "clean cached buffer unmap drain",
-              scheduler.CurrentTick() == clean_unmap_tick + 1 &&
+      // Queued GPU work only reads the cached copy of a clean buffer: its unmap needs no drain.
+      Require(name, "clean cached buffer unmap without drain",
+              scheduler.CurrentTick() == clean_unmap_tick &&
                   !resources.IsMapped(index_begin, index_page),
-              "unmapping a clean cached buffer did not drain native work");
+              "unmapping a clean cached buffer drained native work");
       resources.MapMemory(index_begin, index_page);
       const auto index_bridge =
           cache.FindBuffer(index_begin + index_page - 1, index_page + 2);
@@ -5689,13 +5690,13 @@ public:
               "unmapping the table kept its images pinned");
       // A smaller table enters once a second draw acquires it and leaves at the suspend point
       // after a frame that did not acquire it. Larger tables stay.
-      const IR::ImageHeapRequest small{table, table_size / 2u, 32u, 0u, table_size / 64u, &sampled};
+      const IR::ImageHeapRequest smaller{table, table_size / 2u, 32u, 0u, table_size / 64u, &sampled};
       Require(name, "first small draw",
-              acquire(sampled, idle_table) && !heap.Acquire(small, view) &&
-                  !heap.Acquire(small, view),
+              acquire(sampled, idle_table) && !heap.Acquire(smaller, view) &&
+                  !heap.Acquire(smaller, view),
               "a smaller table entered on its first draw");
       draw();
-      Require(name, "second small draw", heap.Acquire(small, view),
+      Require(name, "second small draw", heap.Acquire(smaller, view),
               "a smaller table was declined on its second draw");
       context.RunGarbageCollector();
       Require(name, "acquired frame", ImageHeapTestAccess::MemoryCount(heap) == 2u,
@@ -11062,6 +11063,11 @@ public:
       TextureCacheTestAccess::ClearImage(context.GetTextureCache(), scheduler.Current(),
                                          source.image_id,
                                          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, red);
+      // Deleted Vulkan images are pooled and reused with their old contents: the subresource
+      // the resolve must leave alone starts out zero.
+      TextureCacheTestAccess::ClearImage(context.GetTextureCache(), scheduler.Current(),
+                                         whole.image_id,
+                                         {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
       registers.SetColorControl({.mode = 3});
       Require(name, "resolve",
               RenderExecutorTestAccess::ResolveColorTargets(executor, scheduler.Current()),

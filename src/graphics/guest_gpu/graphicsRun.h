@@ -17,6 +17,7 @@
 #include <semaphore>
 #include <span>
 #include <thread>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -34,6 +35,10 @@ public:
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
 	// Retries blocked submissions now instead of after the 100 ms stall timeout.
 	void               Wake();
+	// Runs a host command on the execution thread before the operations queued so far, and
+	// waits for it. Only for work that no queued operation depends on (memory the guest unmaps
+	// after the operations that used it executed).
+	void SendUrgentCommandSync(Common::UniqueFunction<void>&& command);
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
 	void Submit(std::span<const uint32_t> commands);
@@ -89,6 +94,7 @@ private:
 	void              Enqueue(Submission submission);
 	void              ProcessCommands();
 	void              ExecutionThread();
+	void              ResolveThread();
 	void              StopExecution();
 	// Command processor thread of a pipelined GPU: runs a command on the execution thread and
 	// waits for it.
@@ -132,7 +138,11 @@ private:
 	};
 
 	const bool                      m_pipelined;
+	// With a resolve stage, the command processor queues operations for the resolve thread,
+	// which forwards them to the execution thread.
+	const bool                      m_resolving;
 	Common::SpscQueue<GpuOperation> m_operations;
+	Common::SpscQueue<GpuOperation> m_resolved;
 	Common::ProgressCounter         m_executed;
 	uint64_t                        m_emitted = 0;
 	// Command processor thread: a ring of the writes of operations that may not have executed
@@ -142,6 +152,11 @@ private:
 	size_t                        m_pending_first = 0;
 	size_t                        m_pending_count = 0;
 	void                          ForgetExecutedWrites();
+	// Commands that run before the next operation the execution thread takes.
+	void                                      RunUrgentCommands();
+	std::mutex                                m_urgent_mutex;
+	std::vector<Common::UniqueFunction<void>> m_urgent_commands;
+	std::atomic_uint32_t                      m_urgent_pending {0};
 	// Game and host threads bump it when they queue work, under m_queue_mutex; the command
 	// processor thread spins on it before it sleeps.
 	std::atomic_uint64_t m_work_epoch {0};
@@ -150,6 +165,7 @@ private:
 	HW::Shader                      m_neutral_shaders;
 	GpuRegisterState                m_neutral_state;
 	std::jthread                    m_executor;
+	std::jthread                    m_resolver;
 
 	std::jthread m_thread;
 
