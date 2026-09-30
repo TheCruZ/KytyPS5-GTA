@@ -170,6 +170,66 @@ bool DrawPrepScanner::ApplyRegisterIndirect(uint32_t header, const uint32_t* bod
 	return true;
 }
 
+bool DrawPrepareGraphics(RenderContext& renderer, const DrawPrep::Key& key, const HW::Context& ctx,
+                         const HW::UserConfig& ucfg, const HW::Shader& sh) {
+	if (!DrawPrepHasVertexShader(sh)) {
+		DrawPrep::Add(DrawPrep::Counter::SkipUnsupported);
+		return false;
+	}
+	std::array<Prospero::ColorComponentMapping, 8> mapping {};
+	const bool ps_active = DrawPrepPixelState(ctx, sh, mapping);
+	DrawPrep::PacketResult result;
+	DrawPrep::Recycle(result);
+	result.key = key;
+	if (!renderer.GetPipelineCache().DrawPrepGraphics(sh.GetVs(), sh.GetPs(),
+	                                                  ctx.GetShaderRegisters(), ctx, ucfg, mapping,
+	                                                  ps_active, result)) {
+		return false;
+	}
+	DrawPrep::Publish(std::move(result));
+	return true;
+}
+
+// A dispatch: the compute inputs RenderExecutor::DispatchDirect / DispatchIndirect build.
+bool DrawPrepareDispatch(RenderContext& renderer, const DrawPrep::Key& key, const HW::Shader& sh,
+                         const HW::Context& ctx, const uint32_t* groups, uint32_t mode) {
+	const auto& cs = sh.GetCs();
+	if (cs.cs_regs.data_addr == 0 || PipelineCache::IsSkipListed(cs.cs_regs.data_addr)) {
+		DrawPrep::Add(DrawPrep::Counter::SkipUnsupported);
+		return false;
+	}
+	ShaderComputeInputInfo input_info {};
+	const bool use_thread_dimensions =
+	    (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+	input_info.dispatch_thread_dimensions = use_thread_dimensions;
+	if (groups != nullptr) {
+		if (groups[0] == 0 || groups[1] == 0 || groups[2] == 0) {
+			DrawPrep::Add(DrawPrep::Counter::SkipUnsupported);
+			return false;
+		}
+		const uint32_t group_sizes[3] = {cs.cs_regs.num_thread_x, cs.cs_regs.num_thread_y,
+		                                 cs.cs_regs.num_thread_z};
+		for (uint32_t axis = 0; axis < 3u; ++axis) {
+			input_info.workgroup_counts[axis] = groups[axis];
+			if (use_thread_dimensions) {
+				const auto size = std::max(group_sizes[axis], 1u);
+				input_info.workgroup_counts[axis] = groups[axis] / size + (groups[axis] % size != 0u);
+			}
+		}
+	} else {
+		input_info.dispatch_dimensions_indirect = use_thread_dimensions;
+	}
+	DrawPrep::PacketResult result;
+	DrawPrep::Recycle(result);
+	result.key = key;
+	if (!renderer.GetPipelineCache().DrawPrepCompute(cs, ctx.GetShaderRegisters(), input_info,
+	                                                 result)) {
+		return false;
+	}
+	DrawPrep::Publish(std::move(result));
+	return true;
+}
+
 void DrawPrepScanner::ScanDraw(uint64_t seq, uint32_t ordinal, const uint32_t* packet) {
 	if (m_state->tainted) {
 		DrawPrep::Add(DrawPrep::Counter::Tainted);
@@ -180,26 +240,10 @@ void DrawPrepScanner::ScanDraw(uint64_t seq, uint32_t ordinal, const uint32_t* p
 		DrawPrep::Add(DrawPrep::Counter::SkipBehind);
 		return;
 	}
-	const auto& ctx  = m_state->cp->GetCtx();
-	const auto& sh   = m_state->cp->GetShCtx();
-	const auto& ucfg = m_state->cp->GetUcfg();
-	if (!DrawPrepHasVertexShader(sh)) {
-		DrawPrep::Add(DrawPrep::Counter::SkipUnsupported);
-		return;
-	}
-	std::array<Prospero::ColorComponentMapping, 8> mapping {};
-	const bool ps_active = DrawPrepPixelState(ctx, sh, mapping);
-	DrawPrep::PacketResult result;
-	DrawPrep::Recycle(result);
-	result.key = key;
-	if (m_renderer.GetPipelineCache().DrawPrepGraphics(sh.GetVs(), sh.GetPs(),
-	                                                   ctx.GetShaderRegisters(), ctx, ucfg, mapping,
-	                                                   ps_active, result)) {
-		DrawPrep::Publish(std::move(result));
-	}
+	(void)DrawPrepareGraphics(m_renderer, key, m_state->cp->GetCtx(), m_state->cp->GetUcfg(),
+	                          m_state->cp->GetShCtx());
 }
 
-// A dispatch: the compute inputs RenderExecutor::DispatchDirect / DispatchIndirect build.
 void DrawPrepScanner::ScanDispatch(uint64_t seq, uint32_t ordinal, const uint32_t* packet,
                                    uint32_t opcode) {
 	if (m_state->tainted) {
@@ -213,57 +257,24 @@ void DrawPrepScanner::ScanDispatch(uint64_t seq, uint32_t ordinal, const uint32_
 	}
 	// As CommandProcessor::DispatchDirect / DispatchIndirect: the dispatch initiator selects the
 	// wave size, which is part of the program key (without it, wave32 dispatches found no entry).
-	{
-		uint32_t mode = 0;
-		if (opcode == Pm4::IT_DISPATCH_DIRECT) {
-			mode = KYTY_PM4_LEN(packet[0]) == 5u ? packet[4] : 0u;
-		} else {
-			mode = packet[0] == 0xc0021600u ? packet[3] : packet[2];
-		}
-		m_state->cp->GetShCtx().SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	uint32_t mode = 0;
+	if (opcode == Pm4::IT_DISPATCH_DIRECT) {
+		mode = KYTY_PM4_LEN(packet[0]) == 5u ? packet[4] : 0u;
+	} else {
+		mode = packet[0] == 0xc0021600u ? packet[3] : packet[2];
 	}
-	const auto& cs = m_state->cp->GetShCtx().GetCs();
-	if (cs.cs_regs.data_addr == 0 || PipelineCache::IsSkipListed(cs.cs_regs.data_addr)) {
-		DrawPrep::Add(DrawPrep::Counter::SkipUnsupported);
-		return;
-	}
-	ShaderComputeInputInfo input_info {};
+	m_state->cp->GetShCtx().SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 	if (opcode == Pm4::IT_DISPATCH_DIRECT) {
 		if (KYTY_PM4_LEN(packet[0]) != 5u) {
 			DrawPrep::Add(DrawPrep::Counter::SkipUnsupported);
 			return;
 		}
 		const uint32_t groups[3] = {packet[1], packet[2], packet[3]};
-		const uint32_t mode      = packet[4];
-		if (groups[0] == 0 || groups[1] == 0 || groups[2] == 0) {
-			DrawPrep::Add(DrawPrep::Counter::SkipUnsupported);
-			return;
-		}
-		const bool use_thread_dimensions =
-		    (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
-		input_info.dispatch_thread_dimensions = use_thread_dimensions;
-		const uint32_t group_sizes[3] = {cs.cs_regs.num_thread_x, cs.cs_regs.num_thread_y,
-		                                 cs.cs_regs.num_thread_z};
-		for (uint32_t axis = 0; axis < 3u; ++axis) {
-			input_info.workgroup_counts[axis] = groups[axis];
-			if (use_thread_dimensions) {
-				const auto size = std::max(group_sizes[axis], 1u);
-				input_info.workgroup_counts[axis] = groups[axis] / size + (groups[axis] % size != 0u);
-			}
-		}
+		(void)DrawPrepareDispatch(m_renderer, key, m_state->cp->GetShCtx(), m_state->cp->GetCtx(),
+		                          groups, packet[4]);
 	} else {
-		const uint32_t mode = packet[0] == 0xc0021600u ? packet[3] : packet[2];
-		const bool     use_thread_dimensions =
-		    (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
-		input_info.dispatch_thread_dimensions   = use_thread_dimensions;
-		input_info.dispatch_dimensions_indirect = use_thread_dimensions;
-	}
-	DrawPrep::PacketResult result;
-	DrawPrep::Recycle(result);
-	result.key = key;
-	if (m_renderer.GetPipelineCache().DrawPrepCompute(cs, m_state->cp->GetCtx().GetShaderRegisters(),
-	                                                  input_info, result)) {
-		DrawPrep::Publish(std::move(result));
+		(void)DrawPrepareDispatch(m_renderer, key, m_state->cp->GetShCtx(), m_state->cp->GetCtx(),
+		                          nullptr, mode);
 	}
 }
 

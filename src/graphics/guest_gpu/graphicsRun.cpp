@@ -49,6 +49,7 @@
 #include <unordered_map>
 #include <utility>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -238,7 +239,8 @@ static bool LogIndirectDraw() {
 GuestGpu::GuestGpu(RenderContext& renderer)
     : m_renderer(renderer),
       m_pipelined((Config::GpuPipelineStages() & Config::GPU_PIPELINE_COMMAND_PROCESSOR) != 0),
-      m_operations(OperationQueueSize),
+      m_resolving(m_pipelined && (Config::GpuPipelineStages() & Config::GPU_PIPELINE_RESOLVE) != 0),
+      m_operations(OperationQueueSize), m_resolved(ResolvedQueueSize),
       m_neutral_state {&m_neutral_context, &m_neutral_user_config, &m_neutral_shaders} {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
@@ -248,6 +250,9 @@ GuestGpu::GuestGpu(RenderContext& renderer)
 		m_pending_writes = std::make_unique<GuestWrite[]>(PendingWriteCapacity);
 		m_gfx_cp->AttachPipeline(this);
 		m_executor = std::jthread([this] { ExecutionThread(); });
+		if (m_resolving) {
+			m_resolver = std::jthread([this] { ResolveThread(); });
+		}
 	} else if (DrawPrep::Enabled()) {
 		// Frank's scanner prepares draws ahead of a single GPU thread; the pipeline resolves ahead
 		// by itself (KYTY_GPU_PIPELINE=0 selects the single thread and the scanner).
@@ -576,12 +581,13 @@ void GuestGpu::ExecutionThread() {
 	// waiter now and then and before sleeping.
 	constexpr uint32_t NotifyInterval = 16;
 	uint32_t           unnotified     = 0;
+	auto&              operations     = m_resolving ? m_resolved : m_operations;
 	for (;;) {
-		auto operation = m_operations.TryPop();
+		auto operation = operations.TryPop();
 		if (!operation) {
 			m_executed.Notify();
 			unnotified = 0;
-			operation  = m_operations.Pop();
+			operation  = operations.Pop();
 			if (!operation) {
 				break;
 			}
@@ -600,9 +606,80 @@ void GuestGpu::ExecutionThread() {
 	g_gpu_thread = false;
 }
 
+// Prepares what the draws and dispatches the command processor emitted need in the descriptor
+// walks of their stages, ahead of the execution thread (DrawPrep: the walk reads only bytes no
+// GPU work has written and records them; the execution thread takes the result when the program,
+// the user data and every recorded range still match, and walks itself otherwise). Operations
+// reach the execution thread in the order they came, prepared or not.
+void GuestGpu::ResolveThread() {
+	KYTY_PROFILER_THREAD("Thread_GpuResolve");
+	Config::ConfigureGpuStageThread(Config::GpuStageThread::Resolve);
+	// The clean-backing reads answer "maybe GPU-written" on any other thread than the execution
+	// thread; a read delegate checks the buffer cache's GPU-dirty ranges under their shared lock.
+	LibKernel::Memory::SetGpuReadDelegate(true);
+	const bool prepare = DrawPrep::Enabled();
+	for (;;) {
+		auto operation = m_operations.TryPop();
+		if (!operation) {
+			operation = m_operations.Pop();
+			if (!operation) {
+				break;
+			}
+		}
+		if (prepare) {
+			PrepareAhead(*operation);
+		}
+		m_resolved.Push(std::move(*operation));
+	}
+	m_resolved.Stop();
+}
+
+void GuestGpu::PrepareAhead(GpuOperation& operation) {
+	const DrawPrep::Key key {.queue   = operation.queue,
+	                         .seq     = operation.sequence,
+	                         .ordinal = 0,
+	                         .packet  = nullptr};
+	if (operation.kind != GpuOperationKind::Callback) {
+		DrawPrep::Add(DrawPrep::Counter::Scanned);
+		if (!DrawPrep::GpuProgress(key.queue).Before(key)) {
+			DrawPrep::Add(DrawPrep::Counter::SkipBehind);
+			return;
+		}
+	}
+	// The register snapshots stay valid until the operation executed.
+	const auto& state = operation.state;
+	switch (operation.kind) {
+		case GpuOperationKind::DrawIndex:
+		case GpuOperationKind::DrawAuto:
+			operation.prepared = DrawPrepareGraphics(m_renderer, key, *state.context,
+			                                         *state.user_config, *state.shaders);
+			break;
+		case GpuOperationKind::DispatchDirect: {
+			const auto&    dispatch = operation.dispatch;
+			const uint32_t groups[3] = {dispatch.thread_group_x, dispatch.thread_group_y,
+			                            dispatch.thread_group_z};
+			operation.prepared = DrawPrepareDispatch(m_renderer, key, *state.shaders,
+			                                         *state.context, groups, dispatch.mode);
+			break;
+		}
+		case GpuOperationKind::DispatchIndirect:
+			operation.prepared = DrawPrepareDispatch(m_renderer, key, *state.shaders,
+			                                         *state.context, nullptr,
+			                                         operation.dispatch.mode);
+			break;
+		default: break;
+	}
+	if (operation.prepared) {
+		operation.prep_key = key;
+	}
+}
+
 void GuestGpu::StopExecution() {
 	WaitForExecution();
 	m_operations.Stop();
+	if (m_resolver.joinable()) {
+		m_resolver.join();
+	}
 	if (m_executor.joinable()) {
 		m_executor.join();
 	}
@@ -661,6 +738,7 @@ GpuOperation CommandProcessor::MakeOperation(GpuOperationKind kind) {
 	operation.processor     = this;
 	operation.submit_id     = m_submit_id;
 	operation.num_instances = m_num_instances;
+	operation.queue         = DrawPrepQueue();
 	if (m_pipeline == nullptr) {
 		operation.state = {&m_ctx, &m_ucfg, &m_sh_ctx};
 	} else if (kind == GpuOperationKind::Callback) {
@@ -674,7 +752,7 @@ GpuOperation CommandProcessor::MakeOperation(GpuOperationKind kind) {
 
 template <typename T>
 const T* CommandProcessor::Snapshot(SnapshotRing<T>& ring, const T& live, bool& dirty,
-                                    uint64_t sequence) {
+                                    uint64_t sequence, uint64_t* id) {
 	static_assert(std::is_trivially_copyable_v<T>);
 	if (dirty || ring.current == SnapshotRing<T>::Size) {
 		if (ring.slots == nullptr) {
@@ -686,19 +764,25 @@ const T* CommandProcessor::Snapshot(SnapshotRing<T>& ring, const T& live, bool& 
 		// operation's snapshots; the wait acquires that.
 		m_pipeline->WaitForExecution(ring.last_use[ring.next]);
 		slot.value   = live;
+		slot.id      = s_snapshot_ids.fetch_add(1, std::memory_order_relaxed) + 1;
 		ring.current = ring.next;
 		ring.next    = (ring.next + 1) % SnapshotRing<T>::Size;
 		dirty        = false;
 	}
 	// The operation built from this state is the next one the command processor emits.
 	ring.last_use[ring.current] = sequence;
+	if (id != nullptr) {
+		*id = ring.slots[ring.current].id;
+	}
 	return &ring.slots[ring.current].value;
 }
 
 GpuRegisterState CommandProcessor::SnapshotState(uint64_t sequence) {
-	return {Snapshot(m_ctx_snapshots, m_ctx, m_ctx_dirty, sequence),
-	        Snapshot(m_ucfg_snapshots, m_ucfg, m_ucfg_dirty, sequence),
-	        Snapshot(m_sh_ctx_snapshots, m_sh_ctx, m_sh_ctx_dirty, sequence)};
+	GpuRegisterState state;
+	state.context     = Snapshot(m_ctx_snapshots, m_ctx, m_ctx_dirty, sequence, &state.context_id);
+	state.user_config = Snapshot(m_ucfg_snapshots, m_ucfg, m_ucfg_dirty, sequence);
+	state.shaders     = Snapshot(m_sh_ctx_snapshots, m_sh_ctx, m_sh_ctx_dirty, sequence);
+	return state;
 }
 
 uint64_t CommandProcessor::Emit(GpuOperation&& operation) {
@@ -741,6 +825,11 @@ uint64_t CommandProcessor::EmitCallback(GpuCallback&& callback) {
 void CommandProcessor::Execute(GpuOperation& operation) {
 	EXIT_IF(operation.processor != this);
 	BindState(operation.state);
+	if (operation.prepared) {
+		DrawPrep::SetCurrent(operation.prep_key);
+	} else if (operation.kind != GpuOperationKind::Callback) {
+		DrawPrep::ClearCurrent();
+	}
 	switch (operation.kind) {
 		case GpuOperationKind::DrawIndex: ExecuteDrawIndex(operation, operation.draw_index); break;
 		case GpuOperationKind::DrawAuto: ExecuteDrawAuto(operation, operation.draw_auto); break;
@@ -757,6 +846,9 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 				operation.callback();
 			}
 			break;
+	}
+	if (operation.prepared) {
+		DrawPrep::ClearCurrent();
 	}
 }
 
@@ -2283,7 +2375,8 @@ static bool PatchUserSgpr(HW::Shader& shaders, uint32_t location, uint32_t value
 // KYTY_START_INSTANCE_SGPR=0 restores the old behaviour (the start instance register keeps the
 // value the game wrote). Without a pipeline the registers are the live ones. A pipelined
 // operation carries a register snapshot shared with other operations: a copy is patched and
-// bound for this draw. Returns whether the packet names any register.
+// bound for this draw, and the ahead resolution (made from the unpatched registers) is dropped
+// when a value changed. Returns whether the packet names any register.
 bool CommandProcessor::PatchIndirectDrawOffsets(const GpuOperation& operation,
                                                 uint32_t vertex_offset, uint32_t instance_offset,
                                                 uint32_t first_index, uint32_t draw_index) {
