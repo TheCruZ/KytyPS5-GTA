@@ -115,6 +115,12 @@ int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// Reads guest memory on the GPU thread without waiting for the GPU when the bytes are not
+// GPU-owned, even if they share a read-protected page with GPU-owned bytes; false when the GPU
+// owns some of them. ReadGuestMemoryOnGpuThread then reads them with a plain load, which faults
+// into a readback.
+bool                   TryReadGuestMemoryOnGpuThread(uint64_t vaddr, void* data, uint64_t size);
+void                   ReadGuestMemoryOnGpuThread(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size);
 // Whether TryReadBacking or TryReadPrtBacking can read the whole range.
 bool                   IsBackingReadable(uint64_t vaddr, uint64_t size);

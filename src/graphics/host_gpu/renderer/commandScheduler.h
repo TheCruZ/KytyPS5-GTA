@@ -42,6 +42,9 @@ public:
 	void                      Wait(uint64_t tick);
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
+	// Whether a deferred or priority operation (a completion that may write guest memory) is
+	// queued or running.
+	[[nodiscard]] bool        HasPendingOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);

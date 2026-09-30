@@ -149,6 +149,9 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
+	// An indirect thread-dimension dispatch: the GPU writes the thread limit, so the shader data
+	// lives in a storage buffer instead of push constants.
+	bool               dispatch_indirect_threads  = false;
 	int                thread_ids_num             = 0;
 	int                workgroup_register         = 0;
 	bool               tg_size_en                 = false;

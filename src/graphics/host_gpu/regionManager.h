@@ -161,6 +161,12 @@ public:
 		return m_has_cpu_dirty.load(std::memory_order_acquire);
 	}
 
+	// Whether any page is GPU dirty, i.e. read protected. Read without the lock: a stale answer
+	// only chooses between a plain read and a checked one.
+	[[nodiscard]] bool HasGpuDirty() const {
+		return m_has_gpu_dirty.load(std::memory_order_acquire);
+	}
+
 	TrackingSpinLock lock;
 
 private:
@@ -173,6 +179,9 @@ private:
 			return;
 		}
 		previous = protection;
+		if constexpr (is_read) {
+			m_has_gpu_dirty.store(m_gpu_dirty.Any(), std::memory_order_release);
+		}
 		m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, mask);
 	}
 
@@ -212,6 +221,7 @@ private:
 	RegionBits   m_readable;
 	// A new region starts with every page CPU dirty.
 	std::atomic_bool      m_has_cpu_dirty {true};
+	std::atomic_bool      m_has_gpu_dirty {false};
 	std::atomic<uint64_t> m_cpu_dirty_epoch {1};
 
 	inline static std::atomic<uint64_t> s_cpu_dirty_epoch {0};

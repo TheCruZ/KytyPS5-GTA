@@ -482,6 +482,8 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
 			return false;
 		}
+	} else if (m_runtime.read_guest_memory != nullptr) {
+		m_runtime.read_guest_memory(address, &word, sizeof(word));
 	} else {
 		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 	}
@@ -1409,6 +1411,8 @@ bool CompiledSrtWalker::ReadWord(uint64_t address, uint64_t& result) {
 		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
 			return false;
 		}
+	} else if (m_runtime.read_guest_memory != nullptr) {
+		m_runtime.read_guest_memory(address, &word, sizeof(word));
 	} else {
 		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 	}

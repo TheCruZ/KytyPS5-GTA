@@ -538,23 +538,11 @@ static bool ResolveTextureMipView(const TileSurfaceDescription& description, boo
 	return false;
 }
 
-TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                                              const ShaderRecompiler::IR::DescriptorValue& value,
-                                              bool table_candidate, GuestRange* examined) {
-	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+// What ResolveTexture derives from a T# and the shader's view of it before any texture-cache
+// lookup: a pure function of both (EXITs on unsupported descriptors).
+static TextureDescDerivation DeriveTextureDesc(const ShaderRecompiler::IR::ImageResource& resource,
+                                               const ShaderTextureResource& descriptor) {
 	const bool storage = resource.written;
-	if (storage) {
-		ValidateStorageImageResource(resource);
-	}
-
-	auto& texture_cache = m_context.GetTextureCache();
-	if (descriptor.IsNull()) {
-		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
-		                                                    : TextureCache::BindingType::Texture);
-		const auto id   = texture_cache.FindImage(desc);
-		return {id, nullptr, std::move(desc)};
-	}
-
 	const auto address         = descriptor.Base40();
 	const auto width           = static_cast<uint32_t>(descriptor.Width5()) + 1u;
 	const auto height          = static_cast<uint32_t>(descriptor.Height5()) + 1u;
@@ -692,6 +680,68 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                                 view_levels, desc.info.resources.layers);
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
+	return {std::move(desc), shader_conversion, pixel_format, view_format, size.size};
+}
+
+size_t RenderExecutor::TextureDescKeyHash::operator()(const TextureDescKey& key) const noexcept {
+	uint64_t hash = 0xcbf29ce484222325ull;
+	for (const auto word: key.dwords) {
+		hash = (hash ^ word) * 0x100000001b3ull;
+	}
+	for (const auto word: key.view) {
+		hash = (hash ^ word) * 0x100000001b3ull;
+	}
+	return static_cast<size_t>(hash ^ (hash >> 29u));
+}
+
+TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                              const ShaderRecompiler::IR::DescriptorValue& value,
+                                              bool table_candidate, GuestRange* examined) {
+	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	const bool storage = resource.written;
+	if (storage) {
+		ValidateStorageImageResource(resource);
+	}
+
+	auto& texture_cache = m_context.GetTextureCache();
+	if (descriptor.IsNull()) {
+		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                                    : TextureCache::BindingType::Texture);
+		const auto id   = texture_cache.FindImage(desc);
+		return {id, nullptr, std::move(desc)};
+	}
+
+	// The description is computed once per T# and view of it; images are looked up every time.
+	TextureDescKey key {};
+	key.dwords  = value.dwords;
+	key.view[0] = static_cast<uint32_t>(resource.resource_class) |
+	              (static_cast<uint32_t>(resource.numeric_class) << 8u) |
+	              (static_cast<uint32_t>(resource.dimension) << 16u) |
+	              (static_cast<uint32_t>(resource.mip_mode) << 24u);
+	key.view[1] = resource.mip_count;
+	key.view[2] = static_cast<uint32_t>(resource.conversion_format);
+	key.view[3] = resource.shader_swizzle;
+	key.view[4] = static_cast<uint32_t>(resource.read) | (static_cast<uint32_t>(resource.written) << 1u) |
+	              (static_cast<uint32_t>(resource.atomic) << 2u) |
+	              (static_cast<uint32_t>(resource.depth_compare) << 3u) |
+	              (static_cast<uint32_t>(resource.cube) << 4u) |
+	              (static_cast<uint32_t>(resource.r128) << 5u);
+	auto cached = m_texture_descs.find(key);
+	if (cached == m_texture_descs.end()) {
+		// Derived before insertion: a derivation that exits (softly, for table candidates) leaves
+		// nothing behind.
+		auto derived = DeriveTextureDesc(resource, descriptor);
+		if (m_texture_descs.size() >= MaxTextureDescs) {
+			m_texture_descs.clear();
+		}
+		cached = m_texture_descs.emplace(key, std::move(derived)).first;
+	}
+	const auto& derived           = cached->second;
+	auto        desc              = derived.desc;
+	const bool  shader_conversion = derived.shader_conversion;
+	const auto  pixel_format      = derived.pixel_format;
+	const auto  view_format       = derived.view_format;
+	const auto  size_bytes        = derived.size;
 
 	if (examined != nullptr) {
 		*examined = desc.info.data;
@@ -721,7 +771,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
-		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size.size);
+		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size_bytes);
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
@@ -794,6 +844,19 @@ RenderExecutor::FindTableResolution(const ShaderRecompiler::IR::ImageResource& r
 	return *found;
 }
 
+// What ResolveTexture checks of the backing for a table candidate (a GPU-modified range needs no
+// backing).
+bool RenderExecutor::TableElementBackingReadable(const TableElementResolution& element) {
+	const auto& data = element.range;
+	const bool  data_readable =
+	    m_context.GetTextureCache().IsRegionGpuModified(data.address, data.size) ||
+	    Libs::LibKernel::Memory::IsBackingReadable(data.address, data.size);
+	return data_readable &&
+	       (element.metadata_range.Empty() ||
+	        Libs::LibKernel::Memory::IsBackingReadable(element.metadata_range.address,
+	                                                   element.metadata_range.size));
+}
+
 const TextureBinding&
 RenderExecutor::ResolveTableElement(TableResolution&                             table,
                                     const ShaderRecompiler::IR::DescriptorValue& value) {
@@ -806,6 +869,10 @@ RenderExecutor::ResolveTableElement(TableResolution&                            
 		if (element.permanent ||
 		    (element.checked_epoch == set_epoch && element.backing_epoch == backing_epoch)) {
 			return element.texture;
+		}
+		if (element.backing_epoch != backing_epoch && element.backing_checkable &&
+		    TableElementBackingReadable(element) == element.backing_readable) {
+			element.backing_epoch = backing_epoch;
 		}
 		const auto image_epoch =
 		    element.range.Valid()
@@ -828,6 +895,11 @@ RenderExecutor::ResolveTableElement(TableResolution&                            
 	if (!data.Empty()) {
 		element.range        = data;
 		element.volatile_dcc = element.texture.desc.info.metadata.kind == ImageMetadataKind::Dcc;
+		if (element.texture.desc.info.metadata.kind != ImageMetadataKind::None) {
+			element.metadata_range = element.texture.desc.info.metadata.range;
+		}
+		element.backing_checkable = data.Valid();
+		element.backing_readable  = element.backing_checkable && TableElementBackingReadable(element);
 	} else if (!ShaderRecompiler::IR::ImageTableSlotCompatible(table.root, value)) {
 		element.permanent = true;
 	} else {

@@ -38,6 +38,16 @@ struct DrawRenderState;
 class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
+struct IndirectThreadPass;
+
+// An image description derived from a T# and a shader's view of it (see ResolveTexture).
+struct TextureDescDerivation {
+	TextureCache::ImageDesc desc;
+	bool                    shader_conversion = false;
+	vk::Format              pixel_format      = vk::Format::eUndefined;
+	vk::Format              view_format       = vk::Format::eUndefined;
+	uint64_t                size              = 0;
+};
 
 enum class CommandBufferDebugOp : uint32_t {
 	DispatchDirect,
@@ -200,6 +210,12 @@ private:
 		uint64_t       checked_epoch = 0;
 		bool           permanent     = false; // Null for the root's view, whatever the memory.
 		bool           volatile_dcc  = false;
+		// A resolved element depends on the guest backing only through whether its data and
+		// metadata are readable: when the backing epoch moves (any map or unmap anywhere), the
+		// element stays valid while that answer is unchanged.
+		bool           backing_checkable = false;
+		bool           backing_readable  = false;
+		GuestRange     metadata_range;
 	};
 	struct TableDescriptorHash {
 		size_t operator()(const std::array<uint32_t, 8>& dwords) const noexcept;
@@ -214,6 +230,19 @@ private:
 	[[nodiscard]] const TextureBinding&
 	ResolveTableElement(TableResolution& table, const ShaderRecompiler::IR::DescriptorValue& value);
 	[[nodiscard]] TableResolution& FindTableResolution(const ShaderRecompiler::IR::ImageResource& root);
+	[[nodiscard]] bool TableElementBackingReadable(const TableElementResolution& element);
+
+	// ResolveTexture's image descriptions by T# and shader view (see DeriveTextureDesc).
+	struct TextureDescKey {
+		std::array<uint32_t, 8> dwords {};
+		std::array<uint32_t, 5> view {};
+		bool operator==(const TextureDescKey&) const = default;
+	};
+	struct TextureDescKeyHash {
+		size_t operator()(const TextureDescKey& key) const noexcept;
+	};
+	static constexpr size_t MaxTextureDescs = size_t {1} << 16u;
+	std::unordered_map<TextureDescKey, TextureDescDerivation, TextureDescKeyHash> m_texture_descs;
 
 	// table_candidate rejects (EXIT) a texture whose guest memory cannot be read, for tables
 	// that keep T#s of freed textures, and declines depth/color conversions. examined receives
@@ -240,6 +269,7 @@ private:
 	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
 	struct DrawRenderStorage;
+	struct ColorTargetMemo;
 	[[nodiscard]] DrawRenderState& AcquireDrawRenderState(bool tessellation);
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer,
 	                                          const DrawCallInfo& draw,
@@ -277,6 +307,12 @@ private:
 	// Reused by every draw; see AcquireDrawRenderState().
 	std::unique_ptr<DrawRenderStorage, void (*)(DrawRenderStorage*)> m_draw_state {nullptr,
 	                                                                               nullptr};
+	// The last color-target descriptions per slot; see ResolveRenderColorTarget().
+	std::unique_ptr<ColorTargetMemo, void (*)(ColorTargetMemo*)> m_color_target_memo {nullptr,
+	                                                                                  nullptr};
+	// Converts the thread counts of indirect thread-dimension dispatches on the GPU.
+	std::unique_ptr<IndirectThreadPass, void (*)(IndirectThreadPass*)> m_indirect_thread_pass {
+	    nullptr, nullptr};
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

@@ -1,3 +1,4 @@
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -10,6 +11,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "gpu_tiler_shaders/indirect_thread_dispatch_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
@@ -524,25 +526,99 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ResetBindings();
 }
 
+// Converts the arguments of an indirect dispatch given in threads into workgroup counts and the
+// shader's thread limit on the GPU (shaders/indirect_thread_dispatch.comp).
+struct IndirectThreadPass {
+	struct Push {
+		uint32_t local_size[3];
+		uint32_t args_index;
+		uint32_t groups_index;
+		uint32_t limit_index;
+	};
+
+	explicit IndirectThreadPass(GraphicContext& graphics): graphics(graphics) {
+		const vk::DescriptorSetLayoutBinding bindings[] {
+		    {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+		    {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+		    {2, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+		};
+		vk::DescriptorSetLayoutCreateInfo layout_info {};
+		layout_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+		layout_info.bindingCount = static_cast<uint32_t>(std::size(bindings));
+		layout_info.pBindings    = bindings;
+		RequireVulkanSuccess(
+		    graphics.device.createDescriptorSetLayout(&layout_info, nullptr, &descriptor_layout),
+		    "create indirect-thread descriptor layout");
+		vk::PushConstantRange push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(Push)};
+		vk::PipelineLayoutCreateInfo pipeline_layout_info {};
+		pipeline_layout_info.setLayoutCount         = 1;
+		pipeline_layout_info.pSetLayouts            = &descriptor_layout;
+		pipeline_layout_info.pushConstantRangeCount = 1;
+		pipeline_layout_info.pPushConstantRanges    = &push;
+		RequireVulkanSuccess(
+		    graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr, &pipeline_layout),
+		    "create indirect-thread pipeline layout");
+		const auto module = CompileSPV(INDIRECT_THREAD_DISPATCH_SPV, graphics.device);
+		vk::PipelineShaderStageCreateInfo stage {};
+		stage.stage  = vk::ShaderStageFlagBits::eCompute;
+		stage.module = module;
+		stage.pName  = "main";
+		vk::ComputePipelineCreateInfo pipeline_info {};
+		pipeline_info.stage  = stage;
+		pipeline_info.layout = pipeline_layout;
+		const auto result =
+		    graphics.device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline);
+		graphics.device.destroyShaderModule(module, nullptr);
+		RequireVulkanSuccess(result, "create indirect-thread pipeline");
+	}
+	~IndirectThreadPass() {
+		graphics.device.destroyPipeline(pipeline, nullptr);
+		graphics.device.destroyPipelineLayout(pipeline_layout, nullptr);
+		graphics.device.destroyDescriptorSetLayout(descriptor_layout, nullptr);
+	}
+	KYTY_CLASS_NO_COPY(IndirectThreadPass);
+
+	GraphicContext&         graphics;
+	vk::DescriptorSetLayout descriptor_layout = nullptr;
+	vk::PipelineLayout      pipeline_layout   = nullptr;
+	vk::Pipeline            pipeline          = nullptr;
+};
+
+// DISPATCH_INDIRECT. With USE_THREAD_DIMENSIONS the arguments count threads: the command processor
+// reads them on the CPU when it can do so without waiting for the GPU and dispatches directly;
+// arguments the GPU still owns (written by an earlier dispatch) come here and are converted into
+// workgroup counts and the thread limit on the GPU instead of being read back.
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
                                       uint64_t args_addr, uint32_t mode) {
-	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
-	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
+	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0);
+	const bool thread_dimensions =
+	    (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	m_context.GetCommandScheduler().PopPendingOperations();
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
-	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
+	                    thread_dimensions ? 1u : 0u, mode,
+	                    buffer.GetShaders().GetCs().cs_regs.data_addr);
 	Common::LockGuard lock(m_context.GetMutex());
 	const auto& cs_regs = buffer.GetShaders().GetCs();
 	if (cs_regs.cs_regs.data_addr == 0) {
 		return;
 	}
 	ShaderComputeInputInfo input_info {};
+	input_info.dispatch_thread_dimensions = thread_dimensions;
+	input_info.dispatch_indirect_threads  = thread_dimensions;
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
 	if (!compute_program) {
 		// Temporary until RT is implemented.
 		return;
+	}
+	if (thread_dimensions) {
+		EXIT_IF(input_info.stage.program->bindings.UsesPushData());
+		// As in DispatchDirect: a metadata clear does not depend on the dispatch size.
+		if (TryConsumeComputeMetaClear(input_info, buffer)) {
+			ResetBindings();
+			return;
+		}
 	}
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
@@ -563,6 +639,74 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
+	vk::Buffer indirect_buffer = args_buffer->Handle();
+	auto       indirect_offset = args_offset;
+	if (thread_dimensions) {
+		// The pass writes the workgroup counts into a scratch range of the stream buffer and the
+		// thread limit into the shader data just uploaded for this dispatch; both ranges are new,
+		// so only the argument writes of earlier GPU work need a barrier.
+		auto& stream   = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+		auto  recorder = buffer.Handle();
+		const std::array<uint32_t, 8> scratch_init {};
+		const auto scratch_offset = stream.Copy(scratch_init.data(), sizeof(scratch_init), 256);
+		if (!m_indirect_thread_pass) {
+			m_indirect_thread_pass = {new IndirectThreadPass(m_context.GetGraphics()),
+			                          [](IndirectThreadPass* pass) { delete pass; }};
+		}
+		const auto& pass        = *m_indirect_thread_pass;
+		const auto& shader_data = bindings.shader_data_buffer;
+		const bool  has_limit   = program.bindings.dispatch_thread_limit;
+		EXIT_IF(has_limit && shader_data.buffer == nullptr);
+		const auto alignment = m_context.GetGraphics().StorageMinAlignment();
+		const auto args_base = Common::AlignDown(args_offset, alignment);
+		const vk::DescriptorBufferInfo infos[] {
+		    {args_buffer->Handle(), args_base,
+		     args_offset - args_base + sizeof(vk::DispatchIndirectCommand)},
+		    {stream.Handle(), scratch_offset, sizeof(scratch_init)},
+		    has_limit ? shader_data
+		              : vk::DescriptorBufferInfo {stream.Handle(), scratch_offset,
+		                                          sizeof(scratch_init)},
+		};
+		std::array<vk::WriteDescriptorSet, 3> writes {};
+		for (uint32_t index = 0; index < writes.size(); ++index) {
+			writes[index].dstBinding      = index;
+			writes[index].descriptorCount = 1;
+			writes[index].descriptorType  = vk::DescriptorType::eStorageBuffer;
+			writes[index].pBufferInfo     = &infos[index];
+		}
+		IndirectThreadPass::Push push {};
+		push.local_size[0] = std::max(cs_regs.cs_regs.num_thread_x, 1u);
+		push.local_size[1] = std::max(cs_regs.cs_regs.num_thread_y, 1u);
+		push.local_size[2] = std::max(cs_regs.cs_regs.num_thread_z, 1u);
+		push.args_index    = static_cast<uint32_t>((args_offset - args_base) / sizeof(uint32_t));
+		push.groups_index  = 0;
+		// Without a limit in the shader data the pass writes it past the counts in the scratch.
+		push.limit_index = has_limit ? program.bindings.DispatchThreadLimitDword() : 4u;
+
+		vk::MemoryBarrier before {};
+		before.srcAccessMask = vk::AccessFlagBits::eShaderWrite |
+		                       vk::AccessFlagBits::eTransferWrite | vk::AccessFlagBits::eHostWrite;
+		before.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+		recorder.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                          vk::PipelineStageFlagBits::eComputeShader, {}, 1, &before, 0,
+		                          nullptr, 0, nullptr);
+		recorder.bindPipeline(vk::PipelineBindPoint::eCompute, pass.pipeline);
+		recorder.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pass.pipeline_layout, 0,
+		                               writes);
+		recorder.pushConstants(pass.pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+		                        sizeof(push), &push);
+		recorder.dispatch(1, 1, 1);
+		vk::MemoryBarrier after {};
+		after.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+		after.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead |
+		                      vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eUniformRead;
+		recorder.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+		                          vk::PipelineStageFlagBits::eDrawIndirect |
+		                              vk::PipelineStageFlagBits::eComputeShader,
+		                          {}, 1, &after, 0, nullptr, 0, nullptr);
+		indirect_buffer = stream.Handle();
+		indirect_offset = scratch_offset;
+	}
 	PreparedBindings* descriptor_stage = &bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
@@ -585,7 +729,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 }

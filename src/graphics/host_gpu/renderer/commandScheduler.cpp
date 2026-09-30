@@ -345,6 +345,11 @@ void CommandScheduler::DrainPriorityOperations() {
 	    lock, [this] { return m_priority_operations.empty() && !m_priority_active; });
 }
 
+bool CommandScheduler::HasPendingOperations() {
+	std::lock_guard lock(m_operation_mutex);
+	return !m_pending_operations.empty() || !m_priority_operations.empty() || m_priority_active;
+}
+
 void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	std::unique_lock lock(m_operation_mutex);

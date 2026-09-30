@@ -297,6 +297,7 @@ struct PipelineCache::ProgramCache {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
 		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .read_guest_memory          = Libs::LibKernel::Memory::ReadGuestMemoryOnGpuThread,
 		};
 		if (entry != programs.end()) {
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
@@ -683,7 +684,10 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
                                                ShaderComputeInputInfo&      input_info) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
-	uint32_t          push_data_cursor = 0;
+	// The GPU writes the thread limit of an indirect thread-dimension dispatch into its shader
+	// data, which therefore cannot be push constants.
+	uint32_t push_data_cursor =
+	    input_info.dispatch_indirect_threads ? ShaderRecompiler::IR::PushData::NoStart : 0u;
 	return m_program_cache->Get(params, input_info, push_data_cursor);
 }
 

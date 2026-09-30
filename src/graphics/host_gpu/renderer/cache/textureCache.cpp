@@ -284,18 +284,30 @@ bool TextureCache::HasImagesInRegion(uint64_t address, uint64_t size) {
 }
 
 uint64_t TextureCache::ImageEpochInRegion(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	return ImageEpochInRegionUnlocked(address, size);
+}
+
+uint64_t TextureCache::ImageEpochInRegionUnlocked(uint64_t address, uint64_t size) const {
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
 		return UINT64_MAX;
 	}
-	std::scoped_lock lock {m_lock};
-	uint64_t         epoch = 0;
+	uint64_t epoch = 0;
 	ForEachPage(address, size, [&](uint64_t page) {
 		if (const auto* page_epoch = m_image_page_epochs.Find(page)) {
 			epoch = std::max(epoch, *page_epoch);
 		}
 	});
 	return epoch;
+}
+
+size_t TextureCache::ExactLookupSlot(const ImageInfo& info) noexcept {
+	uint64_t hash = info.data.address * 0x9e3779b97f4a7c15ull;
+	hash ^= (info.data.size + static_cast<uint64_t>(info.pixel_format)) * 0xc2b2ae3d27d4eb4full;
+	hash ^= (static_cast<uint64_t>(info.extent.width) << 32u | info.extent.height) *
+	        0x165667b19e3779f9ull;
+	return static_cast<size_t>(hash >> 32u) % ExactLookupWays;
 }
 
 void TextureCache::DeleteImage(ImageId id) {
@@ -1332,6 +1344,28 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
+		// Draws look up the same targets and textures over and over: remember lookups that found
+		// an image with the same backing (no overlap resolution, no insertion) until the image set
+		// changes.
+		auto& exact = (*m_exact_lookups)[ExactLookupSlot(desc.info)];
+		if (exact.valid && exact.exact_format == exact_format &&
+		    desc.type != BindingType::VideoOut &&
+		    std::memcmp(&exact.info, &desc.info, sizeof(ImageInfo)) == 0 &&
+		    (exact.epoch == m_image_set_epoch ||
+		     ImageEpochInRegionUnlocked(desc.info.data.address, desc.info.data.size) <=
+		         exact.epoch)) {
+			auto& image                = m_slot_images[exact.id];
+			image.tick_accessed_last = m_scheduler.CurrentTick();
+			TouchImage(image);
+			result = exact.id;
+		}
+	}
+	if (result) {
+		MaterializeColorClear(result, desc, metadata_base_layer);
+		return result;
+	}
+	{
+		std::scoped_lock lock {m_lock};
 		const auto       candidates =
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
@@ -1341,6 +1375,7 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 				result = id;
 			}
 		}
+		const bool same_backing = static_cast<bool>(result);
 
 		int32_t view_mip   = -1;
 		int32_t view_layer = -1;
@@ -1370,6 +1405,14 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 				FreeImage(result);
 				result = {};
 			}
+		}
+		if (result && same_backing && desc.type != BindingType::VideoOut) {
+			auto& exact = (*m_exact_lookups)[ExactLookupSlot(desc.info)];
+			std::memcpy(&exact.info, &desc.info, sizeof(ImageInfo));
+			exact.id           = result;
+			exact.epoch        = m_image_set_epoch;
+			exact.exact_format = exact_format;
+			exact.valid        = true;
 		}
 		if (!result) {
 			result         = InsertImage(desc.info);

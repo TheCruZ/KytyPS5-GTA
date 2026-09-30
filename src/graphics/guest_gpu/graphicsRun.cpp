@@ -1410,7 +1410,8 @@ void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 
 		if (!indirect.indexed) {
 			DrawIndirectArgs args {};
-			std::memcpy(&args, args_addr, sizeof(args));
+			LibKernel::Memory::ReadGuestMemoryOnGpuThread(reinterpret_cast<uint64_t>(args_addr),
+			                                              &args, sizeof(args));
 			m_indirect_instances          = args.instance_count;
 			m_indirect_instances_sequence = operation.num_instances.sequence;
 			m_has_indirect_instances      = true;
@@ -1423,7 +1424,8 @@ void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 		}
 
 		DrawIndexedIndirectArgs args {};
-		std::memcpy(&args, args_addr, sizeof(args));
+		LibKernel::Memory::ReadGuestMemoryOnGpuThread(reinterpret_cast<uint64_t>(args_addr), &args,
+		                                              sizeof(args));
 
 		auto* index_addr = reinterpret_cast<const void*>(
 		    indirect.index_base + static_cast<uint64_t>(args.start_index_location) * index_size);
@@ -1507,9 +1509,13 @@ void CommandProcessor::ExecuteDispatchIndirect(const GpuOperation& operation) {
 	NoteRecordedWork();
 	if ((dispatch.mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
 		// The arguments are read when the dispatch executes: earlier GPU work may produce them.
-		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(dispatch.args_addr);
-		ExecuteDispatchDirect(operation, args->x, args->y, args->z, dispatch.mode);
-		return;
+		// Arguments the GPU still owns are converted on the GPU instead of being read back.
+		vk::DispatchIndirectCommand args {};
+		if (LibKernel::Memory::TryReadGuestMemoryOnGpuThread(dispatch.args_addr, &args,
+		                                                     sizeof(args))) {
+			ExecuteDispatchDirect(operation, args.x, args.y, args.z, dispatch.mode);
+			return;
+		}
 	}
 	m_renderer.GetRenderExecutor().DispatchIndirect(operation.submit_id, CurrentBuffer(),
 	                                                dispatch.args_addr, dispatch.mode);

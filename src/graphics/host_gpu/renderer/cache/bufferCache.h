@@ -81,6 +81,10 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// Lock-free and conservative: false means no page of the range is GPU dirty.
+	[[nodiscard]] bool MayBeGpuModified(uint64_t vaddr, uint64_t size) const {
+		return m_memory_tracker.MayBeGpuModified(vaddr, size);
+	}
 	void               ProcessFaultBuffer();
 	// Guest ranges whose GPU contents are a uniform 32-bit value written by a recorded compute
 	// fill. Lets CPU-side consumers read the value without draining the GPU.

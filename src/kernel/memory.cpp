@@ -949,6 +949,30 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+bool TryReadGuestMemoryOnGpuThread(uint64_t vaddr, void* data, uint64_t size) {
+	// A page with GPU-owned bytes is read protected: a plain load from it waits for the GPU to
+	// finish all queued work and downloads the page. A readback only replaces the GPU-owned bytes
+	// (BufferCache::DownloadBufferMemory copies the dirty byte ranges), so the other bytes of the
+	// page are already current in the backing and can be read from it. The region flag is read
+	// without a lock: a stale "clean" answer only means a plain load that faults as before.
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	    Graphics::GuestGpu::IsGpuThread()) {
+		auto& buffer_cache = GetGpuResources().GetBufferCache();
+		if (buffer_cache.MayBeGpuModified(vaddr, size) &&
+		    buffer_cache.IsRegionGpuModified(vaddr, size)) {
+			return TryReadGpuCleanBacking(vaddr, data, size);
+		}
+	}
+	std::memcpy(data, reinterpret_cast<const void*>(vaddr), size);
+	return true;
+}
+
+void ReadGuestMemoryOnGpuThread(uint64_t vaddr, void* data, uint64_t size) {
+	if (!TryReadGuestMemoryOnGpuThread(vaddr, data, size)) {
+		std::memcpy(data, reinterpret_cast<const void*>(vaddr), size);
+	}
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 

@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <bit>
@@ -140,7 +141,11 @@ void FaultManager::ProcessFaultBuffer() {
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
-			(void)m_buffer_cache.FindBuffer(start, end - start);
+			// The guest may have unmapped the range since the GPU accessed it: an unmap does not
+			// wait for this completion.
+			if (m_scheduler.Context().IsMapped(start, end - start)) {
+				(void)m_buffer_cache.FindBuffer(start, end - start);
+			}
 		});
 		m_fault_areas[area] = 0;
 	});

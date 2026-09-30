@@ -17,6 +17,9 @@ struct SrtRuntime {
 	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
+	// Without read_memory: reads guest memory directly (a plain load when null). Unlike
+	// read_memory, these reads are not captured as specialization reads.
+	void (*read_guest_memory)(uint64_t address, void* data, uint64_t size) = nullptr;
 };
 
 enum class RuntimeValueType { Any, Integer };
