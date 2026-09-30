@@ -181,6 +181,10 @@ public:
 	[[nodiscard]] uint64_t GetSubmitId() const { return m_submit_id; }
 	void                   SetSubmitId(uint64_t submit_id) { m_submit_id = submit_id; }
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
+	// The GPU queue as DrawPrep numbers them: 0 graphics, 1.. the compute queues.
+	[[nodiscard]] uint32_t DrawPrepQueue() const {
+		return m_interrupt_event_id >= 0x20 ? static_cast<uint32_t>(m_interrupt_event_id - 0x20 + 1) : 0u;
+	}
 	[[nodiscard]] RenderContext& GetRenderContext() const { return m_renderer; }
 
 private:
@@ -238,15 +242,19 @@ private:
 	struct SnapshotRing {
 		static constexpr size_t Size = 512;
 		struct alignas(64) Slot {
-			T value;
+			T        value;
+			uint64_t id = 0;
 		};
 		std::unique_ptr<Slot[]>     slots;
 		std::unique_ptr<uint64_t[]> last_use;
 		size_t                      current = Size;
 		size_t                      next    = 0;
 	};
+	// Numbers the snapshots of every ring of every processor: ids never repeat.
+	static inline std::atomic_uint64_t s_snapshot_ids {0};
 	template <typename T>
-	const T* Snapshot(SnapshotRing<T>& ring, const T& live, bool& dirty, uint64_t sequence);
+	const T* Snapshot(SnapshotRing<T>& ring, const T& live, bool& dirty, uint64_t sequence,
+	                  uint64_t* id = nullptr);
 
 	RenderContext& m_renderer;
 	GuestGpu*      m_pipeline = nullptr;

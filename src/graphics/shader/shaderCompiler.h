@@ -41,7 +41,8 @@ ShaderParams PrepareProgram(
     const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
     ShaderPixelInputInfo&                               input_info);
-ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, ShaderComputeInputInfo& input_info);
+ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
+                            ShaderComputeInputInfo& input_info);
 
 // Reads the guest memory PrepareProgram needs besides registers and shader code (vertex fetch
 // tables); false when the range cannot be read.

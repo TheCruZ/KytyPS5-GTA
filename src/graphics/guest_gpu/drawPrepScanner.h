@@ -1,6 +1,8 @@
 #ifndef EMULATOR_SRC_GRAPHICS_GUEST_GPU_DRAWPREPSCANNER_H_
 #define EMULATOR_SRC_GRAPHICS_GUEST_GPU_DRAWPREPSCANNER_H_
 
+#include "graphics/host_gpu/renderer/drawPrep.h"
+
 #include <array>
 #include <condition_variable>
 #include <cstdint>
@@ -17,7 +19,20 @@ class CommandProcessor;
 
 namespace HW {
 class Context;
+class Shader;
+class UserConfig;
 } // namespace HW
+
+// Prepares the descriptor walks of one draw or dispatch from the register state it will execute
+// with and publishes them for the execution thread (DrawPrep::Take), as the scanner does for the
+// packets it scans. Used by the scanner and, with the pipelined GPU, by its resolve thread, which
+// prepares the operations the command processor emitted. False when nothing was prepared.
+bool DrawPrepareGraphics(RenderContext& renderer, const DrawPrep::Key& key, const HW::Context& ctx,
+                         const HW::UserConfig& ucfg, const HW::Shader& sh);
+// `groups` are the thread group counts of a direct dispatch (null for an indirect one); `mode` is
+// the dispatch initiator.
+bool DrawPrepareDispatch(RenderContext& renderer, const DrawPrep::Key& key, const HW::Shader& sh,
+                         const HW::Context& ctx, const uint32_t* groups, uint32_t mode);
 
 // The draw-prep scanner (host_gpu/renderer/drawPrep.h; KYTY_DRAW_PREP=0 turns it off): reads each graphics
 // submission when it is queued, ahead of the GPU thread, follows its register writes on a command

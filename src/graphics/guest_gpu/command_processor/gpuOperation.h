@@ -2,6 +2,7 @@
 #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_GPU_OPERATION_H
 
 #include "common/inlineFunction.h"
+#include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <cstdint>
@@ -21,6 +22,9 @@ struct GpuRegisterState {
 	const HW::Context*    context     = nullptr;
 	const HW::UserConfig* user_config = nullptr;
 	const HW::Shader*     shaders     = nullptr;
+	// Unique per snapshot of the context registers (0: live registers, not a snapshot):
+	// operations with the same id see the same context registers.
+	uint64_t context_id = 0;
 };
 
 // NUM_INSTANCES as the command processor last set it. Indirect draws also set the persistent
@@ -95,8 +99,14 @@ struct GpuOperation {
 	uint64_t          submit_id = 0;
 	// Position in the stream of a pipelined GPU; see GuestGpu::EmitOperation().
 	uint64_t          sequence  = 0;
+	// The GPU queue (DrawPrep): 0 graphics, 1.. the compute queues.
+	uint32_t          queue     = 0;
 	GpuRegisterState  state;
 	GpuNumInstances   num_instances;
+	// Draws and dispatches: the descriptor walks the resolve thread prepared ahead of execution
+	// (DrawPrep::Take), under this key.
+	DrawPrep::Key prep_key {};
+	bool          prepared = false;
 	union {
 		DrawIndexArgs       draw_index;
 		DrawAutoArgs        draw_auto;

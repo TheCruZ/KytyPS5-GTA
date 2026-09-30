@@ -23,6 +23,7 @@
 #include <bit>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <span>

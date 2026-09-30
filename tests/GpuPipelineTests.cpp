@@ -7,6 +7,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <thread>
 #include <vector>
