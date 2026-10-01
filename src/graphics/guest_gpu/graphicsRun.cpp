@@ -3452,6 +3452,7 @@ void CommandProcessor::Flip() {
 
 	EmitCallback([this, flip = m_flip] {
 		auto& command = CurrentBuffer();
+		m_renderer.GetOcclusionQueries().OnFrame();
 		auto  request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
 		                                          flip.flip_mode, flip.flip_arg);
 		(void)command.Handle();
@@ -3474,6 +3475,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	const auto sequence = EmitCallback([this, dst_gpu_addr, value, flip = m_flip] {
 		auto& command = CurrentBuffer();
 		std::memcpy(dst_gpu_addr, &value, sizeof(value));
+		m_renderer.GetOcclusionQueries().OnFrame();
 		auto request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
 		                                         flip.flip_mode, flip.flip_arg);
 		(void)command.Handle();
@@ -3503,6 +3505,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	const auto sequence = EmitCallback([this, dst_gpu_addr, value, flip = m_flip] {
 		auto& command = CurrentBuffer();
 		std::memcpy(dst_gpu_addr, &value, sizeof(value));
+		m_renderer.GetOcclusionQueries().OnFrame();
 		auto request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
 		                                         flip.flip_mode, flip.flip_arg);
 		(void)command.Handle();

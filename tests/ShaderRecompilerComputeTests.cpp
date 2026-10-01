@@ -2650,7 +2650,7 @@ public:
     packets[11] = static_cast<uint32_t>(base >> 32u);
     write(packets.data() + 12, &skipped, 11, true);
     write(packets.data() + 17, &after, 22);
-    gpu.Submit(packets);
+    gpu.Submit(packets, {});
     bool done = false;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     do {
@@ -22222,8 +22222,8 @@ private:
     m_runtime_context.conditional_rendering_enabled = true;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
-    m_runtime_context.occlusion_queries_enabled = m_host_query_reset;
-    m_runtime_context.occlusion_query_precise_enabled = m_occlusion_query_precise;
+    m_runtime_context.host_query_reset_enabled = m_host_query_reset;
+    m_runtime_context.occlusion_query_precise = m_occlusion_query_precise;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,

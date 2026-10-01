@@ -28,11 +28,7 @@ bool CommandBuffer::IsInvalid() const {
 	return !m_open;
 }
 
-bool CommandBuffer::IsInvalid() const {
-	return m_stream != nullptr ? !m_open : m_buffer == nullptr;
-}
-
-CommandRecorder CommandBuffer::Handle() const {
+vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
 	if (m_scheduler.Threaded()) {
 		// Recording directly: the recording thread must have run everything queued first.
@@ -48,11 +44,7 @@ CommandRecorder CommandBuffer::Recorder() const {
 
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
-	if (m_stream != nullptr) {
-		// The recording thread begins its Vulkan command buffer when it replays commands.
-		return;
-	}
-	auto buffer = m_buffer;
+	auto buffer = Handle();
 
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
@@ -158,7 +150,9 @@ void CommandBuffer::EndRendering(std::source_location site) const {
 	if (!m_rendering) {
 		return;
 	}
-	Recorder().endRendering(site);
+	const auto recorder = Recorder();
+	m_context.GetOcclusionQueries().OnEndRendering(recorder);
+	recorder.endRendering(site);
 	m_rendering    = false;
 	m_render_state = {};
 }

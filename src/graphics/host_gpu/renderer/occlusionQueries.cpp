@@ -25,9 +25,10 @@ constexpr uint32_t PoolCapacity = 16384;
 OcclusionQueries::OcclusionQueries(RenderContext& context)
     : m_context(context), m_device(context.GetGraphics().device), m_segments(PoolCapacity) {
 	const auto& graphics = context.GetGraphics();
-	if (!graphics.occlusion_queries_enabled) {
-		Log::WriteToConsoleAndLog("Occlusion queries: off (--no-occlusion-queries or no Vulkan "
-		                          "hostQueryReset); they read always visible\n");
+	if (!graphics.host_query_reset_enabled) {
+		Common::HackNotice::Report("occlusion queries unavailable: their counters read always visible",
+		                           "OcclusionQueries::OcclusionQueries", 0, 0,
+		                           "the Vulkan device lacks hostQueryReset");
 		return;
 	}
 	vk::QueryPoolCreateInfo info {};
@@ -35,13 +36,14 @@ OcclusionQueries::OcclusionQueries(RenderContext& context)
 	info.queryCount = PoolCapacity;
 	if (m_device.createQueryPool(&info, nullptr, &m_pool) != vk::Result::eSuccess) {
 		m_pool = nullptr;
-		Log::WriteToConsoleAndLog("Occlusion queries: cannot create the query pool; they read "
-		                          "always visible\n");
+		Common::HackNotice::Report("occlusion queries unavailable: their counters read always visible",
+		                           "OcclusionQueries::OcclusionQueries", 0, 1,
+		                           "the query pool cannot be created");
 		return;
 	}
 	SetVulkanObjectNameF(m_device, m_pool, "Kyty.OcclusionQueries");
 	m_device.resetQueryPool(m_pool, 0, PoolCapacity);
-	if (graphics.occlusion_query_precise_enabled) {
+	if (graphics.occlusion_query_precise) {
 		m_control = vk::QueryControlFlagBits::ePrecise;
 	}
 	m_results.resize(PoolCapacity);
@@ -138,7 +140,7 @@ void OcclusionQueries::OnUnmap(uint64_t address, uint64_t size) {
 void OcclusionQueries::Dump(CommandScheduler& scheduler, uint64_t address) {
 	EXIT_IF(m_pool == nullptr);
 	auto&      buffer   = scheduler.Current();
-	const auto recorder = buffer.Handle();
+	const auto recorder = buffer.Recorder();
 	if (m_query_active) {
 		EndQuery(recorder);
 	}
@@ -174,9 +176,8 @@ uint64_t OcclusionQueries::ReadSamples(uint64_t first_slot, uint64_t end_slot) {
 		    m_pool, slot, count, count * sizeof(uint64_t), m_results.data(), sizeof(uint64_t),
 		    vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
 		if (result != vk::Result::eSuccess) {
-			Log::WriteToConsoleAndLog(fmt::format(
-			    "Occlusion queries: vkGetQueryPoolResults failed ({}); the query reads visible\n",
-			    vk::to_string(result)));
+			Common::HackNotice::Report("occlusion query result unreadable: the query reads visible",
+			                           "OcclusionQueries::ReadSamples", 0, 0, vk::to_string(result));
 			samples += OcclusionCounters::UncountedSamples;
 		} else {
 			for (uint32_t i = 0; i < count; i++) {
