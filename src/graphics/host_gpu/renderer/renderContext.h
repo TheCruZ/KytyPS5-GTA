@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/renderer/indirectWriteTables.h"
+#include "graphics/host_gpu/renderer/occlusionQueries.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
@@ -52,6 +53,7 @@ public:
 	TextureCache&       GetTextureCache() { return m_texture_cache; }
 	BindlessTable&      GetBindlessTable() { return m_bindless_table; }
 	IndirectWriteTables& GetIndirectWriteTables() { return m_indirect_write_tables; }
+	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
@@ -102,6 +104,7 @@ private:
 	TextureCache              m_texture_cache;
 	BindlessTable             m_bindless_table;
 	IndirectWriteTables       m_indirect_write_tables {*this};
+	OcclusionQueries          m_occlusion_queries {*this};
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	uint64_t                  m_mapped_ranges_version = 0;

@@ -33,6 +33,12 @@ public:
 	void bindPipeline(vk::PipelineBindPoint bind_point, vk::Pipeline pipeline) const {
 		Run([=](vk::CommandBuffer command) { command.bindPipeline(bind_point, pipeline); });
 	}
+	void beginQuery(vk::QueryPool pool, uint32_t query, vk::QueryControlFlags flags) const {
+		Run([=](vk::CommandBuffer command) { command.beginQuery(pool, query, flags); });
+	}
+	void endQuery(vk::QueryPool pool, uint32_t query) const {
+		Run([=](vk::CommandBuffer command) { command.endQuery(pool, query); });
+	}
 	void draw(uint32_t vertices, uint32_t instances, uint32_t first_vertex,
 	          uint32_t first_instance) const {
 		const bool safe = NextDrawSafe();

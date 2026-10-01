@@ -143,13 +143,16 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	m_render_state.depth_stencil_attachment.depth_clear   = false;
 	m_render_state.depth_stencil_attachment.stencil_clear = false;
 	m_rendering                                           = true;
+	m_context.GetOcclusionQueries().OnBeginRendering(recorder);
 }
 
 void CommandBuffer::EndRendering(std::source_location site) const {
 	if (!m_rendering) {
 		return;
 	}
-	Recorder().endRendering(site);
+	const auto recorder = Recorder();
+	m_context.GetOcclusionQueries().OnEndRendering(recorder);
+	recorder.endRendering(site);
 	m_rendering    = false;
 	m_render_state = {};
 }

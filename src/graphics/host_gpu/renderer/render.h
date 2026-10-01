@@ -134,6 +134,7 @@ public:
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering(std::source_location site = std::source_location::current()) const;
+	[[nodiscard]] bool IsRendering() const noexcept { return m_rendering; }
 
 	// The raw command buffer. With the recording thread (CommandScheduler::EnableRecordingThread)
 	// this first waits until the thread has run everything queued; hot paths use Recorder().
