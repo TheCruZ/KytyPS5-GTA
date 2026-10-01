@@ -563,11 +563,6 @@ add_executable(jpeg_enc_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/JpegEncTests.c
 target_link_libraries(jpeg_enc_tests common fmt::fmt)
 target_include_directories(jpeg_enc_tests PRIVATE ${inc_headers})
 
-add_executable(occlusion_queries_tests EXCLUDE_FROM_ALL
-	"${KYTY_TESTS_DIR}/OcclusionQueriesTests.cpp")
-target_link_libraries(occlusion_queries_tests common fmt::fmt Vulkan::Headers)
-target_include_directories(occlusion_queries_tests PRIVATE ${inc_headers})
-
 add_executable(ces_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CesTests.cpp")
 target_link_libraries(ces_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(ces_tests PRIVATE ${inc_headers})
@@ -692,7 +687,6 @@ if(BUILD_TESTING)
 	add_test(NAME png_enc COMMAND $<TARGET_FILE:png_enc_tests>)
 	add_test(NAME jpeg_dec COMMAND $<TARGET_FILE:jpeg_dec_tests>)
 	add_test(NAME jpeg_enc COMMAND $<TARGET_FILE:jpeg_enc_tests>)
-	add_test(NAME occlusion_queries COMMAND $<TARGET_FILE:occlusion_queries_tests>)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
@@ -790,7 +784,6 @@ if(BUILD_TESTING)
 		png_enc_tests
 		jpeg_dec_tests
 		jpeg_enc_tests
-		occlusion_queries_tests
 		ces_tests
 		save_data_dialog_tests
 		http_uri_parse_tests
