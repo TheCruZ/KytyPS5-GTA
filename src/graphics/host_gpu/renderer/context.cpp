@@ -115,7 +115,8 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pColorAttachments    = colors.data();
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
-	Handle().beginRendering(rendering);
+	const auto recorder = Handle();
+	recorder.beginRendering(rendering);
 	// The open pass holds the cleared contents, so a later clear begins a new pass.
 	m_render_state = state;
 	for (auto& color: m_render_state.color_attachments) {
@@ -124,13 +125,16 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	m_render_state.depth_stencil_attachment.depth_clear   = false;
 	m_render_state.depth_stencil_attachment.stencil_clear = false;
 	m_rendering                                           = true;
+	m_context.GetOcclusionQueries().OnBeginRendering(recorder);
 }
 
 void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
 	}
-	Handle().endRendering();
+	const auto recorder = Handle();
+	m_context.GetOcclusionQueries().OnEndRendering(recorder);
+	recorder.endRendering();
 	m_rendering    = false;
 	m_render_state = {};
 }
