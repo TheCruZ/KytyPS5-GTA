@@ -670,7 +670,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		    vk::SampleCountFlagBits::e1;
 	}
 	graphics.sample_rate_shading_enabled                 = true;
-	// Occlusion queries reset their queries from the host and count samples exactly where they can.
+	// Host occlusion queries back the guest's ZPASS_DONE counters: exact sample counts, and slots
+	// reset from the host once their results were read.
 	graphics.occlusion_queries_enabled =
 	    Config::OcclusionQueriesEnabled() && supported_features12.hostQueryReset;
 	graphics.occlusion_query_precise_enabled =
