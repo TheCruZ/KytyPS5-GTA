@@ -91,8 +91,8 @@ private:
 	BufferCache               m_buffer_cache;
 	TextureCache              m_texture_cache;
 	ImageHeap                 m_image_heap;
-	OcclusionQueries          m_occlusion_queries;
 	IndirectWriteTables       m_indirect_write_tables {*this};
+	OcclusionQueries          m_occlusion_queries {*this};
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	uint64_t                  m_mapped_ranges_version = 0;
