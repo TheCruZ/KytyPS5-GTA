@@ -277,6 +277,8 @@ private:
 	FlipInfo m_flip;
 	uint64_t m_submit_id      = 0;
 	bool     m_predicate_skip = false;
+	// A ZPASS predication waits for host occlusion query results it asked for.
+	bool     m_occlusion_wait_requested = false;
 	// A WAIT_REG_MEM was processed since the last operation was made.
 	bool m_wait_since_operation = false;
 
