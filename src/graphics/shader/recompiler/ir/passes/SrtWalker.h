@@ -2,6 +2,7 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SRTWALKER_H_
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 
 #include <algorithm>
 #include <span>
@@ -54,8 +55,10 @@ struct SrtRuntime {
 
 class SrtReadCapture {
 public:
-	SrtReadCapture(SrtRuntime source, std::vector<std::pair<uint64_t, uint64_t>>& ranges):
-	    m_source(source), m_ranges(ranges) {}
+	// slots (optional) receives NoSrtSlot for each read: these are no scalar loads of the shader.
+	SrtReadCapture(SrtRuntime source, std::vector<std::pair<uint64_t, uint64_t>>& ranges,
+	               std::vector<uint32_t>* slots = nullptr):
+	    m_source(source), m_ranges(ranges), m_slots(slots) {}
 	SrtRuntime ObservedRuntime();
 
 private:
@@ -63,6 +66,7 @@ private:
 
 	SrtRuntime                                  m_source;
 	std::vector<std::pair<uint64_t, uint64_t>>& m_ranges;
+	std::vector<uint32_t>*                      m_slots = nullptr;
 };
 
 enum class RuntimeValueType { Any, Integer, ImmutableInteger };
@@ -76,9 +80,12 @@ bool ValidateWaveUniformValue(const ResourcePlan& program, Value value);
 // only evaluates the values, with every block reachable.
 void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values = {});
 // Runs the walker. flat receives the scalar reads of reachable blocks and reads, when non-null,
-// one DWORD range per guest load. False when a reachable read is unknown.
+// one DWORD range per guest load; read_slots, when non-null, receives for each the flat SRT slot
+// whose scalar load made it, the RawReadSlot() of a load the shader issues itself, or NoSrtSlot.
+// False when a reachable read is unknown.
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
-             std::vector<std::pair<uint64_t, uint64_t>>* reads);
+             std::vector<std::pair<uint64_t, uint64_t>>* reads,
+             std::vector<uint32_t>* read_slots = nullptr);
 // Results of the last walk; false when unknown.
 bool WalkedValue(const ResourcePlan& plan, Value value, uint32_t& result);
 bool WalkedDescriptor(const ResourcePlan& plan, uint32_t source, DescriptorValue& result);

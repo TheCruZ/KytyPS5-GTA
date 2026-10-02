@@ -1708,13 +1708,16 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	     std::ranges::any_of(program.descriptor_sources, uses_workgroup_count));
 	auto& reads = snapshot.specialization_reads;
 	reads = program.source_reads;
-	if (!WalkSrt(program, runtime, snapshot.flattened_srt, capture_reads ? &reads : nullptr)) {
+	auto& slots = snapshot.specialization_read_slots;
+	slots.assign(reads.size(), NoSrtSlot);
+	if (!WalkSrt(program, runtime, snapshot.flattened_srt, capture_reads ? &reads : nullptr,
+	             capture_reads ? &slots : nullptr)) {
 		// Ahead of execution a walk fails on any fault; the execution thread walks again.
 		if (runtime.record_load != nullptr) return false;
 		return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
 		    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
 	}
-	SrtReadCapture capture {runtime, reads};
+	SrtReadCapture capture {runtime, reads, &slots};
 	auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
 	std::array<uint32_t, 3> workgroup_counts {};
 	if (runtime.indirect_args_address != 0u) {
