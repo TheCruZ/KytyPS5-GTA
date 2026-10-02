@@ -173,6 +173,14 @@ bool CaptureOrdinaryRead(void* userdata, uint64_t address, std::span<uint32_t> v
 	return true;
 }
 
+// Whether the descriptors of written resources must come from clean backing: the renderer
+// checks the scalar reads of every stage of a draw against their ranges. A compute dispatch is
+// one stage, so it needs them only for its own captured reads; otherwise an ordinary read,
+// which downloads bytes the GPU wrote, gives the range.
+bool StrictWrittenDescriptors(const ResourcePlan& program) {
+	return program.capture_specialization_reads || program.stage != ShaderType::Compute;
+}
+
 const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
 	if (source >= program.descriptor_sources.size()) {
 		return nullptr;
@@ -1134,11 +1142,14 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	}
 	plan.capture_specialization_reads = masked_image || !plan.control_flow.empty();
 	// Writable descriptor addresses must come from clean backing for the alias proof.
+	const bool strict_writes = StrictWrittenDescriptors(plan);
 	for (const auto& buffer: plan.info.buffers) {
-		if (buffer.written) MarkCleanFlatSlots(plan, Source(plan, buffer.source), plan.clean_flat_slots);
+		if (buffer.written && strict_writes)
+			MarkCleanFlatSlots(plan, Source(plan, buffer.source), plan.clean_flat_slots);
 	}
 	for (const auto& image: plan.info.images) {
-		if (image.written) MarkCleanFlatSlots(plan, Source(plan, image.source), plan.clean_flat_slots);
+		if (image.written && strict_writes)
+			MarkCleanFlatSlots(plan, Source(plan, image.source), plan.clean_flat_slots);
 	}
 	if (masked_image) plan.resource_tracking_complete &= !program.has_address_writes;
 	return plan;
@@ -1152,6 +1163,7 @@ static bool MaterializeWith(const ResourcePlan& program, const SrtRuntime& runti
 		return false;
 	}
 	const bool capture_reads = program.capture_specialization_reads;
+	const bool strict_writes = StrictWrittenDescriptors(program);
 	auto& reads = snapshot.specialization_reads;
 	reads.clear();
 	snapshot.specialization_read_slots.clear();
@@ -1187,7 +1199,7 @@ static bool MaterializeWith(const ResourcePlan& program, const SrtRuntime& runti
 			return false;
 		}
 		if (active.empty() || active[source]) {
-			return (written ? clean : walker).EvaluateDescriptor(source, value);
+			return (written && strict_writes ? clean : walker).EvaluateDescriptor(source, value);
 		}
 		value = {};
 		value.dword_count = program.descriptor_sources[source].dword_count;

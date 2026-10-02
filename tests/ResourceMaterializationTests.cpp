@@ -224,10 +224,10 @@ void TestUnbasedFlatCacheHitMaterializes() {
         "unbased FLAT plan produced unexpected descriptors");
 }
 
-void TestWrittenDescriptorUsesStrictReaderOnce() {
+void TestWrittenDescriptorUsesStrictReaderOnce(Libs::Graphics::ShaderType stage) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
-  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.stage = stage;
   program.srt_plan_complete = true;
   program.resource_tracking_complete = true;
   auto &block = AddValueBlock(program);
@@ -264,6 +264,13 @@ void TestWrittenDescriptorUsesStrictReaderOnce() {
       }};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  if (stage == Libs::Graphics::ShaderType::Compute) {
+    // A compute dispatch without captured scalar reads has no alias proof to serve.
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              reads.ordinary == 1 && reads.strict == 0 && snapshot.buffers[0].dwords[0] == 0x8000u,
+          "compute writable descriptor without an alias proof required clean backing");
+    return;
+  }
   Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
             reads.ordinary == 0 && reads.strict == 1,
         "GPU-dirty dynamic writable descriptor bypassed strict provenance");
@@ -869,7 +876,8 @@ int main() {
   TestMappedSrtUsesDirectReaderByDefault();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestUnbasedFlatCacheHitMaterializes();
-  TestWrittenDescriptorUsesStrictReaderOnce();
+  TestWrittenDescriptorUsesStrictReaderOnce(Libs::Graphics::ShaderType::Pixel);
+  TestWrittenDescriptorUsesStrictReaderOnce(Libs::Graphics::ShaderType::Compute);
   TestFailedMaterializationRejectsStage();
   TestMixedSamplerDuplicatesTheCorrectSnapshot();
   TestCompiledWalkerDirectReads();

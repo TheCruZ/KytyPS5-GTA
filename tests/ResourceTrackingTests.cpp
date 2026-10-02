@@ -3234,6 +3234,49 @@ void TestScalarReadBeforeOwnBufferWrite() {
   }
 }
 
+// GTA V CS 0e7bdeda7768b057 (Fidelity BVH build) has no scalar branch: it builds the V# it
+// stores through from the "PSR_BVHL" header that CS 9df701ab41f8ed18 just updated, so the GPU
+// may still own those bytes. A dispatch without captured reads has no alias proof that needs
+// clean backing.
+void TestWrittenDescriptorWithoutAliasProof() {
+  Fixture fixture;
+  MemoryInfo address;
+  address.kind = ResourceKind::ScalarAddress;
+  const auto root = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+  std::array<Value, 4> words{Value(), Value(), Value(), Value(0x16204u)};
+  const std::array<uint32_t, 3> offsets{48, 52, 112};
+  for (uint32_t word = 0; word < offsets.size(); ++word) {
+    address.offset = offsets[word];
+    words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+        {root, Value(0u), Value(0u), Value(true)}, fixture.AddMemory(address, 4 + word * 4));
+  }
+  MemoryInfo store;
+  store.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::StoreBufferU32,
+      {fixture.Buffer(words), Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+      fixture.AddMemory(store, 16));
+  fixture.PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture.program);
+  Check(!plan.capture_specialization_reads && plan.srt_reads.size() == 3 &&
+            plan.info.buffers.size() == 1 && plan.info.buffers[0].written,
+        "BVH descriptor fixture lost its flattened V# or gained a scalar branch");
+  LinearTestMemory memory;
+  memory.words[0x30 / 4] = 0x1800u;
+  memory.words[0x70 / 4] = 64u;
+  const std::array<uint32_t, 2> user_data{0x1000u, 0u};
+  const auto Dirty = +[](void *, uint64_t, std::span<uint32_t>) { return false; };
+  const SrtRuntime runtime{.user_data = user_data, .read_memory = ReadLinearTestMemory,
+                           .userdata = &memory, .read_specialization_memory = Dirty};
+  for (const bool reference : {false, true}) {
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check((reference ? MaterializeResourcesReference(plan, runtime, snapshot, specialization)
+                     : MaterializeResources(plan, runtime, snapshot, specialization)) &&
+              snapshot.buffers[0].dwords[0] == 0x1800u && snapshot.buffers[0].dwords[2] == 64u,
+          "written V# from GPU-owned memory needed clean backing without an alias proof");
+  }
+}
+
 // GTA V CS d03361dd03166145 selects the base of an atomic V# with S_CBRANCH_SCC0 on s2,
 // adds it with S_ADD_U32/S_ADDC_U32 in each arm, sets a flag on the merged high word with
 // S_BITSET1_B32, and also stores through another buffer.
@@ -3931,6 +3974,7 @@ int main() {
     Run("conditional buffer materialization", TestConditionalBufferMaterialization);
     Run("guarded scalar descriptor reads", TestGuardedScalarDescriptorReads);
     Run("scalar read before own buffer write", TestScalarReadBeforeOwnBufferWrite);
+    Run("written descriptor without alias proof", TestWrittenDescriptorWithoutAliasProof);
     Run("written scalar-branch buffer", TestWrittenScalarBranchBuffer);
     Run("conservative buffer reachability", TestConservativeBufferReachability);
     Run("writable buffer phi", TestWritableBufferPhi);
