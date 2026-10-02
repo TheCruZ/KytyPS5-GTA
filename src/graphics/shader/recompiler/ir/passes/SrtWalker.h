@@ -17,6 +17,8 @@ struct SrtRuntime {
 	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
+	// When set, holds the flat SRT slot whose scalar load is reading memory, or NoSrtSlot.
+	uint32_t*                 read_slot                  = nullptr;
 };
 
 enum class RuntimeValueType { Any, Integer };
@@ -81,6 +83,8 @@ struct CompiledSrtPlan {
 	// Copies of the plan state that every refresh reads, kept next to the nodes.
 	std::vector<Node>       nodes;
 	std::vector<SrtRead>    srt_reads;
+	// The flat SRT slot whose scalar load each node is, or NoSrtSlot.
+	std::vector<uint32_t>   read_slots;
 	std::vector<Descriptor> descriptors;
 	std::vector<uint32_t>   conditions;
 	bool                    srt_plan_complete = false;
@@ -155,7 +159,7 @@ private:
 	bool EvaluateInst(uint32_t node, uint64_t& result);
 	bool EvaluateRawRead(uint32_t node, uint64_t& result);
 	bool EvaluateLeaf(uint32_t node, uint64_t& result) const;
-	bool ReadWord(uint64_t address, uint64_t& result);
+	bool ReadWord(uint32_t node, uint64_t address, uint64_t& result);
 
 	const ResourcePlan&       m_program;
 	const CompiledSrtPlan&    m_plan;

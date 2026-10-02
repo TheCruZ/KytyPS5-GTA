@@ -40,6 +40,8 @@ struct ImageTableSnapshot {
 	std::vector<uint32_t>        mapping; // Entry count, then the slot of each entry.
 };
 
+inline constexpr uint32_t NoSrtSlot = UINT32_MAX;
+
 struct ResourceSnapshot {
 	std::vector<DescriptorValue> buffers;
 	std::vector<DescriptorValue> images;
@@ -48,6 +50,9 @@ struct ResourceSnapshot {
 	std::vector<ImageTableSnapshot> image_tables;
 	std::vector<uint32_t>        user_data;
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
+	// For each specialization read, the flat SRT slot whose scalar load made it, or NoSrtSlot.
+	// The shader reads such a value from the flattened SRT, never from guest memory.
+	std::vector<uint32_t>        specialization_read_slots;
 	UniformFill                 uniform_fill;
 };
 
