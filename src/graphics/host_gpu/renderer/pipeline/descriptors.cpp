@@ -1204,7 +1204,7 @@ bool RenderExecutor::IsStaleImageBinding(const TextureBinding& binding) {
 	       image->binding.needs_rebind;
 }
 
-bool RenderExecutor::ResolveStaleImages(PreparedBindings& prepared) {
+bool RenderExecutor::ResolveStaleImages(PreparedBindings& prepared, bool null_tables) {
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = *prepared.runtime->program;
 	const auto& snapshot = *prepared.runtime->resources;
@@ -1248,8 +1248,11 @@ bool RenderExecutor::ResolveStaleImages(PreparedBindings& prepared) {
 		if (auto* old_image = texture_cache.m_slot_images.try_get(texture.image_id)) {
 			old_image->binding = {};
 		}
-		texture = ResolveTableTexture(program.info.images.at(prepared.table_roots[k]),
-		                              prepared.table_sources[k]);
+		const auto& root = program.info.images.at(prepared.table_roots[k]);
+		texture =
+		    null_tables
+		        ? ResolveTexture(root, ShaderRecompiler::IR::DescriptorValue {.dword_count = 8u})
+		        : ResolveTableTexture(root, prepared.table_sources[k]);
 		BindImage(texture.image_id, false);
 	}
 	return true;
@@ -1259,8 +1262,10 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	// Rediscovering one binding can replace (expand, merge or recreate) the image another binding,
 	// direct or table element, already resolved to. Repeat until every binding names a current
-	// image before acquiring any view.
-	for (uint32_t pass = 0; ResolveStaleImages(prepared); pass++) {
+	// image before acquiring any view. Bindless tables can hold chains of overlapping textures
+	// that keep replacing each other (GTA V's ray tracing material table has thousands of T#s):
+	// on the last passes, their stale elements bind as null; the shader may never read them.
+	for (uint32_t pass = 0; ResolveStaleImages(prepared, pass + 1u >= MaxRebindPasses); pass++) {
 		if (pass == MaxRebindPasses) {
 			EXIT("image bindings did not settle after %u rediscovery passes\n", MaxRebindPasses);
 		}
@@ -1338,7 +1343,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		}
 		bool changed = false;
 		for (auto* stage: stages) {
-			changed |= ResolveStaleImages(*stage);
+			changed |= ResolveStaleImages(*stage, pass + 1u >= MaxRebindPasses);
 		}
 		for (auto& target: colors) {
 			EXIT_IF(!target.image_id);

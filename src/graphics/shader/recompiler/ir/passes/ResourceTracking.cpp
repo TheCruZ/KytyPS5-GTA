@@ -389,7 +389,9 @@ public:
 				plan.handle->SetArg(dword, plan.key);
 			}
 			for (const auto index: plan.memory) {
-				m_program.memory_info[index].planning_only = true;
+				if (index != KeptTableRead) {
+					m_program.memory_info[index].planning_only = true;
+				}
 			}
 		}
 		m_program.descriptor_sources         = std::move(m_sources);
@@ -749,6 +751,9 @@ private:
 		if (memory == nullptr) return;
 		const auto offset = inst->Arg(1).Resolve();
 		if (!offset.IsImmediate() || offset.GetType() != Type::U32) return;
+		// A FLAT/global address may depend on data the GPU produces, such as the instance a ray
+		// tracing shader's BVH traversal reached: those reads stay GPU loads.
+		if (m_optional_scalar_reads && !ValidateRuntimeValue(m_program, Value(inst))) return;
 		m_scalar_reads.push_back(inst);
 	}
 
@@ -787,8 +792,11 @@ private:
 					MakeSource(*handle, width, sampler,
 					           sampler && (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0,
 					           base, source, flags.pc);
+					// An address the GPU computes at runtime needs no host evaluation.
+					m_optional_scalar_reads = kind == ValueOpcode::GetAddressResource;
 					for (uint32_t word = 0; word < width; ++word)
 						CollectScalarRead(source.dwords[word], flags.pc);
+					m_optional_scalar_reads = false;
 				}
 			}
 		}
@@ -929,6 +937,22 @@ private:
 	// Whether a T# DWORD read feeds image descriptors only. The register may also flow into
 	// loop Phis that merge it with other loads of the same register; those are followed, and
 	// an image handle built from such a Phi is tracked on its own.
+	// The memory index of a T# read that is still emitted (see TryMakeIndirectImage).
+	static constexpr uint32_t KeptTableRead = UINT32_MAX;
+
+	// Whether the read is a T# for an image instruction and otherwise only reaches Phis.
+	static bool ImageDescriptorUsesDirectly(const Inst& read) {
+		bool image = false;
+		for (const auto& use: read.Uses()) {
+			if (use.user->GetOpcode() == ValueOpcode::GetImageResource) {
+				image = true;
+			} else if (use.user->GetOpcode() != ValueOpcode::Phi) {
+				return false;
+			}
+		}
+		return image;
+	}
+
 	static bool ImageDescriptorUsesOnly(const Inst& read) {
 		bool                     direct = false;
 		std::vector<const Inst*> visited;
@@ -1582,11 +1606,15 @@ private:
 				return false;
 			}
 			table_handle = current_handle;
-			// Several image instructions may share one T# load.
-			if (!ImageDescriptorUsesOnly(*read)) {
+			// Several image instructions may share one T# load. A register the shader also uses
+			// for other data before or after the T# merges with it in Phis of those other
+			// lifetimes (GTA V's ray tracing shaders): the read stays an ordinary scalar load for
+			// them and only its image uses take the table path.
+			const bool images_only = ImageDescriptorUsesOnly(*read);
+			if (!images_only && !ImageDescriptorUsesDirectly(*read)) {
 				return false;
 			}
-			plan.memory[dword] = memory_index;
+			plan.memory[dword] = images_only ? memory_index : KeptTableRead;
 			plan.reads[dword] = read;
 		}
 
@@ -2150,10 +2178,14 @@ private:
 				    m_program.stage == ShaderType::Compute && memory.kind == ResourceKind::Buffer &&
 				    memory.SupportsIndirectBufferStore(op) &&
 				    MatchIndirectWriteTable(*handle, table_source, table_offset);
+				// A scalar load through a V# the shader read from memory (GTA V's ray tracing
+				// shaders fetch instance data this way) reads its DWORD directly.
+				const bool indirect_scalar =
+				    memory.kind == ResourceKind::ScalarBuffer && op == ValueOpcode::ReadConstBuffer;
 				if (indirect_store) {
 					AddIndirectWriteTable(table_source, table_offset, flags.pc);
-				} else if (memory.kind != ResourceKind::Buffer ||
-				           !memory.SupportsIndirectBufferLoad(op)) {
+				} else if (!indirect_scalar && (memory.kind != ResourceKind::Buffer ||
+				                                !memory.SupportsIndirectBufferLoad(op))) {
 					Fail(flags.pc,
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
 					     "requires a raw DWORD x2/x3/x4 load or a V# table store");
@@ -2277,6 +2309,7 @@ private:
 	std::vector<ResolvedHandle>                m_resolved_handles;
 	std::vector<const Inst*>                   m_srt_visiting;
 	std::vector<const Inst*>                   m_srt_visited;
+	bool                                       m_optional_scalar_reads = false;
 	std::vector<Inst*>                         m_scalar_reads;
 	ShaderInfo                                 m_info;
 	std::vector<DescriptorSource>              m_sources;

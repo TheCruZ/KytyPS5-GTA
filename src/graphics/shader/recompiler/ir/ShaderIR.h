@@ -81,7 +81,8 @@ struct MemoryInfo {
 			return opcode == ValueOpcode::LoadBufferU32;
 		}
 		return opcode == ValueOpcode::LoadBufferU32 || opcode == ValueOpcode::LoadBufferU32x2 ||
-		       opcode == ValueOpcode::LoadBufferU32x3 || opcode == ValueOpcode::LoadBufferU32x4;
+		       opcode == ValueOpcode::LoadBufferU32x3 || opcode == ValueOpcode::LoadBufferU32x4 ||
+		       opcode == ValueOpcode::ReadConstBuffer;
 	}
 	// Raw DWORD stores through a V# selected at runtime from a descriptor table.
 	[[nodiscard]] bool SupportsIndirectBufferStore(ValueOpcode opcode) const {
