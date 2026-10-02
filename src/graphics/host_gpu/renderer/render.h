@@ -338,7 +338,8 @@ private:
 	static constexpr uint32_t MaxRebindPasses = 8;
 	[[nodiscard]] bool        IsStaleImageBinding(const TextureBinding& binding);
 	// Rediscovers every stale direct or table image of one stage; true when any was replaced.
-	[[nodiscard]] bool ResolveStaleImages(PreparedBindings& bindings);
+	// null_tables: bind stale bindless table elements as null instead of resolving them again.
+	[[nodiscard]] bool ResolveStaleImages(PreparedBindings& bindings, bool null_tables = false);
 	void               AcquireImageViews(PreparedBindings& bindings);
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);

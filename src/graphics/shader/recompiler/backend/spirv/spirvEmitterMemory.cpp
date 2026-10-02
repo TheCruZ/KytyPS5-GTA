@@ -1376,10 +1376,45 @@ uint32_t EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return EmitNative<spv::OpLoad, IR::Type::U32>(state, pointer);
 }
 
+// S_BUFFER_LOAD through a V# selected at runtime: the DWORD at (offset & ~3) + immediate, zero
+// past NUM_RECORDS bytes (times the stride of a structured buffer).
+static uint32_t LoadIndirectScalar(ValueEmitContext& ctx, const IR::Inst& inst,
+                                   const IR::MemoryInfo& mem) {
+	auto&       state   = ctx.state;
+	const auto& handle  = *inst.Arg(0).ResolveInstruction();
+	const auto  word1   = ctx.Arg(handle, 1);
+	const auto  records = ctx.Arg(handle, 2);
+	const auto  stride =
+	    EmitBitFieldUExtract(state, word1, ConstantU32(state, 16), ConstantU32(state, 14));
+	const auto base = DeviceAddressFromWords(
+	    state, ctx.Arg(handle, 0),
+	    EmitBitFieldUExtract(state, word1, ConstantU32(state, 0), ConstantU32(state, 16)));
+	const auto byte = Binary(
+	    state, spv::OpIAdd, TypeU32(state),
+	    Binary(state, spv::OpBitwiseAnd, TypeU32(state), ctx.Arg(inst, 1), ConstantU32(state, ~3u)),
+	    ConstantU32(state, mem.offset & ~3u));
+	const auto limit =
+	    Select(state, TypeU32(state),
+	           Binary(state, spv::OpIEqual, TypeBool(state), stride, ConstantU32(state, 0)),
+	           records, Binary(state, spv::OpIMul, TypeU32(state), records, stride));
+	const auto in_bounds = AndCondition(
+	    state,
+	    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), limit, ConstantU32(state, 4)),
+	    Binary(state, spv::OpULessThanEqual, TypeBool(state), byte,
+	           Binary(state, spv::OpISub, TypeU32(state), limit, ConstantU32(state, 4))));
+	const auto address = Binary(state, spv::OpIAdd, TypeScalarU64(state), base,
+	                            Unary(state, spv::OpUConvert, TypeScalarU64(state), byte));
+	return LoadBda(ctx, address, in_bounds, 32u);
+}
+
 void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto mem = ctx.Memory(inst);
 	if (mem.planning_only) return;
 	auto& state        = ctx.state;
+	if (mem.kind == IR::ResourceKind::IndirectBuffer) {
+		ctx.Define(inst, LoadIndirectScalar(ctx, inst, mem));
+		return;
+	}
 	mem.kind           = IR::ResourceKind::ScalarBuffer;
 	auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), ctx.Arg(inst, 1),
 	                    ConstantU32(state, 2));
