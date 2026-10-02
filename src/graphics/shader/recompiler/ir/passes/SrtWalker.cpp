@@ -29,6 +29,9 @@ bool SrtReadCapture::Read(void* userdata, uint64_t address, std::span<uint32_t> 
 		return false;
 	}
 	capture.m_ranges.emplace_back(address, values.size_bytes());
+	if (capture.m_slots != nullptr) {
+		capture.m_slots->push_back(NoSrtSlot);
+	}
 	return true;
 }
 
@@ -970,8 +973,20 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate));
 		}
 		++m_captures;
+		// The slot the load fills (see WalkSrt): one flat SRT slot, or a load the shader also
+		// issues itself; a load shared by several slots has no single slot.
+		const auto roots = std::ranges::count_if(m_plan.srt_reads, [&](const SrtRead& read) {
+			return read.value.Resolve().TryInstruction() == &inst;
+		});
+		const auto root = std::ranges::find_if(m_plan.srt_reads, [&](const SrtRead& read) {
+			return read.value.Resolve().TryInstruction() == &inst;
+		});
+		const uint32_t slot = roots == 1   ? root->flat_offset
+		                      : roots == 0 ? RawReadSlot(inst.Flags<MemoryFlags>().index)
+		                                   : NoSrtSlot;
 		c.mov(c.qword[c.r8], c.r10);
 		c.mov(c.dword[c.r8 + 8], c.eax);
+		c.mov(c.dword[c.r8 + 12], slot);
 		c.add(c.r8, 16);
 		Store(node);
 	}
@@ -1372,7 +1387,8 @@ void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
 }
 
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
-             std::vector<std::pair<uint64_t, uint64_t>>* reads) {
+             std::vector<std::pair<uint64_t, uint64_t>>* reads,
+             std::vector<uint32_t>* read_slots) {
 	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
 	flat.assign(plan.srt_reads.size(), 0u);
 	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
@@ -1387,6 +1403,10 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	const auto* first = plan.srt_scratch.data() + plan.srt_captures / 8u;
 	if (reads != nullptr) {
 		for (auto* read = first; read != end; read += 2) reads->emplace_back(*read, sizeof(uint32_t));
+	}
+	if (read_slots != nullptr) {
+		for (auto* read = first; read != end; read += 2)
+			read_slots->push_back(static_cast<uint32_t>(read[1] >> 32u));
 	}
 	if (runtime.record_load != nullptr) {
 		for (auto* read = first; read != end; read += 2) {

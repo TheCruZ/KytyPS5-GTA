@@ -1449,15 +1449,21 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 			for (const auto* writer: prepared_bindings) {
 				const auto& program = writer->runtime->module->info;
-				for (const auto& resource: program.info.buffers) {
+				for (uint32_t index = 0; index < program.info.buffers.size(); ++index) {
+					const auto& resource = program.info.buffers[index];
 					if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
 					const auto& written = writer->buffer_sources[resource.descriptor_index];
 					// ADD_TID and swizzle move fixed-offset writes past write_extent.
 					const bool linear = (resource.packed_stride & ((1u << 14u) | (1u << 20u))) == 0u;
 					const auto written_size =
 					    linear ? std::min<uint64_t>(written.size, resource.write_extent) : written.size;
-					if (written_size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written_size)) {
+					// A flattened scalar load issued before the shader's own writes to the
+					// buffer may observe its dispatch-time snapshot on hardware.
+					if (written_size != 0 &&
+					    ImageRangeOverlaps(address, size, written.address, written_size) &&
+					    (writer != reader ||
+					     ShaderRecompiler::IR::SpecializationReadFollowsBufferWrite(
+					         program, *reader->runtime->resources, read, index))) {
 						EXIT("scalar resource reads overlap a shader buffer write\n");
 					}
 				}
