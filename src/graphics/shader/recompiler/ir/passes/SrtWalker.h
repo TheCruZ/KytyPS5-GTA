@@ -18,20 +18,28 @@ struct SrtRuntime {
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
+	// When set, holds the flat SRT slot whose scalar load is reading memory, or NoSrtSlot.
+	uint32_t*                 read_slot                  = nullptr;
 };
 
 class SrtReadCapture {
 public:
-	SrtReadCapture(SrtRuntime source, std::vector<std::pair<uint64_t, uint64_t>>& ranges):
-	    m_source(source), m_ranges(ranges) {}
+	// slots (optional) receives, for each read, the slot the walkers set (SrtRuntime::read_slot).
+	SrtReadCapture(SrtRuntime source, std::vector<std::pair<uint64_t, uint64_t>>& ranges,
+	               std::vector<uint32_t>* slots = nullptr):
+	    m_source(source), m_ranges(ranges), m_slots(slots) {}
 	SrtRuntime ObservedRuntime();
 
 private:
 	static bool ReadStrict(void* userdata, uint64_t address, std::span<uint32_t> values);
 	static bool ReadOrdinary(void* userdata, uint64_t address, std::span<uint32_t> values);
+	void        Record(uint64_t address, uint64_t size);
 
 	SrtRuntime                                  m_source;
 	std::vector<std::pair<uint64_t, uint64_t>>& m_ranges;
+	std::vector<uint32_t>*                      m_slots = nullptr;
+	// Set by the walkers around the load of a flattened scalar read.
+	uint32_t                                    m_slot = NoSrtSlot;
 };
 
 // Retained reads no longer need the guest instruction PC. A clean read evaluates
@@ -79,6 +87,8 @@ struct CompiledSrtPlan {
 		// A scalar read that the clean evaluator reads (SrtReadFlags::clean).
 		bool        clean = false;
 		uint32_t    args[5] {};
+		// The memory-info index of a raw read.
+		uint32_t    memory = UINT32_MAX;
 		uint64_t    imm = 0;
 	};
 	struct Context {
@@ -103,6 +113,8 @@ struct CompiledSrtPlan {
 	// Copies of the plan state that every refresh reads, kept next to the nodes.
 	std::vector<Node>       nodes;
 	std::vector<SrtRead>    srt_reads;
+	// The flat SRT slot whose scalar load each node is, or NoSrtSlot.
+	std::vector<uint32_t>   read_slots;
 	std::vector<Descriptor> descriptors;
 	std::vector<uint32_t>   conditions;
 	bool                    srt_plan_complete = false;
@@ -174,7 +186,7 @@ private:
 	bool EvaluateInst(uint32_t node, uint64_t& result);
 	bool EvaluateRawRead(uint32_t node, uint64_t& result);
 	bool EvaluateLeaf(uint32_t node, uint64_t& result) const;
-	bool ReadWord(uint64_t address, uint64_t& result);
+	bool ReadWord(uint32_t node, uint64_t address, uint64_t& result);
 
 	const ResourcePlan&       m_program;
 	const CompiledSrtPlan&    m_plan;

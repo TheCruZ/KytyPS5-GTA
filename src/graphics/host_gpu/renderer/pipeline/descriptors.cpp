@@ -1403,11 +1403,17 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 			for (const auto* writer: prepared_bindings) {
 				const auto& program = *writer->runtime->program;
-				for (const auto& resource: program.info.buffers) {
+				for (uint32_t index = 0; index < program.info.buffers.size(); ++index) {
+					const auto& resource = program.info.buffers[index];
 					if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
 					const auto& written = writer->buffer_sources[resource.descriptor_index];
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
+					// A flattened scalar load issued before the shader's own writes to the
+					// buffer may observe its dispatch-time snapshot on hardware.
+					if (written.size != 0 &&
+					    ImageRangeOverlaps(address, size, written.address, written.size) &&
+					    (writer != reader ||
+					     ShaderRecompiler::IR::SpecializationReadFollowsBufferWrite(
+					         program, *reader->runtime->resources, read, index))) {
 						EXIT("scalar resource reads overlap a shader buffer write\n");
 					}
 				}

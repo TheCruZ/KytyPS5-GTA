@@ -1208,7 +1208,8 @@ static bool MaterializeWith(const ResourcePlan& program, const SrtRuntime& runti
 	const bool capture_reads = program.capture_specialization_reads || !program.source_reads.empty();
 	auto& reads = snapshot.specialization_reads;
 	reads = program.source_reads;
-	SrtReadCapture capture {runtime, reads};
+	snapshot.specialization_read_slots.assign(reads.size(), NoSrtSlot);
+	SrtReadCapture capture {runtime, reads, &snapshot.specialization_read_slots};
 	const auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
 	Walker clean(program, CleanRuntime(observed));
 	Walker walker(program, observed,
