@@ -626,6 +626,8 @@ bool SameSnapshot(const Libs::Graphics::ShaderRecompiler::IR::ResourceSnapshot &
   if (a.buffers != b.buffers || a.images != b.images ||
       a.samplers != b.samplers || a.flattened_srt != b.flattened_srt ||
       a.user_data != b.user_data || !(a.uniform_fill == b.uniform_fill) ||
+      a.specialization_reads != b.specialization_reads ||
+      a.specialization_read_slots != b.specialization_read_slots ||
       a.image_tables.size() != b.image_tables.size()) {
     return false;
   }
