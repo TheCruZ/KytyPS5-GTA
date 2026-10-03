@@ -81,7 +81,7 @@ static void PrintUsage() {
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation                  Enable shader validation.\n");
 	::printf("  --shader-cache                       Keep compiled shaders and pipelines between boots.\n");
-	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
+	::printf("  --no-tessellation                    Skip tessellation patches instead of drawing them.\n");
 	::printf("  --no-occlusion-queries               Read occlusion queries as always visible.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
@@ -212,6 +212,7 @@ static constexpr Flag FLAGS[] = {
     {"--shader-validation", &ConfigOptions::shader_validation_enabled},
     {"--shader-cache", &ConfigOptions::shader_cache_enabled},
     {"--tessellation", &ConfigOptions::tessellation_enabled},
+    {"--no-tessellation", &ConfigOptions::tessellation_enabled, false},
     {"--no-occlusion-queries", &ConfigOptions::occlusion_queries_enabled, false},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},
     {"--graphics-debug-dump", &ConfigOptions::graphics_debug_dump_enabled},
