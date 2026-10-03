@@ -844,7 +844,8 @@ void AppendInputKey(ByteWriter& key, const ShaderVertexInputInfo& info) {
 	key.Put(mesh.fast_launch);
 	const auto& tess = info.tess;
 	for (const auto value: {tess.input_control_points, tess.output_control_points, tess.ls_stride,
-	                        tess.hs_stride, tess.domain, tess.partitioning, tess.output_topology}) {
+	                        tess.hs_stride, tess.domain, tess.partitioning, tess.output_topology,
+	                        tess.patch_base, tess.patch_size}) {
 		key.Put(value);
 	}
 	key.Put(info.fetch_external);
