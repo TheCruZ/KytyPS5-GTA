@@ -130,6 +130,8 @@ public:
 	bool                   readback_tiled_images       = false;
 	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = true;
+	bool                   bindless_images_enabled     = false;
+	QString                skip_shader_hashes;
 	bool                   occlusion_queries_enabled   = true;
 	bool                   shader_cache_enabled        = true;
 	bool                   async_pipelines_enabled     = true;
@@ -138,8 +140,6 @@ public:
 	bool                   perf_overlay_enabled        = false;
 	bool                   skip_notice_screen          = false;
 	bool                   network_connected           = false;
-	bool                   bindless_images_enabled     = false;
-	QString                skip_shader_hashes;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
@@ -175,6 +175,8 @@ public:
 		readback_tiled_images       = other.readback_tiled_images;
 		sync_raw_image_buffers      = other.sync_raw_image_buffers;
 		tessellation_enabled        = other.tessellation_enabled;
+		bindless_images_enabled     = other.bindless_images_enabled;
+		skip_shader_hashes          = other.skip_shader_hashes;
 		occlusion_queries_enabled   = other.occlusion_queries_enabled;
 		shader_cache_enabled        = other.shader_cache_enabled;
 		async_pipelines_enabled     = other.async_pipelines_enabled;
@@ -183,8 +185,6 @@ public:
 		perf_overlay_enabled        = other.perf_overlay_enabled;
 		skip_notice_screen          = other.skip_notice_screen;
 		network_connected           = other.network_connected;
-		bindless_images_enabled     = other.bindless_images_enabled;
-		skip_shader_hashes          = other.skip_shader_hashes;
 		vblank_frequency            = other.vblank_frequency;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;
