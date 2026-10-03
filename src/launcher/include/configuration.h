@@ -94,7 +94,7 @@ public:
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   readback_linear_images      = true;
-	bool                   tessellation_enabled        = false;
+	bool                   tessellation_enabled        = true;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;

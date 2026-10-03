@@ -239,9 +239,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 		args << "--fullscreen";
 	}
 	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
-	if (info.tessellation_enabled) {
-		args << "--tessellation";
-	}
+	args << (info.tessellation_enabled ? "--tessellation" : "--no-tessellation");
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
 	args << "--vulkan-validation" << BoolArg(info.vulkan_validation_enabled);
