@@ -58,7 +58,7 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                  EmitBinaryU32(state, spv::OpShiftRightLogical, offset, ConstantU32(state, 2)),
 	                  ConstantU32(state, 3));
 	const auto type = TypePointer(state, storage, TypeU32(state));
-	if (kind == Attribute::LocalOutput || kind == Attribute::PatchOutput) {
+	if (kind == Attribute::LocalOutput || patch) {
 		state.builder.AddFunction(spv::OpAccessChain, type, pointer, variable, attribute,
 		                          component);
 	} else {
@@ -123,11 +123,10 @@ void DefineTessellationInterfaces(EmitterState& state) {
 			state.builder.AddAnnotation(spv::OpDecorate, state.tess_inner_variable,
 			                            spv::DecorationPatch);
 		} else {
-			state.builder.AddAnnotation(
-			    spv::OpDecorate, variable, spv::DecorationLocation,
-			    kind == Attribute::PatchOutput ? (tess.hs_stride + 15u) / 16u : 0u);
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationLocation,
+			                            patch ? (tess.hs_stride + 15u) / 16u : 0u);
 		}
-		if (kind == Attribute::Factor || kind == Attribute::PatchOutput) {
+		if (kind == Attribute::Factor || patch) {
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationPatch);
 		}
 	}
