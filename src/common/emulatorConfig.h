@@ -85,7 +85,7 @@ struct ConfigOptions {
 	bool                   gpu_assisted_validation_enabled = false;
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = true;
-	bool                   tessellation_enabled        = false;
+	bool                   tessellation_enabled        = true;
 	bool                   trophy_enabled              = true;
 	bool                   playgo_hack_enabled         = false;
 	uint32_t               gpu_pipeline_stages         = GPU_PIPELINE_ALL;
