@@ -379,11 +379,37 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
 		const auto encoded = static_cast<float>(value & 0xffu) / 255.0f;
 		return encoded <= 0.04045f ? encoded / 12.92f : std::pow((encoded + 0.055f) / 1.055f, 2.4f);
 	};
+	const auto unorm16 = [](uint32_t value) {
+		return static_cast<float>(value & 0xffffu) / 65535.0f;
+	};
+	const auto half = [](uint32_t value) {
+		const uint32_t sign     = (value & 0x8000u) << 16u;
+		const uint32_t exponent = (value >> 10u) & 0x1fu;
+		const uint32_t mantissa = value & 0x3ffu;
+		if (exponent == 0) {
+			const float magnitude = std::ldexp(static_cast<float>(mantissa), -24);
+			return sign != 0 ? -magnitude : magnitude;
+		}
+		const uint32_t bits = exponent == 0x1fu ? (0x7f800000u | (mantissa << 13u))
+		                                        : ((exponent + 112u) << 23u) | (mantissa << 13u);
+		return std::bit_cast<float>(sign | bits);
+	};
 	switch (format) {
 		// A single-plane float target carries its clear as raw float bits, the same encoding the
 		// depth decoder below uses. Without this the clear is discarded and the target keeps stale
 		// contents.
 		case vk::Format::eR32Sfloat: next.float32[0] = std::bit_cast<float>(packed); break;
+		// 16-bit channels are packed in surface order, R in the low half.
+		case vk::Format::eR16Sfloat: next.float32[0] = half(packed); break;
+		case vk::Format::eR16G16Sfloat:
+			next.float32[0] = half(packed);
+			next.float32[1] = half(packed >> 16u);
+			break;
+		case vk::Format::eR16Unorm: next.float32[0] = unorm16(packed); break;
+		case vk::Format::eR16G16Unorm:
+			next.float32[0] = unorm16(packed);
+			next.float32[1] = unorm16(packed >> 16u);
+			break;
 		case vk::Format::eR32Uint: next.uint32[0] = packed; break;
 		case vk::Format::eR32Sint: next.int32[0] = static_cast<int32_t>(packed); break;
 		case vk::Format::eR8G8B8A8Srgb:
