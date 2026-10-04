@@ -120,7 +120,7 @@ private:
 	void EmitCompareResult(const Decoder::Instruction& inst, IR::U1 value, bool scalar, bool cmpx);
 	void EmitCompareConstant(const Decoder::Instruction& inst, bool value, bool scalar, bool cmpx);
 	void EmitIntegerCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, IR::Type type,
-	                        bool scalar, bool cmpx);
+	                        bool scalar, bool cmpx, bool swap_operands = false);
 	void EmitInteger16Compare(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                          bool signed_value, bool cmpx);
 	void EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool half,
@@ -158,6 +158,7 @@ private:
 	                  bool mix);
 	void V_FREXP_MANT_F32(const Decoder::Instruction& inst);
 	void V_FRACT(const Decoder::Instruction& inst, bool half);
+	void V_FRACT_F64(const Decoder::Instruction& inst);
 	void V_DOT2C_F32_F16(const Decoder::Instruction& inst);
 	void V_CUBEID_F32(const Decoder::Instruction& inst);
 	void V_CUBESC_F32(const Decoder::Instruction& inst);

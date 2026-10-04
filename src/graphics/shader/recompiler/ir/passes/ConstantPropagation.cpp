@@ -233,7 +233,8 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			}
 			return;
 		case ValueOpcode::SelectU32:
-		case ValueOpcode::SelectF32: FoldSelect(inst); return;
+		case ValueOpcode::SelectF32:
+		case ValueOpcode::SelectF64: FoldSelect(inst); return;
 		case ValueOpcode::BitFieldInsert: {
 			const auto base   = Arg(inst, 0);
 			const auto insert = Arg(inst, 1);

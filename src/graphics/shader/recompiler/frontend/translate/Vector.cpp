@@ -96,15 +96,33 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_CMPX_LE_I32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThanEqual32, IR::Type::U32, false, true);
 			return;
+		case O::V_CMP_F_I64:
+		case O::V_CMP_F_U64: EmitCompareConstant(inst, false, false, false); return;
+		case O::V_CMP_T_I64:
+		case O::V_CMP_T_U64: EmitCompareConstant(inst, true, false, false); return;
+		case O::V_CMPX_F_I64:
+		case O::V_CMPX_F_U64: EmitCompareConstant(inst, false, false, true); return;
+		case O::V_CMPX_T_I64:
+		case O::V_CMPX_T_U64: EmitCompareConstant(inst, true, false, true); return;
 		case O::V_CMP_EQ_I64:
 		case O::V_CMP_EQ_U64:
 			EmitIntegerCompare(inst, IR::ValueOpcode::IEqual64, IR::Type::U64, false, false);
 			return;
+		case O::V_CMPX_EQ_I64:
+		case O::V_CMPX_EQ_U64:
+			EmitIntegerCompare(inst, IR::ValueOpcode::IEqual64, IR::Type::U64, false, true);
+			return;
 		case O::V_CMP_LT_U64:
 			EmitIntegerCompare(inst, IR::ValueOpcode::ULessThan64, IR::Type::U64, false, false);
 			return;
+		case O::V_CMPX_LT_U64:
+			EmitIntegerCompare(inst, IR::ValueOpcode::ULessThan64, IR::Type::U64, false, true);
+			return;
 		case O::V_CMP_GT_U64:
 			EmitIntegerCompare(inst, IR::ValueOpcode::UGreaterThan64, IR::Type::U64, false, false);
+			return;
+		case O::V_CMPX_GT_U64:
+			EmitIntegerCompare(inst, IR::ValueOpcode::UGreaterThan64, IR::Type::U64, false, true);
 			return;
 		case O::V_CMP_NE_I64:
 		case O::V_CMP_NE_U64:
@@ -118,8 +136,31 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_CMP_LT_I64:
 			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThan64, IR::Type::U64, false, false);
 			return;
+		case O::V_CMPX_LT_I64:
+			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThan64, IR::Type::U64, false, true);
+			return;
 		case O::V_CMP_LE_I64:
 			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThanEqual64, IR::Type::U64, false, false);
+			return;
+		case O::V_CMPX_LE_I64:
+			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThanEqual64, IR::Type::U64, false, true);
+			return;
+		// The IR has no signed 64-bit greater-than: a > b is b < a, and a >= b is b <= a.
+		case O::V_CMP_GT_I64:
+			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThan64, IR::Type::U64, false, false,
+			                   true);
+			return;
+		case O::V_CMPX_GT_I64:
+			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThan64, IR::Type::U64, false, true,
+			                   true);
+			return;
+		case O::V_CMP_GE_I64:
+			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThanEqual64, IR::Type::U64, false, false,
+			                   true);
+			return;
+		case O::V_CMPX_GE_I64:
+			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThanEqual64, IR::Type::U64, false, true,
+			                   true);
 			return;
 		case O::V_CMP_LE_U64:
 			EmitIntegerCompare(inst, IR::ValueOpcode::ULessThanEqual64, IR::Type::U64, false, false);
@@ -129,6 +170,10 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 			return;
 		case O::V_CMP_GE_U64:
 			EmitIntegerCompare(inst, IR::ValueOpcode::UGreaterThanEqual64, IR::Type::U64, false, false);
+			return;
+		case O::V_CMPX_GE_U64:
+			EmitIntegerCompare(inst, IR::ValueOpcode::UGreaterThanEqual64, IR::Type::U64, false,
+			                   true);
 			return;
 
 		case O::V_CMP_EQ_U16:
@@ -458,7 +503,7 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_RCP_F64: return FloatUnary(inst, IR::ValueOpcode::FPRecip64);
 		case O::V_RCP_IFLAG_F32: return FloatUnary(inst, IR::ValueOpcode::FPRecipIFlag32);
 		case O::V_FRACT_F32: return V_FRACT(inst, false);
-		case O::V_FRACT_F64: return FloatUnary(inst, IR::ValueOpcode::FPFract64);
+		case O::V_FRACT_F64: return V_FRACT_F64(inst);
 		case O::V_TRUNC_F32: return FloatUnary(inst, IR::ValueOpcode::FPTrunc32);
 		case O::V_TRUNC_F64: return FloatUnary(inst, IR::ValueOpcode::FPTrunc64);
 		case O::V_CEIL_F32: return FloatUnary(inst, IR::ValueOpcode::FPCeil32);
