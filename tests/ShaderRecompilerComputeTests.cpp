@@ -25001,6 +25001,136 @@ TestCase VectorSpecialF32FlushesDenormalInputs() {
            O::V_SQRT_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+// The 64-bit integer compares by family. The relation is the low three bits
+// of the opcode: F, LT, EQ, LE, GT, NE, GE, T. V_CMP and V_CMPX start at 0xa0
+// and 0xb0 for signed values and at 0xe0 and 0xf0 for unsigned values; V_CMP
+// writes a lane mask, V_CMPX writes EXEC.
+struct Compare64Family {
+  u32 base;
+  bool is_signed;
+  bool exec;
+  std::array<ShaderOpcode, 8> opcodes;
+};
+
+const std::array<Compare64Family, 4> &Compare64Families() {
+  using O = ShaderOpcode;
+  static const std::array<Compare64Family, 4> families{{
+      {0xa0,
+       true,
+       false,
+       {O::V_CMP_F_I64, O::V_CMP_LT_I64, O::V_CMP_EQ_I64, O::V_CMP_LE_I64,
+        O::V_CMP_GT_I64, O::V_CMP_NE_I64, O::V_CMP_GE_I64, O::V_CMP_T_I64}},
+      {0xb0,
+       true,
+       true,
+       {O::V_CMPX_F_I64, O::V_CMPX_LT_I64, O::V_CMPX_EQ_I64, O::V_CMPX_LE_I64,
+        O::V_CMPX_GT_I64, O::V_CMPX_NE_I64, O::V_CMPX_GE_I64, O::V_CMPX_T_I64}},
+      {0xe0,
+       false,
+       false,
+       {O::V_CMP_F_U64, O::V_CMP_LT_U64, O::V_CMP_EQ_U64, O::V_CMP_LE_U64,
+        O::V_CMP_GT_U64, O::V_CMP_NE_U64, O::V_CMP_GE_U64, O::V_CMP_T_U64}},
+      {0xf0,
+       false,
+       true,
+       {O::V_CMPX_F_U64, O::V_CMPX_LT_U64, O::V_CMPX_EQ_U64, O::V_CMPX_LE_U64,
+        O::V_CMPX_GT_U64, O::V_CMPX_NE_U64, O::V_CMPX_GE_U64, O::V_CMPX_T_U64}},
+  }};
+  return families;
+}
+
+bool Compare64(u32 relation, bool is_signed, uint64_t lhs, uint64_t rhs) {
+  const auto signed_lhs = std::bit_cast<int64_t>(lhs);
+  const auto signed_rhs = std::bit_cast<int64_t>(rhs);
+  switch (relation) {
+  case 0:
+    return false;
+  case 1:
+    return is_signed ? signed_lhs < signed_rhs : lhs < rhs;
+  case 2:
+    return lhs == rhs;
+  case 3:
+    return is_signed ? signed_lhs <= signed_rhs : lhs <= rhs;
+  case 4:
+    return is_signed ? signed_lhs > signed_rhs : lhs > rhs;
+  case 5:
+    return lhs != rhs;
+  case 6:
+    return is_signed ? signed_lhs >= signed_rhs : lhs >= rhs;
+  default:
+    return true;
+  }
+}
+
+// Decodes every 64-bit integer compare in the compact (VOPC) and VOP3
+// encodings, and checks that the DPP and SDWA forms, which do not exist for
+// 64-bit operands, are rejected.
+void RequireInteger64CompareEncodings(const char *name) {
+  namespace D = ShaderRecompiler::Decoder;
+  for (const auto &family : Compare64Families()) {
+    for (u32 relation = 0; relation < 8; ++relation) {
+      const u32 encoding = family.base + relation;
+      const auto opcode = family.opcodes[relation];
+
+      const std::array<u32, 1> compact{EncodeVopc(encoding, Vgpr(1), 3)};
+      D::Instruction vopc;
+      D::DecodeInstruction(compact, 0, vopc);
+      Require(
+          name, "VOPC decode",
+          vopc.family == D::Family::VOPC && vopc.opcode == opcode &&
+              vopc.opcode_id == encoding && vopc.word_count == 1 &&
+              vopc.dst.kind == (family.exec ? D::OperandKind::ExecLo
+                                            : D::OperandKind::VccLo) &&
+              vopc.src_count == 2 && vopc.src0.kind == D::OperandKind::Vgpr &&
+              vopc.src0.reg == 1 && vopc.src1.kind == D::OperandKind::Vgpr &&
+              vopc.src1.reg == 3,
+          std::string("VOPC encoding of ") +
+              std::string(magic_enum::enum_name(opcode)) + " did not decode");
+
+      const std::array<u32, 2> wide{EncodeVop3Word0(encoding, 20),
+                                    EncodeVop3Word1(Vgpr(1), Vgpr(3))};
+      D::Instruction vop3;
+      D::DecodeInstruction(wide, 0, vop3);
+      Require(
+          name, "VOP3 decode",
+          vop3.family == D::Family::VOP3 && vop3.opcode == opcode &&
+              vop3.opcode_id == encoding && vop3.word_count == 2 &&
+              (family.exec ? vop3.dst.kind == D::OperandKind::ExecLo
+                           : vop3.dst.kind == D::OperandKind::Sgpr &&
+                                 vop3.dst.reg == 20) &&
+              vop3.src_count == 2 && vop3.src0.reg == 1 && vop3.src1.reg == 3,
+          std::string("VOP3 encoding of ") +
+              std::string(magic_enum::enum_name(opcode)) + " did not decode");
+
+      const std::array<u32, 2> dpp{EncodeVopc(encoding, 250, 3),
+                                   EncodeVop2Dpp(1)};
+      D::Instruction dpp_inst;
+      D::DecodeInstruction(dpp, 0, dpp_inst);
+      Require(name, "DPP rejection",
+              dpp_inst.opcode == ShaderOpcode::UNSUPPORTED &&
+                  dpp_inst.unsupported_reason.find(
+                      "VOPC DPP modifier is not supported for opcode") !=
+                      std::string_view::npos,
+              std::string("DPP form of ") +
+                  std::string(magic_enum::enum_name(opcode)) +
+                  " was not rejected");
+
+      const std::array<u32, 2> sdwa{EncodeVopc(encoding, 249, 3),
+                                    EncodeVopcSdwa(1)};
+      D::Instruction sdwa_inst;
+      D::DecodeInstruction(sdwa, 0, sdwa_inst);
+      Require(name, "SDWA rejection",
+              sdwa_inst.opcode == ShaderOpcode::UNSUPPORTED &&
+                  sdwa_inst.unsupported_reason.find(
+                      "VOPC SDWA modifier is not supported for opcode") !=
+                      std::string_view::npos,
+              std::string("SDWA form of ") +
+                  std::string(magic_enum::enum_name(opcode)) +
+                  " was not rejected");
+    }
+  }
+}
+
 TestCase VectorCompareInteger64Edges() {
   using O = ShaderOpcode;
   constexpr std::array<std::array<uint64_t, 2>, 10> pairs{{
@@ -25070,6 +25200,233 @@ TestCase VectorCompareInteger64Edges() {
                   O::V_CMP_LE_U64, O::V_CMP_GE_U64,
                   O::S_MOV_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpSLessThan", "OpULessThanEqual", "OpUGreaterThanEqual"};
+  return test;
+}
+
+TestCase VectorCompareInteger64Family(u32 wave_size) {
+  using O = ShaderOpcode;
+  // Lane l of group g compares values[p / 8] with values[p % 8] for
+  // p = g * wave_size + l, so the lanes cover every pair of values: INT64_MIN,
+  // -1, 0, 1 and INT64_MAX for the signed compares; 0, 1, 0x8000000000000000
+  // and UINT64_MAX for the unsigned ones; and numbers on both sides of the
+  // 32-bit boundary.
+  constexpr std::array<uint64_t, 8> values{0,
+                                           1,
+                                           0xffffffffull,
+                                           0x100000000ull,
+                                           0x7fffffffffffffffull,
+                                           0x8000000000000000ull,
+                                           0xffffffff80000000ull,
+                                           0xffffffffffffffffull};
+  // Operand forms, for every compare (V_CMPX writes EXEC instead of VCC or
+  // s[20:21]):
+  //   0: v_cmp_xx_e32 vcc, v[1:2], v[3:4]
+  //   1: v_cmp_xx_e64 s[20:21], v[1:2], v[3:4]
+  //   2: v_cmp_xx_e32 vcc, 0xffffffff, v[3:4]   (a literal expands by sign)
+  //   3: v_cmp_xx_e64 s[20:21], v[1:2], 0xffffffff
+  //   4: v_cmp_xx_e64 s[20:21], v[1:2], -1      (an inline constant always
+  //                                              sign extends)
+  // Forms 0 and 1 store VCC, s[20:21] and EXEC, so the registers a compare
+  // must not write are checked too; the other forms store the register the
+  // compare writes.
+  constexpr u32 form_count = 5;
+  constexpr u32 minus_one = 193; // Inline constant -1.
+  constexpr u32 low_exec = 0xeeeeeeeeu, high_exec = 0x77777777u;
+  constexpr uint64_t s20_sentinel = 0x5a5a5a5aa5a5a5a5ull;
+  constexpr uint64_t vcc_sentinel = 0x89abcdef12345678ull;
+  const u32 groups = 64 / wave_size;
+  const uint64_t exec_mask =
+      wave_size == 64 ? (uint64_t(high_exec) << 32) | low_exec : low_exec;
+  TestCase test;
+  test.name = wave_size == 32 ? "VectorCompareInteger64Wave32Family"
+                              : "VectorCompareInteger64Wave64Family";
+  test.initial.assign(groups * 4 * wave_size, 0);
+  for (u32 group = 0; group < groups; ++group) {
+    for (u32 lane = 0; lane < wave_size; ++lane) {
+      const u32 pair = group * wave_size + lane;
+      const auto lhs = values[pair / 8];
+      const auto rhs = values[pair % 8];
+      const auto word = [&](u32 index) {
+        return (group * 4 + index) * wave_size + lane;
+      };
+      test.initial[word(0)] = u32(lhs);
+      test.initial[word(1)] = u32(lhs >> 32);
+      test.initial[word(2)] = u32(rhs);
+      test.initial[word(3)] = u32(rhs >> 32);
+    }
+  }
+  test.expected = test.initial;
+  auto &code = test.code;
+  code.push_back(EncodeSop1(0x04, 10, 126)); // s_mov_b64 s[10:11], exec
+  for (u32 group = 0; group < groups; ++group) {
+    for (u32 word = 0; word < 4; ++word) {
+      code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 0));
+      AppendVMovU32(&code, 31, (group * 4 + word) * wave_size * 4);
+      code.push_back(EncodeVop2(0x25, 31, Vgpr(31), 30));
+      AppendBufferLoadDword(&code, 1 + word, 31);
+    }
+    for (const auto &family : Compare64Families()) {
+      for (u32 relation = 0; relation < 8; ++relation) {
+        const u32 encoding = family.base + relation;
+        for (u32 form = 0; form < form_count; ++form) {
+          const bool vop3 = form == 1 || form == 3 || form == 4;
+          const bool check_all = form < 2;
+          const uint64_t literal = family.is_signed ? ~0ull : 0xffffffffull;
+          uint64_t mask = 0;
+          for (u32 lane = 0; lane < wave_size; ++lane) {
+            const u32 pair = group * wave_size + lane;
+            uint64_t lhs = values[pair / 8];
+            uint64_t rhs = values[pair % 8];
+            if (form == 2) {
+              lhs = literal;
+            } else if (form == 3) {
+              rhs = literal;
+            } else if (form == 4) {
+              rhs = ~0ull;
+            }
+            const bool active =
+                ((lane < 32 ? low_exec >> lane : high_exec >> (lane - 32)) &
+                 1u) != 0;
+            if (active && Compare64(relation, family.is_signed, lhs, rhs)) {
+              mask |= uint64_t(1) << lane;
+            }
+          }
+
+          AppendSMovLiteral(&code, 126, low_exec);
+          if (wave_size == 64) {
+            AppendSMovLiteral(&code, 127, high_exec);
+          }
+          if (check_all) {
+            AppendSMovLiteral(&code, 20, u32(s20_sentinel));
+            AppendSMovLiteral(&code, 21, u32(s20_sentinel >> 32));
+            AppendSMovLiteral(&code, 106, u32(vcc_sentinel));
+            AppendSMovLiteral(&code, 107, u32(vcc_sentinel >> 32));
+          }
+          switch (form) {
+          case 0:
+            code.push_back(EncodeVopc(encoding, Vgpr(1), 3));
+            break;
+          case 1:
+            AppendVop3(&code, encoding, 20, Vgpr(1), Vgpr(3));
+            break;
+          case 2:
+            code.push_back(EncodeVopc(encoding, 255, 3));
+            code.push_back(0xffffffffu);
+            break;
+          case 3:
+            AppendVop3(&code, encoding, 20, Vgpr(1), 255);
+            code.push_back(0xffffffffu);
+            break;
+          default:
+            AppendVop3(&code, encoding, 20, Vgpr(1), minus_one);
+            break;
+          }
+          code.push_back(EncodeSop1(0x04, 22, 126)); // s_mov_b64 s[22:23], exec
+          // Only lane 0 stores.
+          code.push_back(EncodeSop1(0x04, 126, InlineU32(1)));
+
+          // A wave32 mask has 32 bits and leaves the other half of its register
+          // alone.
+          const auto written = [&](bool is_dest,
+                                   uint64_t sentinel) -> uint64_t {
+            if (!is_dest) {
+              return sentinel;
+            }
+            return wave_size == 64
+                       ? mask
+                       : (sentinel & ~0xffffffffull) | (mask & 0xffffffffull);
+          };
+          const bool vcc_dest = !family.exec && !vop3;
+          const bool sgpr_dest = !family.exec && vop3;
+          const auto store = [&](u32 reg, uint64_t value, bool high) {
+            AppendStoreSgpr(&code, reg, static_cast<u32>(test.expected.size()));
+            test.expected.push_back(u32(value));
+            if (high) {
+              AppendStoreSgpr(&code, reg + 1,
+                              static_cast<u32>(test.expected.size()));
+              test.expected.push_back(u32(value >> 32));
+            }
+          };
+          const bool wide = wave_size == 64;
+          if (check_all || sgpr_dest) {
+            store(20, written(sgpr_dest, s20_sentinel), wide || check_all);
+          }
+          if (check_all || family.exec) {
+            store(22, family.exec ? mask : exec_mask, wide);
+          }
+          if (check_all || vcc_dest) {
+            store(106, written(vcc_dest, vcc_sentinel), wide || check_all);
+          }
+          code.push_back(EncodeSop1(0x04, 126, 10)); // s_mov_b64 exec, s[10:11]
+        }
+      }
+    }
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  test.opcodes = {O::V_MOV_B32,          O::S_MOV_B32,    O::S_MOV_B64,
+                  O::V_LSHLREV_B32,      O::V_ADD_NC_U32, O::BUFFER_LOAD_DWORD,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  for (const auto &family : Compare64Families()) {
+    for (const auto opcode : family.opcodes) {
+      test.opcodes.push_back(opcode);
+      test.decoded_counts.emplace_back(
+          std::string(magic_enum::enum_name(opcode)) + " ",
+          form_count * groups);
+    }
+  }
+  test.required_spirv = {"OpSLessThan", "OpULessThanEqual",
+                         "OpUGreaterThanEqual", "OpINotEqual"};
+  return test;
+}
+
+TestCase VectorVop3CompareNeI64CapturedScalarSource() {
+  using O = ShaderOpcode;
+  namespace D = ShaderRecompiler::Decoder;
+  constexpr const char *name = "VectorVop3CompareNeI64CapturedScalarSource";
+
+  // GTA V compute shader 0x8395e43f382309df, wave64, PC 0x20cc, after
+  // s_cmp_lg_u64 s2, 0: v_cmp_ne_i64 s[2:3], s[0:1], 0 compares a scalar pair
+  // with an inline zero.
+  const std::array<u32, 2> captured{0xd4a50002u, 0x00010000u};
+  D::Instruction decoded;
+  D::DecodeInstruction(captured, 0, decoded);
+  Require(
+      name, "decode",
+      decoded.family == D::Family::VOP3 && decoded.opcode == O::V_CMP_NE_I64 &&
+          decoded.opcode_id == 0xa5 && decoded.word_count == 2 &&
+          decoded.dst.kind == D::OperandKind::Sgpr && decoded.dst.reg == 2 &&
+          decoded.src_count == 2 && decoded.src0.kind == D::OperandKind::Sgpr &&
+          decoded.src0.reg == 0 &&
+          decoded.src1.kind == D::OperandKind::IntegerInlineConstant &&
+          decoded.src1.value == 0,
+      "the captured instruction must decode as v_cmp_ne_i64 s[2:3], s[0:1], 0");
+  RequireInteger64CompareEncodings(name);
+
+  std::vector<u32> code;
+  std::vector<u32> expected;
+  for (const uint64_t value : {0ull, 1ull, 0x80000000ull, 0x100000000ull,
+                               0x8000000000000000ull, 0xffffffffffffffffull}) {
+    AppendSMovLiteral(&code, 0, u32(value));
+    AppendSMovLiteral(&code, 1, u32(value >> 32));
+    code.insert(code.end(), captured.begin(), captured.end());
+    AppendStoreSgprPair(&code, 2, static_cast<u32>(expected.size()));
+    expected.insert(expected.end(), {u32(value != 0), 0});
+  }
+  AppendEnd(&code);
+
+  TestCase test{name,
+                code,
+                {},
+                expected,
+                {O::S_MOV_B32, O::V_CMP_NE_I64, O::V_MOV_B32,
+                 O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.decoded_counts = {{"V_CMP_NE_I64 s2, s0, 0", 6}};
   return test;
 }
 
@@ -25373,7 +25730,8 @@ TestCase VectorFractF64CapturedAndEdges() {
       {0x4320000000000001ull, 0x3fe0000000000000ull}, // 2^51 + .5
       {0, 0}, {0x8000000000000000ull, 0},
       {0x401c000000000000ull, 0}, {0xc01c000000000000ull, 0},
-      {1, 1}, {0x8000000000000001ull, 0x3ff0000000000000ull},
+      // The tiny negative rounds x - floor(x) to 1.0: V_FRACT clamps below one.
+      {1, 1}, {0x8000000000000001ull, 0x3fefffffffffffffull},
       {0x000fffffffffffffull, 0x000fffffffffffffull},
       {0x7fefffffffffffffull, 0},
       {0x7ff0000000000000ull, 0x7ff8000000000000ull},
@@ -25855,6 +26213,115 @@ TestCase VectorF64ModesModifiersAndExec() {
                   O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.initial.resize(test.expected.size());
   test.required_spirv = {"OpFAdd"};
+  return test;
+}
+
+TestCase VectorFractF64ClampsBelowOne() {
+  using O = ShaderOpcode;
+
+  // As VectorFractClampsBelowOne for V_FRACT_F64 (VOP1 0x3e, VOP3 0x1be): x -
+  // floor(x) of a tiny negative double rounds to 1.0 and the hardware clamps it
+  // to the largest double below one: -2^-60 and -2^-54 (a tie) round to 1.0,
+  // -2^-53 is already that value. NaN passes through. Load at runtime so the
+  // emitted operation runs.
+  struct Sample {
+    uint64_t input;
+    uint64_t fraction;
+    bool vop3;
+    u32 abs; // VOP3 source modifiers.
+    u32 neg;
+  };
+  constexpr uint64_t below_one = 0x3fefffffffffffffull;
+  const std::array<Sample, 14> samples{{
+      {0x4006000000000000ull, 0x3fe8000000000000ull, false, 0, 0}, // 2.75
+      {0xbfd0000000000000ull, 0x3fe8000000000000ull, false, 0, 0}, // -0.25
+      {0x3ff199999999999aull, 0x3fb99999999999a0ull, false, 0, 0}, // 1.1
+      {0xc008000000000000ull, 0, false, 0, 0},                     // -3.0
+      {0, 0, false, 0, 0},                                         // 0.0
+      {0x7e37e43c8800759cull, 0, false, 0, 0},                     // 1e300
+      {0xbc30000000000000ull, below_one, false, 0, 0},             // -2^-60
+      {0xbc90000000000000ull, below_one, false, 0, 0},             // -2^-54
+      {0xbca0000000000000ull, below_one, false, 0, 0},             // -2^-53
+      {0xbfd0000000000000ull, 0x3fe8000000000000ull, true, 0, 0},  // VOP3
+      {0x4006000000000000ull, 0x3fd0000000000000ull, true, 0, 1},  // -(2.75)
+      {0xc006000000000000ull, 0x3fe8000000000000ull, true, 1, 0},  // |-2.75|
+      {0x4006000000000000ull, 0x3fd0000000000000ull, true, 1, 1},  // -|2.75|
+      {0x3c30000000000000ull, below_one, true, 0, 1},              // -(2^-60)
+  }};
+  const std::array<uint64_t, 4> more_inputs{
+      0x7ff8000000000000ull,  // NaN, VOP1
+      0xfff8000000000000ull,  // -NaN, VOP3 negate
+      0xbc30000000000000ull,  // -2^-60, captured in-place v[4:5]
+      0x4006000000000000ull}; // 2.75, captured in-place v[2:3]
+  TestCase test;
+  test.name = "VectorFractF64ClampsBelowOne";
+  for (const auto &sample : samples) {
+    test.initial.insert(test.initial.end(),
+                        {static_cast<u32>(sample.input),
+                         static_cast<u32>(sample.input >> 32)});
+  }
+  for (const auto bits : more_inputs) {
+    test.initial.insert(test.initial.end(),
+                        {static_cast<u32>(bits), static_cast<u32>(bits >> 32)});
+  }
+  test.expected = test.initial;
+  const auto load_pair = [&](u32 reg, size_t index) {
+    AppendVMovU32(&test.code, 30, static_cast<u32>(index * 8u));
+    AppendBufferLoadDword(&test.code, reg, 30);
+    AppendVMovU32(&test.code, 30, static_cast<u32>(index * 8u + 4u));
+    AppendBufferLoadDword(&test.code, reg + 1, 30);
+  };
+  const auto store_pair = [&](u32 reg, uint64_t bits) {
+    AppendStoreVgpr(&test.code, reg, static_cast<u32>(test.expected.size()));
+    AppendStoreVgpr(&test.code, reg + 1,
+                    static_cast<u32>(test.expected.size() + 1));
+    test.expected.insert(test.expected.end(),
+                         {static_cast<u32>(bits), static_cast<u32>(bits >> 32)});
+  };
+  for (size_t i = 0; i < samples.size(); i++) {
+    load_pair(0, i);
+    AppendVMovLiteral(&test.code, 2, 0xa5a5a5a5u); // Both words are written.
+    AppendVMovLiteral(&test.code, 3, 0xa5a5a5a5u);
+    if (samples[i].vop3) {
+      AppendVop3(&test.code, 0x1be, 2, Vgpr(0), 0, 0, samples[i].abs, 0, false,
+                 0, samples[i].neg);
+    } else {
+      test.code.push_back(EncodeVop1(0x3e, 2, Vgpr(0)));
+    }
+    store_pair(2, samples[i].fraction);
+  }
+  // Check the quiet NaN class without constraining its sign or payload.
+  for (u32 negate = 0; negate < 2; negate++) {
+    load_pair(0, samples.size() + negate);
+    if (negate != 0) {
+      AppendVop3(&test.code, 0x1be, 2, Vgpr(0), 0, 0, 0, 0, false, 0, 1);
+    } else {
+      test.code.push_back(EncodeVop1(0x3e, 2, Vgpr(0)));
+    }
+    AppendVMovLiteral(&test.code, 4, 0x7ff80000u);
+    test.code.push_back(EncodeVop2(0x1b, 3, Vgpr(4), 3));
+    AppendStoreVgpr(&test.code, 3, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(0x7ff80000u);
+  }
+  // Captured v_fract_f64 v[4:5], v[4:5] and v[2:3], v[2:3] from
+  // cs_4ee720fc4678fa19 (PCs 0x208 and 0x26c): the source is the destination.
+  load_pair(4, samples.size() + 2u);
+  test.code.push_back(0x7e087d04u);
+  store_pair(4, below_one);
+  load_pair(2, samples.size() + 3u);
+  test.code.push_back(0x7e047d02u);
+  store_pair(2, 0x3fe8000000000000ull);
+  AppendEnd(&test.code);
+  test.initial.resize(test.expected.size());
+  const auto fract_count = samples.size() + 4u;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_FRACT_F64,
+                  O::V_AND_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_FRACT_F64", fract_count}};
+  test.ir_counts = {{" = FPFract64 ", fract_count},
+                    {" = FPOrdGreaterThanEqual64 ", fract_count},
+                    {" = SelectF64 ", fract_count}};
+  test.required_spirv = {"OpCapability Float64", "OpTypeFloat 64", " Fract ",
+                         "OpFOrdGreaterThanEqual"};
   return test;
 }
 
@@ -35683,6 +36150,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorBfeI32SignExtendsField);
   AddCase(VectorAlignByteUsesTwoBitByteOffset);
   AddCase(VectorFractClampsBelowOne);
+  AddCase(VectorFractF64ClampsBelowOne);
   AddCase(ScalarVector64BitFloatInlineConstants);
   AddCase(VectorCarryAndBitCountOps);
   AddCase(VectorMbcntUsesThreadMask);
@@ -35750,6 +36218,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorRcpIflagF32IntegerReciprocal);
   AddCase(VectorCompareF64Edges);
   AddCase(VectorCompareInteger64Edges);
+  cases.push_back(VectorCompareInteger64Family(32));
+  cases.push_back(VectorCompareInteger64Family(64));
+  AddCase(VectorVop3CompareNeI64CapturedScalarSource);
   cases.push_back(VectorCompareExecWaveMasks(32));
   cases.push_back(VectorCompareExecWaveMasks(64));
   cases.push_back(VectorCompare64WaveMasks(32));
@@ -41756,6 +42227,24 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--fract-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorFractClampsBelowOne());
+    RunCase(&vulkan, VectorFractF64ClampsBelowOne());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cmp-i64-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorCompareInteger64Edges());
+    RunCase(&vulkan, VectorCompareInteger64Family(32));
+    RunCase(&vulkan, VectorCompareInteger64Family(64));
+    RunCase(&vulkan, VectorVop3CompareNeI64CapturedScalarSource());
+    RunCase(&vulkan, VectorCompareExecWaveMasks(32));
+    RunCase(&vulkan, VectorCompareExecWaveMasks(64));
+    RunCase(&vulkan, VectorVop3CompareEqI64OnGpu());
+    RunCase(&vulkan, VectorVop3CompareEqU64OnGpu());
+    RunCase(&vulkan, VectorVop3CompareGtU64OnGpu());
+    RunCase(&vulkan, VectorVopcCompareLtU64OnGpu());
+    RunCase(&vulkan, VectorVop3CompareNeU64OnGpu());
+    RunCase(&vulkan, VectorVopcCmpxNeU64CapturedExecMask());
+    RunCase(&vulkan, VectorVop3CmpxNeI64CapturedExecMask());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cvt-pk-sat-only") == 0) {
