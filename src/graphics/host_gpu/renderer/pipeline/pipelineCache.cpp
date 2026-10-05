@@ -637,10 +637,17 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 	for (uint32_t i = 0; i < CompileWorkers; i++) {
 		m_workers.emplace_back([this] { CompileWorker(); });
 	}
+	if (Config::AsyncPipelinesEnabled()) {
+		constexpr uint32_t AsyncThreads = 3;
+		for (uint32_t i = 0; i < AsyncThreads; i++) {
+			m_async_threads.emplace_back([this] { AsyncPipelineWorker(); });
+		}
+	}
 }
 
 PipelineCache::~PipelineCache() {
 	StopWorkers();
+	StopAsyncPipelines();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& pipeline: pipelines | std::views::values) {
@@ -651,6 +658,8 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	destroy(m_async_ready);
+	destroy(m_async_ready_compute);
 	for (const auto& program: m_program_cache | std::views::values) {
 		for (const auto& module: program.modules) {
 			m_graphics.device.destroyShaderModule(module.module, nullptr);
@@ -1311,7 +1320,13 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 		if (known) {
 			m_graphics.device.destroyShaderModule(module->module, nullptr);
 		} else {
-			AddedModule(job.key, entry->second, modules.emplace_back(std::move(*module)), spirv);
+			auto& added = modules.emplace_back(std::move(*module));
+			AddedModule(job.key, entry->second, added, spirv);
+			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+				if (!m_async_threads.empty()) {
+					CreateComputePipelineAhead(added);
+				}
+			}
 		}
 	}
 	if (const auto job_count = m_in_flight.find(job.key); --job_count->second == 0) {
@@ -1352,6 +1367,96 @@ void PipelineCache::StopWorkers() {
 	m_workers.clear();
 }
 
+void PipelineCache::QueueAsyncPipeline(const AsyncPipelineJob& job) {
+	{
+		std::lock_guard lock(m_async_mutex);
+		// A dispatch waits for its pipeline, a draw is only skipped: compute pipelines first.
+		if (job.compute) {
+			m_async_jobs.push_front(job);
+		} else {
+			m_async_jobs.push_back(job);
+		}
+	}
+	m_async_available.notify_one();
+}
+
+template <typename Matches>
+bool PipelineCache::TakeQueuedAsyncPipeline(Matches&& matches) {
+	const auto job = std::ranges::find_if(m_async_jobs, matches);
+	if (job == m_async_jobs.end()) {
+		return false;
+	}
+	m_async_jobs.erase(job);
+	return true;
+}
+
+void PipelineCache::StopAsyncPipelines() {
+	{
+		std::lock_guard lock(m_async_mutex);
+		m_async_stopping = true;
+		m_async_jobs.clear();
+	}
+	m_async_available.notify_all();
+	m_async_threads.clear();
+}
+
+void PipelineCache::AsyncPipelineWorker() {
+	KYTY_PROFILER_THREAD("Thread_PipelineAsync");
+	for (;;) {
+		AsyncPipelineJob job;
+		{
+			std::unique_lock lock(m_async_mutex);
+			m_async_available.wait(lock, [&] { return m_async_stopping || !m_async_jobs.empty(); });
+			if (m_async_stopping) {
+				return;
+			}
+			job = m_async_jobs.front();
+			m_async_jobs.pop_front();
+		}
+		Pipeline pipeline;
+		bool     created = false;
+		try {
+			Common::SoftExitScope soft_exit(true);
+			if (job.compute) {
+				CreatePipelineInternal(m_graphics, pipeline, *job.module, m_driver_cache);
+			} else {
+				CreatePipelineInternal(m_graphics, pipeline, job.key, job.stages, m_driver_cache);
+			}
+			created = pipeline.pipeline != nullptr && pipeline.pipeline_layout != nullptr;
+		} catch (const Common::SoftExitError&) {
+			// The execution thread creates the pipeline itself and reports the error.
+		}
+		if (created) {
+			m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
+		}
+		std::lock_guard lock(m_async_mutex);
+		if (job.compute) {
+			if (created) {
+				m_async_ready_compute.try_emplace(job.module->id, pipeline);
+			}
+			m_async_pending_compute.erase(job.module->id);
+		} else {
+			if (created) {
+				m_async_ready.try_emplace(job.key, pipeline);
+			} else {
+				m_async_failed_graphics.insert(job.key);
+			}
+			m_async_pending_graphics.erase(job.key);
+		}
+	}
+}
+
+void PipelineCache::CreateComputePipelineAhead(const ShaderModule& module) {
+	{
+		std::lock_guard lock(m_async_mutex);
+		if (m_async_ready_compute.contains(module.id) ||
+		    !m_async_pending_compute.insert(module.id).second) {
+			return;
+		}
+	}
+	QueueAsyncPipeline({.compute = true, .module = &module});
+}
+
 const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                      ShaderComputeInputInfo&      input_info) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
@@ -1378,8 +1483,9 @@ const ShaderModule* PipelineCache::GetComputeProgramAhead(const HW::ComputeShade
 	return GetAhead(params, input_info, push_data_cursor, ahead);
 }
 
-PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
-                                                            const DrawRenderState& state) {
+PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
+                                                            const DrawRenderState& state,
+                                                            bool                   allow_async) {
 	const auto* colors        = state.colors;
 	const auto& depth         = *state.depth;
 	const auto  vertex_info   = state.VertexStages();
@@ -1560,15 +1666,53 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 
 	// Consecutive draws mostly use the pipeline of the draw before.
 	if (m_last_graphics_pipeline != nullptr && key == m_last_graphics_key) {
-		return *m_last_graphics_pipeline;
+		return m_last_graphics_pipeline;
 	}
-	auto [iter, inserted] = m_graphics_pipelines.try_emplace(key);
-	auto& pipeline        = iter->second;
-	if (!inserted) {
+	if (const auto found = m_graphics_pipelines.find(key); found != m_graphics_pipelines.end()) {
 		m_last_graphics_key      = key;
-		m_last_graphics_pipeline = &pipeline;
-		return pipeline;
+		m_last_graphics_pipeline = &found->second;
+		return &found->second;
 	}
+	if (!m_async_threads.empty()) {
+		std::unique_lock lock(m_async_mutex);
+		for (;;) {
+			if (auto node = m_async_ready.extract(key); !node.empty()) {
+				lock.unlock();
+				auto& ready              = m_graphics_pipelines.insert(std::move(node)).position->second;
+				m_last_graphics_key      = key;
+				m_last_graphics_pipeline = &ready;
+				StorePipeline(key);
+				return &ready;
+			}
+			if (!m_async_pending_graphics.contains(key)) {
+				if (!allow_async || m_async_failed_graphics.contains(key)) {
+					break;
+				}
+				// The driver compiles a new pipeline for up to half a second: the draws that need
+				// it are skipped until a background thread created it.
+				m_async_pending_graphics.insert(key);
+				lock.unlock();
+				QueueAsyncPipeline({.key = key, .stages = stages});
+				return nullptr;
+			}
+			if (allow_async) {
+				return nullptr;
+			}
+			// A draw that cannot be skipped creates the pipeline itself while it is still queued
+			// (the queue may hold many pipelines of skipped draws), or waits for the thread
+			// creating it.
+			if (TakeQueuedAsyncPipeline([&](const AsyncPipelineJob& job) {
+				    return !job.compute && job.key == key;
+			    })) {
+				m_async_pending_graphics.erase(key);
+				break;
+			}
+			lock.unlock();
+			std::this_thread::yield();
+			lock.lock();
+		}
+	}
+	auto& pipeline = m_graphics_pipelines[key];
 
 	if (graphics_debug_dump_enabled()) {
 		ShaderDbgDumpInputInfo(vs_input_info);
@@ -1588,8 +1732,10 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	}
 	StorePipeline(key);
 	m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
+	m_last_graphics_key      = key;
+	m_last_graphics_pipeline = &pipeline;
 
-	return pipeline;
+	return &pipeline;
 }
 
 PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info) {
@@ -1598,11 +1744,32 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 	EXIT_IF(input_info.stage.module == nullptr);
 	const auto& module = *input_info.stage.module;
 
-	auto [iter, inserted] = m_compute_pipelines.try_emplace(module.id);
-	auto& pipeline        = iter->second;
-	if (!inserted) {
-		return pipeline;
+	if (const auto found = m_compute_pipelines.find(module.id); found != m_compute_pipelines.end()) {
+		return found->second;
 	}
+	if (!m_async_threads.empty()) {
+		// Dispatches always run: take the pipeline a background thread created, create it here
+		// while it is still queued, or wait for the thread creating it.
+		std::unique_lock lock(m_async_mutex);
+		for (;;) {
+			if (auto node = m_async_ready_compute.extract(module.id); !node.empty()) {
+				return m_compute_pipelines.insert(std::move(node)).position->second;
+			}
+			if (!m_async_pending_compute.contains(module.id)) {
+				break;
+			}
+			if (TakeQueuedAsyncPipeline([&](const AsyncPipelineJob& job) {
+				    return job.compute && job.module->id == module.id;
+			    })) {
+				m_async_pending_compute.erase(module.id);
+				break;
+			}
+			lock.unlock();
+			std::this_thread::yield();
+			lock.lock();
+		}
+	}
+	auto& pipeline = m_compute_pipelines[module.id];
 
 	if (graphics_debug_dump_enabled()) {
 		ShaderDbgDumpInputInfo(input_info);
