@@ -592,8 +592,10 @@ public:
 				}
 			}
 			if (plan.reads[0] != nullptr && !plan.retain_reads) {
-				for (uint32_t word = 0; word < plan.read_dwords; ++word)
-					m_program.memory_info[plan.memory[word]].planning_only = true;
+				for (uint32_t word = 0; word < plan.read_dwords; ++word) {
+					if ((plan.kept_reads & (1u << word)) == 0u)
+						m_program.memory_info[plan.memory[word]].planning_only = true;
+				}
 			}
 		}
 		// Project descriptor-only SSA onto its key. Existing Phis preserve dominance;
@@ -642,6 +644,8 @@ private:
 		Value                      key;
 		std::array<Value, 8>       roots {};
 		std::array<uint32_t, 8>    memory {};
+		// T# reads that stay ordinary scalar loads for their non-image users (bit per dword).
+		uint32_t                   kept_reads = 0;
 		std::array<const Inst*, 8> reads {};
 		bool split_offsets = false;
 		bool retain_reads = false;
@@ -1122,6 +1126,19 @@ private:
 		}
 		result = value.U32();
 		return true;
+	}
+
+	// Whether the read is a T# for an image instruction and otherwise only reaches Phis.
+	static bool ImageDescriptorUsesDirectly(const Inst& read) {
+		bool image = false;
+		for (const auto& use: read.Uses()) {
+			if (use.user->GetOpcode() == ValueOpcode::GetImageResource) {
+				image = true;
+			} else if (use.user->GetOpcode() != ValueOpcode::Phi) {
+				return false;
+			}
+		}
+		return image;
 	}
 
 	static bool UsesOnlyImageDescriptors(const Inst& value) {
@@ -2924,9 +2941,14 @@ private:
 			}
 			plan.split_offsets |= !indexed && offset != table_offset;
 			table_handle = current_handle;
+			// A register the shader also uses for other data before or after the T# merges with it
+			// in Phis of those other lifetimes (GTA V's ray tracing any-hit shaders): the read stays
+			// an ordinary scalar load for them and only its image uses take the table path.
+			const bool images_only =
+			    handle.GetOpcode() != ValueOpcode::GetImageResource || UsesOnlyImageDescriptors(*read);
 			if (handle.GetOpcode() != ValueOpcode::GetBufferResource) {
 				plan.retain_reads |= handle.GetOpcode() == ValueOpcode::GetSamplerResource ||
-				    (memory->kind == ResourceKind::ScalarAddress && !UsesOnlyImageDescriptors(*read));
+				    (memory->kind == ResourceKind::ScalarAddress && !images_only);
 			} else if (std::ranges::any_of(read->Uses(), [&](const Use& use) {
 				return use.user->GetOpcode() != ValueOpcode::GetBufferResource ||
 				       std::ranges::any_of(use.user->Uses(), [&](const Use& consumer) {
@@ -2936,6 +2958,7 @@ private:
 				plan.retain_reads = true;
 			}
 			plan.memory[dword] = memory_index;
+			plan.kept_reads |= images_only ? 0u : 1u << dword;
 			plan.reads[dword] = read;
 		}
 
@@ -3201,7 +3224,8 @@ private:
 			    (key_memory == nullptr || key_memory->offset <= INT32_MAX) &&
 			    table_base <= UINT32_MAX && (table_base & 31u) == 0u && address != nullptr &&
 			    std::ranges::all_of(plan.reads, [&](const Inst* read) {
-				    return read != nullptr && UsesOnlyImageDescriptors(*read);
+				    return read != nullptr && (UsesOnlyImageDescriptors(*read) ||
+				                               ImageDescriptorUsesDirectly(*read));
 			    }) &&
 			    std::ranges::all_of(address->Uses(), [&](const Use& use) {
 				    return std::ranges::find(plan.reads, use.user) != plan.reads.end();
@@ -3793,9 +3817,12 @@ private:
 	bool IsIndirectPlanningMemory(uint32_t index) const {
 		return std::any_of(m_indirect_descriptors.begin(), m_indirect_descriptors.end(),
 		                   [&](const IndirectDescriptorPlan& plan) {
-			return plan.reads[0] != nullptr && !plan.retain_reads &&
-			       std::find(plan.memory.begin(), plan.memory.begin() + plan.read_dwords, index) !=
-			           plan.memory.begin() + plan.read_dwords;
+			if (plan.reads[0] == nullptr || plan.retain_reads) return false;
+			// A T# read that stays an ordinary scalar load is a buffer access like any other.
+			for (uint32_t word = 0; word < plan.read_dwords; ++word) {
+				if (plan.memory[word] == index && (plan.kept_reads & (1u << word)) == 0u) return true;
+			}
+			return false;
 		});
 	}
 
