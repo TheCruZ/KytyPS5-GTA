@@ -146,6 +146,8 @@ public:
 	void OnUnmap(uint64_t address, uint64_t size);
 	// Whether a dump waits for the GPU before its counters reach guest memory.
 	[[nodiscard]] bool HasPendingDumps() const noexcept { return !m_pending.empty(); }
+	// Whether the samples of the draws recorded now reach a guest occlusion counter.
+	[[nodiscard]] bool Counting() const noexcept { return Enabled() && m_segments.Counting(); }
 
 private:
 	void BeginQuery(const CommandRecorder& recorder);
