@@ -283,6 +283,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	AddFlag(args, !info.occlusion_queries_enabled, "--no-occlusion-queries");
 	AddFlag(args, info.relaxed_shader_float, "--relaxed-shader-float");
 	AddFlag(args, info.shader_cache_enabled, "--shader-cache");
+	AddFlag(args, !info.async_pipelines_enabled, "--no-async-pipelines");
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
 	AddFlag(args, info.vulkan_validation_enabled, "--vulkan-validation");
