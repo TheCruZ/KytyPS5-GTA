@@ -69,6 +69,9 @@ static void PrintUsage() {
 	::printf("  --no-occlusion-queries               Read occlusion queries as always visible.\n");
 	::printf("  --relaxed-shader-float               Native GPU float ops in shaders; faster, can be inaccurate.\n");
 	::printf("  --lod-stats                          Report bound textures in mip statistics.\n");
+	::printf(
+	    "  --no-async-pipelines                 Wait for new pipelines instead of skipping the\n"
+	    "                                       draws that need them while they compile.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
 	::printf("  --command-buffer-dump                Enable command buffer dumps.\n");
@@ -206,6 +209,8 @@ static constexpr Flag FLAGS[] = {
     {"--no-occlusion-queries", &ConfigOptions::occlusion_queries_enabled, false},
     {"--relaxed-shader-float", &ConfigOptions::relaxed_shader_float},
     {"--lod-stats", &ConfigOptions::lod_stats_enabled},
+    {"--async-pipelines", &ConfigOptions::async_pipelines_enabled},
+    {"--no-async-pipelines", &ConfigOptions::async_pipelines_enabled, false},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},
     {"--graphics-debug-dump", &ConfigOptions::graphics_debug_dump_enabled},
     {"--profile", &ConfigOptions::profiler_enabled},

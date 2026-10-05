@@ -106,6 +106,7 @@ struct ConfigOptions {
 	bool                   occlusion_queries_enabled   = true;
 	bool                   relaxed_shader_float        = false;
 	bool                   lod_stats_enabled           = false;
+	bool                   async_pipelines_enabled     = true;
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled            = false;
@@ -181,6 +182,8 @@ bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool RelaxedShaderFloatEnabled();
 bool LodStatsEnabled();
+// Draws whose new pipeline the driver is still compiling are skipped instead of waiting for it.
+bool AsyncPipelinesEnabled();
 bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
 bool PlayGoHackEnabled();
