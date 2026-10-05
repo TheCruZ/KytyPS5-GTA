@@ -598,10 +598,12 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
                                        const HW::ShaderRegisters& /*sh*/,
                                        const ShaderMappedData& data, ShaderComputeInputInfo& info) {
 	const bool dispatch_thread_dimensions = info.dispatch_thread_dimensions;
+	const bool dispatch_indirect_threads  = info.dispatch_indirect_threads;
 	const auto host_subgroup_size         = info.host_subgroup_size;
 	const auto workgroup_counts           = std::to_array(info.workgroup_counts);
 	info                                  = {};
 	info.dispatch_thread_dimensions       = dispatch_thread_dimensions;
+	info.dispatch_indirect_threads        = dispatch_indirect_threads;
 	info.host_subgroup_size               = host_subgroup_size;
 	std::ranges::copy(workgroup_counts, info.workgroup_counts);
 	info.threads_num[0]                   = regs.cs_regs.num_thread_x;
@@ -747,7 +749,8 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	words.push_back(info.thread_ids_num);
 	words.push_back(info.lds_size_dwords);
 	words.push_back(info.scratch_size_dwords);
-	words.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions));
+	words.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions) |
+	                (static_cast<uint32_t>(info.dispatch_indirect_threads) << 1u));
 	for (int i = 0; i < 3; i++) {
 		words.push_back(info.threads_num[i]);
 		words.push_back(static_cast<uint32_t>(info.group_id[i]));
@@ -887,7 +890,36 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	};
 	EXIT_IF(tess.input_control_points == 0 || tess.input_control_points > 32 ||
 	        tess.output_control_points == 0 || tess.output_control_points > 32);
-	ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess);
+	// The analysis decodes both programs: remember it for the next draws of the same programs
+	// (tessellated trees draw the same pair hundreds of times a frame).
+	struct AnalysisKey {
+		uint64_t local_hash   = 0;
+		uint64_t control_hash = 0;
+		uint32_t input_cp     = 0;
+		uint32_t output_cp    = 0;
+		bool     operator==(const AnalysisKey&) const = default;
+	};
+	struct AnalysisKeyHash {
+		size_t operator()(const AnalysisKey& key) const {
+			return static_cast<size_t>((key.local_hash * 0x9e3779b97f4a7c15ull) ^ key.control_hash ^
+			                           (uint64_t {key.input_cp} << 40u) ^
+			                           (uint64_t {key.output_cp} << 48u));
+		}
+	};
+	thread_local std::unordered_map<AnalysisKey, ShaderTessellationInputInfo, AnalysisKeyHash>
+	                  analyses;
+	const AnalysisKey key {local_hash, control_hash, tess.input_control_points,
+	                       tess.output_control_points};
+	if (const auto found = analyses.find(key); found != analyses.end()) {
+		// The analysis only reflects the strides and the per-patch range.
+		tess.ls_stride  = found->second.ls_stride;
+		tess.hs_stride  = found->second.hs_stride;
+		tess.patch_base = found->second.patch_base;
+		tess.patch_size = found->second.patch_size;
+	} else {
+		ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess);
+		analyses.emplace(key, tess);
+	}
 	for (auto& stage: input_info) {
 		stage.tess = tess;
 	}

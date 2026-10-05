@@ -465,6 +465,70 @@ void TestProgramStore() {
 	std::filesystem::remove_all(dir, error);
 }
 
+void TestPipelineStore() {
+	namespace Gfx   = Libs::Graphics;
+	const auto dir  = std::filesystem::temp_directory_path() / "kyty_pipeline_store_test";
+	std::error_code error;
+	std::filesystem::remove_all(dir, error);
+	std::filesystem::create_directories(dir, error);
+	const auto make = [](uint8_t seed, bool compute) {
+		Gfx::StoredPipeline pipeline;
+		pipeline.compute       = compute;
+		pipeline.vertex_stages = compute ? 0 : 1;
+		pipeline.pixel         = !compute;
+		pipeline.programs.resize(compute ? 1 : 2);
+		pipeline.input_infos.resize(pipeline.programs.size());
+		for (size_t i = 0; i < pipeline.programs.size(); i++) {
+			pipeline.programs[i].assign(12, static_cast<uint8_t>(seed + i));
+			pipeline.input_infos[i].assign(40, static_cast<uint8_t>(seed * 3 + i));
+		}
+		if (!compute) {
+			pipeline.state.assign(30, seed);
+		}
+		return pipeline;
+	};
+	const auto same = [](const Gfx::StoredPipeline& a, const Gfx::StoredPipeline& b) {
+		return a.compute == b.compute && a.vertex_stages == b.vertex_stages && a.pixel == b.pixel &&
+		       a.programs == b.programs && a.input_infos == b.input_infos && a.state == b.state;
+	};
+	const auto old_path = dir / "T.old.pipelines";
+	{
+		Gfx::PipelineStore store;
+		Check(store.Open(old_path, "L1").empty(), "a new pipeline store is empty");
+		store.Append(make(1, false));
+		store.Append(make(2, true));
+	}
+	{
+		Gfx::PipelineStore store;
+		const auto pipelines = store.Open(old_path, "L1");
+		Check(pipelines.size() == 2 && same(pipelines[0], make(1, false)) &&
+		          same(pipelines[1], make(2, true)),
+		      "pipeline records round-trip");
+	}
+	// A store of another layout is not a seed; the newest store with the same header is.
+	const auto other_path = dir / "T.other.pipelines";
+	{
+		Gfx::PipelineStore store;
+		(void)store.Open(other_path, "L2");
+		store.Append(make(3, false));
+	}
+	const auto new_path = dir / "T.new.pipelines";
+	Check(Gfx::StoreFile::SeedFromNewest(new_path, "T.", ".pipelines", Gfx::PipelineStore::Header("L1")),
+	      "a new build seeds its store");
+	{
+		Gfx::PipelineStore store;
+		const auto pipelines = store.Open(new_path, "L1");
+		Check(pipelines.size() == 2 && same(pipelines[0], make(1, false)),
+		      "a seeded store holds the records of the earlier build");
+	}
+	Check(!Gfx::StoreFile::SeedFromNewest(new_path, "T.", ".pipelines", Gfx::PipelineStore::Header("L1")),
+	      "an existing store is not seeded again");
+	Check(!Gfx::StoreFile::SeedFromNewest(dir / "T.x.pipelines", "T.", ".pipelines",
+	                                      Gfx::PipelineStore::Header("L3")),
+	      "no store of the same layout: no seed");
+	std::filesystem::remove_all(dir, error);
+}
+
 namespace Occlusion = Libs::Graphics::OcclusionCounters;
 
 // Plays the role of OcclusionQueries over a fake GPU: each allocated slot counts `samples`, and
@@ -612,6 +676,7 @@ void TestPackedColorClear16() {
 
 int main() {
 	TestProgramStore();
+	TestPipelineStore();
 	TestCommandStreamOrder();
 	TestCommandStreamArraysStayInChunk();
 	TestCommandChunkQueueThreads();
