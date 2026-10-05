@@ -16,6 +16,7 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -33,6 +34,7 @@ struct DrawIndexBufferSource;
 class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
+struct IndirectThreadPass;
 
 // An image description derived from a T# and a shader's view of it (see ResolveTexture).
 struct TextureDescDerivation {
@@ -69,12 +71,16 @@ enum class DrawOffsetSource : uint8_t {
 	IndirectArgs,
 };
 
-// Nonzero address: the GPU reads count Vulkan indirect draw records, stride bytes apart.
+// Nonzero address: the GPU reads count Vulkan indirect draw records, stride bytes apart. With a
+// count address the GPU reads the number of draws there too (count is then the maximum): GPU work
+// (culling shaders) writes the records and the count, and reading them on the CPU would wait for
+// all the GPU work recorded before the draw.
 struct DrawIndirectArgs {
 	uint64_t              address = 0;
 	uint32_t              count   = 0;
 	uint32_t              stride  = 0;
 	ShaderIndirectOffsets offsets;
+	uint64_t              count_address = 0;
 };
 
 struct DrawIndexArgs {
@@ -195,6 +201,10 @@ public:
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode, bool async_compute);
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode, bool async_compute);
+	// DISPATCH_INDIRECT with USE_THREAD_DIMENSIONS: converts the thread counts, which GPU work
+	// writes, on the GPU instead of reading them back.
+	void DispatchIndirectThreads(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
+	                             uint32_t mode, bool async_compute);
 
 	// Shader programs and resources of a draw resolved ahead of its execution.
 	struct ResolvedDraw;
@@ -204,7 +214,24 @@ public:
 	// use: the execution thread releases them in order.
 	[[nodiscard]] ResolvedDraw* ResolveDrawAhead(const HW::Context&    context,
 	                                             const HW::UserConfig& user_config,
-	                                             const HW::Shader&     shaders);
+	                                             const HW::Shader&     shaders,
+	                                             const ShaderIndirectOffsets& indirect_offsets = {},
+	                                             bool indirect_draw = false);
+	// Resolve thread: the compute program of a DISPATCH_DIRECT with the given registers and
+	// initiator; null when the dispatch resolves it itself. Shares the ring of draw resolutions.
+	[[nodiscard]] ResolvedDraw* ResolveDispatchAhead(const HW::Context& context,
+	                                                 const HW::Shader& shaders,
+	                                                 const uint32_t (&groups)[3], uint32_t mode,
+	                                                 bool async_compute);
+	// Resolve thread: the compute program of a DISPATCH_INDIRECT with the given registers and
+	// initiator, which does not depend on the arguments the dispatch reads when it executes.
+	[[nodiscard]] ResolvedDraw* ResolveIndirectDispatchAhead(const HW::Context& context,
+	                                                         const HW::Shader&  shaders,
+	                                                         uint32_t           mode, uint64_t args_addr,
+	                                                         bool               async_compute);
+	// Execution thread: the program a dispatch resolved ahead, when the guest memory the
+	// resolution read still holds the same bytes.
+	bool TakeResolvedDispatch(ShaderComputeInputInfo& input_info, const ShaderModule*& module);
 	// Execution thread: the next draw uses `resolved` when the guest memory it read still holds
 	// the same bytes.
 	void UseResolvedDraw(ResolvedDraw* resolved) noexcept { m_resolved_draw = resolved; }
@@ -264,6 +291,15 @@ private:
 		uint64_t       checked_epoch = 0;
 		bool           permanent     = false; // Null for the root's view, whatever the memory.
 		bool           volatile_dcc  = false;
+		// A resolved element depends on the guest backing only through whether its data and
+		// metadata are readable: when the backing epoch moves (any map or unmap anywhere,
+		// constantly while a game streams), the element stays valid while that answer holds.
+		bool           backing_checkable = false;
+		bool           backing_readable  = false;
+		GuestRange     metadata_range;
+		// The PrepareBindings() call that last bound the element, and its index there.
+		uint64_t       prepared_stamp = 0;
+		uint32_t       prepared_index = 0;
 	};
 	struct TableDescriptorHash {
 		size_t operator()(const std::array<uint32_t, 8>& dwords) const noexcept;
@@ -275,9 +311,10 @@ private:
 		    elements;
 	};
 
-	[[nodiscard]] const TextureBinding&
+	[[nodiscard]] TableElementResolution&
 	ResolveTableElement(TableResolution& table, const ShaderRecompiler::IR::DescriptorValue& value);
 	[[nodiscard]] TableResolution& FindTableResolution(const ShaderRecompiler::IR::ImageResource& root);
+	[[nodiscard]] bool TableElementBackingReadable(const TableElementResolution& element);
 
 	// ResolveTexture's image descriptions by T# and shader view (see DeriveTextureDesc).
 	struct TextureDescKey {
@@ -374,10 +411,14 @@ private:
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
+	// CommitBindings(): the image ranges a draw writes (address, size).
+	std::vector<std::pair<uint64_t, uint64_t>> m_written_image_ranges;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<TableResolution>          m_table_resolutions;
 	uint64_t                              m_table_resolution_tick = 0;
+	uint64_t                              m_table_prepare_stamp   = 0;
+	std::vector<vk::DescriptorImageInfo>  m_table_image_infos;
 	// Reused by every draw; see AcquireDrawRenderState().
 	std::unique_ptr<DrawRenderStorage, void (*)(DrawRenderStorage*)> m_draw_state {nullptr,
 	                                                                               nullptr};
@@ -400,6 +441,8 @@ private:
 	// Whether the executing draw reused the render targets of the draw before.
 	bool     m_render_targets_reused = false;
 	uint64_t m_draw_window           = 0;
+	std::unique_ptr<IndirectThreadPass, void (*)(IndirectThreadPass*)> m_indirect_thread_pass {
+	    nullptr, nullptr};
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
