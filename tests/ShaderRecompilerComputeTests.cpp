@@ -5469,7 +5469,7 @@ public:
               "a target mapped after the scan was not cached");
 
       // A dispatch uploads the CPU writes of the new buffers before it runs.
-      context.PrepareBda();
+      context.PrepareBda(true);
       // Stores wrote the pages of `written` and `neighbour`; the CPU wrote
       // `neighbour` after the dispatch was recorded, so its upload wins.
       (void)context.InvalidateMemory(neighbour, 4);
@@ -10776,11 +10776,15 @@ public:
         set_buffer(4, count_args, 1, 4);
         const std::array<u32, 3> packet{static_cast<u32>(count_args),
                                       static_cast<u32>(count_args >> 32u), 0x41u};
-        const auto dirty_tick = scheduler.CurrentTick();
+        // The count reaches the CPU from the GPU (read back, or from the mirror of a submitted
+        // writer) and is clean afterwards.
+        u32 synchronized_count = 0;
         Require(name, "GPU count indirect dispatch",
                 CpOpDispatchIndirect(processor, 0xc0021600u, packet.data(), 0, 0) == 3 &&
-                    scheduler.CurrentTick() > dirty_tick &&
-                    !cache.HasGpuDirtyBytes(count_args, 4),
+                    !cache.HasGpuDirtyBytes(count_args, 4) &&
+                    LibKernel::Memory::TryReadBacking(count_args, &synchronized_count,
+                                                     sizeof(synchronized_count)) &&
+                    synchronized_count == count,
                 "the descriptor dependency did not synchronize its preceding GPU writer");
         const auto clean_tick = scheduler.CurrentTick();
         ShaderComputeInputInfo input{};

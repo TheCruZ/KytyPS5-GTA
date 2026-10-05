@@ -206,6 +206,7 @@ private:
 	void ExecuteDrawIndirect(const GpuOperation& operation);
 	bool PatchIndirectDrawOffsets(const GpuOperation& operation, uint32_t vertex_offset,
 	                              uint32_t instance_offset, uint32_t first_index);
+	bool TryExecuteDrawIndirectOnGpu(const GpuOperation& operation);
 	void ExecuteDispatchDirect(const GpuOperation& operation, uint32_t thread_group_x,
 	                           uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
 	void ExecuteDispatchIndirect(const GpuOperation& operation);
@@ -294,6 +295,8 @@ private:
 	bool     m_has_indirect_instances      = false;
 	// The shader registers of a pipelined indirect draw with its offsets written to user SGPRs.
 	std::unique_ptr<HW::Shader> m_indirect_shaders;
+	// When the GPU executed that draw: its arguments, read only if a later draw needs the count.
+	DrawIndirectSource m_gpu_indirect_instances {};
 	// Keeps later allocations off the last line of the execution-side state.
 	alignas(64) uint8_t m_end_padding = 0;
 };

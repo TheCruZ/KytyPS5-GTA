@@ -10,12 +10,15 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <span>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -71,6 +74,8 @@ struct ProgramResolution {
 };
 
 struct GraphicContext;
+struct PipelineStoreState;
+struct StoredPipeline;
 struct RenderColorInfo;
 struct RenderDepthInfo;
 class CommandBuffer;
@@ -142,7 +147,15 @@ struct PipelineVertexInputState {
 	uint8_t                                               binding_count   = 0;
 	uint8_t                                               attribute_count = 0;
 
-	bool operator==(const PipelineVertexInputState&) const = default;
+	// Entries past the counts keep their default values: only the used ones are compared (draws
+	// compare the key of the last pipeline every time).
+	bool operator==(const PipelineVertexInputState& other) const {
+		return binding_count == other.binding_count && attribute_count == other.attribute_count &&
+		       std::equal(bindings.begin(), bindings.begin() + binding_count,
+		                  other.bindings.begin()) &&
+		       std::equal(attributes.begin(), attributes.begin() + attribute_count,
+		                  other.attributes.begin());
+	}
 };
 
 struct ShaderProgram {
@@ -181,9 +194,12 @@ public:
 	                    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
 	                    bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
 	                    ShaderPixelInputInfo& pixel_info, ProgramResolution* ahead = nullptr);
+	// With `ahead`, only a program and permutation that exist, reading guest memory through the
+	// resolution's log (see GetGraphicsPrograms).
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
-	                                ShaderComputeInputInfo&      input_info);
+	                                ShaderComputeInputInfo&      input_info,
+	                                ProgramResolution*           ahead = nullptr);
 
 	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,
@@ -205,9 +221,11 @@ private:
 		PipelineStaticParameters static_params;
 
 		bool operator==(const GraphicsPipelineKey& other) const {
-			return rendering == other.rendering && vertex_shader_ids == other.vertex_shader_ids &&
-			       ps_shader_id == other.ps_shader_id && vertex_input == other.vertex_input &&
-			       static_params == other.static_params;
+			// The parts that differ most often between consecutive draws first.
+			return vertex_shader_ids[0] == other.vertex_shader_ids[0] &&
+			       ps_shader_id == other.ps_shader_id && static_params == other.static_params &&
+			       vertex_input == other.vertex_input && rendering == other.rendering &&
+			       vertex_shader_ids == other.vertex_shader_ids;
 		}
 	};
 
@@ -240,6 +258,24 @@ private:
 	// The pipeline the last lookup found; pipelines are never removed while the cache lives.
 	GraphicsPipelineKey m_last_graphics_key {};
 	Pipeline*           m_last_graphics_pipeline = nullptr;
+
+	// The pipelines of earlier sessions (see PipelineStore): background threads create them once
+	// the program store compiled their programs, and the execution thread takes them from here
+	// when a lookup misses.
+	std::unique_ptr<PipelineStoreState>        m_stored;
+	std::mutex                                 m_precreated_mutex;
+	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
+	                                                        m_precreated_graphics;
+	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_precreated_compute;
+	std::vector<std::jthread>                               m_precreate_threads;
+
+	void OpenStores(const std::string& title_id);
+	void PrecreatePipelines(const std::stop_token& stop);
+	bool PrecreatePipeline(const StoredPipeline& stored);
+	void RecordGraphicsPipeline(const GraphicsPipelineKey&             key,
+	                            std::span<const ShaderVertexInputInfo> vertex_info,
+	                            const ShaderPixelInputInfo*            ps_input_info);
+	void RecordComputePipeline(const ShaderComputeInputInfo& input_info, uint64_t program_id);
 
 	void InitializeDriverCache();
 	// Writes the driver cache data to m_driver_cache_path; the cache must stay alive meanwhile.
