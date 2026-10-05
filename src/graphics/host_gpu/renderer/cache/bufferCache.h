@@ -470,7 +470,7 @@ private:
 	TextureCache&                                      m_texture_cache;
 	uint64_t                                           m_total_used_memory = 0;
 	// One per TileManager::ColorClearSlots key slot.
-	std::array<RangeSet, 8>                           m_checked_color_metadata;
+	std::array<RangeSet, 16>                          m_checked_color_metadata;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	// As configured; the ones above come down while memory is short (as in the texture cache).
