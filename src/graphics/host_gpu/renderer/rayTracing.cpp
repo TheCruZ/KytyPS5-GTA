@@ -380,7 +380,7 @@ void RayTracing::Apply(Area& area) {
 }
 
 vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
-	m_context.PrepareBda();
+	m_context.PrepareBda(false);
 	Collect();
 	auto& area = m_areas[m_next_area];
 	if (area.tick != 0) {
