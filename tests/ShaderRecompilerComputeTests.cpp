@@ -5546,7 +5546,7 @@ public:
               "a target mapped after the scan was not cached");
 
       // A dispatch uploads the CPU writes of the new buffers before it runs.
-      context.PrepareBda();
+      context.PrepareBda(true);
       // Stores wrote the pages of `written` and `neighbour`; the CPU wrote
       // `neighbour` after the dispatch was recorded, so its upload wins.
       (void)context.InvalidateMemory(neighbour, 4);
@@ -5732,7 +5732,10 @@ public:
       const vk::BufferCopy copy{offset, index * sizeof(u32), sizeof(u32)};
       scheduler.Current().Handle().copyBuffer(buffer.Handle(), readback.buffer, 1, &copy);
     };
-    context.PrepareBda();
+    // Each synchronization stands for a new submission: pages the CPU dirties after one wait for
+    // the next (see RenderContext::PrepareBda()).
+    uint64_t submit = 0;
+    context.PrepareBda(true);
     Require(name, "mapped intersection",
             !cache.IsRegionCpuModified(base, page) &&
                 cache.IsRegionCpuModified(base + page, page) &&
@@ -5744,24 +5747,28 @@ public:
     cache.InvalidateMemory(base + 17, 1);
     words[4] = 0x87654321u;
     words[TRACKER_PAGE_SIZE / sizeof(u32) - 1] = 0xabcdef01u;
-    context.PrepareBda();
+    context.NoteOperation(++submit, false);
+    context.PrepareBda(true);
     snapshot(16, 2);
     snapshot(TRACKER_PAGE_SIZE - sizeof(u32), 3);
     Require(name, "whole-page upload", !cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE),
             "one-byte invalidation did not upload and consume its whole page");
 
     context.MapMemory(base + page, page);
-    context.PrepareBda();
+    context.NoteOperation(++submit, false);
+    context.PrepareBda(true);
     snapshot(page, 4);
     Require(name, "new mapping", !cache.IsRegionCpuModified(base + page, page),
             "mapping into an existing buffer did not queue its dirty pages");
     context.UnmapMemory(base + 2 * page, page);
     words[2 * page / sizeof(u32)] = 0xfedcba98u;
-    context.PrepareBda();
+    context.NoteOperation(++submit, false);
+    context.PrepareBda(true);
     Require(name, "unmapped dirty page", cache.IsRegionCpuModified(base + 2 * page, page),
             "BDA synchronization consumed dirtiness outside mapped memory");
     context.MapMemory(base + 2 * page, page);
-    context.PrepareBda();
+    context.NoteOperation(++submit, false);
+    context.PrepareBda(true);
     snapshot(2 * page, 5);
 
     vk::BufferMemoryBarrier barrier{};
@@ -11575,11 +11582,15 @@ public:
         set_buffer(4, count_args, 1, 4);
         const std::array<u32, 3> packet{static_cast<u32>(count_args),
                                       static_cast<u32>(count_args >> 32u), 0x41u};
-        const auto dirty_tick = scheduler.CurrentTick();
+        // The count reaches the CPU from the GPU (read back, or from the mirror of a submitted
+        // writer) and is clean afterwards.
+        u32 synchronized_count = 0;
         Require(name, "GPU count indirect dispatch",
                 CpOpDispatchIndirect(processor, 0xc0021600u, packet.data(), 0, 0) == 3 &&
-                    scheduler.CurrentTick() > dirty_tick &&
-                    !cache.HasGpuDirtyBytes(count_args, 4),
+                    !cache.HasGpuDirtyBytes(count_args, 4) &&
+                    LibKernel::Memory::TryReadBacking(count_args, &synchronized_count,
+                                                     sizeof(synchronized_count)) &&
+                    synchronized_count == count,
                 "the descriptor dependency did not synchronize its preceding GPU writer");
         const auto clean_tick = scheduler.CurrentTick();
         ShaderComputeInputInfo input{};
