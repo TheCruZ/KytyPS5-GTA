@@ -121,6 +121,7 @@ public:
 	bool                   readback_linear_images      = true;
 	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = true;
+	bool                   async_pipelines_enabled     = true;
 	bool                   trophy_enabled              = true;
 	bool                   skip_notice_screen          = false;
 	int                    vblank_frequency            = 60;
@@ -156,6 +157,7 @@ public:
 		readback_linear_images      = other.readback_linear_images;
 		sync_raw_image_buffers      = other.sync_raw_image_buffers;
 		tessellation_enabled        = other.tessellation_enabled;
+		async_pipelines_enabled     = other.async_pipelines_enabled;
 		trophy_enabled              = other.trophy_enabled;
 		skip_notice_screen          = other.skip_notice_screen;
 		vblank_frequency            = other.vblank_frequency;

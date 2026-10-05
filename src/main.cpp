@@ -72,6 +72,9 @@ static void PrintUsage() {
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation <true|false>     Enable shader validation.\n");
 	::printf("  --no-tessellation                    Skip tessellation patches instead of drawing them.\n");
+	::printf(
+	    "  --no-async-pipelines                 Wait for new pipelines instead of skipping the\n"
+	    "                                       draws that need them while they compile.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
@@ -245,6 +248,16 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 		if (arg == "--no-tessellation") {
 			options.config.tessellation_enabled = false;
+			continue;
+		}
+
+		if (arg == "--async-pipelines") {
+			options.config.async_pipelines_enabled = true;
+			continue;
+		}
+
+		if (arg == "--no-async-pipelines") {
+			options.config.async_pipelines_enabled = false;
 			continue;
 		}
 

@@ -13,8 +13,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -22,6 +25,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -201,12 +205,15 @@ public:
 	                                ShaderComputeInputInfo&      input_info,
 	                                ProgramResolution*           ahead = nullptr);
 
-	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
+	// With `allow_async`, a pipeline that does not exist yet is created on a background thread
+	// and the lookup returns null until it is there (the draw can be skipped meanwhile);
+	// otherwise the lookup creates the pipeline, or waits for a background thread creating it.
+	Pipeline* GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,
 	                              std::span<const ShaderVertexInputInfo> vertex_info,
 	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
 	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
-	                              const GraphicsPrograms& programs);
+	                              const GraphicsPrograms& programs, bool allow_async);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 
@@ -268,6 +275,31 @@ private:
 	                                                        m_precreated_graphics;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_precreated_compute;
 	std::vector<std::jthread>                               m_precreate_threads;
+
+	// Pipelines new to every store, created on background threads instead of stalling the
+	// execution thread: graphics pipelines of draws that may be skipped until they are there,
+	// and compute pipelines of programs the compile workers translated ahead of their dispatch.
+	// Finished pipelines join the precreated ones; the pending keys are under
+	// m_precreated_mutex.
+	struct AsyncPipelineJob;
+	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_async_pending_graphics;
+	std::unordered_set<uint64_t>                                     m_async_pending_compute;
+	// Keys a background thread failed to create: their draws create them and report the error.
+	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_async_failed_graphics;
+	std::mutex                                                       m_async_mutex;
+	std::condition_variable                                          m_async_available;
+	std::deque<std::unique_ptr<AsyncPipelineJob>>                    m_async_jobs;
+	bool                                                             m_async_stopping = false;
+	std::vector<std::jthread>                                        m_async_threads;
+
+	void QueueAsyncPipeline(std::unique_ptr<AsyncPipelineJob> job);
+	// Removes a queued job no thread has started; false when none matches.
+	bool TakeQueuedAsyncPipeline(const std::function<bool(const AsyncPipelineJob&)>& matches);
+	void AsyncPipelineWorker();
+	void StopAsyncPipelines();
+	// Called by a compile worker when it added a compute permutation.
+	void CreateComputePipelineAhead(const ShaderComputeInputInfo& input_info,
+	                                const ShaderProgram&          program);
 
 	void OpenStores(const std::string& title_id);
 	void PrecreatePipelines(const std::stop_token& stop);

@@ -1574,6 +1574,41 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, CommandRecorder vk_bu
 	}
 }
 
+// Whether a draw may be skipped while the driver compiles its pipeline: the picture is all it
+// changes. Its shaders write no memory, its samples reach no guest occlusion counter and it
+// renders to no linear image (the CPU reads those back, e.g. GTA V's vehicle damage).
+static bool DrawOnlyChangesPicture(RenderContext& context, const DrawRenderState& state,
+                                   std::span<const ShaderVertexInputInfo> vertex_stages) {
+	const auto writes_memory = [](const ShaderStageRuntime& stage) {
+		if (stage.program == nullptr) {
+			return true;
+		}
+		const auto& program = *stage.program;
+		return program.has_address_writes ||
+		       std::ranges::any_of(program.info.buffers,
+		                           [](const auto& buffer) { return buffer.written; }) ||
+		       std::ranges::any_of(program.info.images,
+		                           [](const auto& image) { return image.written; });
+	};
+	if (context.GetOcclusionQueries().Counting()) {
+		return false;
+	}
+	for (const auto& stage: vertex_stages) {
+		if (writes_memory(stage.stage)) {
+			return false;
+		}
+	}
+	if (state.ps_active && writes_memory(state.ps_input_info.stage)) {
+		return false;
+	}
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		if (!state.colors[i].desc.info.IsTiled()) {
+			return false;
+		}
+	}
+	return !static_cast<bool>(state.depth->image_id) || state.depth->desc.info.IsTiled();
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -1612,6 +1647,20 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 
+	if (draw.IsIndexed()) {
+		LogDrawPhase(draw.Name(), "CreatePipeline");
+	}
+	auto* const pipeline_ptr = m_context.GetPipelineCache().GetGraphicsPipeline(
+	    std::span {state.colors, state.color_count}, *state.depth, vertex_stages, buffer,
+	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
+	    state.programs,
+	    Config::AsyncPipelinesEnabled() && DrawOnlyChangesPicture(m_context, state, vertex_stages));
+	if (pipeline_ptr == nullptr) {
+		// Skipped until a background thread created the pipeline.
+		return;
+	}
+	auto& pipeline = *pipeline_ptr;
+
 	if (mesh_active && draw.IsIndexed()) {
 		// Register the original guest indices for shader reads; PrepareGraphicsBindings
 		// synchronizes registered BDA ranges before any draw commands are committed.
@@ -1646,13 +1695,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		EXIT_IF(mesh_active);
 		indirect_args = PrepareIndirectArgs(buffer, *emit.indirect, draw.IsIndexed());
 	}
-	if (draw.IsIndexed()) {
-		LogDrawPhase(draw.Name(), "CreatePipeline");
-	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
-	    std::span {state.colors, state.color_count}, *state.depth, vertex_stages, buffer,
-	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering = AcquireRenderTargets(buffer, state.colors, state.color_count,
 	                                            *state.depth, feedback_aspects, stages);
