@@ -5451,7 +5451,7 @@ public:
               "a target mapped after the scan was not cached");
 
       // A dispatch uploads the CPU writes of the new buffers before it runs.
-      context.PrepareBda();
+      context.PrepareBda(true);
       // Stores wrote the pages of `written` and `neighbour`; the CPU wrote
       // `neighbour` after the dispatch was recorded, so its upload wins.
       (void)context.InvalidateMemory(neighbour, 4);

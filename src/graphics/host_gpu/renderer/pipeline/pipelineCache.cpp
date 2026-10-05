@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -120,6 +121,15 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
 
+// Execution thread: the ordinary loads of an SRT walk.
+bool ReadGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
+	if (!Libs::LibKernel::Memory::TryReadAroundGpuWrites(address, values.data(),
+	                                                     values.size_bytes())) {
+		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	}
+	return true;
+}
+
 bool ReadAheadPlain(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	return !values.empty() && static_cast<GuestReadLog*>(userdata)->Read(
 	                              address, values.data(), values.size_bytes(), false);
@@ -186,8 +196,39 @@ bool GuestReadLog::StillValid() const {
 		return false;
 	}
 	std::array<uint8_t, StrictCheckBytes> buffer {};
+	// Most entries lie on pages the GPU does not own: decide that once per page.
+	uint64_t checked_page  = UINT64_MAX;
+	bool     checked_owned = false;
 	for (const auto& entry: m_entries) {
 		const auto* recorded = m_bytes.data() + entry.offset;
+		if (!entry.strict) {
+			const auto first_page = entry.address >> 12u;
+			const auto last_page  = (entry.address + entry.size - 1) >> 12u;
+			bool       gpu_owned  = false;
+			if (first_page == last_page && first_page == checked_page) {
+				gpu_owned = checked_owned;
+			} else {
+				gpu_owned = Libs::LibKernel::Memory::MayFaultOnGpuRead(entry.address, entry.size);
+				if (first_page == last_page) {
+					checked_page  = first_page;
+					checked_owned = gpu_owned;
+				}
+			}
+			// On GPU-owned pages a direct load faults and reads back all the GPU's queued work:
+			// bytes the GPU did not write compare from the backing store.
+			bool around = gpu_owned;
+			for (uint32_t done = 0; around && done < entry.size; done += sizeof(buffer)) {
+				const auto bytes = std::min<uint32_t>(entry.size - done, sizeof(buffer));
+				around           = Libs::LibKernel::Memory::TryReadAroundGpuWrites(
+                    entry.address + done, buffer.data(), bytes);
+				if (around && std::memcmp(buffer.data(), recorded + done, bytes) != 0) {
+					return false;
+				}
+			}
+			if (around) {
+				continue;
+			}
+		}
 		if (entry.strict) {
 			// As specialization memory is read on the execution thread: GPU-owned bytes fail.
 			if (entry.size > buffer.size() ||
@@ -470,9 +511,11 @@ struct PipelineCache::ProgramCache {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
-		} else {
-			static_assert(std::is_same_v<InputInfo, ShaderPixelInputInfo>);
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
 			stage = ShaderType::Pixel;
+		} else {
+			static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
+			stage = ShaderType::Compute;
 		}
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
@@ -543,6 +586,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
+		    .read_memory                = ReadGuestMemory,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
@@ -586,6 +630,7 @@ struct PipelineCache::ProgramCache {
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor));
 		const auto& permutation = entry->second.permutations.back();
+		by_id[permutation.handle.id] = {&entry->first, &permutation};
 		Store(lookup_key, params, input_info, push_data_start, permutation.specialization);
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -680,8 +725,10 @@ struct PipelineCache::ProgramCache {
 		}
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			job->vertex = std::make_unique<ShaderVertexInputInfo>(input_info);
-		} else {
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
 			job->pixel = std::make_unique<ShaderPixelInputInfo>(input_info);
+		} else {
+			job->compute = std::make_unique<ShaderComputeInputInfo>(input_info);
 		}
 		in_flight[lookup_key]++;
 		{
@@ -763,12 +810,16 @@ struct PipelineCache::ProgramCache {
 					stored_specialization = permutation->specialization;
 				}
 				permutations.push_back(std::move(*permutation));
+				by_id[permutations.back().handle.id] = {&entry->first, &permutations.back()};
 			}
 		}
 		if (const auto job_count = in_flight.find(job.key); --job_count->second == 0) {
 			in_flight.erase(job_count);
 		}
 		UnlockPrograms();
+		if (job.stored) {
+			stored_pending.fetch_sub(1, std::memory_order_release);
+		}
 		if (stored_specialization) {
 			Store(job.key, job.params, input_info, job.push_data_cursor, *stored_specialization);
 		}
@@ -798,6 +849,57 @@ struct PipelineCache::ProgramCache {
 	}
 
 	std::unique_ptr<ProgramStore> store;
+	// Programs of the store that the workers have not finished compiling.
+	std::atomic_uint32_t          stored_pending {0};
+	// Under the program lock: every compiled permutation by its id, with its program's key.
+	std::unordered_map<uint64_t, std::pair<const ProgramKey*, const Permutation*>> by_id;
+
+	// Under the program lock: appends the identity of the permutation with this id (see
+	// ProgramStore::PutIdentity). False for an id of no permutation.
+	bool DescribeProgram(uint64_t id, std::vector<uint8_t>& identity) const {
+		const auto found = by_id.find(id);
+		if (found == by_id.end()) {
+			return false;
+		}
+		const auto& [key, permutation] = found->second;
+		ProgramStore::PutIdentity(identity, key->stage, key->hash, key->user_data_count,
+		                          key->code_size, key->static_state,
+		                          permutation->program.bindings.push_data_start_dword,
+		                          permutation->specialization);
+		return true;
+	}
+
+	// Under the program lock: the permutation a stored identity names, if it was compiled.
+	const Permutation* FindProgram(const std::vector<uint8_t>& identity) const {
+		StoreFile::Reader reader(identity);
+		ProgramKey        key;
+		uint32_t          stage           = 0;
+		uint32_t          push_data_start = 0;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		reader.Get(stage);
+		reader.Get(key.hash);
+		reader.Get(key.user_data_count);
+		reader.Get(key.code_size);
+		reader.Get(push_data_start);
+		reader.GetVector(key.static_state);
+		reader.GetVector(specialization.buffers);
+		reader.GetVector(specialization.images);
+		if (!reader.Ok() || !reader.AtEnd()) {
+			return nullptr;
+		}
+		key.stage        = static_cast<ShaderType>(stage);
+		const auto entry = programs.find(key);
+		if (entry == programs.end()) {
+			return nullptr;
+		}
+		for (const auto& permutation: entry->second.permutations) {
+			if (permutation.program.bindings.push_data_start_dword == push_data_start &&
+			    permutation.specialization == specialization) {
+				return &permutation;
+			}
+		}
+		return nullptr;
+	}
 
 	template <typename InputInfo>
 	void Store(const ProgramKey& key, const ShaderParams& params, const InputInfo& input_info,
@@ -901,6 +1003,7 @@ struct PipelineCache::ProgramCache {
 			LockPrograms();
 			in_flight[job->key]++;
 			UnlockPrograms();
+			stored_pending.fetch_add(1, std::memory_order_relaxed);
 			{
 				std::lock_guard lock(job_mutex);
 				jobs.push_back(std::move(job));
@@ -929,6 +1032,27 @@ struct PipelineCache::ProgramCache {
 	}
 };
 
+struct PipelineStoreState {
+	PipelineStore               store;
+	std::vector<StoredPipeline> pipelines;
+	std::atomic_size_t          next {0};
+	std::atomic_uint32_t        running {0};
+	std::atomic_size_t          created {0};
+	std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+};
+
+namespace {
+
+std::string PipelineStateLayout() {
+	return fmt::format("1:{}:{}:{}", sizeof(PipelineRenderingState),
+	                   sizeof(PipelineVertexInputState), sizeof(PipelineStaticParameters));
+}
+
+// Stage resources are not needed to create a pipeline, but a stage without them is invalid.
+const ShaderRecompiler::IR::ResourceSnapshot g_no_resources {};
+
+} // namespace
+
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
@@ -936,25 +1060,32 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	InitializeDriverCache();
 	if (const auto title_id = PipelineCacheTitleId();
 	    !title_id.empty() && KYTY_BUILD == KYTY_BUILD_RELEASE) {
-		// One store per build: the records copy the layouts of the stage input structures, and
-		// what a program key means may change between builds. A build with local changes uses the
-		// time pipelineCache.cpp (which includes those structures) was compiled.
-		const std::string_view hash = KYTY_GIT_HASH;
-		auto build = std::string(std::string_view(KYTY_GIT_REVISION).substr(0, 12));
-		if (hash.ends_with("-dirty")) {
-			build += fmt::format("-{:08x}", static_cast<uint32_t>(XXH3_64bits(
-			                                    __DATE__ __TIME__, sizeof(__DATE__ __TIME__))));
-		}
-		const auto directory = std::filesystem::path("_PipelineCache");
-		const auto name      = fmt::format("{}.{}.programs", title_id, build);
+		OpenStores(title_id);
+	}
+}
+
+void PipelineCache::OpenStores(const std::string& title_id) {
+	// One store per build: the records copy the layouts of the stage input structures, and
+	// what a program key means may change between builds. A build with local changes uses the
+	// time pipelineCache.cpp (which includes those structures) was compiled.
+	const std::string_view hash = KYTY_GIT_HASH;
+	auto build = std::string(std::string_view(KYTY_GIT_REVISION).substr(0, 12));
+	if (hash.ends_with("-dirty")) {
+		build += fmt::format("-{:08x}", static_cast<uint32_t>(XXH3_64bits(
+		                                    __DATE__ __TIME__, sizeof(__DATE__ __TIME__))));
+	}
+	const auto directory = std::filesystem::path("_PipelineCache");
+	const auto prefix    = title_id + ".";
+	for (const std::string_view extension: {".programs", ".pipelines"}) {
 		// Builds that share the directory (a debug and a release folder linked to one cache) keep
 		// their own stores; only the oldest stores beyond a few recent builds are removed.
 		constexpr size_t KeptStores = 4;
+		const auto       name       = fmt::format("{}{}{}", prefix, build, extension);
 		std::error_code  error;
 		std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> stores;
 		for (const auto& file: std::filesystem::directory_iterator(directory, error)) {
 			const auto other = file.path().filename().string();
-			if (other != name && other.starts_with(title_id + ".") && other.ends_with(".programs")) {
+			if (other != name && other.starts_with(prefix) && other.ends_with(extension)) {
 				stores.emplace_back(file.last_write_time(error), file.path());
 			}
 		}
@@ -964,11 +1095,217 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 				std::filesystem::remove(stores[index].second, error);
 			}
 		}
-		m_program_cache->LoadStore(directory / name);
+		// A new build starts from the stores of the newest build with the same layouts: it
+		// recompiles their shaders and pipelines while the game loads, instead of stalling the
+		// first time each one is drawn (with the driver cache cold for every changed shader).
+		const auto path   = directory / name;
+		const bool seeded = StoreFile::SeedFromNewest(
+		    path, prefix, extension,
+		    extension == ".programs" ? ProgramStore::Header()
+		                             : PipelineStore::Header(PipelineStateLayout()));
+		if (seeded) {
+			PipelineCacheLog("Shader store: {} starts from the store of an earlier build",
+			                 Common::PathToString(path));
+		}
+		if (extension == ".programs") {
+			m_program_cache->LoadStore(path);
+		} else {
+			m_stored            = std::make_unique<PipelineStoreState>();
+			m_stored->pipelines = m_stored->store.Open(path, PipelineStateLayout());
+		}
+	}
+	if (!m_stored->pipelines.empty()) {
+		constexpr uint32_t PrecreateThreads = 4;
+		m_stored->running = PrecreateThreads;
+		for (uint32_t i = 0; i < PrecreateThreads; i++) {
+			m_precreate_threads.emplace_back(
+			    [this](const std::stop_token& stop) { PrecreatePipelines(stop); });
+		}
 	}
 }
 
+void PipelineCache::PrecreatePipelines(const std::stop_token& stop) {
+	KYTY_PROFILER_THREAD("Thread_PipelinePrecreate");
+	// The programs of the pipelines come from the program store: wait until it is compiled.
+	while (m_program_cache->stored_pending.load(std::memory_order_acquire) != 0) {
+		if (stop.stop_requested()) {
+			return;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	}
+	auto& state = *m_stored;
+	for (;;) {
+		const auto index = state.next.fetch_add(1, std::memory_order_relaxed);
+		if (index >= state.pipelines.size() || stop.stop_requested()) {
+			break;
+		}
+		if (PrecreatePipeline(state.pipelines[index])) {
+			state.created.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	if (state.running.fetch_sub(1, std::memory_order_acq_rel) == 1 && !stop.stop_requested()) {
+		const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+		                    std::chrono::steady_clock::now() - state.start)
+		                    .count();
+		PipelineCacheLog("Pipeline store: created {} of {} stored pipelines in {} ms",
+		                 state.created.load(), state.pipelines.size(), ms);
+	}
+}
+
+bool PipelineCache::PrecreatePipeline(const StoredPipeline& stored) {
+	std::array<const ProgramCache::Permutation*, ProgramResolution::MaxStages> programs {};
+	if (stored.programs.size() > programs.size()) {
+		return false;
+	}
+	{
+		const ProgramLockGuard lock(m_program_lock);
+		for (size_t i = 0; i < stored.programs.size(); i++) {
+			programs[i] = m_program_cache->FindProgram(stored.programs[i]);
+			if (programs[i] == nullptr) {
+				return false;
+			}
+		}
+	}
+	auto pipeline = std::make_unique<Pipeline>();
+	try {
+		Common::SoftExitScope soft_exit(true);
+		if (stored.compute) {
+			ShaderComputeInputInfo input_info;
+			if (stored.input_infos[0].size() != sizeof(input_info)) {
+				return false;
+			}
+			std::memcpy(&input_info, stored.input_infos[0].data(), sizeof(input_info));
+			input_info.stage = {.program = &programs[0]->program, .resources = &g_no_resources};
+			const auto id    = programs[0]->handle.id;
+			{
+				std::lock_guard lock(m_precreated_mutex);
+				if (m_precreated_compute.contains(id)) {
+					return true;
+				}
+			}
+			CreatePipelineInternal(m_graphics, *pipeline, input_info, programs[0]->handle.module,
+			                       m_driver_cache);
+			m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
+			std::lock_guard lock(m_precreated_mutex);
+			m_precreated_compute.try_emplace(id, std::move(pipeline));
+			return true;
+		}
+		GraphicsPipelineKey                  key {};
+		std::array<ShaderVertexInputInfo, 3> vertex_info;
+		ShaderPixelInputInfo                 pixel_info;
+		GraphicsPrograms                     handles;
+		if (stored.state.size() !=
+		    sizeof(key.rendering) + sizeof(key.vertex_input) + sizeof(key.static_params)) {
+			return false;
+		}
+		const auto* state = stored.state.data();
+		std::memcpy(&key.rendering, state, sizeof(key.rendering));
+		std::memcpy(&key.vertex_input, state + sizeof(key.rendering), sizeof(key.vertex_input));
+		std::memcpy(&key.static_params, state + sizeof(key.rendering) + sizeof(key.vertex_input),
+		            sizeof(key.static_params));
+		for (uint32_t i = 0; i < stored.vertex_stages; i++) {
+			if (stored.input_infos[i].size() != sizeof(ShaderVertexInputInfo)) {
+				return false;
+			}
+			std::memcpy(&vertex_info[i], stored.input_infos[i].data(), sizeof(vertex_info[i]));
+			vertex_info[i].stage = {.program = &programs[i]->program, .resources = &g_no_resources};
+			handles.vertex[i]    = programs[i]->handle;
+			key.vertex_shader_ids[i] = programs[i]->handle.id;
+		}
+		if (stored.pixel) {
+			const auto& bytes = stored.input_infos[stored.vertex_stages];
+			if (bytes.size() != sizeof(pixel_info)) {
+				return false;
+			}
+			std::memcpy(&pixel_info, bytes.data(), sizeof(pixel_info));
+			const auto* program = programs[stored.vertex_stages];
+			pixel_info.stage    = {.program = &program->program, .resources = &g_no_resources};
+			handles.pixel       = program->handle;
+			key.ps_shader_id    = program->handle.id;
+		}
+		{
+			std::lock_guard lock(m_precreated_mutex);
+			if (m_precreated_graphics.contains(key)) {
+				return true;
+			}
+		}
+		CreatePipelineInternal(m_graphics, *pipeline, key.rendering, key.vertex_input,
+		                       std::span {vertex_info.data(), stored.vertex_stages},
+		                       stored.pixel ? &pixel_info : nullptr, handles, key.static_params,
+		                       m_driver_cache);
+		m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
+		std::lock_guard lock(m_precreated_mutex);
+		m_precreated_graphics.try_emplace(key, std::move(pipeline));
+		return true;
+	} catch (const Common::SoftExitError&) {
+		// The pipeline is created again when a draw needs it, and fails there if it still does.
+		return false;
+	}
+}
+
+void PipelineCache::RecordGraphicsPipeline(const GraphicsPipelineKey&             key,
+                                           std::span<const ShaderVertexInputInfo> vertex_info,
+                                           const ShaderPixelInputInfo*            ps_input_info) {
+	if (m_stored == nullptr) {
+		return;
+	}
+	StoredPipeline stored;
+	stored.vertex_stages = static_cast<uint8_t>(vertex_info.size());
+	stored.pixel         = ps_input_info != nullptr;
+	stored.programs.resize(vertex_info.size() + (stored.pixel ? 1u : 0u));
+	{
+		const ProgramLockGuard lock(m_program_lock);
+		for (size_t i = 0; i < vertex_info.size(); i++) {
+			if (!m_program_cache->DescribeProgram(key.vertex_shader_ids[i], stored.programs[i])) {
+				return;
+			}
+		}
+		if (stored.pixel &&
+		    !m_program_cache->DescribeProgram(key.ps_shader_id, stored.programs.back())) {
+			return;
+		}
+	}
+	const auto add_input = [&](const auto& input_info) {
+		auto info  = input_info;
+		info.stage = {};
+		auto& out  = stored.input_infos.emplace_back(sizeof(info));
+		std::memcpy(out.data(), &info, sizeof(info));
+	};
+	for (const auto& info: vertex_info) {
+		add_input(info);
+	}
+	if (stored.pixel) {
+		add_input(*ps_input_info);
+	}
+	StoreFile::Put(stored.state, key.rendering);
+	StoreFile::Put(stored.state, key.vertex_input);
+	StoreFile::Put(stored.state, key.static_params);
+	m_stored->store.Append(stored);
+}
+
+void PipelineCache::RecordComputePipeline(const ShaderComputeInputInfo& input_info,
+                                          uint64_t                      program_id) {
+	if (m_stored == nullptr) {
+		return;
+	}
+	StoredPipeline stored;
+	stored.compute = true;
+	stored.programs.resize(1);
+	{
+		const ProgramLockGuard lock(m_program_lock);
+		if (!m_program_cache->DescribeProgram(program_id, stored.programs[0])) {
+			return;
+		}
+	}
+	auto info  = input_info;
+	info.stage = {};
+	auto& out  = stored.input_infos.emplace_back(sizeof(info));
+	std::memcpy(out.data(), &info, sizeof(info));
+	m_stored->store.Append(stored);
+}
+
 PipelineCache::~PipelineCache() {
+	m_precreate_threads.clear();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -980,6 +1317,8 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	destroy(m_precreated_graphics);
+	destroy(m_precreated_compute);
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	}
@@ -1150,10 +1489,6 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
     ProgramResolution* ahead) {
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
-	if (ahead != nullptr && tess_active) {
-		ahead->reads.Fail();
-		return {};
-	}
 	// Ahead of execution, the vertex fetch tables are read through the resolution's log.
 	const ShaderGuestReaderScope reader(ahead != nullptr ? ReadAheadShaderState : nullptr,
 	                                    ahead != nullptr ? &ahead->reads : nullptr);
@@ -1246,8 +1581,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			result.pixel =
 			    m_program_cache->GetAhead(pixel_params, pixel_info, push_data_cursor, *ahead);
 		}
-		if (!ahead->reads.Failed()) {
-			result.vertex[0] = m_program_cache->GetAhead(vertex_params[0], vertex_info[0],
+		for (uint32_t i = 0; i < (tess_active ? 3u : 1u) && !ahead->reads.Failed(); i++) {
+			result.vertex[i] = m_program_cache->GetAhead(vertex_params[i], vertex_info[i],
 			                                             push_data_cursor, *ahead);
 		}
 		return ahead->reads.Failed() ? GraphicsPrograms {} : result;
@@ -1263,13 +1598,20 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
-                                               ShaderComputeInputInfo&      input_info) {
+                                               ShaderComputeInputInfo&      input_info,
+                                               ProgramResolution*           ahead) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
-	uint32_t          push_data_cursor = 0;
+	// Indirect thread counts reach the shader through its shader data buffer.
+	uint32_t          push_data_cursor = input_info.dispatch_indirect_threads
+	                                         ? ShaderRecompiler::IR::PushData::NoStart
+	                                         : 0u;
 	const ProgramLockGuard lock(m_program_lock);
+	if (ahead != nullptr) {
+		return m_program_cache->GetAhead(params, input_info, push_data_cursor, *ahead);
+	}
 	return m_program_cache->Get(params, input_info, push_data_cursor);
 }
 
@@ -1461,6 +1803,16 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		m_last_graphics_pipeline = iter->second.get();
 		return *iter->second;
 	}
+	if (m_stored != nullptr) {
+		std::unique_lock lock(m_precreated_mutex);
+		if (auto node = m_precreated_graphics.extract(key); !node.empty()) {
+			lock.unlock();
+			const auto result        = m_graphics_pipelines.insert(std::move(node));
+			m_last_graphics_key      = key;
+			m_last_graphics_pipeline = result.position->second.get();
+			return *result.position->second;
+		}
+	}
 
 	if (graphics_debug_dump_enabled()) {
 		ShaderDbgDumpInputInfo(vs_input_info);
@@ -1482,6 +1834,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
+	RecordGraphicsPipeline(key, vertex_info, ps_input_info);
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
 
@@ -1499,6 +1852,13 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	    iter != m_compute_pipelines.end()) {
 		return *iter->second;
 	}
+	if (m_stored != nullptr) {
+		std::unique_lock lock(m_precreated_mutex);
+		if (auto node = m_precreated_compute.extract(compute_program.id); !node.empty()) {
+			lock.unlock();
+			return *m_compute_pipelines.insert(std::move(node)).position->second;
+		}
+	}
 
 	if (graphics_debug_dump_enabled()) {
 		ShaderDbgDumpInputInfo(input_info);
@@ -1511,6 +1871,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
+	RecordComputePipeline(input_info, compute_program.id);
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
 

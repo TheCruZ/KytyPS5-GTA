@@ -89,6 +89,14 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// Execution thread: a small command-processor write (WRITE_DATA) to GPU-owned pages without
+	// reading the GPU's work back first: the bytes go to the backing store and, in stream order,
+	// to the cached buffer. False when the caller must take the faulting path.
+	[[nodiscard]] bool WriteAroundGpuWrites(uint64_t vaddr, const void* data, uint64_t size);
+	// Lock-free: false when no page of the tracking regions the range touches may be GPU dirty.
+	[[nodiscard]] bool MayBeGpuModified(uint64_t vaddr, uint64_t size) const {
+		return m_memory_tracker.MayBeGpuModified(vaddr, size);
+	}
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               PrepareFaultBuffer() { m_fault_manager.PrepareFaultBuffer(); }
@@ -143,6 +151,11 @@ public:
 		return epoch;
 	}
 	void               RunGarbageCollector();
+	// Execution thread, after each operation: the GPU writes the operation recorded get the
+	// tick of the command buffer that holds them (see DownloadOnReadbackQueue()).
+	void CommitWriteTicks();
+	// The operation being recorded accesses memory through device addresses.
+	void NoteDeviceAddressUse() noexcept { m_device_address_pending = true; }
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -181,6 +194,31 @@ private:
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// Reads GPU-written bytes whose last writes were already submitted: a copy on the readback
+	// queue waits for those submissions only, not for the work queued after them.
+	[[nodiscard]] bool DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::BufferCopy> copies,
+	                                           uint64_t total_size);
+	void NoteWrite(uint64_t vaddr, uint64_t size) {
+		// Draws bind the same written ranges again and again.
+		if (m_pending_writes.empty() || m_pending_writes.back() != std::pair {vaddr, size}) {
+			m_pending_writes.emplace_back(vaddr, size);
+		}
+	}
+
+	// The tick of the command buffer that last wrote each guest range a cached buffer holds.
+	class WriteTicks {
+	public:
+		void Assign(uint64_t begin, uint64_t end, uint64_t tick);
+		// The latest tick over [begin, end); UINT64_MAX when part of it has no tick.
+		[[nodiscard]] uint64_t Latest(uint64_t begin, uint64_t end) const;
+
+	private:
+		struct Range {
+			uint64_t end  = 0;
+			uint64_t tick = 0;
+		};
+		std::map<uint64_t, Range> m_ranges;
+	};
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -196,6 +234,17 @@ private:
 	bool                                              m_record_released = false;
 	MemoryTracker                                     m_memory_tracker;
 	uint64_t                                           m_gpu_write_generation = 0;
+	WriteTicks                                        m_write_ticks;
+	std::vector<std::pair<uint64_t, uint64_t>>        m_pending_writes;
+	uint64_t                                          m_device_address_tick    = 0;
+	bool                                              m_device_address_pending = false;
+	struct ReadbackQueue {
+		vk::CommandPool         pool    = nullptr;
+		vk::CommandBuffer       command = nullptr;
+		vk::Fence               fence   = nullptr;
+		std::unique_ptr<Buffer> staging;
+	};
+	ReadbackQueue m_readback;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;

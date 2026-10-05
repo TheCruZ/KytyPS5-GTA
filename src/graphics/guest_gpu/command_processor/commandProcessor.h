@@ -203,6 +203,7 @@ private:
 	void ExecuteDrawIndex(const GpuOperation& operation, DrawIndexArgs args);
 	void ExecuteDrawAuto(const GpuOperation& operation, DrawAutoArgs args);
 	void ExecuteDrawIndirect(const GpuOperation& operation);
+	bool TryExecuteDrawIndirectOnGpu(const GpuOperation& operation);
 	void ExecuteDispatchDirect(const GpuOperation& operation, uint32_t thread_group_x,
 	                           uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
 	void ExecuteDispatchIndirect(const GpuOperation& operation);
@@ -289,6 +290,8 @@ private:
 	uint32_t m_indirect_instances         = 0;
 	uint64_t m_indirect_instances_sequence = 0;
 	bool     m_has_indirect_instances      = false;
+	// When the GPU executed that draw: its arguments, read only if a later draw needs the count.
+	DrawIndirectSource m_gpu_indirect_instances {};
 	// Keeps later allocations off the last line of the execution-side state.
 	alignas(64) uint8_t m_end_padding = 0;
 };

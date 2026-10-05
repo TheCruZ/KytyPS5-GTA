@@ -413,11 +413,29 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priority = 1.0f;
-	vk::DeviceQueueCreateInfo queue_create_info {};
+	const float queue_priority = 1.0f;
+	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {};
+	auto& queue_create_info            = queue_create_infos[0];
 	queue_create_info.queueFamilyIndex = queue_family;
 	queue_create_info.queueCount       = 1;
 	queue_create_info.pQueuePriorities = &queue_priority;
+	// A transfer-only family serves buffer readbacks (GraphicContext::readback_queue).
+	uint32_t   queue_create_count = 1;
+	const auto families           = physical_device.getQueueFamilyProperties();
+	graphics.readback_family      = static_cast<uint32_t>(-1);
+	for (uint32_t family = 0; family < families.size(); family++) {
+		const auto flags = families[family].queueFlags;
+		if (family != queue_family && families[family].queueCount != 0 &&
+		    (flags & vk::QueueFlagBits::eTransfer) &&
+		    !(flags & (vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute))) {
+			graphics.readback_family = family;
+			auto& readback           = queue_create_infos[queue_create_count++];
+			readback.queueFamilyIndex = family;
+			readback.queueCount       = 1;
+			readback.pQueuePriorities = &queue_priority;
+			break;
+		}
+	}
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -594,6 +612,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	features12.hostQueryReset             = supported_features12.hostQueryReset;
 	graphics.occlusion_query_precise      = device_features.occlusionQueryPrecise == VK_TRUE;
 	graphics.host_query_reset_enabled     = features12.hostQueryReset == VK_TRUE;
+	device_features.multiDrawIndirect         = supported_features2.features.multiDrawIndirect;
+	device_features.drawIndirectFirstInstance = supported_features2.features.drawIndirectFirstInstance;
+	features12.drawIndirectCount              = supported_features12.drawIndirectCount;
+	graphics.indirect_draws_enabled = device_features.multiDrawIndirect == VK_TRUE &&
+	                                  device_features.drawIndirectFirstInstance == VK_TRUE &&
+	                                  features12.drawIndirectCount == VK_TRUE;
 	device_features.shaderInt64 = VK_TRUE;
 	device_features.shaderFloat64 =
 	    supported_features2.features.shaderFloat64 &&
@@ -654,8 +678,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.sparseImageInt64Atomics = VK_FALSE;
 		create_info.pNext = &image_atomic_int64;
 	}
-	create_info.pQueueCreateInfos       = &queue_create_info;
-	create_info.queueCreateInfoCount    = 1;
+	create_info.pQueueCreateInfos       = queue_create_infos.data();
+	create_info.queueCreateInfoCount    = queue_create_count;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
@@ -1041,6 +1065,9 @@ void WindowContext::CreateVulkan() {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	if (graphic_ctx.readback_family != static_cast<uint32_t>(-1)) {
+		graphic_ctx.device.getQueue(graphic_ctx.readback_family, 0, &graphic_ctx.readback_queue);
+	}
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");

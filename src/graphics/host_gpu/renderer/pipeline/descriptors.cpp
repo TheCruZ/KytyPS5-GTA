@@ -921,7 +921,20 @@ RenderExecutor::FindTableResolution(const ShaderRecompiler::IR::ImageResource& r
 	return *found;
 }
 
-const TextureBinding&
+// What ResolveTexture checks of the backing for a table candidate (a GPU-modified range needs no
+// backing).
+bool RenderExecutor::TableElementBackingReadable(const TableElementResolution& element) {
+	const auto& data = element.range;
+	const bool  data_readable =
+	    m_context.GetTextureCache().IsRegionGpuModified(data.address, data.size) ||
+	    Libs::LibKernel::Memory::IsBackingReadable(data.address, data.size);
+	return data_readable &&
+	       (element.metadata_range.Empty() ||
+	        Libs::LibKernel::Memory::IsBackingReadable(element.metadata_range.address,
+	                                                   element.metadata_range.size));
+}
+
+RenderExecutor::TableElementResolution&
 RenderExecutor::ResolveTableElement(TableResolution&                             table,
                                     const ShaderRecompiler::IR::DescriptorValue& value) {
 	auto&      texture_cache = m_context.GetTextureCache();
@@ -932,7 +945,11 @@ RenderExecutor::ResolveTableElement(TableResolution&                            
 	if (!inserted && !element.volatile_dcc) {
 		if (element.permanent ||
 		    (element.checked_epoch == set_epoch && element.backing_epoch == backing_epoch)) {
-			return element.texture;
+			return element;
+		}
+		if (element.backing_epoch != backing_epoch && element.backing_checkable &&
+		    TableElementBackingReadable(element) == element.backing_readable) {
+			element.backing_epoch = backing_epoch;
 		}
 		const auto image_epoch =
 		    element.range.Valid()
@@ -940,7 +957,7 @@ RenderExecutor::ResolveTableElement(TableResolution&                            
 		        : 0;
 		if (image_epoch <= element.image_epoch && element.backing_epoch == backing_epoch) {
 			element.checked_epoch = set_epoch;
-			return element.texture;
+			return element;
 		}
 	}
 	// Record the epoch before resolving: an image the lookup itself inserts makes the next use
@@ -955,6 +972,11 @@ RenderExecutor::ResolveTableElement(TableResolution&                            
 	if (!data.Empty()) {
 		element.range        = data;
 		element.volatile_dcc = element.texture.desc.info.metadata.kind == ImageMetadataKind::Dcc;
+		if (element.texture.desc.info.metadata.kind != ImageMetadataKind::None) {
+			element.metadata_range = element.texture.desc.info.metadata.range;
+		}
+		element.backing_checkable = data.Valid();
+		element.backing_readable  = element.backing_checkable && TableElementBackingReadable(element);
 	} else if (!ShaderRecompiler::IR::ImageTableSlotCompatible(table.root, value)) {
 		element.permanent = true;
 	} else {
@@ -962,7 +984,7 @@ RenderExecutor::ResolveTableElement(TableResolution&                            
 		// backing alone (no range examined: only a backing change can alter the outcome).
 		element.range = examined;
 	}
-	return element.texture;
+	return element;
 }
 
 vk::Sampler RenderExecutor::NativeSampler(const ShaderRecompiler::IR::CompiledShaderInfo& program,
@@ -1087,25 +1109,34 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.table_images.clear();
 	prepared.table_sources.clear();
 	prepared.table_roots.clear();
+	prepared.table_slots.clear();
+	const auto stamp = ++m_table_prepare_stamp;
 	for (const auto& binding: program.bindings.descriptors) {
 		for (const auto& range: binding.tables) {
 			const auto& root  = program.info.images.at(range.root);
 			const auto& table = snapshot.image_tables.at(range.table);
 			const ShaderRecompiler::IR::DescriptorValue null_value {.dword_count = 8u};
-			auto&       resolution   = FindTableResolution(root);
-			const auto& null_texture = ResolveTableElement(resolution, null_value);
-			BindImage(null_texture.image_id, false);
-			for (uint32_t slot = 0; slot < range.capacity; slot++) {
-				const bool real = slot != 0u && slot < table.slots.size();
-				if (real) {
-					const auto& texture = ResolveTableElement(resolution, table.slots[slot]);
-					BindImage(texture.image_id, false);
-					prepared.table_images.push_back(texture);
-				} else {
-					prepared.table_images.push_back(null_texture);
+			auto& resolution = FindTableResolution(root);
+			// Bind each distinct element once, however many slots name it.
+			const auto add = [&](TableElementResolution&                      element,
+			                     const ShaderRecompiler::IR::DescriptorValue& value) {
+				if (element.prepared_stamp != stamp) {
+					element.prepared_stamp = stamp;
+					element.prepared_index = static_cast<uint32_t>(prepared.table_images.size());
+					BindImage(element.texture.image_id, false);
+					prepared.table_images.push_back(element.texture);
+					prepared.table_sources.push_back(value);
+					prepared.table_roots.push_back(range.root);
 				}
-				prepared.table_sources.push_back(real ? table.slots[slot] : null_value);
-				prepared.table_roots.push_back(range.root);
+				prepared.table_slots.push_back(element.prepared_index);
+			};
+			auto& null_element = ResolveTableElement(resolution, null_value);
+			for (uint32_t slot = 0; slot < range.capacity; slot++) {
+				if (slot != 0u && slot < table.slots.size()) {
+					add(ResolveTableElement(resolution, table.slots[slot]), table.slots[slot]);
+				} else {
+					add(null_element, null_value);
+				}
 			}
 		}
 	}
@@ -1291,16 +1322,18 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
-	bool uses_dma = false;
+	bool uses_dma  = false;
+	bool dma_write = false;
 	for (auto* stage: stages) {
 		FindBuffers(*stage);
 		if (stage->runtime->program->info.uses_dma) {
 			m_context.CacheDmaBases(*stage->runtime);
 			uses_dma = true;
+			dma_write |= stage->runtime->program->has_address_writes;
 		}
 	}
 	if (uses_dma) {
-		m_context.PrepareBda();
+		m_context.PrepareBda(dma_write);
 	}
 	for (auto* stage: stages) {
 		RebindImages(*stage);
@@ -1361,6 +1394,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
 		         shader_stage != vk::ShaderStageFlagBits::eCompute));
 	}
+	// The image and attachment ranges the draw writes, collected once for the scalar read checks
+	// below (most bound images are only sampled).
+	bool written_images_collected = false;
 	for (const auto* reader: prepared_bindings) {
 		const auto& reads = reader->runtime->resources->specialization_reads;
 		if (reads.empty()) continue;
@@ -1369,17 +1405,26 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
 			}
 		}
-		for (const auto [address, size]: reads) {
+		if (!written_images_collected) {
+			written_images_collected = true;
+			m_written_image_ranges.clear();
 			for (const auto id: m_bound_images) {
 				const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
 				if (image == nullptr ||
 				    (!image->binding.shader_write && !image->binding.is_target)) continue;
 				for (const auto written: {image->info.data, image->info.stencil,
 				                          image->info.metadata.range}) {
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap an image or attachment write\n");
+					if (written.size != 0) {
+						m_written_image_ranges.emplace_back(written.address, written.size);
 					}
+				}
+			}
+		}
+		for (size_t read = 0; read < reads.size(); ++read) {
+			const auto [address, size] = reads[read];
+			for (const auto& [written_address, written_size]: m_written_image_ranges) {
+				if (ImageRangeOverlaps(address, size, written_address, written_size)) {
+					EXIT("scalar resource reads overlap an image or attachment write\n");
 				}
 			}
 			for (const auto* writer: prepared_bindings) {
@@ -1473,6 +1518,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 
 		m_image_occurrences.assign(descriptors.images.size(), 0);
 		size_t table_element = 0;
+		m_table_image_infos.clear();
 		for (const auto& binding: program.bindings.descriptors) {
 			vk::WriteDescriptorSet write {};
 			write.dstBinding     = ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind);
@@ -1486,10 +1532,17 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					m_descriptor_images.push_back(MakeImageInfo(
 					    descriptors.images.at(resource), m_image_occurrences.at(resource)++));
 				}
+				if (!binding.tables.empty() && m_table_image_infos.empty()) {
+					m_table_image_infos.reserve(descriptors.table_images.size());
+					for (const auto& texture: descriptors.table_images) {
+						m_table_image_infos.push_back(MakeImageInfo(texture));
+					}
+				}
 				for (const auto& range: binding.tables) {
+					EXIT_IF(table_element + range.capacity > descriptors.table_slots.size());
 					for (uint32_t slot = 0; slot < range.capacity; slot++) {
 						m_descriptor_images.push_back(
-						    MakeImageInfo(descriptors.table_images.at(table_element++)));
+						    m_table_image_infos[descriptors.table_slots[table_element++]]);
 					}
 				}
 			} else {
