@@ -1526,8 +1526,11 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 				memory.sampler = sampler_plan.mapping[memory.sampler][type];
 				EXIT_IF(memory.sampler == UINT32_MAX);
 			}
-			EXIT_IF((image.indirect_root == memory.resource || image.table_capacity != 0u) &&
-			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw);
+			EXIT_IF((image.indirect_root == memory.resource &&
+			         inst.GetOpcode() != ValueOpcode::ImageSampleRaw) ||
+			        (image.table_capacity != 0u &&
+			         inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
+			         inst.GetOpcode() != ValueOpcode::ImageQueryDimensions));
 		}
 	}
 	for (auto& memory: memory_info) {
