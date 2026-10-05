@@ -52,6 +52,21 @@ constexpr size_t ResolvedQueueSize = 256;
 // How long a command processor whose queues all wait spins before it retries them.
 constexpr auto BlockedRetryInterval = std::chrono::microseconds(20);
 
+struct DrawIndirectArgs {
+	uint32_t vertex_count_per_instance;
+	uint32_t instance_count;
+	uint32_t start_vertex_location;
+	uint32_t start_instance_location;
+};
+
+struct DrawIndexedIndirectArgs {
+	uint32_t index_count_per_instance;
+	uint32_t instance_count;
+	uint32_t start_index_location;
+	uint32_t base_vertex_location;
+	uint32_t start_instance_location;
+};
+
 // Reads memory other threads may write, with the widest aligned accesses.
 static void CopyFromGuest(void* destination, const volatile void* source, size_t size) {
 	auto*      out     = static_cast<uint8_t*>(destination);
@@ -404,11 +419,26 @@ void GuestGpu::ResolveThread() {
 			}
 		}
 		if (operation->kind == GpuOperationKind::DrawIndex ||
-		    operation->kind == GpuOperationKind::DrawAuto) {
+		    operation->kind == GpuOperationKind::DrawAuto ||
+		    operation->kind == GpuOperationKind::DrawIndirect) {
 			// The register snapshots stay valid until the operation executed.
 			operation->resolved =
 			    executor.ResolveDrawAhead(*operation->state.context, *operation->state.user_config,
 			                              *operation->state.shaders);
+		} else if (operation->kind == GpuOperationKind::DispatchDirect) {
+			const uint32_t groups[] = {operation->dispatch.thread_group_x,
+			                           operation->dispatch.thread_group_y,
+			                           operation->dispatch.thread_group_z};
+			operation->resolved = executor.ResolveDispatchAhead(
+			    *operation->state.context, *operation->state.shaders, groups,
+			    operation->dispatch.mode, operation->processor->IsAsyncComputeQueue());
+		} else if (operation->kind == GpuOperationKind::DispatchIndirect) {
+			// The program does not depend on the GPU-written arguments, only on the registers
+			// and the guest memory its resources read.
+			operation->resolved = executor.ResolveIndirectDispatchAhead(
+			    *operation->state.context, *operation->state.shaders, operation->dispatch.mode,
+			    operation->dispatch.args_addr,
+			    operation->processor->IsAsyncComputeQueue());
 		}
 		m_resolved.Push(std::move(*operation));
 	}
@@ -581,6 +611,14 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 			copies->Drain();
 		}
 	}
+	struct CommitWriteTicks {
+		RenderContext& renderer;
+		~CommitWriteTicks() {
+			if (renderer.GetBufferCache().CommitWriteTicks()) {
+				renderer.GetCommandScheduler().Flush();
+			}
+		}
+	} commit_write_ticks {m_renderer};
 	switch (operation.kind) {
 		case GpuOperationKind::DrawIndex:
 		case GpuOperationKind::DrawAuto: {
@@ -596,14 +634,35 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 			}
 			break;
 		}
-		case GpuOperationKind::DrawIndirect: ExecuteDrawIndirect(operation); break;
+		case GpuOperationKind::DrawIndirect:
+			// The resolution serves the first draw of the packet (its programs do not depend on
+			// the arguments); later draws resolve their own.
+			executor.UseResolvedDraw(operation.resolved);
+			ExecuteDrawIndirect(operation);
+			executor.UseResolvedDraw(nullptr);
+			if (operation.resolved != nullptr) {
+				RenderExecutor::ReleaseResolvedDraw(operation.resolved);
+			}
+			break;
 		case GpuOperationKind::DispatchDirect: {
 			const auto& dispatch = operation.dispatch;
+			executor.UseResolvedDraw(operation.resolved);
 			ExecuteDispatchDirect(operation, dispatch.thread_group_x, dispatch.thread_group_y,
 			                      dispatch.thread_group_z, dispatch.mode);
+			executor.UseResolvedDraw(nullptr);
+			if (operation.resolved != nullptr) {
+				RenderExecutor::ReleaseResolvedDraw(operation.resolved);
+			}
 			break;
 		}
-		case GpuOperationKind::DispatchIndirect: ExecuteDispatchIndirect(operation); break;
+		case GpuOperationKind::DispatchIndirect:
+			executor.UseResolvedDraw(operation.resolved);
+			ExecuteDispatchIndirect(operation);
+			executor.UseResolvedDraw(nullptr);
+			if (operation.resolved != nullptr) {
+				RenderExecutor::ReleaseResolvedDraw(operation.resolved);
+			}
+			break;
 		case GpuOperationKind::Callback:
 			if (operation.callback) {
 				operation.callback();
@@ -764,7 +823,12 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	// Completion labels can be reused immediately; memcpy may write a destination twice, so
 	// publish each word exactly once.
 	const auto sequence = EmitCallback([this, dst, src, dw_num, write_one_address] {
-		m_renderer.PrepareGpuWrite(dst, uint64_t {write_one_address ? 1u : dw_num} * sizeof(uint32_t));
+		const auto* data  = write_one_address ? src + dw_num - 1 : src;
+		const auto  bytes = uint64_t {write_one_address ? 1u : dw_num} * sizeof(uint32_t);
+		if (m_renderer.WriteAroundGpuWrites(dst, data, bytes)) {
+			return;
+		}
+		m_renderer.PrepareGpuWrite(dst, bytes);
 		auto* output = static_cast<volatile uint32_t*>(dst);
 		for (uint32_t i = 0; i < dw_num; i++) {
 			*output = src[i];
@@ -1308,17 +1372,26 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 	m_num_instances.sequence++;
 }
 
-uint32_t CommandProcessor::ResolveNumInstances(const GpuOperation& operation) {
+uint32_t CommandProcessor::ResolveNumInstances(const GpuOperation& operation) const {
 	// An indirect draw executed after the last NUM_INSTANCES packet of the operation's stream
 	// position set the persistent count.
 	if (m_has_indirect_instances &&
 	    m_indirect_instances_sequence == operation.num_instances.sequence) {
-		if (m_indirect_instances_addr != 0) {
-			// A draw the GPU read its records for: the count is read when a later draw inherits it.
-			m_indirect_instances      = *reinterpret_cast<const uint32_t*>(m_indirect_instances_addr);
-			m_indirect_instances_addr = 0;
+		const auto& gpu = m_gpu_indirect_instances;
+		if (gpu.args_addr == 0) {
+			return m_indirect_instances;
 		}
-		return m_indirect_instances;
+		// The GPU read the arguments: read the last draw's instance count now (the second dword
+		// of both argument layouts), waiting for the GPU work that wrote it.
+		uint32_t count = gpu.max_count;
+		if (gpu.count_addr != 0) {
+			const uint32_t written = *reinterpret_cast<const volatile uint32_t*>(gpu.count_addr);
+			count                  = std::min(written, count);
+		}
+		if (count != 0) {
+			return *reinterpret_cast<const volatile uint32_t*>(
+			    gpu.args_addr + uint64_t {count - 1} * gpu.stride + sizeof(uint32_t));
+		}
 	}
 	return operation.num_instances.value;
 }
@@ -1407,31 +1480,24 @@ void CommandProcessor::ExecuteDrawIndex(const GpuOperation& operation, DrawIndex
 	m_renderer.GetRenderExecutor().DrawIndex(operation.submit_id, CurrentBuffer(), args);
 }
 
-const void* CommandProcessor::IndexAddress(uint64_t base, uint32_t type_and_size,
-                                           uint32_t first_index) {
+void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count) {
 	uint64_t index_size = 0;
-	switch (type_and_size) {
+	switch (m_index_type_and_size) {
 		case 0: index_size = 2; break;
 		case 1: index_size = 4; break;
 		case 2: index_size = 1; break;
-		default: EXIT("unknown index_type_and_size: %u
-", type_and_size);
+		default: EXIT("unknown index_type_and_size: %u\n", m_index_type_and_size);
 	}
-	return reinterpret_cast<const void*>(base + first_index * index_size);
-}
 
-const void* CommandProcessor::IndexAddress(uint32_t first_index) const {
-	return IndexAddress(m_index_base_addr, m_index_type_and_size, first_index);
-}
+	auto* index_addr = reinterpret_cast<const void*>(
+	    m_index_base_addr + static_cast<uint64_t>(index_offset) * index_size);
 
-void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count) {
-	DrawIndex({.index_count = index_count, .index_addr = IndexAddress(index_offset)});
+	DrawIndex({.index_count = index_count, .index_addr = index_addr});
 }
 
 void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
                                     uint32_t draw_initiator, bool indexed) {
-	const auto args_size =
-	    indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand);
+	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 	DrawIndirectMulti(data_offset, 1, nullptr, args_size, registers, draw_initiator, indexed);
 }
 
@@ -1441,10 +1507,6 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
                                          uint32_t draw_initiator, bool indexed) {
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
-	// The guest records match Vulkan's indirect commands byte for byte.
-	EXIT_NOT_IMPLEMENTED((stride_in_bytes & 3u) != 0 ||
-	                     stride_in_bytes < (indexed ? sizeof(vk::DrawIndexedIndirectCommand)
-	                                                : sizeof(vk::DrawIndirectCommand)));
 
 	auto operation          = MakeOperation(GpuOperationKind::DrawIndirect);
 	operation.draw_indirect = {.args_base         = m_draw_indirect_args_base_addr,
@@ -1462,35 +1524,43 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	Emit(std::move(operation));
 }
 
-static bool PatchUserSgpr(HW::Shader& shaders, uint32_t location, uint32_t value) {
-	const auto in  = [location](uint32_t base) { return location >= base && location < base + 32u; };
-	const auto set = [value](const HW::UserSgprInfo& sgprs, uint32_t id, auto&& setter) {
-		if (id < sgprs.count && sgprs.value[id] == value) {
-			return false;
+// The user SGPR at an SH register offset of a draw-indirect packet, or false when the offset is
+// not a graphics user SGPR.
+static bool FindUserSgpr(const HW::Shader& shaders, uint32_t location,
+                         const HW::UserSgprInfo** sgprs, uint32_t* id) {
+	const std::pair<uint32_t, const HW::UserSgprInfo*> banks[] = {
+	    {Pm4::SPI_SHADER_USER_DATA_GS_0, &shaders.GetVs().gs_user_sgpr},
+	    {Pm4::SPI_SHADER_USER_DATA_HS_0, &shaders.GetVs().hs_user_sgpr},
+	    {Pm4::SPI_SHADER_USER_DATA_PS_0, &shaders.GetPs().ps_user_sgpr}};
+	for (const auto& [base, bank]: banks) {
+		if (location >= base && location < base + HW::UserSgprInfo::SGPRS_MAX) {
+			*sgprs = bank;
+			*id    = location - base;
+			return true;
 		}
-		setter(id, value, sgprs.type[id]);
-		return true;
-	};
-	if (in(Pm4::SPI_SHADER_USER_DATA_GS_0)) {
-		return set(shaders.GetVs().gs_user_sgpr, location - Pm4::SPI_SHADER_USER_DATA_GS_0,
-		           [&](uint32_t id, uint32_t v, HW::UserSgprType t) {
-			           shaders.SetGsUserSgpr(id, v, t);
-		           });
 	}
-	if (in(Pm4::SPI_SHADER_USER_DATA_HS_0)) {
-		return set(shaders.GetVs().hs_user_sgpr, location - Pm4::SPI_SHADER_USER_DATA_HS_0,
-		           [&](uint32_t id, uint32_t v, HW::UserSgprType t) {
-			           shaders.SetHsUserSgpr(id, v, t);
-		           });
-	}
-	if (in(Pm4::SPI_SHADER_USER_DATA_PS_0)) {
-		return set(shaders.GetPs().ps_user_sgpr, location - Pm4::SPI_SHADER_USER_DATA_PS_0,
-		           [&](uint32_t id, uint32_t v, HW::UserSgprType t) {
-			           shaders.SetPsUserSgpr(id, v, t);
-		           });
-	}
-	EXIT("unsupported indirect draw offset register 0x%" PRIx32 "\n", location);
 	return false;
+}
+
+// Returns whether the value changed.
+static bool PatchUserSgpr(HW::Shader& shaders, uint32_t location, uint32_t value) {
+	const HW::UserSgprInfo* sgprs = nullptr;
+	uint32_t                id    = 0;
+	if (!FindUserSgpr(shaders, location, &sgprs, &id)) {
+		EXIT("unsupported indirect draw offset register 0x%" PRIx32 "\n", location);
+	}
+	if (id < sgprs->count && sgprs->value[id] == value) {
+		return false;
+	}
+	const auto type = sgprs->type[id];
+	if (sgprs == &shaders.GetPs().ps_user_sgpr) {
+		shaders.SetPsUserSgpr(id, value, type);
+	} else if (sgprs == &shaders.GetVs().hs_user_sgpr) {
+		shaders.SetHsUserSgpr(id, value, type);
+	} else {
+		shaders.SetGsUserSgpr(id, value, type);
+	}
+	return true;
 }
 
 // Writes the offsets of one draw of an indirect packet to the user SGPRs the packet names, as
@@ -1538,10 +1608,87 @@ bool CommandProcessor::PatchIndirectDrawOffsets(const GpuOperation& operation,
 	return true;
 }
 
+// Leaves the arguments of an indirect draw to the host GPU when the draw allows it: GPU work
+// (culling shaders) writes them, and reading them here would wait for all the GPU work recorded
+// so far. False when the draw must read them on the CPU.
+bool CommandProcessor::TryExecuteDrawIndirectOnGpu(const GpuOperation& operation) {
+	const auto& indirect  = operation.draw_indirect;
+	const auto  args_size = static_cast<uint32_t>(
+        indirect.indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs));
+	const auto  args_addr = indirect.args_base + indirect.data_offset;
+	const auto  stride    = indirect.multi ? indirect.stride : args_size;
+	const auto  count     = reinterpret_cast<uint64_t>(indirect.count_addr);
+	if ((args_addr & 3u) != 0 || (count & 3u) != 0 || (stride & 3u) != 0 || stride < args_size) {
+		return false;
+	}
+	uint64_t index_bytes = 0;
+	if (indirect.indexed) {
+		switch (indirect.index_type) {
+			case 0: index_bytes = uint64_t {indirect.index_buffer_size} * 2u; break;
+			case 1: index_bytes = uint64_t {indirect.index_buffer_size} * 4u; break;
+			default: return false;
+		}
+	}
+	if (!m_renderer.GetRenderExecutor().CanDrawIndirectOnGpu(CurrentBuffer(), indirect.indexed,
+	                                                         indirect.index_type, index_bytes)) {
+		return false;
+	}
+	// The host GPU adds the offsets it reads to the vertex and instance indices and leaves the
+	// user SGPRs the packet names as they are. The draw reads the offsets the CP would write there
+	// only if those SGPRs hold zero (a native fetch adds them to the index the host already
+	// offset), and never sees the first index: such draws read their arguments on the CPU.
+	// Without a pipeline the CP writes the live registers, which keep the offsets for later
+	// packets as on the console.
+	const auto& registers = indirect.registers;
+	if (registers.index_offset != Pm4::SH_NOP ||
+	    (m_pipeline == nullptr &&
+	     (registers.vertex_offset != Pm4::SH_NOP || registers.instance_offset != Pm4::SH_NOP))) {
+		return false;
+	}
+	for (const auto location: {registers.vertex_offset, registers.instance_offset}) {
+		const HW::UserSgprInfo* sgprs = nullptr;
+		uint32_t                id    = 0;
+		if (location != Pm4::SH_NOP &&
+		    (!FindUserSgpr(*operation.state.shaders, location, &sgprs, &id) ||
+		     sgprs->value[id] != 0)) {
+			return false;
+		}
+	}
+	const DrawIndirectSource source {.args_addr   = args_addr,
+	                                 .max_count   = indirect.max_count,
+	                                 .stride      = stride,
+	                                 .count_addr  = count,
+	                                 .index_bytes = index_bytes};
+	m_indirect_instances_sequence = operation.num_instances.sequence;
+	m_has_indirect_instances      = true;
+	m_gpu_indirect_instances      = source;
+	// The counts and offsets are placeholders for the ones the GPU reads.
+	if (indirect.indexed) {
+		ExecuteDrawIndex(operation, {.index_count         = 1,
+		                             .index_addr          = reinterpret_cast<const void*>(indirect.index_base),
+		                             .instance_count      = 1,
+		                             .index_type_and_size = indirect.index_type,
+		                             .offset_source       = DrawOffsetSource::IndirectArgs,
+		                             .gpu_indirect        = &source});
+	} else {
+		ExecuteDrawAuto(operation, {.vertex_count   = 1,
+		                            .instance_count = 1,
+		                            .offset_source  = DrawOffsetSource::IndirectArgs,
+		                            .gpu_indirect   = &source});
+	}
+	return true;
+}
+
 // The arguments are read when the draw executes: earlier GPU work may produce them.
 void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 	const auto& indirect = operation.draw_indirect;
 
+	if (indirect.max_count == 0) {
+		return;
+	}
+	if (TryExecuteDrawIndirectOnGpu(operation)) {
+		return;
+	}
 	uint32_t draw_count = indirect.max_count;
 	if (indirect.count_addr != nullptr) {
 		draw_count = *indirect.count_addr;
@@ -1554,85 +1701,72 @@ void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws, draw_count);
 
-	const auto  args_addr = indirect.args_base + indirect.data_offset;
-	const auto& registers = indirect.registers;
-	// NUM_INSTANCES keeps the last draw's instance count.
-	m_indirect_instances_addr     = args_addr + static_cast<uint64_t>(draw_count - 1) * indirect.stride +
-	                                offsetof(vk::DrawIndirectCommand, instanceCount);
-	m_indirect_instances_sequence = operation.num_instances.sequence;
-	m_has_indirect_instances      = true;
-	// With no SGPRs to patch, the GPU reads the records if the shaders allow. Shaders apply
-	// the records' offsets only through those SGPRs; Vulkan applies them, which matches
-	// while they are zero.
-	if (registers.vertex_offset == Pm4::SH_NOP && registers.instance_offset == Pm4::SH_NOP &&
-	    registers.index_offset == Pm4::SH_NOP && (!indirect.indexed || indirect.index_buffer_size != 0)) {
-		NoteRecordedWork();
-		auto&                  executor = m_renderer.GetRenderExecutor();
-		const DrawIndirectArgs records {args_addr, draw_count, indirect.stride};
-		if (indirect.indexed
-		        ? executor.DrawIndex(operation.submit_id, CurrentBuffer(),
-		                             {.index_count         = indirect.index_buffer_size,
-		                              .index_addr          = IndexAddress(indirect.index_base,
-		                                                                  indirect.index_type, 0),
-		                              .index_type_and_size = indirect.index_type,
-		                              .indirect            = records})
-		        : executor.DrawAuto(operation.submit_id, CurrentBuffer(), {.indirect = records})) {
-			return;
+	const auto args_size =
+	    indirect.indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
+	EXIT_NOT_IMPLEMENTED(indirect.multi && indirect.stride < args_size);
+
+	uint64_t index_size = 0;
+	if (indirect.indexed) {
+		switch (indirect.index_type) {
+			case 0: index_size = 2; break;
+			case 1: index_size = 4; break;
+			case 2: index_size = 1; break;
+			default: EXIT("unknown index_type_and_size: %u\n", indirect.index_type);
 		}
 	}
 
-	const uint32_t max_indices = indirect.index_buffer_size != 0 ? indirect.index_buffer_size : UINT32_MAX;
-	}
-
-	const uint32_t max_indices = m_index_buffer_size != 0 ? m_index_buffer_size : UINT32_MAX;
 	for (uint32_t i = 0; i < draw_count; i++) {
-		const auto* record_addr = reinterpret_cast<const void*>(
-		    args_addr + static_cast<uint64_t>(i) * indirect.stride);
+		const auto* args_addr = reinterpret_cast<const void*>(
+		    indirect.args_base + indirect.data_offset + static_cast<uint64_t>(i) * indirect.stride);
 
 		if (!indirect.indexed) {
-			vk::DrawIndirectCommand args {};
-			std::memcpy(&args, record_addr, sizeof(args));
-			m_indirect_instances          = args.instanceCount;
-			m_indirect_instances_addr     = 0;
+			DrawIndirectArgs args {};
+			std::memcpy(&args, args_addr, sizeof(args));
+			m_indirect_instances          = args.instance_count;
 			m_indirect_instances_sequence = operation.num_instances.sequence;
 			m_has_indirect_instances      = true;
-			PatchIndirectDrawOffsets(operation, args.firstVertex,
-			                         args.firstInstance, 0);
-			ExecuteDrawAuto(operation, {.vertex_count   = args.vertexCount,
-			                            .instance_count = args.instanceCount,
-			                            .first_vertex   = args.firstVertex,
-			                            .first_instance = args.firstInstance,
+			m_gpu_indirect_instances      = {};
+			PatchIndirectDrawOffsets(operation, args.start_vertex_location,
+			                         args.start_instance_location, 0);
+			ExecuteDrawAuto(operation, {.vertex_count   = args.vertex_count_per_instance,
+			                            .instance_count = args.instance_count,
+			                            .first_vertex   = args.start_vertex_location,
+			                            .first_instance = args.start_instance_location,
 			                            .offset_source  = DrawOffsetSource::IndirectArgs});
 			continue;
 		}
 
-		vk::DrawIndexedIndirectCommand args {};
-		std::memcpy(&args, record_addr, sizeof(args));
-		PatchIndirectDrawOffsets(operation, args.vertexOffset,
-		                         args.firstInstance, args.firstIndex);
+		DrawIndexedIndirectArgs args {};
+		std::memcpy(&args, args_addr, sizeof(args));
+		PatchIndirectDrawOffsets(operation, args.base_vertex_location,
+		                         args.start_instance_location, args.start_index_location);
 
-		const auto*    index_addr = IndexAddress(indirect.index_base, indirect.index_type, args.firstIndex);
-		const uint32_t index_count = std::min(args.indexCount, max_indices);
-		if (GraphicsRunDebugDumpEnabled() && index_count != args.indexCount) {
+		auto* index_addr = reinterpret_cast<const void*>(
+		    indirect.index_base + static_cast<uint64_t>(args.start_index_location) * index_size);
+
+		const uint32_t index_count =
+		    (indirect.index_buffer_size != 0
+		         ? std::min(args.index_count_per_instance, indirect.index_buffer_size)
+		         : args.index_count_per_instance);
+		if (GraphicsRunDebugDumpEnabled() && index_count != args.index_count_per_instance) {
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
 				LOGF("\t DrawIndexIndirect: clamped index_count from %" PRIu32 " to %" PRIu32
 				     " using INDEX_BUFFER_SIZE\n",
-				     args.indexCount, index_count);
+				     args.index_count_per_instance, index_count);
 			}
 		}
 
-		m_indirect_instances          = args.instanceCount;
-		m_indirect_instances_addr     = 0;
-			m_indirect_instances_addr     = 0;
+		m_indirect_instances          = args.instance_count;
 		m_indirect_instances_sequence = operation.num_instances.sequence;
 		m_has_indirect_instances      = true;
+		m_gpu_indirect_instances      = {};
 		ExecuteDrawIndex(operation, {.index_count         = index_count,
 		                             .index_addr          = index_addr,
-		                             .instance_count      = args.instanceCount,
+		                             .instance_count      = args.instance_count,
 		                             .index_type_and_size = indirect.index_type,
-		                             .base_vertex    = args.vertexOffset,
-		                             .first_instance = args.firstInstance,
+		                             .base_vertex    = static_cast<int32_t>(args.base_vertex_location),
+		                             .first_instance = args.start_instance_location,
 		                             .offset_source  = DrawOffsetSource::IndirectArgs});
 	}
 }
@@ -1689,9 +1823,10 @@ void CommandProcessor::ExecuteDispatchIndirect(const GpuOperation& operation) {
 	const auto& dispatch = operation.dispatch;
 	NoteRecordedWork();
 	if ((dispatch.mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
-		// The arguments are read when the dispatch executes: earlier GPU work may produce them.
-		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(dispatch.args_addr);
-		ExecuteDispatchDirect(operation, args->x, args->y, args->z, dispatch.mode);
+		// Earlier GPU work writes the thread counts: reading them here would wait for it.
+		m_renderer.GetRenderExecutor().DispatchIndirectThreads(operation.submit_id, CurrentBuffer(),
+		                                                       dispatch.args_addr, dispatch.mode,
+		                                                       IsAsyncComputeQueue());
 		return;
 	}
 	m_renderer.GetRenderExecutor().DispatchIndirect(operation.submit_id, CurrentBuffer(),
