@@ -479,6 +479,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
+	if (m_submit_hook != nullptr) {
+		m_submit_hook(m_submit_hook_data, m_command);
+	}
 
 	m_command.End();
 	// Only this scheduler's owner allocates its ticks, in submission order.
@@ -543,6 +546,8 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 		                  debug.debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	// Ticks are submitted in order, by one thread at a time.
+	m_submitted_tick.store(tick, std::memory_order_release);
 }
 
 void CommandScheduler::RecordingThread() {
