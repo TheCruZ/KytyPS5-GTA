@@ -3795,10 +3795,12 @@ private:
 		    // The array is sampled: any other access (loads, gathers of other classes) needs its
 		    // own image.
 		    std::ranges::all_of(handle.Uses(), [](const Use& use) {
-			    return use.user->GetOpcode() == ValueOpcode::ImageSampleRaw;
+			    return use.user->GetOpcode() == ValueOpcode::ImageSampleRaw ||
+			           use.user->GetOpcode() == ValueOpcode::ImageQueryDimensions;
 		    }) &&
 		    std::ranges::all_of(plan.reads, [&](const Inst* read) {
-			    return read != nullptr && UsesOnlyImageDescriptors(*read);
+			    return read != nullptr && (UsesOnlyImageDescriptors(*read) ||
+			                               ImageDescriptorUsesDirectly(*read));
 		    }) &&
 		    std::ranges::all_of(table_address->Uses(), [&](const Use& use) {
 			    return std::ranges::find(plan.reads, use.user) != plan.reads.end();
