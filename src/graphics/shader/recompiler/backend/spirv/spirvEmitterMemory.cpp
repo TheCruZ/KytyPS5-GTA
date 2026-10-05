@@ -1055,30 +1055,85 @@ uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
 	return EmitValueOrZeroIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		const auto buffer = PrepareIndirectBuffer(ctx, inst);
+		constexpr auto Formats =
+		    static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
+		// Every format reads at most 16 bytes from the address aligned to its size (up to a
+		// DWORD). Load that window, shift it once per alignment and bound it once per size,
+		// outside the format switch: each case then only decodes constant bit fields. Loading and
+		// bounding in every case made GTA V's ray tracing shaders several MB of SPIR-V that the
+		// driver took minutes to compile.
+		const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
+		                            ConstantU64(state, ~uint64_t {3}));
+		std::array<uint32_t, 5> window {};
+		for (uint32_t word = 0; word < window.size(); ++word) {
+			window[word] = LoadBdaDword(
+			    ctx, word == 0u ? aligned
+			                    : Binary(state, spv::OpIAdd, TypeU64(state), aligned,
+			                             ConstantU64(state, word * 4u)));
+		}
+		const auto misalign = Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+		                             Unary(state, spv::OpUConvert, TypeU32(state), buffer.address),
+		                             ConstantU32(state, 3));
+		const auto base_mask = [](const Format::BufferFormatInfo& info) {
+			return ~(std::min(4u, info.byte_size) - 1u) & 3u;
+		};
+		// shifted[mask][k]: DWORD k of the window from the format base, misalign & mask.
+		std::array<std::array<uint32_t, 4>, 4> shifted {};
+		std::array<uint32_t, 17>               in_bounds {};
+		for (uint32_t format = 0; format < Formats; ++format) {
+			const auto info = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(format));
+			if (info.type == Format::ComponentType::Unknown || info.byte_size > 16u) continue;
+			if (in_bounds[info.byte_size] == 0u) {
+				in_bounds[info.byte_size] =
+				    IndirectBufferInBounds(state, buffer, 0u, info.byte_size, true);
+			}
+			const auto mask = base_mask(info);
+			if (shifted[mask][0] != 0u) continue;
+			if (mask == 0u) {
+				std::copy_n(window.begin(), 4, shifted[mask].begin());
+				continue;
+			}
+			const auto shift = Unary(
+			    state, spv::OpUConvert, TypeU64(state),
+			    Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+			           Binary(state, spv::OpBitwiseAnd, TypeU32(state), misalign,
+			                  ConstantU32(state, mask)),
+			           ConstantU32(state, 3)));
+			for (uint32_t word = 0; word < 4u; ++word) {
+				shifted[mask][word] = Unary(
+				    state, spv::OpUConvert, TypeU32(state),
+				    Binary(state, spv::OpShiftRightLogical, TypeU64(state),
+				           PackU64(state, window[word], window[word + 1u]), shift));
+			}
+		}
+		const auto low_bits = [&](uint32_t value, uint32_t bits) {
+			return bits == 32u ? value
+			                   : Binary(state, spv::OpBitwiseAnd, TypeU32(state), value,
+			                            ConstantU32(state, (1u << bits) - 1u));
+		};
 		return EmitIndexSwitch(
-		    state, buffer.format, static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) + 1u,
-		    TypeU32(state), [&](uint32_t format) {
+		    state, buffer.format, Formats, TypeU32(state), [&](uint32_t format) {
 			    const auto info = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(format));
-			    if (info.type == Format::ComponentType::Unknown) return ConstantU32(state, 0);
+			    if (info.type == Format::ComponentType::Unknown || info.byte_size > 16u)
+				    return ConstantU32(state, 0);
 			    const auto constant = Select(
 			        state, TypeU32(state),
 			        Binary(state, spv::OpIEqual, TypeBool(state), buffer.selector, ConstantU32(state, 1)),
 			        FormattedConstant(ctx, info, FormattedSourceKind::One), ConstantU32(state, 0));
-			    return EmitValueOrDefaultIfCondition(
-			        state, Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), buffer.selector,
-			                      ConstantU32(state, 4)),
-			        TypeU32(state), constant, [&]() {
-				        const auto in_bounds = IndirectBufferInBounds(state, buffer, 0u, info.byte_size, true);
-				        const auto base = Binary(
-				            state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
-				            ConstantU64(state, ~(uint64_t(std::min(4u, info.byte_size)) - 1u)));
+			    // The decode is plain arithmetic: select it instead of branching around it.
+			    const auto decoded = [&]() {
+				        const auto  bounded = in_bounds[info.byte_size];
+				        const auto& words   = shifted[base_mask(info)];
+				        // Component fields never cross a DWORD of the format.
 				        const auto load = [&](uint32_t component, uint32_t bits) {
-					        const auto offset = Format::GetFormatComponentByteOffset(info, component);
-					        const auto address = offset == 0u
-					                                 ? base
-					                                 : Binary(state, spv::OpIAdd, TypeU64(state),
-					                                          base, ConstantU64(state, offset));
-					        return LoadBda(ctx, address, in_bounds, bits);
+					        const auto byte  = Format::GetFormatComponentByteOffset(info, component);
+					        auto       value = words[byte / 4u];
+					        if (byte % 4u != 0u) {
+						        value = Binary(state, spv::OpShiftRightLogical, TypeU32(state), value,
+						                       ConstantU32(state, byte % 4u * 8u));
+					        }
+					        return Select(state, TypeU32(state), bounded, low_bits(value, bits),
+					                      ConstantU32(state, 0));
 				        };
 				        const auto emit_component = [&](uint32_t component) {
 					        return LoadFormattedComponent(
@@ -1090,9 +1145,48 @@ uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst) {
 				            state, spv::OpUMod, TypeU32(state),
 				            Binary(state, spv::OpISub, TypeU32(state), buffer.selector, ConstantU32(state, 4)),
 				            ConstantU32(state, info.component_count));
-				        return EmitIndexSwitch(state, component, info.component_count, TypeU32(state),
-				                               emit_component);
-			        });
+				        // Components of one width at consecutive bytes decode alike: read the selected
+				        // one at its runtime offset instead of decoding each in a case of its own.
+				        bool uniform = !info.packed_bitfield && info.component_bits[0] % 8u == 0u;
+				        for (uint32_t c = 1; c < info.component_count; ++c) {
+					        uniform &= info.component_bits[c] == info.component_bits[0] &&
+					                   info.component_bit_offset[c] == c * info.component_bits[0];
+				        }
+				        if (!uniform) {
+					        return EmitIndexSwitch(state, component, info.component_count,
+					                               TypeU32(state), emit_component);
+				        }
+				        const auto width = info.component_bits[0] / 8u;
+				        const auto byte  = Binary(state, spv::OpIMul, TypeU32(state), component,
+				                                  ConstantU32(state, width));
+				        const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+				                                  byte, ConstantU32(state, 2));
+				        auto word = words[0];
+				        for (uint32_t k = 1; k * 4u < info.byte_size; ++k) {
+					        word = Select(state, TypeU32(state),
+					                      Binary(state, spv::OpIEqual, TypeBool(state), index,
+					                             ConstantU32(state, k)),
+					                      words[k], word);
+				        }
+				        if (width < 4u) {
+					        word = Binary(state, spv::OpShiftRightLogical, TypeU32(state), word,
+					                      Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+					                             Binary(state, spv::OpBitwiseAnd, TypeU32(state), byte,
+					                                    ConstantU32(state, 3)),
+					                             ConstantU32(state, 3)));
+				        }
+				        const auto dynamic = [&](uint32_t, uint32_t bits) {
+					        return Select(state, TypeU32(state), bounded, low_bits(word, bits),
+					                      ConstantU32(state, 0));
+				        };
+				        return LoadFormattedComponent(
+				            ctx, info, {FormattedSourceKind::Memory, 0u},
+				            [&](uint32_t source) { return dynamic(source, 32u); }, dynamic);
+			    }();
+			    return Select(state, TypeU32(state),
+			                  Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), buffer.selector,
+			                         ConstantU32(state, 4)),
+			                  decoded, constant);
 		    });
 	});
 }
