@@ -122,6 +122,7 @@ public:
 	bool                   hide_cursor_enabled         = false;
 	bool                   readback_linear_images      = true;
 	bool                   tessellation_enabled        = true;
+	bool                   async_pipelines_enabled     = true;
 	bool                   trophy_enabled              = true;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
@@ -155,6 +156,7 @@ public:
 		hide_cursor_enabled         = other.hide_cursor_enabled;
 		readback_linear_images      = other.readback_linear_images;
 		tessellation_enabled        = other.tessellation_enabled;
+		async_pipelines_enabled     = other.async_pipelines_enabled;
 		trophy_enabled              = other.trophy_enabled;
 		vblank_frequency            = other.vblank_frequency;
 		console_language            = other.console_language;
@@ -203,6 +205,7 @@ public:
 		KYTY_CFG_SET(hide_cursor_enabled);
 		KYTY_CFG_SET(readback_linear_images);
 		KYTY_CFG_SET(tessellation_enabled);
+		KYTY_CFG_SET(async_pipelines_enabled);
 		KYTY_CFG_SET(trophy_enabled);
 		KYTY_CFG_SET(vblank_frequency);
 		KYTY_CFG_SET(console_language);
@@ -247,6 +250,8 @@ public:
 		KYTY_CFG_GET(hide_cursor_enabled);
 		KYTY_CFG_GET(readback_linear_images);
 		KYTY_CFG_GET(tessellation_enabled);
+		// On by default, also in configurations saved before the option existed.
+		async_pipelines_enabled = s->value("async_pipelines_enabled", true).toBool();
 		trophy_enabled = s->value("trophy_enabled", trophy_enabled).toBool();
 		vblank_frequency = s->value("vblank_frequency", vblank_frequency).toInt();
 		console_language = s->value("console_language", console_language).toInt();

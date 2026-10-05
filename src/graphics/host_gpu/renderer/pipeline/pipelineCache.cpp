@@ -758,6 +758,7 @@ struct PipelineCache::ProgramCache {
 		std::optional<ShaderRecompiler::IR::ResourceSpecialization> stored_specialization;
 		std::optional<Permutation>                        permutation;
 		std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
+		const Permutation*                                          added = nullptr;
 		try {
 			Common::SoftExitScope soft_exit(true);
 			const auto [options, stage_name] =
@@ -811,6 +812,7 @@ struct PipelineCache::ProgramCache {
 				}
 				permutations.push_back(std::move(*permutation));
 				by_id[permutations.back().handle.id] = {&entry->first, &permutations.back()};
+				added                                = &permutations.back();
 			}
 		}
 		if (const auto job_count = in_flight.find(job.key); --job_count->second == 0) {
@@ -822,6 +824,11 @@ struct PipelineCache::ProgramCache {
 		}
 		if (stored_specialization) {
 			Store(job.key, job.params, input_info, job.push_data_cursor, *stored_specialization);
+		}
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			if (added != nullptr && !job.stored && compute_added) {
+				compute_added(input_info, *added);
+			}
 		}
 	}
 
@@ -849,6 +856,9 @@ struct PipelineCache::ProgramCache {
 	}
 
 	std::unique_ptr<ProgramStore> store;
+	// Called by a compile worker, without the program lock, for each compute permutation it
+	// added for a dispatch of this session.
+	std::function<void(const ShaderComputeInputInfo&, const Permutation&)> compute_added;
 	// Programs of the store that the workers have not finished compiling.
 	std::atomic_uint32_t          stored_pending {0};
 	// Under the program lock: every compiled permutation by its id, with its program's key.
@@ -1056,6 +1066,18 @@ const ShaderRecompiler::IR::ResourceSnapshot g_no_resources {};
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	if (Config::AsyncPipelinesEnabled()) {
+		constexpr uint32_t AsyncThreads = 3;
+		for (uint32_t i = 0; i < AsyncThreads; i++) {
+			m_async_threads.emplace_back([this] { AsyncPipelineWorker(); });
+		}
+		m_program_cache->compute_added = [this](const ShaderComputeInputInfo&    input_info,
+		                                        const ProgramCache::Permutation& permutation) {
+			auto info  = input_info;
+			info.stage = {.program = &permutation.program, .resources = &g_no_resources};
+			CreateComputePipelineAhead(info, permutation.handle);
+		};
+	}
 	m_program_cache->StartWorkers(&m_program_lock);
 	InitializeDriverCache();
 	if (const auto title_id = PipelineCacheTitleId();
@@ -1243,6 +1265,136 @@ bool PipelineCache::PrecreatePipeline(const StoredPipeline& stored) {
 	}
 }
 
+struct PipelineCache::AsyncPipelineJob {
+	bool compute = false;
+	// Graphics.
+	GraphicsPipelineKey                  key {};
+	std::array<ShaderVertexInputInfo, 3> vertex_info;
+	uint32_t                             vertex_stages = 0;
+	std::optional<ShaderPixelInputInfo>  pixel_info;
+	GraphicsPrograms                     programs;
+	// Compute.
+	ShaderComputeInputInfo compute_info;
+	ShaderProgram          compute_program;
+};
+
+void PipelineCache::QueueAsyncPipeline(std::unique_ptr<AsyncPipelineJob> job) {
+	{
+		std::lock_guard lock(m_async_mutex);
+		// A dispatch waits for its pipeline, a draw is only skipped: compute pipelines first.
+		if (job->compute) {
+			m_async_jobs.push_front(std::move(job));
+		} else {
+			m_async_jobs.push_back(std::move(job));
+		}
+	}
+	m_async_available.notify_one();
+}
+
+bool PipelineCache::TakeQueuedAsyncPipeline(
+    const std::function<bool(const AsyncPipelineJob&)>& matches) {
+	std::lock_guard lock(m_async_mutex);
+	const auto      job = std::ranges::find_if(
+        m_async_jobs, [&](const std::unique_ptr<AsyncPipelineJob>& queued) { return matches(*queued); });
+	if (job == m_async_jobs.end()) {
+		return false;
+	}
+	m_async_jobs.erase(job);
+	return true;
+}
+
+void PipelineCache::StopAsyncPipelines() {
+	{
+		std::lock_guard lock(m_async_mutex);
+		m_async_stopping = true;
+		m_async_jobs.clear();
+	}
+	m_async_available.notify_all();
+	m_async_threads.clear();
+}
+
+void PipelineCache::AsyncPipelineWorker() {
+	KYTY_PROFILER_THREAD("Thread_PipelineAsync");
+	for (;;) {
+		std::unique_ptr<AsyncPipelineJob> job;
+		{
+			std::unique_lock lock(m_async_mutex);
+			m_async_available.wait(lock, [&] { return m_async_stopping || !m_async_jobs.empty(); });
+			if (m_async_stopping) {
+				return;
+			}
+			job = std::move(m_async_jobs.front());
+			m_async_jobs.pop_front();
+		}
+		auto pipeline = std::make_unique<Pipeline>();
+		bool created  = false;
+		try {
+			Common::SoftExitScope soft_exit(true);
+			if (job->compute) {
+				CreatePipelineInternal(m_graphics, *pipeline, job->compute_info,
+				                       job->compute_program.module, m_driver_cache);
+			} else {
+				CreatePipelineInternal(m_graphics, *pipeline, job->key.rendering,
+				                       job->key.vertex_input,
+				                       std::span {job->vertex_info.data(), job->vertex_stages},
+				                       job->pixel_info ? &*job->pixel_info : nullptr, job->programs,
+				                       job->key.static_params, m_driver_cache);
+			}
+			created = pipeline->pipeline != nullptr && pipeline->pipeline_layout != nullptr;
+		} catch (const Common::SoftExitError&) {
+			// The execution thread creates the pipeline itself and reports the error.
+		}
+		if (created) {
+			m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
+			if (job->compute) {
+				RecordComputePipeline(job->compute_info, job->compute_program.id);
+			} else {
+				RecordGraphicsPipeline(job->key,
+				                       std::span {job->vertex_info.data(), job->vertex_stages},
+				                       job->pixel_info ? &*job->pixel_info : nullptr);
+			}
+		}
+		std::lock_guard lock(m_precreated_mutex);
+		bool            kept = false;
+		if (job->compute) {
+			if (created) {
+				kept =
+				    m_precreated_compute.try_emplace(job->compute_program.id, std::move(pipeline))
+				        .second;
+			}
+			m_async_pending_compute.erase(job->compute_program.id);
+		} else {
+			if (created) {
+				kept = m_precreated_graphics.try_emplace(job->key, std::move(pipeline)).second;
+			} else {
+				m_async_failed_graphics.insert(job->key);
+			}
+			m_async_pending_graphics.erase(job->key);
+		}
+		if (created && !kept) {
+			m_graphics.device.destroyPipeline(pipeline->pipeline, nullptr);
+			m_graphics.device.destroyPipelineLayout(pipeline->pipeline_layout, nullptr);
+			m_graphics.device.destroyDescriptorSetLayout(pipeline->descriptor_set_layout, nullptr);
+		}
+	}
+}
+
+void PipelineCache::CreateComputePipelineAhead(const ShaderComputeInputInfo& input_info,
+                                               const ShaderProgram&          program) {
+	{
+		std::lock_guard lock(m_precreated_mutex);
+		if (m_precreated_compute.contains(program.id) ||
+		    !m_async_pending_compute.insert(program.id).second) {
+			return;
+		}
+	}
+	auto job             = std::make_unique<AsyncPipelineJob>();
+	job->compute         = true;
+	job->compute_info    = input_info;
+	job->compute_program = program;
+	QueueAsyncPipeline(std::move(job));
+}
+
 void PipelineCache::RecordGraphicsPipeline(const GraphicsPipelineKey&             key,
                                            std::span<const ShaderVertexInputInfo> vertex_info,
                                            const ShaderPixelInputInfo*            ps_input_info) {
@@ -1305,6 +1457,8 @@ void PipelineCache::RecordComputePipeline(const ShaderComputeInputInfo& input_in
 }
 
 PipelineCache::~PipelineCache() {
+	m_program_cache->StopWorkers();
+	StopAsyncPipelines();
 	m_precreate_threads.clear();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
@@ -1619,11 +1773,11 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
-PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
+PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
-    bool primitive_restart_enable, const GraphicsPrograms& programs) {
+    bool primitive_restart_enable, const GraphicsPrograms& programs, bool allow_async) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -1790,22 +1944,59 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	// Consecutive draws mostly use the pipeline of the draw before.
 	if (m_last_graphics_pipeline != nullptr && key == m_last_graphics_key) {
-		return *m_last_graphics_pipeline;
+		return m_last_graphics_pipeline;
 	}
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
 		m_last_graphics_key      = key;
 		m_last_graphics_pipeline = iter->second.get();
-		return *iter->second;
+		return iter->second.get();
 	}
-	if (m_stored != nullptr) {
+	for (;;) {
 		std::unique_lock lock(m_precreated_mutex);
 		if (auto node = m_precreated_graphics.extract(key); !node.empty()) {
 			lock.unlock();
 			const auto result        = m_graphics_pipelines.insert(std::move(node));
 			m_last_graphics_key      = key;
 			m_last_graphics_pipeline = result.position->second.get();
-			return *result.position->second;
+			return result.position->second.get();
 		}
+		if (!m_async_pending_graphics.contains(key)) {
+			if (!allow_async || m_async_threads.empty() || m_async_failed_graphics.contains(key)) {
+				break;
+			}
+			// The driver compiles a new pipeline for up to half a second: the draws that need it
+			// are skipped until a background thread created it.
+			m_async_pending_graphics.insert(key);
+			lock.unlock();
+			auto job           = std::make_unique<AsyncPipelineJob>();
+			job->key           = key;
+			job->vertex_stages = static_cast<uint32_t>(vertex_info.size());
+			for (uint32_t i = 0; i < job->vertex_stages; i++) {
+				job->vertex_info[i]                 = vertex_info[i];
+				job->vertex_info[i].stage.resources = &g_no_resources;
+			}
+			if (ps_active) {
+				job->pixel_info.emplace(*ps_input_info);
+				job->pixel_info->stage.resources = &g_no_resources;
+			}
+			job->programs = programs;
+			QueueAsyncPipeline(std::move(job));
+			return nullptr;
+		}
+		if (allow_async) {
+			return nullptr;
+		}
+		// A draw that cannot be skipped creates the pipeline itself while it is still queued (the
+		// queue may hold many pipelines of skipped draws), or waits for the thread creating it.
+		lock.unlock();
+		if (TakeQueuedAsyncPipeline([&](const AsyncPipelineJob& job) {
+			    return !job.compute && job.key == key;
+		    })) {
+			std::lock_guard pending_lock(m_precreated_mutex);
+			m_async_pending_graphics.erase(key);
+			break;
+		}
+		std::this_thread::yield();
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1832,7 +2023,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
 
-	return *iter->second;
+	return iter->second.get();
 }
 
 PipelineCache::Pipeline&
@@ -1846,12 +2037,26 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	    iter != m_compute_pipelines.end()) {
 		return *iter->second;
 	}
-	if (m_stored != nullptr) {
+	for (;;) {
 		std::unique_lock lock(m_precreated_mutex);
 		if (auto node = m_precreated_compute.extract(compute_program.id); !node.empty()) {
 			lock.unlock();
 			return *m_compute_pipelines.insert(std::move(node)).position->second;
 		}
+		if (!m_async_pending_compute.contains(compute_program.id)) {
+			break;
+		}
+		// Dispatches always run: create the pipeline here while it is still queued, or wait for
+		// the thread creating it.
+		lock.unlock();
+		if (TakeQueuedAsyncPipeline([&](const AsyncPipelineJob& job) {
+			    return job.compute && job.compute_program.id == compute_program.id;
+		    })) {
+			std::lock_guard pending_lock(m_precreated_mutex);
+			m_async_pending_compute.erase(compute_program.id);
+			break;
+		}
+		std::this_thread::yield();
 	}
 
 	if (graphics_debug_dump_enabled()) {

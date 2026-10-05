@@ -86,6 +86,7 @@ struct ConfigOptions {
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = true;
 	bool                   tessellation_enabled        = true;
+	bool                   async_pipelines_enabled     = true;
 	bool                   trophy_enabled              = true;
 	bool                   playgo_hack_enabled         = false;
 	uint32_t               gpu_pipeline_stages         = GPU_PIPELINE_ALL;
@@ -137,6 +138,8 @@ bool GpuAssistedValidationEnabled();
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
 bool TessellationEnabled();
+// Draws whose new pipeline the driver is still compiling are skipped instead of waiting for it.
+bool AsyncPipelinesEnabled();
 bool TrophyEnabled();
 bool PlayGoHackEnabled();
 // GpuPipelineStage bits. The KYTY_GPU_PIPELINE environment variable overrides the option: 0 runs

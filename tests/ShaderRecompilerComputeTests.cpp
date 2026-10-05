@@ -954,6 +954,8 @@ void EnsureConfigInitialized() {
     options.printf_direction = Config::LogDirection::Silent;
     // The checks drive the renderer and inspect its Vulkan command buffers synchronously.
     options.gpu_pipeline_stages = 0;
+    // ... and expect every draw to run, also those whose pipeline is new.
+    options.async_pipelines_enabled = false;
     Config::Load(options);
     subsystems.Initialize<Log::Lifecycle>();
     subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
@@ -16296,10 +16298,10 @@ public:
       mode.polymode_back_ptype = back;
       mode.provoking_vtx_last = provoking_last;
       registers.SetModeControl(mode);
-      return context.GetPipelineCache().GetGraphicsPipeline(
+      return *context.GetPipelineCache().GetGraphicsPipeline(
           std::span{&color, 1u}, depth, std::span{&vertex, 1u}, scheduler.Current(), &pixel,
           topology, false,
-          PipelineCache::GraphicsPrograms{{vertex_shader}, pixel_shader});
+          PipelineCache::GraphicsPrograms{{vertex_shader}, pixel_shader}, false);
     };
     auto &filled = pipeline(true, 2, 2);
     const auto draw = [&](const PipelineCache::Pipeline &selected, uint32_t vertex_count = 3,

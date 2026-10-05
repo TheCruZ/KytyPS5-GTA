@@ -247,6 +247,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
 	args << "--trophy-notifications" << BoolArg(info.trophy_enabled);
 	args << (info.tessellation_enabled ? "--tessellation" : "--no-tessellation");
+	args << (info.async_pipelines_enabled ? "--async-pipelines" : "--no-async-pipelines");
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
 	args << "--vulkan-validation" << BoolArg(info.vulkan_validation_enabled);
