@@ -1108,7 +1108,9 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	}
 	for (size_t k = 0; k < prepared.table_images.size(); k++) {
 		auto& texture = prepared.table_images[k];
-		if (stale_tables[k]) {
+		// A rediscovery above may have replaced (expanded, merged or recreated) the image this
+		// element resolved to.
+		if (stale_tables[k] || stale(texture)) {
 			if (auto* old_image = texture_cache.m_slot_images.try_get(texture.image_id)) {
 				old_image->binding = {};
 			}
