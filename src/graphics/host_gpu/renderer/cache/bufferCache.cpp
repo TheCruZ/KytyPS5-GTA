@@ -334,6 +334,26 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
+void BufferCache::InvalidateFaultedPage(uint64_t vaddr) {
+	// The guest fills its streaming memory (vertex and constant rings) upwards, and every page it
+	// writes under a cached buffer takes a fault: thousands per frame, each a system call to drop
+	// the protection. When the page below is already writable the guest is filling the range
+	// upwards, so release the pages ahead up to the next 64 KB boundary with this fault; they are
+	// only uploaded again at their next synchronization. A range with pages the GPU wrote must be
+	// read back first, so it keeps to the faulting page.
+	static constexpr uint64_t FaultBlockSize = 64 * 1024;
+	static_assert(TRACKER_REGION_SIZE % FaultBlockSize == 0);
+	const auto page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto end  = Common::AlignDown(page, FaultBlockSize) + FaultBlockSize;
+	if (page >= TRACKER_PAGE_SIZE && GuestRange {page - TRACKER_PAGE_SIZE, end - page}.Valid() &&
+	    m_memory_tracker.IsRegionCpuModified(page - TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE) &&
+	    !m_memory_tracker.IsRegionGpuModified(page, end - page)) {
+		InvalidateMemory(page, end - page);
+		return;
+	}
+	InvalidateMemory(vaddr, 1);
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
@@ -374,6 +394,12 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 		}
 	}
 	return CreateBuffer(vaddr, size);
+}
+
+void BufferCache::CacheFaultedMemory(uint64_t vaddr, uint64_t size) {
+	if (const auto id = FindBuffer(vaddr, size)) {
+		m_slot_buffers[id].device_address_pinned = true;
+	}
 }
 
 BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t size) {
@@ -435,6 +461,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	if (accumulate_stream_score) {
 		new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
 	}
+	new_buffer.device_address_pinned |= overlap.device_address_pinned;
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
 	NoteWrite(overlap.CpuAddress(), overlap.Size());
@@ -1225,8 +1252,48 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
+void BufferCache::CollectStaleBuffers(uint64_t tick) {
+	// Buffers outlive the draws that created them, and once the guest moves elsewhere the memory
+	// they cover is reused for other data. Every device-address synchronization keeps uploading the
+	// guest's writes there and protecting the pages again, so the guest takes write faults on
+	// memory no draw reads, more of it the longer the session runs (the collection under memory
+	// pressure below rarely runs). Release the buffers no lookup used for a long time; the next use
+	// creates them again. Buffers with GPU writes stay, and so do the ones shaders reached through
+	// device addresses the host could not see coming.
+	static constexpr uint64_t StaleAge      = 2048; // garbage-collection ticks: about half a minute
+	static constexpr uint64_t StalePeriod   = 8;
+	static constexpr size_t   StaleVisitMax = 64;
+	static constexpr size_t   StaleFreeMax  = 16;
+	if (tick < StaleAge || tick % StalePeriod != 0) {
+		return;
+	}
+	std::vector<BufferId> stale;
+	std::vector<BufferId> kept;
+	m_lru_cache.ForEachItemBelow(tick - StaleAge, [&](BufferId id) {
+		const auto& buffer = m_slot_buffers[id];
+		const bool  keep   = buffer.device_address_pinned ||
+		                  m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size()) ||
+		                  m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
+		(keep ? kept : stale).push_back(id);
+		return stale.size() == StaleFreeMax || stale.size() + kept.size() == StaleVisitMax;
+	});
+	// The buffers that stay move to the back of the queue, so the next passes reach the others.
+	for (const auto id: kept) {
+		m_lru_cache.Touch(m_slot_buffers[id].lru_id, tick);
+	}
+	for (const auto id: stale) {
+		const auto& buffer = m_slot_buffers[id];
+		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+		if (m_record_released) {
+			m_released_ranges.Add(buffer.CpuAddress(), buffer.Size());
+		}
+		DeleteBuffer(id);
+	}
+}
+
 void BufferCache::RunGarbageCollector() {
 	const auto tick = m_gc_tick++;
+	CollectStaleBuffers(tick);
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
@@ -1287,6 +1354,17 @@ void BufferCache::RunGarbageCollector() {
 
 void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
+}
+
+void BufferCache::ProcessUseBuffer() {
+	m_fault_manager.ProcessUseBuffer([this](std::span<const uint64_t> pages) {
+		for (const auto page: pages) {
+			const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
+			if (owner != nullptr && *owner) {
+				TouchBuffer(m_slot_buffers[*owner]);
+			}
+		}
+	});
 }
 
 void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
