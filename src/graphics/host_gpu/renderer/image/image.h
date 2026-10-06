@@ -177,6 +177,9 @@ public:
 	// The LRU clock value of the image's last LRU touch (as in the texture cache's LRU list,
 	// without loading its entry).
 	uint64_t         lru_tick           = 0;
+	// Bindless table bindings that keep binding the image without looking it up again (see
+	// TextureCache::PinImage()).
+	uint32_t         table_pins         = 0;
 
 private:
 	friend struct ImageTestAccess;

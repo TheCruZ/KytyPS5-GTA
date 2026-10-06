@@ -515,7 +515,7 @@ public:
 			m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		}
-		BumpBackingEpoch();
+		BumpBackingEpoch(vaddr, size);
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
 #else
@@ -527,7 +527,7 @@ public:
 		RemoveMappingsUnlocked(vaddr, size);
 		m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 		EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
-		BumpBackingEpoch();
+		BumpBackingEpoch(vaddr, size);
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
 #endif
@@ -537,7 +537,7 @@ public:
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
-		BumpBackingEpoch();
+		BumpBackingEpoch(vaddr, size);
 
 		if (placeholder_preserved != nullptr) {
 			*placeholder_preserved = false;

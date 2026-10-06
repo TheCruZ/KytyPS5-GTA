@@ -50,6 +50,13 @@ struct ImageLookupState {
 	}
 };
 
+// The image state a bindless table element's view was last acquired in: while the image keeps
+// it, the view still holds and acquiring it again would only refresh the image's use.
+struct TableViewMemo {
+	ImageLookupState state;
+	bool             valid = false;
+};
+
 struct TextureBinding {
 	ImageId                    image_id;
 	vk::ImageView              image_view = nullptr;
@@ -74,11 +81,22 @@ struct PreparedBindings {
 	// The uniform views of the buffers that have a uniform_index, by that index.
 	std::vector<vk::DescriptorBufferInfo> uniform_buffers;
 	std::vector<TextureBinding>           images;
-	// Bindless table descriptors in binding and table-range order, with the T# and the root
-	// image each element was resolved for.
-	std::vector<TextureBinding>                         table_images;
+	// The distinct bindless table elements, with the T# and the root image each was resolved
+	// for, and, for every slot of every table range in binding order, the element it binds.
+	// GTA V's ray tracing tables have ~16k slots that name far fewer distinct textures. The
+	// bindings live in the executor's table resolutions (see
+	// RenderExecutor::TableElementResolution), which keep them until ResetBindings().
+	std::vector<TextureBinding*>                        table_images;
+	std::vector<TableViewMemo*>                         table_views;
 	std::vector<ShaderRecompiler::IR::DescriptorValue> table_sources;
 	std::vector<uint32_t>                               table_roots;
+	std::vector<uint32_t>                               table_slots;
+	// The program's table binding state (RenderExecutor::TableBindingState). When
+	// `tables_reused`, the table vectors above stay empty: the tables bind what the state holds,
+	// and `table_visits` lists the state's elements this binding looks up again.
+	void*                                               table_state   = nullptr;
+	bool                                                tables_reused = false;
+	std::vector<uint32_t>                               table_visits;
 	std::vector<vk::Sampler>              samplers;
 	vk::DescriptorBufferInfo              gds {nullptr, 0, VK_WHOLE_SIZE};
 	vk::DescriptorBufferInfo              flattened_srt;
