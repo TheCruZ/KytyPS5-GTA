@@ -913,9 +913,13 @@ RenderExecutor::FindTableResolution(const ShaderRecompiler::IR::ImageResource& r
 			found = std::ranges::min_element(m_table_resolutions, {}, &TableResolution::last_use);
 		}
 		found->root = std::move(view);
+		m_retired_table_elements.push_back(std::move(found->elements));
 		found->elements.clear();
+		found->slots.clear();
 	} else if (found->elements.size() > MaxElements) {
+		m_retired_table_elements.push_back(std::move(found->elements));
 		found->elements.clear();
+		found->slots.clear();
 	}
 	found->last_use = tick;
 	return *found;
@@ -936,11 +940,21 @@ bool RenderExecutor::TableElementBackingReadable(const TableElementResolution& e
 
 RenderExecutor::TableElementResolution&
 RenderExecutor::ResolveTableElement(TableResolution&                             table,
-                                    const ShaderRecompiler::IR::DescriptorValue& value) {
+                                    const ShaderRecompiler::IR::DescriptorValue& value,
+                                    uint64_t stamp, TableElementResolution* known) {
 	auto&      texture_cache = m_context.GetTextureCache();
 	const auto backing_epoch = Libs::LibKernel::Memory::BackingEpoch();
-	const auto [entry, inserted] = table.elements.try_emplace(value.dwords);
-	auto& element                = entry->second;
+	bool       inserted      = false;
+	if (known == nullptr) {
+		const auto [entry, emplaced] = table.elements.try_emplace(value.dwords);
+		known                        = &entry->second;
+		inserted                     = emplaced;
+	}
+	auto& element = *known;
+	if (!inserted && element.prepared_stamp == stamp) {
+		// Resolved for an earlier slot of the same bindings.
+		return element;
+	}
 	const auto set_epoch = texture_cache.ImageSetEpoch();
 	if (!inserted && !element.volatile_dcc) {
 		if (element.permanent ||
@@ -962,8 +976,12 @@ RenderExecutor::ResolveTableElement(TableResolution&                            
 	}
 	// Record the epoch before resolving: an image the lookup itself inserts makes the next use
 	// resolve again, after which the element is stable.
-	element               = {};
-	element.image_epoch   = set_epoch;
+	const auto prepared_stamp = element.prepared_stamp;
+	const auto prepared_index = element.prepared_index;
+	element                   = {};
+	element.prepared_stamp    = prepared_stamp;
+	element.prepared_index    = prepared_index;
+	element.image_epoch       = set_epoch;
 	element.checked_epoch = set_epoch;
 	element.backing_epoch = backing_epoch;
 	GuestRange examined {};
@@ -1045,6 +1063,7 @@ void RenderExecutor::BindRenderTarget(ImageId id) {
 }
 
 void RenderExecutor::ResetBindings() {
+	m_retired_table_elements.clear();
 	for (const auto id: m_bound_images) {
 		if (auto* image = m_context.GetTextureCache().m_slot_images.try_get(id); image != nullptr) {
 			image->binding = {};
@@ -1107,6 +1126,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		prepared.last_images = snapshot.images;
 	}
 	prepared.table_images.clear();
+	prepared.table_views.clear();
 	prepared.table_sources.clear();
 	prepared.table_roots.clear();
 	prepared.table_slots.clear();
@@ -1124,18 +1144,26 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 					element.prepared_stamp = stamp;
 					element.prepared_index = static_cast<uint32_t>(prepared.table_images.size());
 					BindImage(element.texture.image_id, false);
-					prepared.table_images.push_back(element.texture);
+					prepared.table_images.push_back(&element.texture);
+					prepared.table_views.push_back(&element.view);
 					prepared.table_sources.push_back(value);
 					prepared.table_roots.push_back(range.root);
 				}
 				prepared.table_slots.push_back(element.prepared_index);
 			};
-			auto& null_element = ResolveTableElement(resolution, null_value);
+			if (resolution.slots.size() < range.capacity) {
+				resolution.slots.resize(range.capacity);
+			}
 			for (uint32_t slot = 0; slot < range.capacity; slot++) {
-				if (slot != 0u && slot < table.slots.size()) {
-					add(ResolveTableElement(resolution, table.slots[slot]), table.slots[slot]);
+				const auto& value =
+				    slot != 0u && slot < table.slots.size() ? table.slots[slot] : null_value;
+				auto& memo = resolution.slots[slot];
+				if (memo.element != nullptr && memo.dwords == value.dwords) {
+					add(ResolveTableElement(resolution, value, stamp, memo.element), value);
 				} else {
-					add(null_element, null_value);
+					auto& element = ResolveTableElement(resolution, value, stamp);
+					memo          = {value.dwords, &element};
+					add(element, value);
 				}
 			}
 		}
@@ -1275,7 +1303,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	// are stale before any rebind clears an image's binding state.
 	std::vector<bool> stale_tables(prepared.table_images.size());
 	for (size_t k = 0; k < prepared.table_images.size(); k++) {
-		stale_tables[k] = stale(prepared.table_images[k]);
+		stale_tables[k] = stale(*prepared.table_images[k]);
 	}
 	// Acquire each view before a later overlapping descriptor can replace its image.
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
@@ -1325,8 +1353,10 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		binding.lookup = nullptr;
 		binding.reused = false;
 	}
+	const auto tick = m_context.GetCommandScheduler().CurrentTick();
 	for (size_t k = 0; k < prepared.table_images.size(); k++) {
-		auto& texture = prepared.table_images[k];
+		auto& texture = *prepared.table_images[k];
+		auto& view    = *prepared.table_views[k];
 		// A rediscovery above may have replaced (expanded, merged or recreated) the image this
 		// element resolved to.
 		if (stale_tables[k] || stale(texture)) {
@@ -1336,9 +1366,24 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			texture = ResolveTableTexture(program.info.images.at(prepared.table_roots[k]),
 			                              prepared.table_sources[k]);
 			BindImage(texture.image_id, false);
+			view.valid = false;
+		}
+		// Most elements are textures nothing touched since their last acquisition: keep the
+		// view and refresh the image's use, as the acquisition would. Guest-dirty images are
+		// refreshed by the acquisition.
+		if (auto* image = texture_cache.m_slot_images.try_get(texture.image_id);
+		    view.valid && image != nullptr && texture.image_view &&
+		    ImageLookupState::Of(texture.image_id, *image) == view.state) {
+			image->tick_accessed_last = tick;
+			texture_cache.TouchImage(*image);
+			continue;
 		}
 		texture.image_view = texture_cache.FindTexture(texture.image_id, texture.desc);
-		texture_cache.GetImage(texture.image_id).usage.texture = true;
+		auto& image        = texture_cache.GetImage(texture.image_id);
+		image.usage.texture = true;
+		view.state = ImageLookupState::Of(texture.image_id, image);
+		view.valid = !view.state.cpu_dirty && !view.state.buffer_modified &&
+		             !image.info.data.Empty();
 	}
 }
 
@@ -1539,8 +1584,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		for (auto& binding: descriptors.images) {
 			transit(binding);
 		}
-		for (auto& binding: descriptors.table_images) {
-			transit(binding);
+		for (auto* binding: descriptors.table_images) {
+			transit(*binding);
 		}
 
 		m_image_occurrences.assign(descriptors.images.size(), 0);
@@ -1561,8 +1606,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				}
 				if (!binding.tables.empty() && m_table_image_infos.empty()) {
 					m_table_image_infos.reserve(descriptors.table_images.size());
-					for (const auto& texture: descriptors.table_images) {
-						m_table_image_infos.push_back(MakeImageInfo(texture));
+					for (const auto* texture: descriptors.table_images) {
+						m_table_image_infos.push_back(MakeImageInfo(*texture));
 					}
 				}
 				for (const auto& range: binding.tables) {
