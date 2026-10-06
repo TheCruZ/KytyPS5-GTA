@@ -11903,6 +11903,127 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // A GPU-selected material shader binds its T# table as a descriptor array; slot 0 and every
+  // entry that holds no T# are null elements. Their binding has no image: acquiring the view of
+  // an element must skip them, when the table is resolved and when the next dispatch reuses it.
+  void CheckNullBindlessTableElements() {
+    constexpr const char *name = "NullBindlessTableElements";
+    constexpr uintptr_t base = 0x0000000204b00000ull;
+    constexpr uint64_t size = 0x10000;
+    constexpr u32 count = 70, lanes = 32;
+    constexpr uint64_t table_address = base + 0x1000, material_address = base + 0x2000;
+    constexpr uint64_t output_address = base + 0x3000;
+    std::vector<u32> code{EncodeVopc(0xc5, InlineU32(0), 0),
+                          EncodeSop1(0x24, 24, 106), EncodeSopp(0x08, 0)};
+    code.insert(code.end(), {EncodeSop1(0x04, 26, 126), EncodeVop1(0x01, 16, InlineU32(1))});
+    // An earlier descriptor waterfall separates the EXECZ witness from the material load.
+    const auto previous_loop = code.size();
+    code.insert(code.end(), {EncodeSop1(0x04, 28, 126),
+                             EncodeVop1(0x02, 22, Vgpr(0)), EncodeVopc(0xd2, 22, 0),
+                             EncodeVop1(0x01, 16, InlineU32(0)),
+                             EncodeSop1(0x04, 126, 28), EncodeVopc(0xd5, InlineU32(0), 16)});
+    code.push_back(EncodeSopp(0x09, static_cast<int16_t>(previous_loop - code.size() - 1u)));
+    code.insert(code.end(), {EncodeSop1(0x04, 126, 26),
+                             EncodeMubuf0(0x0c, 0, true, false), EncodeMubuf1(15, 1, 0),
+                             EncodeVop2(0x16, 15, InlineU32(4), 15),
+                             EncodeVop1(0x01, 16, InlineU32(1))});
+    const auto image_loop = code.size();
+    code.insert(code.end(), {EncodeSop1(0x04, 28, 126),
+                             EncodeVop1(0x02, 20, Vgpr(15)), EncodeVopc(0xd2, 20, 15),
+                             EncodeSop2(0x1e, 20, 20, InlineU32(5)),
+                             EncodeSmem0(0x0b, 32), EncodeSmem1(0, 20),
+                             EncodeMimg0(0x24, 1), EncodeMimg1(4, 0, 8, 2),
+                             EncodeVop2(0x1a, 31, InlineU32(2), 0),
+                             EncodeMubuf0(0x1c), EncodeMubuf1(4, 3, 31),
+                             EncodeVop1(0x01, 16, InlineU32(0)),
+                             EncodeSop1(0x04, 126, 28), EncodeVopc(0xd5, InlineU32(0), 16)});
+    code.push_back(EncodeSopp(0x09, static_cast<int16_t>(image_loop - code.size() - 1u)));
+    code[2] = EncodeSopp(0x08, static_cast<int16_t>(code.size() - 3u));
+    AppendEnd(&code);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+        "table output allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x3, 0x10, physical, size) == 0 && mapped == reinterpret_cast<void *>(base),
+        "table output mapping failed");
+    // No entry of the table holds a T#: the keys select entries, all of them null.
+    std::memset(mapped, 0, size);
+    for (u32 lane = 0; lane < lanes; ++lane)
+      reinterpret_cast<u32 *>(material_address)[lane] = (lane << 4u) | 3u;
+    std::memset(reinterpret_cast<void *>(output_address), 0xa5, lanes * sizeof(u32));
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto &shaders = processor.GetShCtx();
+      auto &executor = context.GetRenderExecutor();
+      for (u32 sgpr = 0; sgpr < 16; ++sgpr)
+        shaders.SetCsUserSgpr(sgpr, 0);
+      const auto set_buffer = [&](u32 first, uint64_t address, u32 stride, u32 records,
+                                  u32 dword3) {
+        ShaderBufferResource buffer{};
+        buffer.UpdateAddress48(address);
+        buffer.fields[1] |= stride << 16u;
+        buffer.fields[2] = records;
+        buffer.fields[3] = dword3;
+        for (u32 i = 0; i < 4; ++i)
+          shaders.SetCsUserSgpr(first + i, buffer.fields[i]);
+      };
+      set_buffer(0, table_address, 32u, count, 0x5204u);
+      set_buffer(4, material_address, 4u, count + 3u, 0x5204u);
+      set_buffer(12, output_address, 0u, lanes * sizeof(u32),
+                 DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u));
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                           .num_thread_x = lanes, .num_thread_y = 1, .num_thread_z = 1,
+                           .wave_size = 32, .user_sgpr = 16});
+      for (u32 pass = 0; pass < 2; ++pass) {
+        ShaderComputeInputInfo input{};
+        (void)context.GetPipelineCache().GetComputeProgram(shaders.GetCs(), input);
+        Require(name, "bindless table program", std::ranges::any_of(
+            input.stage.module->info.info.images,
+            [](const auto &image) { return image.table_capacity != 0u; }),
+            "the GPU-selected material shader did not bind the T# table as an array");
+        // The second pass reuses the bindings of the first dispatch's table.
+        PreparedBindings bindings;
+        executor.PrepareBindings(input.stage, bindings);
+        Require(name, pass == 0 ? "table resolved slot by slot" : "table reused",
+            bindings.tables_reused == (pass == 1), "the table bindings were not reused as expected");
+        executor.RebindImages(bindings);
+        Require(name, "null table elements", pass == 1 || (!bindings.table_images.empty() &&
+            std::ranges::all_of(bindings.table_images, [](const auto *texture) {
+              return !texture->image_id && texture->image_view == nullptr &&
+                  MakeImageInfo(*texture, 0u).imageView == nullptr;
+            })), "an element without a T# was bound to an image");
+        processor.DispatchDirect(1, 1, 1, 0x41u |
+            (1u << Pm4::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT));
+      }
+      std::array<u32, lanes> actual{};
+      context.GetBufferCache().ReadMemory(output_address, sizeof(actual));
+      // Lane 0 only witnesses a nonempty EXEC and does not store.
+      Require(name, "null samples",
+          LibKernel::Memory::TryReadBacking(output_address, actual.data(), sizeof(actual)) &&
+              std::all_of(actual.begin() + 1, actual.end(), [](u32 value) { return value == 0; }),
+          "sampling a null table element returned nonzero components");
+      context.UnmapMemory(base, size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
+            "table output release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckScalarLeafCall() {
     constexpr const char* name = "ScalarLeafCall";
     constexpr uintptr_t base = 0x0000000204800000ull;
@@ -54738,6 +54859,7 @@ int main(int argc, char **argv) {
     CheckImageSamplerSpecialization();
     VulkanHarness vulkan;
     vulkan.CheckNullTextureDescriptors();
+    vulkan.CheckNullBindlessTableElements();
     CheckCountedRowImageSelector(vulkan);
     CheckPointerImageTable(vulkan);
     CheckWorkgroupDividedImageTable(vulkan);
@@ -54958,6 +55080,7 @@ int main(int argc, char **argv) {
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();
   vulkan.CheckNullTextureDescriptors();
+  vulkan.CheckNullBindlessTableElements();
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckBdaSyncUploads();
   vulkan.CheckLargeSparseImageUpload();
