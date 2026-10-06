@@ -93,9 +93,19 @@ void RenderContext::PrepareGpuWrite(const void* destination, uint64_t size) noex
 
 bool RenderContext::WriteAroundGpuWrites(void* destination, const void* data, uint64_t size) {
 	const auto vaddr = reinterpret_cast<uint64_t>(destination);
-	if (size == 0 || !GuestRange {vaddr, size}.Valid() ||
-	    m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
 		return false;
+	}
+	if (m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+		// A write over memory a GPU-written image holds: the faulting path reads the GPU's
+		// buffer writes of the page back (draining the GPU) and leaves the image CPU-dirty. The
+		// write-around keeps the page GPU-owned instead, which needs no readback, and the image
+		// becomes CPU-dirty all the same.
+		if (!m_buffer_cache.WriteAroundGpuWrites(vaddr, data, size)) {
+			return false;
+		}
+		m_texture_cache.InvalidateMemory(vaddr, size);
+		return true;
 	}
 	return m_buffer_cache.WriteAroundGpuWrites(vaddr, data, size);
 }
