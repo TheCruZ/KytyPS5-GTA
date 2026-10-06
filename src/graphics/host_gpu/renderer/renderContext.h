@@ -103,6 +103,10 @@ private:
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
+	// Device-address accesses ran since the use bitmap was last read; reads one in UseScanPeriod
+	// collections (the buffer cache's age collection waits much longer).
+	bool                      m_use_scan_pending      = false;
+	uint32_t                  m_use_scan_countdown    = 0;
 	bool                      m_bda_logged = false;
 
 	Common::Mutex                        m_interrupt_mutex;
