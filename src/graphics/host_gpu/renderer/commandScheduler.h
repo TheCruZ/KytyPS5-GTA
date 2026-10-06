@@ -65,6 +65,11 @@ public:
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
+	// The last tick whose command buffer reached vkQueueSubmit: with deferred recording, a tick
+	// the execution thread already submitted may still wait for the recording thread.
+	[[nodiscard]] uint64_t SubmittedTick() const noexcept {
+		return m_submitted_tick.load(std::memory_order_acquire);
+	}
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
 	// Copies of guest data into the stream buffer that the execution thread hands off, with
@@ -148,6 +153,7 @@ private:
 	// The tick of the oldest pending operation (UINT64_MAX without any), written under
 	// m_operation_mutex: draws check it without the lock.
 	std::atomic<uint64_t>        m_pending_front_tick {UINT64_MAX};
+	std::atomic<uint64_t>        m_submitted_tick {0};
 	// Calls since draws last queried the GPU timeline for pending operations.
 	std::atomic<uint32_t>        m_pending_skips {0};
 	std::queue<PendingOperation> m_priority_operations;

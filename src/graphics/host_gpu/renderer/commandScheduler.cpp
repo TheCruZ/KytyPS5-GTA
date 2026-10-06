@@ -542,6 +542,8 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 		                  debug.debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	// Ticks are submitted in order, by one thread at a time.
+	m_submitted_tick.store(tick, std::memory_order_release);
 }
 
 void CommandScheduler::RecordingThread() {

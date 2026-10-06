@@ -795,6 +795,12 @@ bool BufferCache::DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::Bu
 	if (needed >= m_scheduler.CurrentTick()) {
 		return false;
 	}
+	// The copy waits for the needed submission on the GPU, but must not be submitted before it:
+	// the driver may then block inside vkQueueSubmit, holding locks a submission of the
+	// recording thread (or a present) needs.
+	while (m_scheduler.SubmittedTick() < needed) {
+		Common::SpinPause();
+	}
 	auto& device = m_graphics.device;
 	if (!m_readback.pool) {
 		vk::CommandPoolCreateInfo pool_info {};
