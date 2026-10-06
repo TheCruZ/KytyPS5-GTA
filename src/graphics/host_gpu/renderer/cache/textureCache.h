@@ -85,6 +85,27 @@ public:
 	// The ImageSetEpoch of the last registration or unregistration of an image overlapping the
 	// range's pages: while it is unchanged, a lookup in the range finds the same images.
 	[[nodiscard]] uint64_t ImageEpochInRegion(uint64_t address, uint64_t size);
+	// The granularity of ImageEpochInRegion(): log2 of its page size.
+	static constexpr uint32_t ImagePageBits = 20;
+	// Calls `function(address, size)` for the image range of every registration and
+	// unregistration after ImageSetEpoch() was `epoch`, oldest first. False when the history no
+	// longer reaches back that far.
+	template <typename Function>
+	[[nodiscard]] bool ForEachImageSetChangeSince(uint64_t epoch, Function&& function) {
+		std::scoped_lock lock {m_lock};
+		if (m_image_set_epoch - epoch > ImageSetChangeHistory) {
+			return false;
+		}
+		for (auto change = epoch + 1; change <= m_image_set_epoch; ++change) {
+			const auto& range = m_image_set_changes[change % ImageSetChangeHistory];
+			function(range.first, range.second);
+		}
+		return true;
+	}
+	// A pinned image is used without its bindings looking it up or touching it: the garbage
+	// collector keeps it and overlapping lookups do not delete it as unused. Pins nest.
+	void PinImage(ImageId id);
+	void UnpinImage(ImageId id);
 	void RunGarbageCollector();
 
 private:
@@ -105,6 +126,7 @@ private:
 
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
 	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 44, 14>;
+	static_assert(ImagePageTable::kPageBits == ImagePageBits);
 
 	// Callers have validated the nonempty 44-bit range with TryGetPageRange.
 	template <typename Func>
@@ -203,6 +225,9 @@ private:
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
 	uint64_t         m_image_set_epoch        = 0;
+	// The image range of the last registrations and unregistrations, by ImageSetEpoch.
+	static constexpr uint64_t ImageSetChangeHistory = 1024;
+	std::array<std::pair<uint64_t, uint64_t>, ImageSetChangeHistory> m_image_set_changes {};
 	bool             m_readback_linear_images = false;
 	// Lookups that found an existing image with the same backing, by description: while no image
 	// on the pages of the range was registered or unregistered since, the same lookup finds the

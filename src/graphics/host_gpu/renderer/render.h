@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <span>
@@ -287,13 +288,11 @@ private:
 	// change. Elements with DCC metadata are resolved again on every use: their lookup
 	// materializes fast clears.
 	struct TableElementResolution {
-		TextureBinding texture;
-		GuestRange     range; // Guest memory whose images decide the lookup, if any.
-		uint64_t       image_epoch   = 0;
-		uint64_t       backing_epoch = 0;
-		// The global image-set epoch at which the element was last known valid: while it holds,
-		// no image anywhere changed and the range needs no check.
-		uint64_t       checked_epoch = 0;
+		// What every preparation of a table reads comes first, on one cache line: a table names
+		// thousands of elements.
+		// The PrepareBindings() call that last bound the element, and its index there.
+		uint64_t       prepared_stamp = 0;
+		uint32_t       prepared_index = 0;
 		bool           permanent     = false; // Null for the root's view, whatever the memory.
 		bool           volatile_dcc  = false;
 		// A resolved element depends on the guest backing only through whether its data and
@@ -301,25 +300,120 @@ private:
 		// constantly while a game streams), the element stays valid while that answer holds.
 		bool           backing_checkable = false;
 		bool           backing_readable  = false;
+		uint64_t       image_epoch   = 0;
+		uint64_t       backing_epoch = 0;
+		// The global image-set epoch at which the element was last known valid: while it holds,
+		// no image anywhere changed and the range needs no check.
+		uint64_t       checked_epoch = 0;
+		GuestRange     range; // Guest memory whose images decide the lookup, if any.
 		GuestRange     metadata_range;
-		// The PrepareBindings() call that last bound the element, and its index there.
-		uint64_t       prepared_stamp = 0;
-		uint32_t       prepared_index = 0;
+		TableViewMemo  view;
+		TextureBinding texture;
 	};
 	struct TableDescriptorHash {
 		size_t operator()(const std::array<uint32_t, 8>& dwords) const noexcept;
 	};
+	using TableElements =
+	    std::unordered_map<std::array<uint32_t, 8>, TableElementResolution, TableDescriptorHash>;
+	// The element the last preparation of a root found for one slot: a slot whose T# did not
+	// change skips the lookup by T#.
+	struct TableSlot {
+		std::array<uint32_t, 8> dwords {};
+		TableElementResolution* element = nullptr;
+	};
 	struct TableResolution {
 		ShaderRecompiler::IR::ImageResource root;
 		uint64_t                            last_use = 0;
-		std::unordered_map<std::array<uint32_t, 8>, TableElementResolution, TableDescriptorHash>
-		    elements;
+		TableElements                       elements;
+		std::vector<TableSlot>              slots;
 	};
 
+	// `stamp` identifies the PrepareBindings() call: an element it already resolved is not
+	// resolved again for another slot. `known` is the element of `value`, when the caller has it.
 	[[nodiscard]] TableElementResolution&
-	ResolveTableElement(TableResolution& table, const ShaderRecompiler::IR::DescriptorValue& value);
+	ResolveTableElement(TableResolution& table, const ShaderRecompiler::IR::DescriptorValue& value,
+	                    uint64_t stamp, TableElementResolution* known = nullptr);
 	[[nodiscard]] TableResolution& FindTableResolution(const ShaderRecompiler::IR::ImageResource& root);
 	[[nodiscard]] bool TableElementBackingReadable(const TableElementResolution& element);
+
+	// The bindless tables a program bound last. GTA V's ray tracing dispatches bind ~16k slots
+	// naming ~8k textures each, and almost all of them stay the same from frame to frame: while
+	// the T#s of every slot are unchanged, a binding of the program revisits only the elements
+	// that an image registration or a guest backing change may have affected, and the elements
+	// whose image is no longer bound as before (see ReuseTableBindings()). The images of the
+	// elements stay pinned in the texture cache meanwhile: they are not touched every binding.
+	struct TableBindingState {
+		struct Range {
+			ShaderRecompiler::IR::ImageResource root;
+			TableResolution*                    resolution = nullptr;
+			uint32_t                            table      = 0;
+			uint32_t                            capacity   = 0;
+		};
+		struct Element {
+			TableElementResolution*               resolution = nullptr;
+			TableResolution*                      table      = nullptr;
+			ShaderRecompiler::IR::DescriptorValue source;
+			uint32_t                              root = 0;
+			// Image the element is pinned to.
+			ImageId                               pinned;
+			// Visited by every binding (DCC metadata), or whenever the guest backing changes
+			// (the element's resolution does not record whether its backing is readable).
+			bool always            = false;
+			bool unchecked_backing = false;
+			// The ranges `spans` holds for the element.
+			GuestRange span_range;
+			GuestRange span_metadata;
+		};
+		// The guest pages (in texture-cache page granularity) of an element's data or metadata.
+		struct PageSpan {
+			uint64_t first   = 0;
+			uint64_t last    = 0;
+			uint32_t element = 0;
+		};
+		std::vector<Range>                   ranges;
+		// The T# of every slot of every range, in binding order.
+		std::vector<ShaderRecompiler::IR::DescriptorValue> values;
+		std::vector<Element>                 elements;
+		// The element of every slot.
+		std::vector<uint32_t>                slots;
+		// The descriptor of every element, and of every slot.
+		std::vector<vk::DescriptorImageInfo> infos;
+		std::vector<vk::DescriptorImageInfo> slot_infos;
+		// The slots of each element: element_slots[element_slot_begin[e] .. [e + 1]).
+		std::vector<uint32_t>                element_slot_begin;
+		std::vector<uint32_t>                element_slots;
+		// Element spans by first page; `max_span` is the longest (last - first).
+		std::vector<PageSpan>                spans;
+		uint64_t                             max_span = 0;
+		// Elements visited by every binding, and whenever the guest backing changes.
+		std::vector<uint32_t>                always;
+		std::vector<uint32_t>                unchecked_backing;
+		// Elements marked for a visit by this binding.
+		std::vector<uint64_t>                marks;
+		uint64_t                             mark_stamp = 0;
+		uint64_t                             generation = 0;
+		uint64_t                             set_epoch  = 0;
+		uint64_t                             backing_epoch = 0;
+		bool                                 valid = false;
+	};
+	// Prepares the tables of `prepared` from the program's state when it still applies; false
+	// when the tables must be resolved slot by slot.
+	[[nodiscard]] bool ReuseTableBindings(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+	                                      const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
+	                                      TableBindingState& state, uint64_t stamp,
+	                                      PreparedBindings& prepared);
+	// Marks the elements a change of the image set or of the guest backing since the state's
+	// epochs may affect, and moves the epochs to now.
+	void MarkTableChanges(TableBindingState& state);
+	void MarkTableElement(TableBindingState& state, uint32_t element);
+	void MarkTablePages(TableBindingState& state, uint64_t address, uint64_t size);
+	void RebuildTableSpans(TableBindingState& state);
+	// After CommitBindings() bound the tables: records the descriptors and pins the images.
+	void FinishTableBindings(TableBindingState& state, const PreparedBindings& prepared);
+	void UnpinTableBindings(TableBindingState& state);
+	// RebindImages() of reused tables: visits the elements PrepareBindings() marked and those
+	// whose image is no longer bound as the state records.
+	void RebindReusedTables(PreparedBindings& prepared);
 
 	// ResolveTexture's image descriptions by T# and shader view (see DeriveTextureDesc).
 	struct TextureDescKey {
@@ -423,10 +517,24 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>> m_written_image_ranges;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
-	std::vector<TableResolution>          m_table_resolutions;
+	// Prepared bindings and slot memos point into the elements: a deque never relocates its
+	// entries (std::unordered_map has no noexcept move, so a growing vector copied the elements
+	// and left those pointers dangling).
+	std::deque<TableResolution>           m_table_resolutions;
+	// Elements a table resolution dropped while prepared bindings may still point into them;
+	// freed by ResetBindings().
+	std::deque<TableElements>             m_retired_table_elements;
 	uint64_t                              m_table_resolution_tick = 0;
 	uint64_t                              m_table_prepare_stamp   = 0;
 	std::vector<vk::DescriptorImageInfo>  m_table_image_infos;
+	// Advances whenever a table resolution drops its elements: table binding states pointing
+	// into them no longer apply.
+	uint64_t                              m_table_generation = 0;
+	std::unordered_map<const void*, TableBindingState> m_table_states;
+	std::vector<std::pair<uint64_t, uint64_t>>         m_table_changes;
+	std::vector<uint32_t>                              m_table_marked;
+	// RebindReusedTables(): the elements whose binding changed, one byte per element.
+	std::vector<uint8_t>                               m_table_flags;
 	// Reused by every draw; see AcquireDrawRenderState().
 	std::unique_ptr<DrawRenderStorage, void (*)(DrawRenderStorage*)> m_draw_state {nullptr,
 	                                                                               nullptr};

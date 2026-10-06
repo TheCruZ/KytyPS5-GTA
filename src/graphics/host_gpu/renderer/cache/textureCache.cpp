@@ -219,6 +219,8 @@ void TextureCache::RegisterImage(ImageId id) {
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	const auto epoch = ++m_image_set_epoch;
+	m_image_set_changes[epoch % ImageSetChangeHistory] = {image.info.data.address,
+	                                                      image.info.data.size};
 	ForEachPage(image.info.data.address, image.info.data.size,
 	            [this, epoch](uint64_t page) { m_image_page_epochs[page] = epoch; });
 	m_total_used_memory += image.AccountedSize();
@@ -248,6 +250,8 @@ void TextureCache::UnregisterImage(ImageId id) {
 	m_total_used_memory -= accounted;
 	image.registered = false;
 	const auto epoch = ++m_image_set_epoch;
+	m_image_set_changes[epoch % ImageSetChangeHistory] = {image.info.data.address,
+	                                                      image.info.data.size};
 	ForEachPage(image.info.data.address, image.info.data.size,
 	            [this, epoch](uint64_t page) { m_image_page_epochs[page] = epoch; });
 }
@@ -327,6 +331,18 @@ void TextureCache::FreeImage(ImageId id) {
 		image.ClearGpuModified();
 	}
 	DeleteImage(id);
+}
+
+void TextureCache::PinImage(ImageId id) {
+	if (auto* image = m_slot_images.try_get(id); image != nullptr) {
+		image->table_pins++;
+	}
+}
+
+void TextureCache::UnpinImage(ImageId id) {
+	if (auto* image = m_slot_images.try_get(id); image != nullptr && image->table_pins != 0) {
+		image->table_pins--;
+	}
 }
 
 void TextureCache::TouchImage(Image& image) {
@@ -810,6 +826,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	auto&      cached       = *owner;
 	const auto current_tick = m_scheduler.CurrentTick();
 	const bool safe_to_delete =
+	    cached.table_pins == 0 &&
 	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval;
 
 	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
@@ -2027,6 +2044,11 @@ void TextureCache::RunGarbageCollector() {
 			--deletions;
 			auto owner = m_slot_images.try_get(id);
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
+				continue;
+			}
+			if (owner->table_pins != 0) {
+				// Bound every time without a touch: still in use.
+				m_lru_cache.Touch(owner->lru_id, m_gc_tick);
 				continue;
 			}
 			if (owner->IsGpuModified()) {

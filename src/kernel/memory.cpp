@@ -182,13 +182,33 @@ static callback_func_t g_test_backing_read                         = nullptr;
 #endif
 
 static std::atomic<uint64_t> g_backing_epoch {0};
+// The range of the last backing changes, by epoch.
+static constexpr uint64_t                                      BackingChangeHistory = 4096;
+static std::mutex                                              g_backing_changes_mutex;
+static std::array<std::pair<uint64_t, uint64_t>, BackingChangeHistory> g_backing_changes {};
 
-static void BumpBackingEpoch() noexcept {
-	g_backing_epoch.fetch_add(1, std::memory_order_acq_rel);
+static void BumpBackingEpoch(uint64_t start, uint64_t size) noexcept {
+	std::lock_guard lock(g_backing_changes_mutex);
+	const auto epoch = g_backing_epoch.load(std::memory_order_relaxed) + 1;
+	g_backing_changes[epoch % BackingChangeHistory] = {start, size};
+	// Readers that see the epoch find its change under the lock.
+	g_backing_epoch.store(epoch, std::memory_order_release);
 }
 
 uint64_t BackingEpoch() noexcept {
 	return g_backing_epoch.load(std::memory_order_acquire);
+}
+
+bool BackingChangesSince(uint64_t epoch, std::vector<std::pair<uint64_t, uint64_t>>& changes) {
+	std::lock_guard lock(g_backing_changes_mutex);
+	const auto current = g_backing_epoch.load(std::memory_order_relaxed);
+	if (current - epoch > BackingChangeHistory) {
+		return false;
+	}
+	for (auto change = epoch + 1; change <= current; ++change) {
+		changes.push_back(g_backing_changes[change % BackingChangeHistory]);
+	}
+	return true;
 }
 
 #include "memoryAddressSpace.inc"
@@ -394,14 +414,14 @@ public:
 		if (IsCommittedRangeType(type)) {
 			m_committed.Set(start, size, true);
 		}
-		BumpBackingEpoch();
+		BumpBackingEpoch(start, size);
 		return true;
 	}
 
 	bool Remove(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
 		m_committed.Set(start, size, false);
-		BumpBackingEpoch();
+		BumpBackingEpoch(start, size);
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
@@ -2681,7 +2701,10 @@ int KYTY_SYSV_ABI KernelSetPrtAperture(int index, void* addr, size_t len) {
 		g_prt_apertures[static_cast<size_t>(index)] =
 		    len == 0 ? PrtAperture {} : PrtAperture {address, static_cast<uint64_t>(len)};
 	}
-	BumpBackingEpoch();
+	if (old.size != 0) {
+		BumpBackingEpoch(old.address, old.size);
+	}
+	BumpBackingEpoch(address, len);
 	if (len != 0) {
 		MapGpuRange(address, len);
 	}

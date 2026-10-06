@@ -487,10 +487,24 @@ bool MaterializeImageTable(const ResourcePlan& program,
 		const auto reusable = std::ranges::find_if(previous, [&](const ImageTableSnapshot& old) {
 			return same_table(old) && old.raw == words && !old.slots.empty();
 		});
+		// The tables this thread built last, by any program: resolutions ahead of execution
+		// materialize into a ring of snapshots, so `previous` rarely holds the table.
+		static thread_local std::array<ImageTableSnapshot, 4> built;
+		static thread_local uint32_t                          built_next = 0;
+		const auto cached = reusable != previous.end()
+		                        ? built.end()
+		                        : std::ranges::find_if(built, [&](const ImageTableSnapshot& old) {
+			                          return same_table(old) && !old.slots.empty() &&
+			                                 old.raw == words;
+		                          });
 		if (reusable != previous.end()) {
 			next.raw     = std::move(reusable->raw);
 			next.slots   = std::move(reusable->slots);
 			next.mapping = std::move(reusable->mapping);
+		} else if (cached != built.end()) {
+			next.raw.swap(words);
+			next.slots   = cached->slots;
+			next.mapping = cached->mapping;
 		} else {
 			next.raw.swap(words);
 			next.slots.push_back(DescriptorValue {.dword_count = 8u});
@@ -513,6 +527,7 @@ bool MaterializeImageTable(const ResourcePlan& program,
 				}
 				next.mapping[entry + 1u] = slot->second;
 			}
+			built[built_next++ % built.size()] = next;
 		}
 		snapshot.image_tables.push_back(std::move(next));
 		mapping_offsets.push_back(static_cast<uint32_t>(snapshot.flattened_srt.size()));
