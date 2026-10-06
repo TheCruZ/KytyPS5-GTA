@@ -372,12 +372,12 @@ public:
 #endif
 		m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode});
 		MapsChangedUnlocked();
-		BumpBackingEpoch();
+		BumpBackingEpoch(vaddr, size);
 		return true;
 	}
 
 	bool Unmap(uint64_t vaddr, uint64_t size) {
-		BumpBackingEpoch();
+		BumpBackingEpoch(vaddr, size);
 		const auto            end = vaddr + size;
 		std::vector<MapEntry> targets;
 		{
