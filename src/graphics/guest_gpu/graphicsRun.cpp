@@ -610,7 +610,11 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 	}
 	struct CommitWriteTicks {
 		RenderContext& renderer;
-		~CommitWriteTicks() { renderer.GetBufferCache().CommitWriteTicks(); }
+		~CommitWriteTicks() {
+			if (renderer.GetBufferCache().CommitWriteTicks()) {
+				renderer.GetCommandScheduler().Flush();
+			}
+		}
 	} commit_write_ticks {m_renderer};
 	switch (operation.kind) {
 		case GpuOperationKind::DrawIndex:

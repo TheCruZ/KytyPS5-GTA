@@ -152,10 +152,19 @@ public:
 	}
 	void               RunGarbageCollector();
 	// Execution thread, after each operation: the GPU writes the operation recorded get the
-	// tick of the command buffer that holds them (see DownloadOnReadbackQueue()).
-	void CommitWriteTicks();
+	// tick of the command buffer that holds them (see DownloadOnReadbackQueue()). True when the
+	// operation wrote memory that readbacks keep waiting for: submitting its command buffer now
+	// lets the GPU run it before the readback comes, which then waits for that submission only
+	// instead of draining everything recorded since.
+	[[nodiscard]] bool CommitWriteTicks();
 	// The operation being recorded accesses memory through device addresses.
-	void NoteDeviceAddressUse() noexcept { m_device_address_pending = true; }
+	void NoteDeviceAddressUse() noexcept {
+		m_device_address_pending = true;
+		if (m_device_address_hot != 0 &&
+		    m_readback_count - m_device_address_hot < HotReadbackLifetime) {
+			m_flush_requested = true;
+		}
+	}
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -202,8 +211,17 @@ private:
 		// Draws bind the same written ranges again and again.
 		if (m_pending_writes.empty() || m_pending_writes.back() != std::pair {vaddr, size}) {
 			m_pending_writes.emplace_back(vaddr, size);
+			for (const auto& hot: m_readback_hot) {
+				if (vaddr < hot.end && hot.begin < vaddr + size) {
+					m_flush_requested = true;
+					break;
+				}
+			}
 		}
 	}
+	// A readback of [begin, end) waited for writes still being recorded (`drained`) or for
+	// submitted ones; `device_address` when they were device-address writes.
+	void NoteReadbackWait(uint64_t begin, uint64_t end, bool device_address, bool drained);
 
 	// The tick of the command buffer that last wrote each guest range a cached buffer holds.
 	class WriteTicks {
@@ -238,6 +256,21 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>>        m_pending_writes;
 	uint64_t                                          m_device_address_tick    = 0;
 	bool                                              m_device_address_pending = false;
+	// Pages whose readbacks found the writes they need still being recorded, which drains the
+	// GPU: an operation that writes them is submitted at once (see CommitWriteTicks()). An entry
+	// lives while readbacks of it keep coming, up to HotReadbackLifetime readbacks without one.
+	struct HotReadback {
+		uint64_t begin    = 0;
+		uint64_t end      = 0;
+		uint64_t last_hit = 0;
+	};
+	static constexpr uint64_t HotReadbackLifetime = 4096;
+	static constexpr size_t   MaxHotReadbacks     = 32;
+	std::vector<HotReadback>  m_readback_hot;
+	uint64_t                  m_readback_count = 0;
+	// m_readback_count at the last readback that waited for device-address writes (0: none).
+	uint64_t                  m_device_address_hot = 0;
+	bool                      m_flush_requested    = false;
 	struct ReadbackQueue {
 		vk::CommandPool         pool    = nullptr;
 		vk::CommandBuffer       command = nullptr;

@@ -756,9 +756,36 @@ uint64_t BufferCache::WriteTicks::Latest(uint64_t begin, uint64_t end) const {
 	return cursor >= end ? latest : UINT64_MAX;
 }
 
-void BufferCache::CommitWriteTicks() {
+void BufferCache::NoteReadbackWait(uint64_t begin, uint64_t end, bool device_address,
+                                   bool drained) {
+	const auto count = ++m_readback_count;
+	if (device_address && (drained || m_device_address_hot != 0)) {
+		m_device_address_hot = count;
+	}
+	std::erase_if(m_readback_hot, [count](const HotReadback& hot) {
+		return count - hot.last_hit >= HotReadbackLifetime;
+	});
+	begin = Common::AlignDown(begin, TRACKER_PAGE_SIZE);
+	end   = Common::AlignUp(end, TRACKER_PAGE_SIZE);
+	for (auto& hot: m_readback_hot) {
+		if (begin < hot.end && hot.begin < end) {
+			hot.begin    = std::min(hot.begin, begin);
+			hot.end      = std::max(hot.end, end);
+			hot.last_hit = count;
+			return;
+		}
+	}
+	if (drained && !device_address) {
+		if (m_readback_hot.size() == MaxHotReadbacks) {
+			m_readback_hot.erase(std::ranges::min_element(m_readback_hot, {}, &HotReadback::last_hit));
+		}
+		m_readback_hot.push_back({begin, end, count});
+	}
+}
+
+bool BufferCache::CommitWriteTicks() {
 	if (m_pending_writes.empty() && !m_device_address_pending) {
-		return;
+		return std::exchange(m_flush_requested, false);
 	}
 	// The operation's commands are all recorded: they run in the current command buffer or in
 	// one submitted while it was recorded.
@@ -771,6 +798,7 @@ void BufferCache::CommitWriteTicks() {
 		m_device_address_pending = false;
 		m_device_address_tick    = tick;
 	}
+	return std::exchange(m_flush_requested, false);
 }
 
 bool BufferCache::DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::BufferCopy> copies,
@@ -782,19 +810,25 @@ bool BufferCache::DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::Bu
 	// Writes of the operation being recorded, or through device addresses (which name no range)
 	// since the needed submissions, may still change the bytes.
 	uint64_t needed = m_device_address_tick;
+	const auto readback_begin = buffer_address + copies.front().srcOffset;
+	const auto readback_end   = buffer_address + copies.back().srcOffset + copies.back().size;
 	for (const auto& copy: copies) {
 		const auto begin = buffer_address + copy.srcOffset;
 		const auto end   = begin + copy.size;
 		for (const auto& [vaddr, size]: m_pending_writes) {
 			if (vaddr < end && begin < vaddr + size) {
+				NoteReadbackWait(readback_begin, readback_end, false, true);
 				return false;
 			}
 		}
 		needed = std::max(needed, m_write_ticks.Latest(begin, end));
 	}
+	const bool device_address = needed != 0 && needed == m_device_address_tick;
 	if (needed >= m_scheduler.CurrentTick()) {
+		NoteReadbackWait(readback_begin, readback_end, device_address, true);
 		return false;
 	}
+	NoteReadbackWait(readback_begin, readback_end, device_address, false);
 	// The copy waits for the needed submission on the GPU, but must not be submitted before it:
 	// the driver may then block inside vkQueueSubmit, holding locks a submission of the
 	// recording thread (or a present) needs.
