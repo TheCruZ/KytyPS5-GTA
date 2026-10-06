@@ -220,6 +220,8 @@ void TextureCache::RegisterImage(ImageId id) {
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	const auto epoch = ++m_image_set_epoch;
+	m_image_set_changes[epoch % ImageSetChangeHistory] = {image.info.data.address,
+	                                                      image.info.data.size};
 	ForEachPage(image.info.data.address, image.info.data.size,
 	            [this, epoch](uint64_t page) { m_image_page_epochs[page] = epoch; });
 	m_total_used_memory += image.AccountedSize();
@@ -239,6 +241,8 @@ void TextureCache::UnregisterImage(ImageId id) {
 	m_total_used_memory -= image.AccountedSize();
 	image.registered = false;
 	const auto epoch = ++m_image_set_epoch;
+	m_image_set_changes[epoch % ImageSetChangeHistory] = {image.info.data.address,
+	                                                      image.info.data.size};
 	ForEachPage(image.info.data.address, image.info.data.size,
 	            [this, epoch](uint64_t page) { m_image_page_epochs[page] = epoch; });
 }
@@ -299,6 +303,18 @@ void TextureCache::DeleteImage(ImageId id) {
 void TextureCache::FreeImage(ImageId id) {
 	m_slot_images[id].ClearGpuModified();
 	DeleteImage(id);
+}
+
+void TextureCache::PinImage(ImageId id) {
+	if (auto* image = m_slot_images.try_get(id); image != nullptr) {
+		image->table_pins++;
+	}
+}
+
+void TextureCache::UnpinImage(ImageId id) {
+	if (auto* image = m_slot_images.try_get(id); image != nullptr && image->table_pins != 0) {
+		image->table_pins--;
+	}
 }
 
 void TextureCache::TouchImage(Image& image) {
@@ -807,7 +823,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		BcAlias::Resolve(*this, cached_id, merged_id);
 		return {merged_id};
 	}
-	const bool safe_to_delete = m_gc_tick - cached.tick_accessed_last > NumFramesBeforeRemoval &&
+	const bool safe_to_delete = cached.table_pins == 0 &&
+	                            m_gc_tick - cached.tick_accessed_last > NumFramesBeforeRemoval &&
 	                            cached.heap_refs.load(std::memory_order_relaxed) == 0u;
 
 	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
@@ -2169,8 +2186,8 @@ void TextureCache::RunGarbageCollector() {
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
 				continue;
 			}
-			if (owner->heap_refs.load(std::memory_order_relaxed) != 0u) {
-				// Resident heaps sample it without touching it.
+			if (owner->heap_refs.load(std::memory_order_relaxed) != 0u || owner->table_pins != 0) {
+				// Resident heaps and bindless table bindings sample it without touching it.
 				TouchImage(*owner);
 				continue;
 			}
