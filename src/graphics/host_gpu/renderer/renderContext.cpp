@@ -228,12 +228,21 @@ void RenderContext::PrepareBda(bool may_write) {
 		m_bda_sync_epochs = epochs;
 	}
 	m_fault_process_pending = true;
+	m_use_scan_pending      = true;
 }
 
 void RenderContext::RunGarbageCollector() {
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
+	}
+	constexpr uint32_t UseScanPeriod = 256;
+	if (m_use_scan_countdown != 0) {
+		m_use_scan_countdown--;
+	} else if (m_use_scan_pending) {
+		m_use_scan_pending   = false;
+		m_use_scan_countdown = UseScanPeriod;
+		m_buffer_cache.ProcessUseBuffer();
 	}
 	if (m_indirect_write_tables.TakePendingWrites()) {
 		m_buffer_cache.ProcessWriteBuffer([this](std::span<const uint64_t> pages) {
