@@ -431,6 +431,11 @@ void GuestGpu::ResolveThread() {
 			operation->resolved = executor.ResolveDispatchAhead(
 			    *operation->state.context, *operation->state.shaders, groups,
 			    operation->dispatch.mode);
+		} else if (operation->kind == GpuOperationKind::DispatchIndirect) {
+			// The program does not depend on the GPU-written arguments, only on the registers
+			// and the guest memory its resources read.
+			operation->resolved = executor.ResolveIndirectDispatchAhead(
+			    *operation->state.context, *operation->state.shaders, operation->dispatch.mode);
 		}
 		m_resolved.Push(std::move(*operation));
 	}
@@ -643,7 +648,14 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 			}
 			break;
 		}
-		case GpuOperationKind::DispatchIndirect: ExecuteDispatchIndirect(operation); break;
+		case GpuOperationKind::DispatchIndirect:
+			executor.UseResolvedDraw(operation.resolved);
+			ExecuteDispatchIndirect(operation);
+			executor.UseResolvedDraw(nullptr);
+			if (operation.resolved != nullptr) {
+				RenderExecutor::ReleaseResolvedDraw(operation.resolved);
+			}
+			break;
 		case GpuOperationKind::Callback:
 			if (operation.callback) {
 				operation.callback();

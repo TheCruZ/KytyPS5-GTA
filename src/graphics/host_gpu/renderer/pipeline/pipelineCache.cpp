@@ -533,13 +533,17 @@ struct PipelineCache::ProgramCache {
 		const auto                             stage_index    = ahead.stages++;
 		auto&                                  resources      = ahead.resources[stage_index];
 		auto&                                  specialization = ahead.specializations[stage_index];
-		const ShaderRecompiler::IR::SrtRuntime runtime {
+		ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data                  = std::span(params.user_data).first(params.user_data_count),
 		    .shader_base                = params.Base(),
 		    .read_memory                = ReadAheadPlain,
 		    .userdata                   = &ahead.reads,
 		    .read_specialization_memory = ReadAheadStrict,
 		};
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			// As Get(): descriptor tables indexed by the workgroup id probe one entry per group.
+			runtime.workgroup_counts = input_info.workgroup_counts;
+		}
 		if (!ShaderRecompiler::IR::MaterializeResources(entry->second.resource_plan, runtime,
 		                                                resources, specialization)) {
 			ahead.reads.Fail();

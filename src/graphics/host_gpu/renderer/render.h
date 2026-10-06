@@ -256,6 +256,11 @@ public:
 	[[nodiscard]] ResolvedDraw* ResolveDispatchAhead(const HW::Context& context,
 	                                                 const HW::Shader& shaders,
 	                                                 const uint32_t (&groups)[3], uint32_t mode);
+	// Resolve thread: the compute program of a DISPATCH_INDIRECT with the given registers and
+	// initiator, which does not depend on the arguments the dispatch reads when it executes.
+	[[nodiscard]] ResolvedDraw* ResolveIndirectDispatchAhead(const HW::Context& context,
+	                                                         const HW::Shader&  shaders,
+	                                                         uint32_t           mode);
 	// Execution thread: the program a dispatch resolved ahead, when the guest memory the
 	// resolution read still holds the same bytes.
 	bool TakeResolvedDispatch(ShaderComputeInputInfo& input_info, ShaderProgram& program);

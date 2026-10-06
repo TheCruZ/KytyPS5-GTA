@@ -569,10 +569,13 @@ void RenderExecutor::DispatchIndirectThreads(uint64_t submit_id, CommandBuffer& 
 		return;
 	}
 	ShaderComputeInputInfo input_info {};
-	input_info.dispatch_thread_dimensions = true;
-	input_info.dispatch_indirect_threads  = true;
-	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
-	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	ShaderProgram          compute_program;
+	if (!TakeResolvedDispatch(input_info, compute_program)) {
+		input_info.dispatch_thread_dimensions = true;
+		input_info.dispatch_indirect_threads  = true;
+		compute_program = m_context.GetPipelineCache().GetComputeProgram(
+		    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	}
 	if (!compute_program) {
 		return;
 	}
@@ -708,8 +711,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 	ShaderComputeInputInfo input_info {};
-	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
-	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	ShaderProgram          compute_program;
+	if (!TakeResolvedDispatch(input_info, compute_program)) {
+		compute_program = m_context.GetPipelineCache().GetComputeProgram(
+		    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	}
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
