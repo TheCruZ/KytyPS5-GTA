@@ -11712,7 +11712,7 @@ public:
       auto &shaders = processor.GetShCtx();
       auto &executor = context.GetRenderExecutor();
       for (u32 sgpr = 0; sgpr < 16; ++sgpr)
-        shaders.SetCsUserSgpr(sgpr, 0);
+        shaders.SetCsUserSgpr(sgpr, 0, HW::UserSgprType::Unknown);
       const auto set_buffer = [&](u32 first, uint64_t address, u32 stride, u32 records,
                                   u32 dword3) {
         ShaderBufferResource buffer{};
@@ -11721,7 +11721,7 @@ public:
         buffer.fields[2] = records;
         buffer.fields[3] = dword3;
         for (u32 i = 0; i < 4; ++i)
-          shaders.SetCsUserSgpr(first + i, buffer.fields[i]);
+          shaders.SetCsUserSgpr(first + i, buffer.fields[i], HW::UserSgprType::Unknown);
       };
       set_buffer(0, table_address, 32u, count, 0x5204u);
       set_buffer(4, material_address, 4u, count + 3u, 0x5204u);
@@ -11732,9 +11732,10 @@ public:
                            .wave_size = 32, .user_sgpr = 16});
       for (u32 pass = 0; pass < 2; ++pass) {
         ShaderComputeInputInfo input{};
-        (void)context.GetPipelineCache().GetComputeProgram(shaders.GetCs(), input);
+        (void)context.GetPipelineCache().GetComputeProgram(
+            shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
         Require(name, "bindless table program", std::ranges::any_of(
-            input.stage.module->info.info.images,
+            input.stage.program->info.images,
             [](const auto &image) { return image.table_capacity != 0u; }),
             "the GPU-selected material shader did not bind the T# table as an array");
         // The second pass reuses the bindings of the first dispatch's table.

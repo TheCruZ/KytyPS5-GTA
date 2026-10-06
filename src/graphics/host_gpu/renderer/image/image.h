@@ -5,7 +5,6 @@
 #include "common/assert.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
 #include <mutex>
@@ -91,7 +90,6 @@ public:
 	void MarkCpuDirty() {
 		m_cpu_dirty       = true;
 		m_maybe_cpu_dirty = false;
-		HeapChanged();
 	}
 
 	[[nodiscard]] bool IsCpuDirty() const { return m_cpu_dirty || m_maybe_cpu_dirty; }
@@ -101,7 +99,6 @@ public:
 		if (!IsCpuDirty()) {
 			m_maybe_cpu_hash  = HashGuestEdges();
 			m_maybe_cpu_dirty = true;
-			HeapChanged();
 		}
 	}
 	[[nodiscard]] bool ResolveMaybeCpuHash(uint64_t hash) {
@@ -126,10 +123,7 @@ public:
 	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
-	void               MarkBufferModified() noexcept {
-		m_buffer_modified = true;
-		HeapChanged();
-	}
+	void               MarkBufferModified() noexcept { m_buffer_modified = true; }
 	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
 
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
@@ -145,23 +139,7 @@ public:
 		return backing.image == nullptr ? 0 : Common::AlignUp(info.data.size, 1024);
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
-	[[nodiscard]] vk::ImageLayout ReadLayout() const noexcept {
-		return info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-		                      : vk::ImageLayout::eShaderReadOnlyOptimal;
-	}
-	// Resident image heaps sample an image without rediscovering it until one changes its
-	// contents, tracking, identity or layout.
-	void HeapChanged() const noexcept {
-		if (heap_refs.load(std::memory_order_relaxed) != 0u) {
-			heap_epoch.fetch_add(1u, std::memory_order_relaxed);
-		}
-	}
 
-	static inline std::atomic<uint64_t> heap_epoch {0};
-	static inline std::atomic<uint64_t> serials {0};
-
-	// Unique per image, unlike ImageId: freed slots are reused.
-	const uint64_t   serial = serials.fetch_add(1u, std::memory_order_relaxed) + 1u;
 	ImageInfo        info;
 	VulkanImage      backing;
 	std::vector<CachedImageView> views;
@@ -199,6 +177,9 @@ public:
 	// The LRU clock value of the image's last LRU touch (as in the texture cache's LRU list,
 	// without loading its entry).
 	uint64_t         lru_tick           = 0;
+	// Bindless table bindings that keep binding the image without looking it up again (see
+	// TextureCache::PinImage()).
+	uint32_t         table_pins         = 0;
 
 private:
 	friend struct ImageTestAccess;

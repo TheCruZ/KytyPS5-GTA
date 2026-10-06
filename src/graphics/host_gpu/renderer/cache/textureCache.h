@@ -113,6 +113,27 @@ public:
 	// The ImageSetEpoch of the last registration or unregistration of an image overlapping the
 	// range's pages: while it is unchanged, a lookup in the range finds the same images.
 	[[nodiscard]] uint64_t ImageEpochInRegion(uint64_t address, uint64_t size);
+	// The granularity of ImageEpochInRegion(): log2 of its page size.
+	static constexpr uint32_t ImagePageBits = 20;
+	// Calls `function(address, size)` for the image range of every registration and
+	// unregistration after ImageSetEpoch() was `epoch`, oldest first. False when the history no
+	// longer reaches back that far.
+	template <typename Function>
+	[[nodiscard]] bool ForEachImageSetChangeSince(uint64_t epoch, Function&& function) {
+		std::scoped_lock lock {m_lock};
+		if (m_image_set_epoch - epoch > ImageSetChangeHistory) {
+			return false;
+		}
+		for (auto change = epoch + 1; change <= m_image_set_epoch; ++change) {
+			const auto& range = m_image_set_changes[change % ImageSetChangeHistory];
+			function(range.first, range.second);
+		}
+		return true;
+	}
+	// A pinned image is used without its bindings looking it up or touching it: the garbage
+	// collector keeps it and overlapping lookups do not delete it as unused. Pins nest.
+	void PinImage(ImageId id);
+	void UnpinImage(ImageId id);
 	void RunGarbageCollector();
 	// The guest no longer refers to this bindless image from any heap entry (it replaced or
 	// cleared them): free it once no draw has used it for a few frames (engine method).
@@ -155,24 +176,6 @@ private:
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
 	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 44, 14>;
 	static_assert(ImagePageTable::kPageBits == ImagePageBits);
-
-	// Registered images per page of the image page table. Written under m_lock, read without it.
-	class RegisteredPageCounts final {
-	public:
-		RegisteredPageCounts() = default;
-		~RegisteredPageCounts();
-		KYTY_CLASS_NO_COPY(RegisteredPageCounts);
-
-		void               Add(size_t page, int32_t delta);
-		[[nodiscard]] bool Any(size_t first, size_t last_exclusive) const noexcept;
-
-	private:
-		static constexpr size_t kLeafBits = 10;
-		static constexpr size_t kLeafSize = size_t {1} << kLeafBits;
-		using Leaf                        = std::array<std::atomic<uint32_t>, kLeafSize>;
-
-		std::array<std::atomic<Leaf*>, ImagePageTable::kPageCount / kLeafSize> m_leaves {};
-	};
 
 	// Registered images per page of the image page table. Written under m_lock, read without it.
 	class RegisteredPageCounts final {
@@ -355,6 +358,9 @@ private:
 	[[nodiscard]] uint64_t LruClock() const noexcept;
 	mutable uint32_t m_image_query_epoch      = 0;
 	uint64_t         m_image_set_epoch        = 0;
+	// The image range of the last registrations and unregistrations, by ImageSetEpoch.
+	static constexpr uint64_t ImageSetChangeHistory = 1024;
+	std::array<std::pair<uint64_t, uint64_t>, ImageSetChangeHistory> m_image_set_changes {};
 	bool             m_readback_linear_images = false;
 	bool             m_readback_tiled_images  = false;
 	// Lookups that found an existing image with the same backing, by description: while no image

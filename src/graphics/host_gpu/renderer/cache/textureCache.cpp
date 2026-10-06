@@ -348,6 +348,8 @@ void TextureCache::RegisterImage(ImageId id) {
 	image.lru_tick   = LruClock();
 	image.lru_id     = m_lru_cache.Insert(id, image.lru_tick);
 	const auto epoch = ++m_image_set_epoch;
+	m_image_set_changes[epoch % ImageSetChangeHistory] = {image.info.data.address,
+	                                                      image.info.data.size};
 	ForEachPage(image.info.data.address, image.info.data.size,
 	            [this, epoch](uint64_t page) { m_image_page_epochs[page] = epoch; });
 	m_total_used_memory += image.AccountedSize();
@@ -385,6 +387,8 @@ void TextureCache::UnregisterImage(ImageId id) {
 	m_total_used_memory -= accounted;
 	image.registered = false;
 	const auto epoch = ++m_image_set_epoch;
+	m_image_set_changes[epoch % ImageSetChangeHistory] = {image.info.data.address,
+	                                                      image.info.data.size};
 	ForEachPage(image.info.data.address, image.info.data.size,
 	            [this, epoch](uint64_t page) { m_image_page_epochs[page] = epoch; });
 }
@@ -1098,6 +1102,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	const auto current_tick  = m_scheduler.CurrentTick();
 	const auto current_frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
 	const bool safe_to_delete =
+	    cached.table_pins == 0 &&
 	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval &&
 	    (!AliasAgeByFrames() || current_frame - std::min(current_frame, cached.frame_accessed_last) >
 	                                AliasFramesBeforeRemoval);
@@ -2852,6 +2857,11 @@ void TextureCache::RunGarbageCollector() {
 			auto owner = m_slot_images.try_get(id);
 			if (owner == nullptr || !owner->registered) {
 				g_gc_skip.gone++;
+				continue;
+			}
+			if (owner->table_pins != 0) {
+				// Bound every time without a touch: still in use.
+				m_lru_cache.Touch(owner->lru_id, m_gc_tick);
 				continue;
 			}
 			if (owner->depth_id) {
