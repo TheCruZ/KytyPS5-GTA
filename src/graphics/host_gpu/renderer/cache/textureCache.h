@@ -58,7 +58,6 @@ public:
 		ImageInfo     info;
 		ImageViewInfo view_info;
 		BindingType   type = BindingType::Texture;
-		bool          heap = false; // PS5: resolved for a resident image heap.
 	};
 
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
@@ -79,6 +78,12 @@ public:
 	// the bindless images the usage probe saw sampled (AddTextureDumpImages), are written out.
 	void BeginTextureDump(uint64_t frame);
 	void AddTextureDumpImages(std::span<const ImageId> ids);
+	// Hosts without attachment feedback loops cannot sample a depth/stencil target that the draw
+	// writes. Copies `range` (the `aspects` given) of depth image `depth_id` into an image of its
+	// own, outside any render pass, for the draw to sample instead: the draw reads the values from
+	// before it ran. The copy lives until the depth image is deleted.
+	[[nodiscard]] ImageId CopyDepthForFeedback(ImageId depth_id, const ImageSubresourceRange& range,
+	                                           vk::ImageAspectFlags aspects);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
 	// stencil (optional) receives the stencil association the target refreshed, if any.
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc,
@@ -95,8 +100,6 @@ public:
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
-	[[nodiscard]] bool HasImagesInRegion(uint64_t address, uint64_t size);
-	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
@@ -217,6 +220,8 @@ private:
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
 	void                      ReleaseImage(ImageId id);
+	// Releases the depth feedback copy of a depth image, if it has one.
+	void                      ReleaseDepthFeedbackCopy(ImageId depth_id);
 	void                      FreeImage(ImageId id);
 	void                      TouchImage(Image& image);
 	void                      TrackImage(ImageId id);
@@ -313,6 +318,8 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::unordered_set<ImageId>                       m_bindless_evictable;
+	// Depth image -> its depth feedback copy (see CopyDepthForFeedback).
+	std::unordered_map<ImageId, ImageId>              m_depth_feedback_copies;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
@@ -382,7 +389,6 @@ private:
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;
 	friend class RenderExecutor;
-	friend class ImageHeap;
 	friend bool BcAlias::Matches(const ImageInfo&, const ImageInfo&);
 	friend bool BcAlias::Publish(TextureCache&, Image&);
 	friend void BcAlias::Resolve(TextureCache&, ImageId, ImageId);

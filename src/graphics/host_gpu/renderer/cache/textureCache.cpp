@@ -431,8 +431,8 @@ void TextureCache::DeleteImage(ImageId id) {
 		return;
 	}
 	ReleaseDepthFeedbackCopy(id);
-	if (image.depth_id) {
-		std::erase(m_slot_images[image.depth_id].stencil_ids, id);
+	if (image->depth_id) {
+		std::erase(m_slot_images[image->depth_id].stencil_ids, id);
 	} else {
 		// Detach first: deleting each association also unlinks it from its depth owner.
 		for (const auto association: std::exchange(image.stencil_ids, {})) {
