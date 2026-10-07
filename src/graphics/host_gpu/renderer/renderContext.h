@@ -57,6 +57,13 @@ public:
 	// Before the emulated GPU writes guest memory (labels, WRITE_DATA): resolves a tracked page
 	// as its write fault would, without raising the exception.
 	void PrepareGpuWrite(const void* destination, uint64_t size) noexcept;
+	// Execution thread, before each operation (see PrepareBda()).
+	void NoteOperation(uint64_t submit_id, bool after_wait) noexcept {
+		if (submit_id != m_bda_submit || after_wait) {
+			m_bda_submit = submit_id;
+			m_bda_generation++;
+		}
+	}
 	// A small command-processor write that GPU-owned pages would turn into a readback of all
 	// queued GPU work (see BufferCache::WriteAroundGpuWrites()); false when the caller must
 	// PrepareGpuWrite() and store the bytes itself.
@@ -100,6 +107,12 @@ private:
 	// Epochs (CPU dirty, buffer registrations, mapped ranges) read before the last full BDA
 	// synchronization.
 	std::array<uint64_t, 3> m_bda_sync_epochs {UINT64_MAX, UINT64_MAX, UINT64_MAX};
+	// Advances with each guest submission an operation belongs to, after each WAIT_REG_MEM the
+	// command processor resolved and whenever the execution thread itself writes guest memory
+	// the CPU tracks (see PrepareBda()).
+	uint64_t m_bda_generation        = 1;
+	uint64_t m_bda_synced_generation = 0;
+	uint64_t m_bda_submit            = UINT64_MAX;
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;

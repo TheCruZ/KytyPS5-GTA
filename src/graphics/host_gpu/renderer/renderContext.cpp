@@ -68,6 +68,10 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 			return false;
 		}
 	}
+	if (access == PageFaultAccess::Write && GuestGpu::IsGpuThread()) {
+		// A write of the command stream: device-address readers after it must see it.
+		m_bda_generation++;
+	}
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateFaultedPage(fault_vaddr);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
@@ -221,7 +225,16 @@ void RenderContext::PrepareBda(bool may_write) {
 	// mapped since the last synchronization started.
 	const std::array<uint64_t, 3> epochs {RegionManager::CpuDirtyEpoch(),
 	                                      m_buffer_cache.RegisterEpoch(), m_mapped_ranges_version};
-	if (epochs != m_bda_sync_epochs) {
+	// The guest's CPU writes that the work of a submission may read through device addresses
+	// precede the submission, or a WAIT_REG_MEM that the work waited for; the GPU sees later ones
+	// only after such a wait. So once a synchronization ran for a submission, pages the CPU
+	// dirties afterwards wait for the next submission or wait (they stay dirty meanwhile),
+	// unless the execution thread itself wrote them for the command stream (labels, CP writes)
+	// or the buffers or mappings changed.
+	const bool same_layout = epochs[1] == m_bda_sync_epochs[1] && epochs[2] == m_bda_sync_epochs[2];
+	if (epochs != m_bda_sync_epochs &&
+	    (!same_layout || m_bda_synced_generation != m_bda_generation)) {
+		m_bda_synced_generation = m_bda_generation;
 		// A new buffer or mapped range may cover CPU-dirty pages that earlier passes skipped.
 		const bool all = epochs[1] != m_bda_sync_epochs[1] || epochs[2] != m_bda_sync_epochs[2];
 		m_buffer_cache.SynchronizeBuffersInRanges(m_mapped_ranges, all);
