@@ -435,6 +435,7 @@ KYTY_HW_SH_PARSER(HwShIgnoreUserAccumulator) {
 
 KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
+	cp.NoteAcquireMem();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0055800 && cmd_id != 0xc0065800);
 	return KYTY_PM4_LEN(cmd_id) - 1;
