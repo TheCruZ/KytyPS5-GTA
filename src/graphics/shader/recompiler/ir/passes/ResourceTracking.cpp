@@ -452,6 +452,9 @@ public:
 		m_info.sampled_pairs.clear();
 		m_info.address_bases.clear();
 		m_info.dma_base_registers.clear();
+		m_info.dma_windows.clear();
+		m_info.dma_tables.clear();
+		m_info.dma_bounded = false;
 		m_shader_writes = HasShaderMemoryWrites(program);
 	}
 
@@ -468,6 +471,11 @@ public:
 			for (auto& inst: *block) {
 				Collect(inst);
 			}
+		}
+		m_info.dma_bounded = m_dma_tracked && !m_dma_unbounded && !m_program.has_address_writes;
+		if (!m_info.dma_bounded) {
+			m_info.dma_windows.clear();
+			m_info.dma_tables.clear();
 		}
 		LinkIndirectWriteTables();
 		for (const auto& patch: m_handle_patches) {
@@ -4335,6 +4343,101 @@ private:
 		}
 	}
 
+	// The user-data register N of a GetAddressResource(user data N, user data N + 1) base pair.
+	static bool UserDataBasePair(const Inst& handle, uint32_t& reg) {
+		if (handle.GetOpcode() != ValueOpcode::GetAddressResource || handle.NumArgs() != 2u) {
+			return false;
+		}
+		const auto* low  = handle.Arg(0).Resolve().TryInstruction();
+		const auto* high = handle.Arg(1).Resolve().TryInstruction();
+		if (low == nullptr || high == nullptr || low->GetOpcode() != ValueOpcode::GetUserData ||
+		    high->GetOpcode() != ValueOpcode::GetUserData ||
+		    low->Arg(0).GetType() != Type::ScalarReg || high->Arg(0).GetType() != Type::ScalarReg) {
+			return false;
+		}
+		reg = RegIndex(low->Arg(0).ScalarRegister());
+		return RegIndex(high->Arg(0).ScalarRegister()) == reg + 1u;
+	}
+
+	// DMA footprint (see ShaderInfo::dma_windows): an address read at base + offset + immediate,
+	// where the base is a user-data pair and the offset has known possible bits (GuestAddress()
+	// in the SPIR-V emitter computes the address so), reads a bounded window from the base.
+	// Anything else leaves the footprint unknown.
+	void NoteDmaWindow(const Inst& inst, const MemoryInfo& memory) {
+		// The widest address read; the window ends past it.
+		constexpr uint64_t MaxAccessBytes = 16;
+		// Larger windows are no better than synchronizing everything.
+		constexpr uint64_t MaxWindowBytes = 16u << 20u;
+		const auto* handle = inst.Arg(0).Resolve().TryInstruction();
+		uint32_t    reg    = 0;
+		if (memory.address_is_full || inst.NumArgs() < 2u || handle == nullptr ||
+		    !UserDataBasePair(*handle, reg)) {
+			m_dma_unbounded = true;
+			return;
+		}
+		const auto bits = PossibleU32Bits(inst.Arg(1));
+		if (bits >= MaxWindowBytes) {
+			m_dma_unbounded = true;
+			return;
+		}
+		const auto immediate = static_cast<int64_t>(static_cast<int32_t>(memory.offset));
+		const auto first     = std::min<int64_t>(immediate, 0);
+		const auto last      = static_cast<uint64_t>(std::max<int64_t>(immediate, 0)) + bits +
+		                       MaxAccessBytes;
+		for (auto& window: m_info.dma_windows) {
+			if (window.base_register == reg) {
+				window.first = std::min(window.first, first);
+				window.last  = std::max(window.last, last);
+				return;
+			}
+		}
+		m_info.dma_windows.push_back({reg, first, last});
+	}
+
+	// A V# of an indirect buffer access whose first three DWORDs are scalar address reads of one
+	// table entry at base + offset + immediate (+4, +8): the shader reads the buffer the entry
+	// describes. The fourth DWORD only holds the format and selects, which a shader may patch.
+	void NoteDmaDescriptorTable(const Inst& handle) {
+		// Entries the host would decode per draw: more are no better than a full synchronization.
+		constexpr uint32_t MaxOffsetBits = 12;
+		const Inst*        first_read    = nullptr;
+		uint32_t           first_offset  = 0;
+		for (uint32_t dword = 0; dword < 3u && handle.NumArgs() == 4u; dword++) {
+			const auto* read  = handle.Arg(dword).Resolve().TryInstruction();
+			uint32_t    index = 0;
+			const auto* memory = read != nullptr ? ScalarReadMemory(*read, index) : nullptr;
+			if (memory == nullptr || memory->kind != ResourceKind::ScalarAddress) {
+				break;
+			}
+			if (dword == 0u) {
+				first_read   = read;
+				first_offset = memory->offset;
+			} else if (!EquivalentValue(m_program, read->Arg(0), first_read->Arg(0)) ||
+			           !EquivalentValue(m_program, read->Arg(1), first_read->Arg(1)) ||
+			           memory->offset != first_offset + dword * 4u) {
+				break;
+			}
+			if (dword != 2u) {
+				continue;
+			}
+			const auto* address = first_read->Arg(0).Resolve().TryInstruction();
+			uint32_t    reg     = 0;
+			const auto  bits    = PossibleU32Bits(first_read->Arg(1)) & ~3u;
+			if (address == nullptr || !UserDataBasePair(*address, reg) ||
+			    std::popcount(bits) > static_cast<int>(MaxOffsetBits)) {
+				break;
+			}
+			// Scalar address reads drop the low two bits of the offset and immediate.
+			const ShaderInfo::DmaDescriptorTable table {
+			    reg, static_cast<int64_t>(static_cast<int32_t>(first_offset & ~3u)), bits};
+			if (std::ranges::find(m_info.dma_tables, table) == m_info.dma_tables.end()) {
+				m_info.dma_tables.push_back(table);
+			}
+			return;
+		}
+		m_dma_unbounded = true;
+	}
+
 	// A DMA address is usually a 64-bit base from a user-data register pair plus a per-lane
 	// offset: the low dword derives from register N and the high dword from register N + 1 (and,
 	// through the carry, from everything the low dword does). Record N so the host can cache the
@@ -4508,6 +4611,11 @@ private:
 
 	void Collect(Inst& inst) {
 		const auto op           = inst.GetOpcode();
+		if (op == ValueOpcode::BvhIntersect || op == ValueOpcode::Bvh8Intersect) {
+			m_dma_tracked   = true;
+			m_dma_unbounded = true;
+			return;
+		}
 		const auto buffer       = BufferAccessOf(op);
 		const auto address_info = AddressOpcodeInfoOf(op);
 		const auto image_info   = ImageOpcodeInfoOf(op);
@@ -4524,6 +4632,15 @@ private:
 		}
 		const auto& memory = m_program.memory_info[flags.index];
 		if (memory.planning_only || IsIndirectPlanningMemory(flags.index)) {
+			// The planned descriptor reads that stay in the shader read through device addresses.
+			if (!memory.planning_only && address_info.access == AddressAccess::Read &&
+			    IsAddressResourceKind(memory.kind)) {
+				m_dma_tracked = true;
+				NoteDmaWindow(inst, memory);
+			} else if (!memory.planning_only && address_info.access != AddressAccess::None) {
+				m_dma_tracked   = true;
+				m_dma_unbounded = true;
+			}
 			return;
 		}
 		Inst*    handle   = nullptr;
@@ -4555,6 +4672,12 @@ private:
 					     "or a V# table store");
 				}
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
+				m_dma_tracked                           = true;
+				if (handle != nullptr) {
+					NoteDmaDescriptorTable(*handle);
+				} else {
+					m_dma_unbounded = true;
+				}
 				return;
 			}
 			resource = AddBuffer(source, memory, op, flags.pc);
@@ -4605,7 +4728,13 @@ private:
 			if (std::ranges::max(base) != UINT32_MAX &&
 			    std::ranges::find(bases, base) == bases.end())
 				bases.push_back(base);
+			m_dma_tracked = true;
 			CollectDmaBase(*inst.Arg(0).Resolve().TryInstruction());
+			if (address_info.access == AddressAccess::Read) {
+				NoteDmaWindow(inst, memory);
+			} else {
+				m_dma_unbounded = true;
+			}
 			return;
 		}
 
@@ -4685,6 +4814,11 @@ private:
 	};
 	std::vector<IndirectWriteTable>            m_indirect_write_tables;
 	bool                                       m_shader_writes = false;
+	// A DMA access whose footprint is not bounded (see NoteDmaWindow()).
+	bool                                       m_dma_unbounded = false;
+	// A DMA access this pass saw. uses_dma comes later, from the live IR (ShaderInfoCollection):
+	// a DMA access this pass did not see leaves the shader unbounded.
+	bool                                       m_dma_tracked = false;
 };
 
 UniformFillPlan RecognizePatternFill(Program& program, const Decoder::Program& decoded,
