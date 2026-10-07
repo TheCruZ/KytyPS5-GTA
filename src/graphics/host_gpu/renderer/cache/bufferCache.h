@@ -143,6 +143,7 @@ public:
 	// pending write under a buffer anywhere else in `ranges`, provided no buffer was registered
 	// and `ranges` did not change since. Callers pass `all` otherwise.
 	void SynchronizeBuffersInRanges(const RangeSet& ranges, bool all);
+	void FlushUploadBatch();
 	// Advances whenever a buffer is registered: a new buffer may cover CPU-dirty pages that no
 	// earlier synchronization uploaded.
 	[[nodiscard]] uint64_t RegisterEpoch() const { return m_register_epoch; }
@@ -329,6 +330,12 @@ private:
 	uint64_t                       m_mirror_uses      = 0;
 	uint64_t                       m_mirror_flush_use = 0;
 	StreamBuffer                                      m_staging_buffer;
+	// SynchronizeBuffersInRanges(): the uploads of one synchronization, recorded together
+	// behind one pair of barriers (see FlushUploadBatch()).
+	bool                                              m_upload_batching   = false;
+	uint64_t                                          m_upload_batch_tick = 0;
+	std::vector<std::pair<vk::Buffer, uint32_t>>      m_upload_batch_buffers;
+	std::vector<vk::BufferCopy>                       m_upload_batch_copies;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;

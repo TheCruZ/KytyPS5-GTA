@@ -502,7 +502,10 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    total_size += bytes;
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
-	if (source) {
+	if (source && m_upload_batching && source == m_staging_buffer.Handle()) {
+		m_upload_batch_buffers.emplace_back(buffer.Handle(), static_cast<uint32_t>(copies.size()));
+		m_upload_batch_copies.insert(m_upload_batch_copies.end(), copies.begin(), copies.end());
+	} else if (source) {
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();
@@ -540,7 +543,10 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		return nullptr;
 	}
 
-	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
+	// Within a batch of uploads (see FlushUploadBatch()) the staging buffer must not wait for
+	// the current command buffer: that would submit it without the batched copies. A copy that
+	// does not fit then goes through a buffer of its own.
+	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4, !m_upload_batching);
 	if (mapped != nullptr) {
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
@@ -1396,7 +1402,53 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+void BufferCache::FlushUploadBatch() {
+	m_upload_batching = false;
+	if (m_upload_batch_buffers.empty()) {
+		return;
+	}
+	// The staging ranges belong to the command buffer they were mapped for.
+	EXIT_IF(m_scheduler.CurrentTick() != m_upload_batch_tick);
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto native = command.Handle();
+	// As SynchronizeBuffer() records around each upload, for all the buffers at once.
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+	                       vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion, 1,
+	                       &before, 0, nullptr, 0, nullptr);
+	const auto staging = m_staging_buffer.Handle();
+	size_t     first   = 0;
+	for (const auto& [destination, count]: m_upload_batch_buffers) {
+		native.copyBuffer(staging, destination, count, m_upload_batch_copies.data() + first);
+		first += count;
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands, vk::DependencyFlagBits::eByRegion,
+	                       1, &after, 0, nullptr, 0, nullptr);
+	m_upload_batch_buffers.clear();
+	m_upload_batch_copies.clear();
+}
+
 void BufferCache::SynchronizeBuffersInRanges(const RangeSet& ranges, bool all) {
+	// Each buffer's upload would record its own pair of barriers: record them once, around
+	// the copies of every buffer (hundreds per frame in GTA V).
+	struct Batch {
+		BufferCache& cache;
+		explicit Batch(BufferCache& owner): cache(owner) {
+			cache.m_upload_batching   = true;
+			cache.m_upload_batch_tick = cache.m_scheduler.CurrentTick();
+		}
+		~Batch() { cache.FlushUploadBatch(); }
+		Batch(const Batch&)            = delete;
+		Batch& operator=(const Batch&) = delete;
+	} batch {*this};
 	// Read each region's epoch before scanning it: pages dirtied during or after the scan advance
 	// it again, and the next call visits the region again.
 	m_sync_regions.clear();
