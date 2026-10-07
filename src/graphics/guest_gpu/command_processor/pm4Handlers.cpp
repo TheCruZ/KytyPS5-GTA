@@ -1303,6 +1303,7 @@ KYTY_HW_UC_PARSER(HwUcSetGdsOaRegisters) {
 
 KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
+	cp.NoteAcquireMem();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0055800 && cmd_id != 0xc0061050);
 	return (cmd_id == 0xc0061050 ? 7 : 6);
