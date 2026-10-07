@@ -152,6 +152,7 @@ bool GuestReadLog::Read(uint64_t address, void* data, uint64_t size, bool strict
 		m_failed = true;
 		return false;
 	}
+	m_gpu_written = m_gpu_written || Libs::LibKernel::Memory::MayBeGpuWritten(address, size);
 	const auto offset = static_cast<uint32_t>(m_bytes.size());
 	m_bytes.insert(m_bytes.end(), static_cast<const uint8_t*>(data),
 	               static_cast<const uint8_t*>(data) + size);
@@ -403,24 +404,15 @@ struct PipelineCache::ProgramCache {
 			return revision != call_source->revision;
 		}
 
-		template <bool HasCalls>
+		// Materializes the resources and finds the permutation they select (see
+		// ProgramCache::FindPermutation()).
 		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                             uint32_t push_data_cursor) {
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    resource_plan, runtime, resources, specialization));
-			for (auto& candidate: permutations) {
-				const auto& layout = candidate.program.bindings;
-				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
-				        push_data_cursor, layout.ShaderDataDwords()) ||
-				    candidate.specialization != specialization) {
-					continue;
-				}
-				if constexpr (HasCalls) {
-					if (!std::ranges::equal(candidate.function_code, FunctionCode())) continue;
-				}
-				return &candidate;
-			}
-			return nullptr;
+			const auto found =
+			    ProgramCache::FindPermutation(*this, specialization, push_data_cursor);
+			return found != permutations.end() ? &*found : nullptr;
 		}
 
 		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
@@ -430,6 +422,9 @@ struct PipelineCache::ProgramCache {
 		// A deque: resolutions ahead of execution keep pointers to programs while new
 		// permutations are added.
 		std::deque<Permutation> permutations;
+		// The permutation found last (see FindPermutation()) by the execution thread and by the
+		// others (all under the program lock).
+		std::array<size_t, 2> last_permutation {SIZE_MAX, SIZE_MAX};
 	};
 
 	struct ProgramKeyHash {
@@ -547,6 +542,31 @@ struct PipelineCache::ProgramCache {
 		return {options, stage_name};
 	}
 
+	// The permutation of an entry that a specialization and push data cursor select. Consecutive
+	// lookups of a thread mostly repeat it; a program can have thousands of permutations.
+	static std::deque<Permutation>::iterator
+	FindPermutation(SourceEntry& entry, const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                uint32_t push_data_cursor) {
+		const auto matches = [&](const Permutation& candidate) {
+			const auto& layout = candidate.program.bindings;
+			return layout.push_data_start_dword ==
+			           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
+			                                                    layout.ShaderDataDwords()) &&
+			       candidate.specialization == specialization &&
+			       (!entry.call_source ||
+			        std::ranges::equal(candidate.function_code, entry.FunctionCode()));
+		};
+		auto& last = entry.last_permutation[GuestGpu::IsGpuThread() ? 0u : 1u];
+		if (last < entry.permutations.size() && matches(entry.permutations[last])) {
+			return entry.permutations.begin() + static_cast<std::ptrdiff_t>(last);
+		}
+		const auto found = std::ranges::find_if(entry.permutations, matches);
+		if (found != entry.permutations.end()) {
+			last = static_cast<size_t>(found - entry.permutations.begin());
+		}
+		return found;
+	}
+
 	// Resolves a stage ahead of execution: only programs and permutations that exist, into the
 	// storage of the resolution, reading guest memory through its log.
 	template <typename InputInfo>
@@ -596,16 +616,15 @@ struct PipelineCache::ProgramCache {
 			ahead.reads.Fail();
 			return {};
 		}
-		const auto permutation =
-		    std::ranges::find_if(entry->second.permutations, [&](const Permutation& candidate) {
-			    const auto& layout = candidate.program.bindings;
-			    return layout.push_data_start_dword ==
-			               ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
-			                                                        layout.ShaderDataDwords()) &&
-			           candidate.specialization == specialization;
-		    });
+		const auto permutation = FindPermutation(entry->second, specialization, push_data_cursor);
 		if (permutation == entry->second.permutations.end()) {
-			QueueCompile(stage, params, input_info, push_data_cursor, &specialization);
+			// A specialization made of stale bytes of GPU-written memory is usually one the
+			// execution thread never asks for (in GTA V, V#s of garbage strides: thousands of
+			// permutations of some compute shaders, each compiled, stored and given a pipeline).
+			// Only the execution thread's own lookup compiles those.
+			if (!ahead.reads.MayHaveReadGpuWrites()) {
+				QueueCompile(stage, params, input_info, push_data_cursor, &specialization);
+			}
 			ahead.reads.Fail();
 			return {};
 		}
@@ -649,9 +668,9 @@ struct PipelineCache::ProgramCache {
 			Permutation* permutation = nullptr;
 			if (cached.call_source) {
 				source_changed = cached.RefreshCallSource(runtime);
-				if (!source_changed) permutation = cached.FindPermutation<true>(runtime, push_data_cursor);
+				if (!source_changed) permutation = cached.FindPermutation(runtime, push_data_cursor);
 			} else {
-				permutation = cached.FindPermutation<false>(runtime, push_data_cursor);
+				permutation = cached.FindPermutation(runtime, push_data_cursor);
 			}
 			if (permutation != nullptr) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
@@ -691,7 +710,7 @@ struct PipelineCache::ProgramCache {
 			    entry->second.specialization));
 		} else if (source_changed) {
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor)) {
+			if (const auto* permutation = entry->second.FindPermutation(runtime, push_data_cursor)) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
@@ -1143,6 +1162,9 @@ const ShaderRecompiler::IR::ResourceSnapshot g_no_resources {};
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	// GTA V's ray tracing shader selects up to ~200 T#s by key from guest data that changes every
+	// frame; each new layout is a pipeline compile of several seconds.
+	ShaderRecompiler::IR::SetComputeIndirectFloors(256, 8);
 	if (Config::AsyncPipelinesEnabled()) {
 		constexpr uint32_t AsyncThreads = 3;
 		for (uint32_t i = 0; i < AsyncThreads; i++) {

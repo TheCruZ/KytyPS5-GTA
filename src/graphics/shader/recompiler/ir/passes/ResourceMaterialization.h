@@ -47,6 +47,11 @@ struct ResourceSpecialization {
 // its values and is independent of the translated shader CFG.
 ResourcePlan ExtractResourcePlan(const Program& program);
 
+// Indirect descriptors of compute shaders reserve mapping room for at least `keys` keys and bind
+// at least `images` images per indirect image root (powers of two), so that the guest data they
+// select from changes the shader permutation less often. Defaults: 8 keys, no image floor.
+void SetComputeIndirectFloors(size_t keys, size_t images);
+
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
