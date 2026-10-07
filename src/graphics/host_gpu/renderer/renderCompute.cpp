@@ -428,7 +428,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 	                }) ||
 	    has_storage_writes;
-	if (has_storage_writes) {
+	// On the guest's GPU, dispatches of one queue overlap unless the guest orders them (a wait,
+	// a partial flush, an ACQUIRE_MEM; the operations other than dispatches record their own
+	// barriers). Without such an order since the previous direct dispatch of its queue, nothing
+	// was recorded after that one and its barrier is still deferred: the barrier before the
+	// earlier dispatch already ordered everything before it, so neither is needed and the two
+	// overlap. GTA V's ray tracing structure builds run hundreds of such dispatches per frame.
+	const bool chained = std::exchange(m_dispatch_chained, false) && m_deferred_barrier;
+	if (has_storage_writes && !chained) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -496,8 +503,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 
-	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	// The removed host fence also ordered read-only dispatches before later writers. Recorded
+	// before the next operation, unless that is a dispatch the guest did not order after this one.
+	m_deferred_barrier       = true;
+	m_deferred_barrier_queue = m_guest_queue;
 	if (known_fill) {
 		// Recorded after binding, which forgets older fills over the written ranges.
 		m_context.GetBufferCache().NoteKnownFill(known_fill_descriptor.Base48(), known_fill_size,
