@@ -1008,9 +1008,10 @@ void TestBoundedComputeImageLoop() {
   ResourceSpecialization specialization;
   for (const uint32_t count : {2u, 3u, 2u}) {
     user_data[2] = count;
+    // Distinct T#s are padded to a power of two (see MaterializeIndirectDescriptor()).
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == count &&
-              specialization.images.size() == count &&
+              snapshot.images.size() == std::bit_ceil(count) &&
+              specialization.images.size() == std::bit_ceil(count) &&
               snapshot.flattened_srt[
                   specialization.images[0].indirect_mapping_offset] == count &&
               snapshot.images.back().dwords[0] == 0x100u + count - 1u,

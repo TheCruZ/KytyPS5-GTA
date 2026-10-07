@@ -38,13 +38,17 @@ public:
 	void Clear() {
 		m_entries.clear();
 		m_bytes.clear();
-		m_failed = false;
+		m_failed      = false;
+		m_gpu_written = false;
 	}
 	// Reads the backing store without faulting. Strict reads are checked the way specialization
 	// memory is read (GPU-owned bytes fail), the others as plain loads.
 	bool               Read(uint64_t address, void* data, uint64_t size, bool strict);
 	void               Fail() { m_failed = true; }
 	[[nodiscard]] bool Failed() const { return m_failed; }
+	// Whether some read may have taken stale bytes of memory the GPU wrote (the backing store
+	// gets them only once read back).
+	[[nodiscard]] bool MayHaveReadGpuWrites() const { return m_gpu_written; }
 	// Execution thread: whether every read still gives the recorded bytes.
 	[[nodiscard]] bool StillValid() const;
 
@@ -58,7 +62,8 @@ private:
 	};
 	std::vector<Entry>   m_entries;
 	std::vector<uint8_t> m_bytes;
-	bool                 m_failed = false;
+	bool                 m_failed      = false;
+	bool                 m_gpu_written = false;
 };
 
 // Storage of the shader programs a draw resolved ahead of its execution: the resource snapshots

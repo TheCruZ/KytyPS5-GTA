@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstdio>
 #include <cstring>
@@ -23,6 +24,11 @@ namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 constexpr uint64_t MaxIndirectDescriptorProbes = 65536u;
+// Keys an indirect descriptor mapping reserves room for at least (see MaterializeIndirectDescriptor()).
+constexpr size_t MinIndirectMappingCapacity = 8u;
+// See SetComputeIndirectFloors().
+std::atomic<size_t> g_compute_indirect_keys {MinIndirectMappingCapacity};
+std::atomic<size_t> g_compute_indirect_images {1u};
 
 bool SpecializationFail(std::string_view message) {
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
@@ -423,7 +429,18 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 
 	const auto mapping_offset = snapshot.flattened_srt.size();
 	const auto key_count = sources.empty() ? keys.size() : sources.size();
-	snapshot.flattened_srt.resize(mapping_offset + 1u + key_count * 2u);
+	// The mapping's layout is part of the shader permutation (its offset in the flattened SRT
+	// and the number of search steps), while the number of keys follows guest data from dispatch
+	// to dispatch (GTA V's ray tracing shader saw dozens of permutations, each a multi-second
+	// pipeline compile). Reserve room for a power-of-two number of keys instead: the shader
+	// searches the runtime count, and later mappings keep their offsets until a count crosses a
+	// power of two.
+	// Compute shaders can keep one layout for more keys (see SetComputeIndirectFloors()).
+	const auto key_capacity = std::max<size_t>(
+	    program.stage == ShaderType::Compute ? g_compute_indirect_keys.load(std::memory_order_relaxed)
+	                                         : MinIndirectMappingCapacity,
+	    std::bit_ceil(key_count));
+	snapshot.flattened_srt.resize(mapping_offset + 1u + key_capacity * 2u);
 	snapshot.flattened_srt[mapping_offset] = static_cast<uint32_t>(key_count);
 	for (uint32_t entry = 0; entry < key_count; ++entry) {
 		const auto key = sources.empty() ? keys[entry] : entry;
@@ -453,10 +470,25 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	if (descriptors.size() == children_begin) {
 		snapshot.flattened_srt.resize(mapping_offset);
 	} else {
+		if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Image>) {
+			// The same for the distinct T#s: pad them with copies of the last one, which no key
+			// selects, so that with the root they are a power of two (at least 8 for compute).
+			const auto children = descriptors.size() - children_begin;
+			const auto total    = std::max<size_t>(
+                program.stage == ShaderType::Compute
+                    ? g_compute_indirect_images.load(std::memory_order_relaxed)
+                    : 1u,
+                std::bit_ceil(children + 1u));
+			for (auto padded = children;
+			     padded + 1u < total && descriptors.size() < maximum_resources; ++padded) {
+				descriptors.push_back(descriptors.back());
+				specializations.push_back(specializations.back());
+			}
+		}
 		auto& root                      = specializations[resource_index];
 		root.indirect_root              = resource_index;
 		root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
-		root.indirect_search_iterations = std::bit_width(key_count);
+		root.indirect_search_iterations = std::bit_width(key_capacity);
 	}
 	return true;
 }
@@ -1395,6 +1427,13 @@ static bool MaterializeWith(const ResourcePlan& program, const SrtRuntime& runti
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	return BuildResourceSpecialization(program, snapshot, specialization);
+}
+
+void SetComputeIndirectFloors(size_t keys, size_t images) {
+	g_compute_indirect_keys.store(std::max(std::bit_ceil(keys), MinIndirectMappingCapacity),
+	                              std::memory_order_relaxed);
+	g_compute_indirect_images.store(std::max<size_t>(std::bit_ceil(images), 1u),
+	                                std::memory_order_relaxed);
 }
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
