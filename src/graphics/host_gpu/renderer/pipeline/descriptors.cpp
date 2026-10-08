@@ -3115,7 +3115,9 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages, bool
 				source = {};
 				continue;
 			}
-			source = {address, size, cache.FindBuffer(address, size)};
+			// Without device-address reads, ObtainBuffer() finds the buffer when it needs one
+			// (draws stream most small buffers from CPU-dirty pages without it).
+			source = {address, size, find_buffers ? cache.FindBuffer(address, size) : NULL_BUFFER_ID};
 		}
 	}
 }
@@ -3436,13 +3438,10 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
-	bool                                     dma_write = false;
-	std::array<const ShaderStageRuntime*, 4> dma_stages {};
-	uint32_t                                 dma_stage_count = 0;
-	bool                                     uses_image_heap = false;
+	bool uses_dma = false;
 	// Operations with device-address reads need their buffers before the BDA synchronization.
 	FindBuffers(stages, std::ranges::any_of(stages, [](const auto* stage) {
-		            return stage->runtime->module->info.info.uses_dma;
+		            return stage->runtime->program->info.uses_dma;
 	            }));
 	for (auto* stage: stages) {
 		if (stage->runtime->program->info.uses_dma) {
