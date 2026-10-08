@@ -249,6 +249,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	});
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
+	image.lru_tick   = m_gc_tick;
 	const auto epoch = ++m_image_set_epoch;
 	m_image_set_changes[epoch % ImageSetChangeHistory] = {image.info.data.address,
 	                                                      image.info.data.size};
@@ -451,7 +452,9 @@ void TextureCache::UnpinImage(ImageId id) {
 }
 
 void TextureCache::TouchImage(Image& image) {
-	if (image.registered) {
+	// Draws touch the same images many times per tick: only the first touch moves the entry.
+	if (image.registered && image.lru_tick < m_gc_tick) {
+		image.lru_tick = m_gc_tick;
 		m_lru_cache.Touch(image.lru_id, m_gc_tick);
 	}
 }
@@ -2259,6 +2262,7 @@ void TextureCache::RunGarbageCollector() {
 			if (owner->table_pins != 0) {
 				// Bound every time without a touch: still in use.
 				m_lru_cache.Touch(owner->lru_id, m_gc_tick);
+				owner->lru_tick = std::max(owner->lru_tick, m_gc_tick);
 				continue;
 			}
 			if (owner->IsGpuModified()) {

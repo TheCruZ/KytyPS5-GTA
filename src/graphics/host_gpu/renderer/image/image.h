@@ -154,6 +154,9 @@ public:
 	ImageSubresourceRange stencil_subresources;
 	uint64_t         tick_accessed_last = 0;
 	size_t           lru_id             = 0;
+	// The tick of the image's last LRU touch (as in the texture cache's LRU list, without
+	// loading its entry).
+	uint64_t         lru_tick           = 0;
 	// Bindless table bindings that keep binding the image without looking it up again (see
 	// TextureCache::PinImage()).
 	uint32_t         table_pins         = 0;
