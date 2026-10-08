@@ -143,6 +143,9 @@ public:
 	// pending write under a buffer anywhere else in `ranges`, provided no buffer was registered
 	// and `ranges` did not change since. Callers pass `all` otherwise.
 	void SynchronizeBuffersInRanges(const RangeSet& ranges, bool all);
+	// Uploads the pending CPU writes of the buffers within each [first, second) span, recorded
+	// together as SynchronizeBuffersInRanges() records them.
+	void SynchronizeBuffersInSpans(std::span<const std::pair<uint64_t, uint64_t>> spans);
 	void FlushUploadBatch();
 	// Advances whenever a buffer is registered: a new buffer may cover CPU-dirty pages that no
 	// earlier synchronization uploaded.
@@ -330,6 +333,7 @@ private:
 	uint64_t                       m_mirror_uses      = 0;
 	uint64_t                       m_mirror_flush_use = 0;
 	StreamBuffer                                      m_staging_buffer;
+	struct UploadBatch;
 	// SynchronizeBuffersInRanges(): the uploads of one synchronization, recorded together
 	// behind one pair of barriers (see FlushUploadBatch()).
 	bool                                              m_upload_batching   = false;

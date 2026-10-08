@@ -20,6 +20,8 @@
 #include <array>
 #include <memory>
 #include <shared_mutex>
+#include <span>
+#include <utility>
 #include <vector>
 
 namespace Libs::VideoOut {
@@ -75,8 +77,14 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               CacheDmaBases(const ShaderStageRuntime& runtime);
-	// may_write: a shader of the operation may store through device addresses.
-	void               PrepareBda(bool may_write);
+	// Uploads the CPU writes of the guest memory that the device-address reads of the stages can
+	// reach (see ShaderInfo::dma_windows); false when a stage's reach is not known, and nothing
+	// was uploaded.
+	[[nodiscard]] bool SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* const> stages);
+	// may_write: a shader of the operation may store through device addresses. full_sync: upload
+	// the CPU writes of all cached memory first (SynchronizeDmaFootprint() did not cover the
+	// operation).
+	void               PrepareBda(bool may_write, bool full_sync = true);
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -104,6 +112,8 @@ private:
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	uint64_t                  m_mapped_ranges_version = 0;
+	// SynchronizeDmaFootprint(): the spans of an operation.
+	std::vector<std::pair<uint64_t, uint64_t>> m_dma_spans;
 	// Epochs (CPU dirty, buffer registrations, mapped ranges) read before the last full BDA
 	// synchronization.
 	std::array<uint64_t, 3> m_bda_sync_epochs {UINT64_MAX, UINT64_MAX, UINT64_MAX};
