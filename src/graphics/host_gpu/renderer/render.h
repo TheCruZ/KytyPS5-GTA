@@ -229,7 +229,8 @@ public:
 	// Settles again, within the budget, the keys of a window of each heap whose T# changed since
 	// they were settled; returns how many it resolved.
 	uint32_t RevalidateBindlessKeys(uint32_t budget);
-	void                           FindBuffers(std::span<PreparedBindings* const> stages);
+	void                           FindBuffers(std::span<PreparedBindings* const> stages,
+	                                           bool                               find_buffers = true);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
