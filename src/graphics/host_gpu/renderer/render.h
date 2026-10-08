@@ -541,6 +541,14 @@ private:
 	std::vector<ImageId>                  m_bound_images;
 	// CommitBindings(): the image ranges a draw writes (address, size).
 	std::vector<std::pair<uint64_t, uint64_t>> m_written_image_ranges;
+	// CommitBindings(): the buffer ranges the stages of an operation write.
+	struct WrittenBufferRange {
+		uint64_t                address  = 0;
+		uint64_t                size     = 0;
+		const PreparedBindings* writer   = nullptr;
+		uint32_t                resource = 0;
+	};
+	std::vector<WrittenBufferRange> m_written_buffer_ranges;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
