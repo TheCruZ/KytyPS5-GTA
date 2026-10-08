@@ -1869,7 +1869,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 	// The image, attachment and buffer ranges the draw writes, collected once for the scalar read
 	// checks below (most bound images are only sampled, and draws rarely write buffers).
-	bool written_ranges_collected = false;
+	bool     written_ranges_collected = false;
+	// The span of every written range: most scalar reads (descriptor tables, constants) lie
+	// outside it and need no range checks.
+	uint64_t written_first = UINT64_MAX;
+	uint64_t written_end   = 0;
 	for (const auto* reader: prepared_bindings) {
 		const auto& reads = reader->runtime->resources->specialization_reads;
 		if (reads.empty()) continue;
@@ -1904,9 +1908,20 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					}
 				}
 			}
+			for (const auto& [written_address, written_size]: m_written_image_ranges) {
+				written_first = std::min(written_first, written_address);
+				written_end   = std::max(written_end, written_address + written_size);
+			}
+			for (const auto& written: m_written_buffer_ranges) {
+				written_first = std::min(written_first, written.address);
+				written_end   = std::max(written_end, written.address + written.size);
+			}
 		}
 		for (size_t read = 0; read < reads.size(); ++read) {
 			const auto [address, size] = reads[read];
+			if (address >= written_end || address + size <= written_first) {
+				continue;
+			}
 			for (const auto& [written_address, written_size]: m_written_image_ranges) {
 				if (ImageRangeOverlaps(address, size, written_address, written_size)) {
 					EXIT("scalar resource reads overlap an image or attachment write\n");
