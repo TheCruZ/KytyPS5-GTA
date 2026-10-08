@@ -594,6 +594,25 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
 
+	// Draws stream the same small buffers (frame and pass constants) again and again. Within a
+	// draw window the guest cannot have written them since the last copy, so draws share it while
+	// it is in the stream buffer and no work wrote cached buffers. A copy made in the window
+	// answers before the CPU-dirty checks: it was made from CPU-dirty pages that the guest has not
+	// written since, and GPU writes advance the generation (or show in the GPU-dirty check).
+	const bool  small_read = !is_written && size <= CACHING_PAGESIZE;
+	StreamMemo* stream     = nullptr;
+	uint64_t    window     = 0;
+	if (small_read && !m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+		window = m_scheduler.Context().GetRenderExecutor().DrawWindow();
+		stream = &(*m_stream_memo)[((vaddr ^ (size << 40u)) * 0x9e3779b97f4a7c15ull >> 32u) %
+		                           StreamMemoSlots];
+		if (stream->vaddr == vaddr && stream->size == size && stream->window == window &&
+		    stream->lap == m_stream_buffer.Lap() &&
+		    stream->write_generation == m_gpu_write_generation) {
+			return {&m_stream_buffer, stream->offset};
+		}
+	}
+
 	// Draws bind the same read-only ranges over and over. While the range stays in the same
 	// buffer and none of its pages became CPU dirty since a lookup found it clean (or uploaded
 	// it), the lookup finds the same buffer and has nothing to upload. The epoch is read before
@@ -613,32 +632,19 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	}
 
-	if (!is_written && size <= CACHING_PAGESIZE &&
-	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
-		// Draws stream the same small buffers (frame and pass constants) again and again. Within
-		// a draw window the guest cannot have written them since the last copy, so draws share it
-		// while it is in the stream buffer and no work wrote cached buffers.
-		const auto window = m_scheduler.Context().GetRenderExecutor().DrawWindow();
-		auto& stream = (*m_stream_memo)[((vaddr ^ (size << 40u)) * 0x9e3779b97f4a7c15ull >> 32u) %
-		                                StreamMemoSlots];
-		if (stream.vaddr == vaddr && stream.size == size && stream.window == window &&
-		    stream.lap == m_stream_buffer.Lap() &&
-		    stream.write_generation == m_gpu_write_generation) {
-			return {&m_stream_buffer, stream.offset};
-		}
+	if (stream != nullptr && m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		if (mapped != nullptr) {
 			StreamGuestData(mapped, vaddr, size);
 			m_stream_buffer.Commit();
-			stream = {.vaddr            = vaddr,
-			          .size             = size,
-			          .window           = window,
-			          .lap              = m_stream_buffer.Lap(),
-			          .write_generation = m_gpu_write_generation,
-			          .offset           = offset};
+			*stream = {.vaddr            = vaddr,
+			           .size             = size,
+			           .window           = window,
+			           .lap              = m_stream_buffer.Lap(),
+			           .write_generation = m_gpu_write_generation,
+			           .offset           = offset};
 			return {&m_stream_buffer, offset};
 		}
 	}
