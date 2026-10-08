@@ -1436,19 +1436,28 @@ void BufferCache::FlushUploadBatch() {
 	m_upload_batch_copies.clear();
 }
 
+// Each buffer's upload would record its own pair of barriers: record them once, around the
+// copies of every buffer (hundreds per frame in GTA V).
+struct BufferCache::UploadBatch {
+	BufferCache& cache;
+	explicit UploadBatch(BufferCache& owner): cache(owner) {
+		cache.m_upload_batching   = true;
+		cache.m_upload_batch_tick = cache.m_scheduler.CurrentTick();
+	}
+	~UploadBatch() { cache.FlushUploadBatch(); }
+	UploadBatch(const UploadBatch&)            = delete;
+	UploadBatch& operator=(const UploadBatch&) = delete;
+};
+
+void BufferCache::SynchronizeBuffersInSpans(std::span<const std::pair<uint64_t, uint64_t>> spans) {
+	const UploadBatch batch {*this};
+	for (const auto& [first, last]: spans) {
+		SynchronizeBuffersInRange(first, last - first);
+	}
+}
+
 void BufferCache::SynchronizeBuffersInRanges(const RangeSet& ranges, bool all) {
-	// Each buffer's upload would record its own pair of barriers: record them once, around
-	// the copies of every buffer (hundreds per frame in GTA V).
-	struct Batch {
-		BufferCache& cache;
-		explicit Batch(BufferCache& owner): cache(owner) {
-			cache.m_upload_batching   = true;
-			cache.m_upload_batch_tick = cache.m_scheduler.CurrentTick();
-		}
-		~Batch() { cache.FlushUploadBatch(); }
-		Batch(const Batch&)            = delete;
-		Batch& operator=(const Batch&) = delete;
-	} batch {*this};
+	const UploadBatch batch {*this};
 	// Read each region's epoch before scanning it: pages dirtied during or after the scan advance
 	// it again, and the next call visits the region again.
 	m_sync_regions.clear();
