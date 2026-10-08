@@ -1,3 +1,4 @@
+#include "common/syncAcct.h"
 #include "common/hostException.h"
 
 #include <atomic>
@@ -5,6 +6,14 @@
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
+// windows.h first
+#include <tlhelp32.h>
+
+#include <algorithm>
+#include <cinttypes>
+#include <cstdlib>
+#include <thread>
+#include <vector>
 #else
 #include <algorithm>
 #include <csignal>
@@ -82,6 +91,155 @@ bool InitializeThreadSignalStack() {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
+// Local debugging: KYTY_WATCH_WRITE=<hex address> arms a hardware write watchpoint on the
+// 8 bytes at that address in every thread of the process (rearmed as threads appear) and logs
+// each distinct writer, plus every write that stores KYTY_WATCH_VALUE (hex, default all ones).
+static uint64_t             g_watch_address = 0;
+static uint64_t             g_watch_value   = UINT64_MAX;
+static std::atomic_uint64_t g_watch_hits {0};
+static std::atomic_uint32_t g_watch_logged {0};
+static std::atomic<uint64_t> g_watch_writers[64] {};
+
+static LONG WINAPI WatchFilter(PEXCEPTION_POINTERS exception) noexcept {
+	if (exception->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP ||
+	    (exception->ContextRecord->Dr6 & 0xfu) == 0) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	auto* context = exception->ContextRecord;
+	context->Dr6  = 0;
+	const auto value = *reinterpret_cast<volatile uint64_t*>(g_watch_address);
+	const auto hits  = g_watch_hits.fetch_add(1, std::memory_order_relaxed) + 1;
+	bool       fresh = false;
+	for (auto& writer: g_watch_writers) {
+		uint64_t current = writer.load(std::memory_order_relaxed);
+		if (current == context->Rip) {
+			break;
+		}
+		if (current == 0 && writer.compare_exchange_strong(current, context->Rip)) {
+			fresh = true;
+			break;
+		}
+		if (current == context->Rip) {
+			break;
+		}
+	}
+	if ((fresh || value == g_watch_value) &&
+	    g_watch_logged.fetch_add(1, std::memory_order_relaxed) < 400) {
+		HMODULE module = nullptr;
+		GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+		                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		                   reinterpret_cast<LPCSTR>(context->Rip), &module);
+		std::printf("WATCH write 0x%016" PRIx64 " = 0x%016" PRIx64 " hit=%" PRIu64
+		            " tid=%lu rip=0x%016" PRIx64 " host_module=%p %s\n",
+		            g_watch_address, value, hits, GetCurrentThreadId(), context->Rip,
+		            static_cast<void*>(module), fresh ? "new-writer" : "WATCHED-VALUE");
+		PWSTR thread_name = nullptr;
+		if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &thread_name)) && thread_name != nullptr) {
+			std::printf("  thread: %ls\n", thread_name);
+			LocalFree(thread_name);
+		}
+		std::printf("  rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64
+		            " rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n",
+		            context->Rax, context->Rbx, context->Rcx, context->Rdx, context->Rsi,
+		            context->Rdi, context->Rbp, context->Rsp);
+		std::printf("  r8=%016" PRIx64 " r9=%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64
+		            " r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64 "\n",
+		            context->R8, context->R9, context->R10, context->R11, context->R12,
+		            context->R13, context->R14, context->R15);
+		const auto* stack = reinterpret_cast<const uint64_t*>(context->Rsp);
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(stack, &info, sizeof(info)) != 0 && info.State == MEM_COMMIT &&
+		    reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize >=
+		        context->Rsp + 48 * sizeof(uint64_t)) {
+			std::printf("  stack:");
+			for (int i = 0; i < 48; i++) {
+				std::printf("%s %016" PRIx64, (i % 6 == 0) ? "\n   " : "", stack[i]);
+			}
+			std::printf("\n");
+		}
+		std::fflush(stdout);
+	}
+	return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static void ArmWatch(DWORD thread_id) {
+	HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME,
+	                           FALSE, thread_id);
+	if (thread == nullptr) {
+		return;
+	}
+	if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
+		CONTEXT context {};
+		context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+		if (GetThreadContext(thread, &context) != 0) {
+			context.Dr0 = g_watch_address;
+			// L0, R/W0 = 01 (writes), LEN0 = 10 (8 bytes).
+			context.Dr7 = (context.Dr7 & ~uint64_t {0xf0003}) | 1u | (1u << 16u) | (2u << 18u);
+			SetThreadContext(thread, &context);
+		}
+		ResumeThread(thread);
+	}
+	CloseHandle(thread);
+}
+
+static void ArmWatchThreads();
+
+static void StartWriteWatch() {
+	const char* address = std::getenv("KYTY_WATCH_WRITE");
+	if (address == nullptr) {
+		return;
+	}
+	g_watch_address = std::strtoull(address, nullptr, 16) & ~uint64_t {7};
+	if (const char* value = std::getenv("KYTY_WATCH_VALUE"); value != nullptr) {
+		g_watch_value = std::strtoull(value, nullptr, 16);
+	}
+	ArmWatchThreads();
+}
+
+// Debug: arms the write watchpoint at runtime on an address known only then (once).
+void ArmWriteWatch(uint64_t address) {
+	static std::atomic_bool armed {false};
+	if (address == 0 || armed.exchange(true)) {
+		return;
+	}
+	g_watch_address = address & ~uint64_t {7};
+	ArmWatchThreads();
+}
+
+static void ArmWatchThreads() {
+	if (g_watch_address == 0 || AddVectoredExceptionHandler(1, WatchFilter) == nullptr) {
+		return;
+	}
+	std::printf("WATCH armed on 0x%016" PRIx64 " (value 0x%016" PRIx64 ")\n", g_watch_address,
+	            g_watch_value);
+	std::thread([] {
+		const auto self = GetCurrentThreadId();
+		const auto pid  = GetCurrentProcessId();
+		std::vector<DWORD> armed;
+		for (;;) {
+			HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+			if (snapshot != INVALID_HANDLE_VALUE) {
+				THREADENTRY32 entry {};
+				entry.dwSize = sizeof(entry);
+				std::vector<DWORD> current;
+				for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
+					if (entry.th32OwnerProcessID == pid && entry.th32ThreadID != self) {
+						current.push_back(entry.th32ThreadID);
+					}
+				}
+				CloseHandle(snapshot);
+				for (const auto id: current) {
+					if (std::find(armed.begin(), armed.end(), id) == armed.end()) {
+						ArmWatch(id);
+					}
+				}
+				armed = std::move(current);
+			}
+			Sleep(20);
+		}
+	}).detach();
+}
+
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	auto* exception_record = exception->ExceptionRecord;
 
@@ -133,6 +291,13 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	info.r15 = exception->ContextRecord->R15;
 
 	const auto handler = g_handler.load(std::memory_order_acquire);
+	// Debug (KYTY_SYNC_ACCT): the emulator's exception handling (arg = vaddr, arg2 = type).
+	KYTY_SYNC_SITE(s_av, "fault: access violation handler", Tax);
+	KYTY_SYNC_SITE(s_ill, "fault: illegal instruction handler", Tax);
+	SyncAcct::Scope sync_scope(info.type == ExceptionType::AccessViolation ? s_av : s_ill,
+	                           info.access_violation_vaddr,
+	                           static_cast<uint64_t>(info.access_violation_type),
+	                           info.exception_address);
 	if (handler != nullptr && handler(info)) {
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}
@@ -298,6 +463,7 @@ bool InstallHandler(Handler handler) {
 		printf("AddVectoredExceptionHandler() failed\n");
 		return false;
 	}
+	StartWriteWatch();
 #elif defined(__APPLE__)
 	struct sigaction sa {};
 	sa.sa_sigaction = SignalHandler;

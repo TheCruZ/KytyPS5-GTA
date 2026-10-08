@@ -177,6 +177,12 @@ public:
 	[[nodiscard]] uint64_t GetSubmitId() const { return m_submit_id; }
 	void                   SetSubmitId(uint64_t submit_id) { m_submit_id = submit_id; }
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
+	[[nodiscard]] int      DbgQueueId() const { return m_interrupt_event_id; }
+	// Debug (KYTY_SYNC_ACCT): the WAIT_REG_MEM this queue is blocked on (0 when none), when it
+	// first failed and the ref it waits for.
+	uint64_t m_dbg_wrm_addr  = 0;
+	uint64_t m_dbg_wrm_since = 0;
+	uint64_t m_dbg_wrm_ref   = 0;
 
 private:
 	template <typename T>
@@ -283,13 +289,15 @@ private:
 	bool     m_occlusion_wait_requested = false;
 	// A WAIT_REG_MEM was processed since the last operation was made.
 	bool m_wait_since_operation = false;
-	// An ACQUIRE_MEM since the last operation.
-	bool m_acquire_since_operation = true;
+	bool m_guest_sync           = true;
 
 public:
-	void NoteAcquireMem() noexcept { m_acquire_since_operation = true; }
+	void NoteGuestSync() noexcept { m_guest_sync = true; }
 
 private:
+	// Debug (KYTY_EXEC_TRACE): the newest pending write a WAIT_REG_MEM since the last operation
+	// decided on.
+	uint64_t m_dbg_dep_seq = 0;
 
 	// State of the execution side, on cache lines of its own.
 	alignas(64) uint64_t m_synthetic_occlusion_counter = 0;

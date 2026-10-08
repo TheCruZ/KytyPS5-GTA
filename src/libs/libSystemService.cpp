@@ -12,6 +12,7 @@
 #include "libs/systemService.h"
 #include "loader/symbolDatabase.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -235,7 +236,14 @@ static int KYTY_SYSV_ABI SystemServiceGetNoticeScreenSkipFlag(bool* value) {
 		return SYSTEM_SERVICE_ERROR_PARAMETER;
 	}
 
-	*value = Config::SkipNoticeScreen();
+	// KYTY_SKIP_NOTICE_SCREENS=1 forces the skip_notice_screen option (debug aid to shorten
+	// automated runs: GTA V then skips the rockstar_logos Bink movie and the legal screens).
+	static const bool skip = [] {
+		const char* env = std::getenv("KYTY_SKIP_NOTICE_SCREENS");
+		return env != nullptr && env[0] != '\0' && env[0] != '0';
+	}();
+
+	*value = Config::SkipNoticeScreen() || skip;
 
 	return OK;
 }

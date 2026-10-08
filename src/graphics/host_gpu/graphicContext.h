@@ -49,6 +49,10 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	// Local debugging (KYTY_X_LANE_R): a second queue of `queue_family` for the ray tracing
+	// dispatches of the guest's asynchronous compute queues (null when not created).
+	Common::Mutex                      rt_queue_mutex;
+	vk::Queue                          rt_queue     = nullptr;
 	// A queue of a transfer-only family (a copy engine that runs beside the graphics one), for
 	// buffer readbacks that must not wait for the work queued on `queue` after the writes they
 	// read. Null without such a family; buffers are then shared by `queue_family` alone.
@@ -105,6 +109,7 @@ struct GraphicContext {
 	[[nodiscard]] bool CreateAllocator();
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
+	void               LogAllocationCounts() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;

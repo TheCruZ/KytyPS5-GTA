@@ -38,6 +38,8 @@ struct ExceptionInfo {
 using Handler = bool (*)(const ExceptionInfo&);
 
 bool InstallHandler(Handler handler);
+// Debug: a hardware write watchpoint on the 8 bytes at address, armed once (Windows).
+void ArmWriteWatch(uint64_t address);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 bool InitializeThreadSignalStack();

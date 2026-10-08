@@ -1,4 +1,7 @@
+#include "common/syncAcct.h"
+#include "common/profiler.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/host_gpu/gpuProfiler.h"
 
 #include "common/abi.h"
 #include "common/assert.h"
@@ -27,6 +30,7 @@
 #include <atomic>
 #include <fmt/format.h>
 #include <list>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -526,7 +530,12 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 		return VIDEO_OUT_ERROR_INVALID_INDEX;
 	}
 
+	std::optional<Graphics::GpuProfiler::TimedWait> timed_lock;
+	if (source == FlipRequestSource::GpuEop) {
+		timed_lock.emplace("exec: flip port lock");
+	}
 	Common::LockGuard lock(video_out->mutex);
+	timed_lock.reset();
 	if ((video_out->master != nullptr) != (flip_mode == VIDEO_OUT_FLIP_MODE_SLAVE) ||
 	    (video_out->slave_count != 0) != (flip_mode == VIDEO_OUT_FLIP_MODE_MASTER)) {
 		return VIDEO_OUT_ERROR_INVALID_FLIP_MODE;
@@ -840,6 +849,7 @@ void VideoOutDriver::Impl::VblankEnd() {
 }
 
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
+	Profiler::SetThreadName("Thread_VideoOutPresent");
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
 
@@ -849,6 +859,8 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		if (total_wait > 0) {
 			const auto remaining_us =
 			    (static_cast<uint64_t>(total_wait) * 1000000u + frequency - 1) / frequency;
+			KYTY_SYNC_SITE(s_vblank_sleep, "present: sleep to vblank", Block);
+			Common::SyncAcct::Scope scope(s_vblank_sleep, remaining_us);
 			Common::Thread::SleepMicro(static_cast<uint32_t>(
 			    std::clamp<uint64_t>(remaining_us, 1, std::numeric_limits<uint32_t>::max())));
 		}
@@ -870,6 +882,8 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		}
 
 		VblankBegin();
+		KYTY_SYNC_SITE(s_vblank, "present: vblank", Point);
+		Common::SyncAcct::Point(s_vblank, 0);
 		bool presented = m_flip_queue.Flip(0);
 		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
 			if (m_presenter.PresentLastFrame()) {
@@ -1174,6 +1188,9 @@ void FlipQueue::WaitForSubmitSlot(VideoOutConfig& cfg) {
 		if (m_requests.empty()) {
 			EXIT("video-out queue is saturated by CPU flips queued behind the current EOP\n");
 		}
+		Graphics::GpuProfiler::TimedWait timed("flip queue full (WaitForSubmitSlot)");
+		KYTY_SYNC_SITE(s_slot, "flip: queue full (WaitForSubmitSlot)", Block);
+		Common::SyncAcct::Scope scope(s_slot, 0);
 		m_submit_slot_cond_var.Wait(&m_mutex);
 	}
 }
@@ -1187,6 +1204,9 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 		       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
 	};
 	while (has_request()) {
+		Graphics::GpuProfiler::TimedWait timed("game: WaitFlipDone");
+		KYTY_SYNC_SITE(s_flip_done, "flip: WaitFlipDone (buffer still queued/shown)", Block);
+		Common::SyncAcct::Scope scope(s_flip_done, static_cast<uint64_t>(index));
 		m_done_cond_var.Wait(&m_mutex);
 	}
 }
@@ -1258,8 +1278,14 @@ bool FlipQueue::Flip(uint32_t micros) {
 	}
 	if (due) {
 		unlock_ports();
+		KYTY_SYNC_SITE(s_present, "present: Presenter::Present", Work);
+		Common::SyncAcct::Scope scope(s_present, group, static_cast<uint64_t>(requests[0].index));
 		m_presenter.Present(std::span(layers.data(), count));
+		scope.End();
 		due = lock_ports();
+	} else {
+		KYTY_SYNC_SITE(s_not_due, "flip: ready but not due", Point);
+		Common::SyncAcct::Point(s_not_due, group);
 	}
 
 	m_mutex.Lock();
@@ -1630,6 +1656,9 @@ void VideoOutDriver::PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& b
 }
 
 void VideoOutDriver::CompleteFlip(uint64_t request_id) {
+	Graphics::GpuProfiler::AddFrame();
+	KYTY_SYNC_SITE(s_flip_complete, "flip: GPU flip complete (ready)", Point);
+	Common::SyncAcct::Point(s_flip_complete, request_id);
 	m_impl->GetFlipQueue().Complete(request_id);
 }
 
@@ -1784,6 +1813,8 @@ KYTY_SYSV_ABI int VideoOutWaitVblank(int handle) {
 
 	Common::LockGuard lock(ctx->mutex);
 	const auto        count = ctx->vblank_status.count;
+	KYTY_SYNC_SITE(s_wait_vblank, "game: VideoOutWaitVblank", Block);
+	Common::SyncAcct::Scope scope(s_wait_vblank, 0);
 	while (ctx->opened && ctx->vblank_status.count == count) {
 		ctx->vblank_cond.Wait(&ctx->mutex);
 	}

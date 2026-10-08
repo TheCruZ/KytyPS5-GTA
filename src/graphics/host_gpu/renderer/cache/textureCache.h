@@ -39,6 +39,7 @@ void Resolve(TextureCache& cache, ImageId cached, ImageId merged);
 
 class TextureCache {
 public:
+	[[nodiscard]] std::string DescribeRegion(uint64_t address, uint64_t size);
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	struct ImageDesc {

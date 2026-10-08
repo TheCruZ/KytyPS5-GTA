@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/gpuProfiler.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 
 #include "common/assert.h"
@@ -467,9 +468,11 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 		region.dstSubresource = region.srcSubresource;
 		region.extent = write_desc.info.extent;
 	}
+	GpuProfiler::Region(command, true, "depth copy");
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
 	                  destination.backing.image, vk::ImageLayout::eTransferDstOptimal,
 	                  count, regions.data());
+	GpuProfiler::Region(command, false, "depth copy");
 	return true;
 }
 

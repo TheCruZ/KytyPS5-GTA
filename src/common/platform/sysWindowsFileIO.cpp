@@ -13,6 +13,7 @@
 #include "common/platform/sysTimer.h"
 #include "common/stringUtils.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -66,7 +67,12 @@ static DWORD GetCacheAccessType(sys_file_cache_type_t t) {
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
 	if (f.type == SYS_FILE_FILE) {
 		DWORD w = 0;
-		ReadFile(f.handle, data, size, &w, nullptr);
+		if (!ReadFile(f.handle, data, size, &w, nullptr)) {
+			// A kernel-mode write into a write-protected guest page fails here (ERROR_NOACCESS)
+			// instead of raising the fault the write tracker handles; report short reads.
+			std::printf("SysFileRead failed: error=%lu data=%p size=%u read=%lu\n", GetLastError(),
+			            data, size, w);
+		}
 		if (bytes_read != nullptr) {
 			*bytes_read = w;
 		}

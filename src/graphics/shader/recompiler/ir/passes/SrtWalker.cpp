@@ -1181,7 +1181,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	if (!m_program.srt_plan_complete) return false;
 	if (m_program.srt_code && m_runtime.read_memory == nullptr) {
 		flat.resize(m_program.srt_reads.size());
-		m_program.active_sources.clear();
+		m_program.Scratch().active_sources.clear();
 		m_context.values.resize(m_program.evaluation_value_count);
 		using Walker = bool KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*,
 		    ResourcePlan::EvaluationContext::Entry*, uint64_t, size_t);
@@ -1198,7 +1198,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
 		return read.flat_offset < flat.size() && evaluator.Evaluate(read.value, flat[read.flat_offset]);
 	};
-	auto& active = m_program.active_sources;
+	auto& active = m_program.Scratch().active_sources;
 	if (m_program.control_flow.empty()) {
 		active.clear();
 		flat.resize(m_program.srt_reads.size());
@@ -1207,9 +1207,9 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		}
 		return true;
 	}
-	auto& visited = m_program.visited_blocks;
-	auto& reachable = m_program.reachable_blocks;
-	auto& pending = m_program.pending_blocks;
+	auto& visited = m_program.Scratch().visited_blocks;
+	auto& reachable = m_program.Scratch().reachable_blocks;
+	auto& pending = m_program.Scratch().pending_blocks;
 	visited.assign(m_program.control_flow.size(), 1u);
 	ResetUnknowns();
 	m_reachable_blocks = &visited;
@@ -1641,28 +1641,28 @@ CompiledSrtPlan::Context& AcquireCompiledContext(const CompiledSrtPlan& plan, co
 	CompiledSrtPlan::Context* context = nullptr;
 	if (!nested) {
 		// The refresh's clean and ordinary walkers; the first one starts a session.
-		const auto depth = plan.depth++;
+		const auto depth = plan.lanes[t_srt_scratch_lane].depth++;
 		if (depth == 0) {
-			++plan.session;
+			++plan.lanes[t_srt_scratch_lane].session;
 		}
-		EXIT_IF(depth >= plan.top_contexts.size());
-		context = &plan.top_contexts[depth];
+		EXIT_IF(depth >= plan.lanes[t_srt_scratch_lane].top_contexts.size());
+		context = &plan.lanes[t_srt_scratch_lane].top_contexts[depth];
 	} else {
 		const auto* read   = reinterpret_cast<const void*>(runtime.read_memory);
 		const auto* strict = reinterpret_cast<const void*>(runtime.read_specialization_memory);
 		CompiledSrtPlan::Context* unused = nullptr;
-		for (auto& candidate: plan.nested_contexts) {
-			if (candidate.session == plan.session && candidate.mask == mask &&
+		for (auto& candidate: plan.lanes[t_srt_scratch_lane].nested_contexts) {
+			if (candidate.session == plan.lanes[t_srt_scratch_lane].session && candidate.mask == mask &&
 			    candidate.read == read && candidate.strict == strict &&
 			    candidate.clean_evaluator == clean_evaluator) {
 				return candidate;
 			}
-			if (candidate.session != plan.session && unused == nullptr) {
+			if (candidate.session != plan.lanes[t_srt_scratch_lane].session && unused == nullptr) {
 				unused = &candidate;
 			}
 		}
-		context                  = unused != nullptr ? unused : &plan.nested_contexts.emplace_back();
-		context->session         = plan.session;
+		context                  = unused != nullptr ? unused : &plan.lanes[t_srt_scratch_lane].nested_contexts.emplace_back();
+		context->session         = plan.lanes[t_srt_scratch_lane].session;
 		context->mask            = mask;
 		context->read            = read;
 		context->strict          = strict;
@@ -1693,7 +1693,7 @@ CompiledSrtWalker::CompiledSrtWalker(const ResourcePlan& program, const SrtRunti
 
 CompiledSrtWalker::~CompiledSrtWalker() {
 	if (!m_nested) {
-		--m_plan.depth;
+		--m_plan.lanes[t_srt_scratch_lane].depth;
 	}
 }
 
@@ -2199,11 +2199,11 @@ void CompiledSrtWalker::ResetUnknowns() const {
 			}
 		}
 	};
-	for (auto& context: m_plan.top_contexts) {
+	for (auto& context: m_plan.lanes[t_srt_scratch_lane].top_contexts) {
 		reset(context);
 	}
-	for (auto& context: m_plan.nested_contexts) {
-		if (context.session == m_plan.session) {
+	for (auto& context: m_plan.lanes[t_srt_scratch_lane].nested_contexts) {
+		if (context.session == m_plan.lanes[t_srt_scratch_lane].session) {
 			reset(context);
 		}
 	}
@@ -2250,7 +2250,7 @@ bool CompiledSrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		flat[read.flat_offset] = static_cast<uint32_t>(wide);
 		return true;
 	};
-	auto& active = m_program.active_sources;
+	auto& active = m_program.Scratch().active_sources;
 	if (m_program.control_flow.empty()) {
 		active.clear();
 		flat.resize(m_plan.srt_reads.size());
@@ -2263,9 +2263,9 @@ bool CompiledSrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	}
 	// As SrtWalker: find the reachable blocks first (to a fixed point when control Phis depend on
 	// them), then refresh their reads in block order.
-	auto& visited   = m_program.visited_blocks;
-	auto& reachable = m_program.reachable_blocks;
-	auto& pending   = m_program.pending_blocks;
+	auto& visited   = m_program.Scratch().visited_blocks;
+	auto& reachable = m_program.Scratch().reachable_blocks;
+	auto& pending   = m_program.Scratch().pending_blocks;
 	visited.assign(m_program.control_flow.size(), 1u);
 	ResetUnknowns();
 	m_reachable_blocks = &visited;

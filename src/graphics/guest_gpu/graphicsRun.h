@@ -70,6 +70,10 @@ public:
 	// Waits until every operation emitted so far executed.
 	void WaitForExecution() { m_executed.WaitFor(m_emitted); }
 	[[nodiscard]] const GpuRegisterState& NeutralState() const noexcept { return m_neutral_state; }
+	// Debug (KYTY_SYNC_ACCT): the WAIT_REG_MEMs that block the command processor, as
+	// queue << 48 | address (cached under the queue lock when every queue blocked).
+	[[nodiscard]] uint64_t DbgBlockedArg(int i) const noexcept { return m_dbg_blocked[i]; }
+	uint64_t               m_dbg_blocked[2] = {};
 
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;

@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/gpuProfiler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include "common/alignment.h"
@@ -6,6 +7,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <vk_mem_alloc.h>
@@ -196,7 +198,9 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	native.pipelineBarrier(before_stage, vk::PipelineStageFlagBits::eTransfer,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, before, 0, nullptr);
 	const vk::BufferCopy copy {source_offset, destination_offset, size};
+	GpuProfiler::Region(native, true, "stream buffer copy");
 	native.copyBuffer(source.Handle(), Handle(), 1, &copy);
+	GpuProfiler::Region(native, false, "stream buffer copy");
 	const vk::BufferMemoryBarrier after[] = {
 	    source.Barrier(source_offset, size, vk::AccessFlagBits::eTransferRead, source_after),
 	    Barrier(destination_offset, size, vk::AccessFlagBits::eTransferWrite, destination_after),
@@ -222,7 +226,9 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
 	                       0, nullptr, 1, &before, 0, nullptr);
+	GpuProfiler::Region(native, true, "stream buffer fill");
 	native.fillBuffer(Handle(), offset, size, value);
+	GpuProfiler::Region(native, false, "stream buffer fill");
 	const auto after = Barrier(offset, size, vk::AccessFlagBits::eTransferWrite,
 	                           vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite);
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
@@ -335,10 +341,16 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
 	}
 	while (requested_upper_bound > wait_bound && wait_cursor < *invalidation_mark) {
 		const auto& watch = watches[wait_cursor];
+		GpuProfiler::AddCount(Usage() == MemoryUsage::Stream ? "stream: wrap checks" : "staging: wrap checks");
 		if (!Scheduler().IsFree(watch.tick) && !allow_wait) {
+			// Debug (rain-perf): the ring caught up with the GPU.
+			GpuProfiler::AddCount(Usage() == MemoryUsage::Stream ? "stream: map refused" : "staging: map refused");
 			return false;
 		}
-		Scheduler().Wait(watch.tick);
+		{
+			GpuProfiler::WaitTagScope tag("stream buffer wrap");
+			Scheduler().Wait(watch.tick);
+		}
 		if (Usage() == MemoryUsage::Download) {
 			Scheduler().WaitPriorityOperations(watch.tick);
 		}

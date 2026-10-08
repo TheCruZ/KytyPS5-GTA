@@ -36,6 +36,28 @@ vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device);
 	}
 }
 
+// Opt-in device-lost diagnostics (KYTY_GPU_CHECKPOINTS=1, needs
+// VK_NV_device_diagnostic_checkpoints): records the shader hashes around each draw/dispatch
+// and prints the last ones the queue reached when a wait fails.
+enum class GpuCheckpointKind : uint32_t { DispatchBegin, DispatchEnd, DrawBegin, DrawEnd };
+bool GpuCheckpointsRequested();
+void EnableGpuCheckpoints(bool extension_enabled);
+void GpuCheckpoint(vk::CommandBuffer command, GpuCheckpointKind kind, uint64_t hash_a,
+                   uint64_t hash_b = 0);
+void DumpGpuCheckpoints(vk::Queue queue);
+bool GpuCheckpointDeferredWanted() noexcept;
+template <typename Recorder>
+    requires(!std::is_same_v<Recorder, vk::CommandBuffer>)
+void GpuCheckpoint(const Recorder& command, GpuCheckpointKind kind, uint64_t hash_a,
+                   uint64_t hash_b = 0) {
+	if (command.IsDirect()) {
+		GpuCheckpoint(command.Direct(), kind, hash_a, hash_b);
+	} else if (GpuCheckpointDeferredWanted()) {
+		// Debug (fidelity-diff): per-operation GPU timestamps of deferred recorders too.
+		command.RecordRaw([=](vk::CommandBuffer c) { GpuCheckpoint(c, kind, hash_a, hash_b); });
+	}
+}
+
 template <typename Handle, typename... Args>
 void SetVulkanObjectNameF(vk::Device device, Handle handle, fmt::format_string<Args...> format,
                           Args&&... args) {

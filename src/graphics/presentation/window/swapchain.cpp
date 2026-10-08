@@ -1,3 +1,4 @@
+#include "common/syncAcct.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -7,6 +8,7 @@
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/gpuProfiler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -22,6 +24,10 @@
 #include <memory>
 #include <vector>
 #include <vulkan/vk_platform.h>
+#include <chrono>
+#include <cstdio>
+#include <optional>
+#include <windows.h>
 
 // IWYU pragma: no_include <intrin.h>
 
@@ -117,6 +123,7 @@ public:
 		frame->busy = true;
 		m_mutex.Unlock();
 
+		GpuProfiler::WaitTagScope tag("present frame pool");
 		m_scheduler.Wait(frame->present_tick);
 		return frame;
 	}
@@ -601,11 +608,17 @@ Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
 	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
 	// Repeated frames can wrap the semaphore ring without acquiring a new source frame.
 	// Wait for the submission that consumed this slot before signaling it again.
-	scheduler.Wait(m_image_acquired_ticks[m_frame_index]);
+	{
+		GpuProfiler::WaitTagScope tag("swapchain acquire slot");
+		scheduler.Wait(m_image_acquired_ticks[m_frame_index]);
+	}
 	m_image_index     = static_cast<uint32_t>(-1);
+	KYTY_SYNC_SITE(s_acquire, "vkAcquireNextImageKHR", Block);
+	Common::SyncAcct::Scope acquire_scope(s_acquire, 0);
 	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
 	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
 	    &m_image_index);
+	acquire_scope.End();
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
@@ -893,8 +906,27 @@ Swapchain::Status Swapchain::Present() {
 
 	vk::Result result;
 	{
+		// Debug: time waiting for the queue lock and time inside vkQueuePresentKHR.
+		const auto        lock_begin = std::chrono::steady_clock::now();
+		KYTY_SYNC_SITE(s_plock, "queue_mutex lock (vkQueuePresentKHR)", Block);
+		Common::SyncAcct::Scope lock_scope(s_plock, 0);
 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
+		lock_scope.End();
+		const auto        present_begin = std::chrono::steady_clock::now();
+		KYTY_SYNC_SITE(s_present, "vkQueuePresentKHR (holds queue_mutex)", Block);
+		Common::SyncAcct::Scope present_scope(s_present, 0);
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
+		present_scope.End();
+		const auto present_end = std::chrono::steady_clock::now();
+		const auto lock_ms =
+		    std::chrono::duration<double, std::milli>(present_begin - lock_begin).count();
+		const auto present_ms =
+		    std::chrono::duration<double, std::milli>(present_end - present_begin).count();
+		if (lock_ms > 30.0 || present_ms > 30.0) {
+			std::printf("SLOW present: lock wait %.1f ms, vkQueuePresentKHR %.1f ms (thread %lu)\n",
+			            lock_ms, present_ms, static_cast<unsigned long>(GetCurrentThreadId()));
+			std::fflush(stdout);
+		}
 	}
 	switch (result) {
 		case vk::Result::eSuccess: break;
@@ -1033,7 +1065,10 @@ void Presenter::Impl::Present() {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
+		std::optional<GpuProfiler::TimedWait> timed_acquire;
+		timed_acquire.emplace("present: acquire image");
 		auto status = swapchain.AcquireNextImage(present_scheduler);
+		timed_acquire.reset();
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;
@@ -1052,7 +1087,10 @@ void Presenter::Impl::Present() {
 				}
 			}
 		}
-		status = swapchain.Present();
+		{
+			GpuProfiler::TimedWait timed_present("present: queue present");
+			status = swapchain.Present();
+		}
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;

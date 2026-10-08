@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/syncAcct.h"
 
 #include <atomic>
 #include <bit>
@@ -13,6 +14,7 @@
 #include <memory>
 #include <new>
 #include <optional>
+#include <string>
 #include <type_traits>
 #include <utility>
 
@@ -21,6 +23,17 @@
 #endif
 
 namespace Common {
+
+// Local debug: spin iterations and kernel waits per stage (0 other, 1 CP, 2 exec, 3 record,
+// 4 resolve, 5 host copies).
+namespace WaitStats {
+inline std::atomic_uint64_t     spins[6];
+inline std::atomic_uint64_t     kernel_waits[6];
+inline std::atomic_uint64_t     gpu_waits[6];
+inline thread_local int         t_stage = 0;
+inline void Spins(uint64_t n) noexcept { spins[t_stage].fetch_add(n, std::memory_order_relaxed); }
+inline void Kernel() noexcept { kernel_waits[t_stage].fetch_add(1, std::memory_order_relaxed); }
+} // namespace WaitStats
 
 inline void SpinPause() noexcept {
 #if defined(_M_X64) || defined(__x86_64__)
@@ -42,11 +55,17 @@ inline std::chrono::nanoseconds SpinBudget() noexcept {
 	return budget;
 }
 
+// Local debugging (KYTY_X_LONG_SPIN): a spin budget of this thread's own (nanoseconds; 0 = the
+// global one).
+inline thread_local int64_t t_spin_budget_ns = 0;
+
 // Busy-waiting with an exponential _mm_pause backoff (1, 2, 4 ... 64 pauses per round) that
 // gives up once the spin budget is spent. The clock is read every few rounds only.
 class SpinWait {
 public:
-	SpinWait() noexcept: m_budget(SpinBudget()) {}
+	SpinWait() noexcept
+	    : m_budget(t_spin_budget_ns > 0 ? std::chrono::nanoseconds(t_spin_budget_ns) : SpinBudget()) {}
+	~SpinWait() { WaitStats::Spins(m_iterations); m_iterations = 0; }
 
 	// Pauses once more; false once the budget is spent and the caller should sleep.
 	bool Spin() noexcept {
@@ -95,6 +114,14 @@ public:
 	ProgressCounter() = default;
 	KYTY_CLASS_NO_COPY(ProgressCounter);
 
+	// Debug (KYTY_SYNC_ACCT): names the waits on this counter.
+	void SetDebugName(const char* name) {
+		if (SyncAcct::Enabled()) {
+			m_site_spin  = SyncAcct::RegisterSite((std::string(name) + " wait spin").c_str(), SyncAcct::Kind::Spin);
+			m_site_block = SyncAcct::RegisterSite((std::string(name) + " wait block").c_str(), SyncAcct::Kind::Block);
+		}
+	}
+
 	[[nodiscard]] uint64_t Load() const noexcept { return m_value.load(std::memory_order_acquire); }
 
 	void Publish(uint64_t value) noexcept { m_value.store(value, std::memory_order_release); }
@@ -115,21 +142,26 @@ public:
 	// Waits until the counter reaches `target`; the wait acquires every write the advancing
 	// thread made before it reached `target`.
 	void WaitFor(uint64_t target) noexcept {
-		if (m_value.load(std::memory_order_acquire) >= target) {
+		const auto start = m_value.load(std::memory_order_acquire);
+		if (start >= target) {
 			return;
 		}
+		SyncAcct::Scope spin_scope(m_site_spin != 0 ? m_site_spin : DefaultSite(false), target, target - start);
 		SpinWait spin;
 		while (spin.Spin()) {
 			if (m_value.load(std::memory_order_acquire) >= target) {
 				return;
 			}
 		}
+		spin_scope.End();
+		SyncAcct::Scope block_scope(m_site_block != 0 ? m_site_block : DefaultSite(true), target, target - start);
 		m_wait_target.store(target, std::memory_order_seq_cst);
 		for (;;) {
 			const auto value = m_value.load(std::memory_order_seq_cst);
 			if (value >= target) {
 				break;
 			}
+			WaitStats::Kernel();
 			m_value.wait(value, std::memory_order_seq_cst);
 		}
 		m_wait_target.store(NoTarget, std::memory_order_relaxed);
@@ -137,6 +169,16 @@ public:
 
 private:
 	static constexpr uint64_t NoTarget = ~uint64_t {0};
+	static uint16_t DefaultSite(bool block) {
+		if (!SyncAcct::Enabled()) {
+			return 0;
+		}
+		static const uint16_t spin_site  = SyncAcct::RegisterSite("progress? wait spin", SyncAcct::Kind::Spin);
+		static const uint16_t block_site = SyncAcct::RegisterSite("progress? wait block", SyncAcct::Kind::Block);
+		return block ? block_site : spin_site;
+	}
+	uint16_t m_site_spin  = 0;
+	uint16_t m_site_block = 0;
 
 	alignas(64) std::atomic_uint64_t m_value {0};
 	alignas(64) std::atomic_uint64_t m_wait_target {NoTarget};
@@ -160,10 +202,17 @@ private:
 template <typename T>
 class SpscQueue {
 public:
-	explicit SpscQueue(size_t capacity)
+	explicit SpscQueue(size_t capacity, const char* debug_name = "spsc?")
 	    : m_capacity(std::bit_ceil(capacity)), m_mask(m_capacity - 1),
 	      m_slots(std::make_unique<Slot[]>(m_capacity)) {
 		EXIT_IF(capacity == 0);
+		if (SyncAcct::Enabled()) {
+			const std::string name(debug_name);
+			m_site_pop_spin   = SyncAcct::RegisterSite((name + " pop spin").c_str(), SyncAcct::Kind::Spin);
+			m_site_pop_block  = SyncAcct::RegisterSite((name + " pop block").c_str(), SyncAcct::Kind::Block);
+			m_site_push_spin  = SyncAcct::RegisterSite((name + " push spin").c_str(), SyncAcct::Kind::Spin);
+			m_site_push_block = SyncAcct::RegisterSite((name + " push block").c_str(), SyncAcct::Kind::Block);
+		}
 	}
 	~SpscQueue() {
 		const auto tail = m_tail.load(std::memory_order_acquire);
@@ -273,6 +322,7 @@ private:
 	}
 
 	void WaitForSpace(uint64_t tail) {
+		SyncAcct::Scope spin_scope(m_site_push_spin, 0);
 		SpinWait spin;
 		while (spin.Spin()) {
 			m_producer_head = m_head.load(std::memory_order_acquire);
@@ -280,6 +330,8 @@ private:
 				return;
 			}
 		}
+		spin_scope.End();
+		SyncAcct::Scope block_scope(m_site_push_block, 0);
 		for (;;) {
 			m_producer_sleeping.store(true, std::memory_order_seq_cst);
 			const auto signal = m_producer_signal.load(std::memory_order_seq_cst);
@@ -287,6 +339,7 @@ private:
 			if (tail - m_producer_head < m_capacity) {
 				break;
 			}
+			WaitStats::Kernel();
 			m_producer_signal.wait(signal, std::memory_order_seq_cst);
 		}
 		m_producer_sleeping.store(false, std::memory_order_relaxed);
@@ -296,6 +349,7 @@ private:
 	bool WaitForElement(uint64_t head) {
 		// The producer may be asleep on a full ring the consumer drained without a check.
 		WakeProducer();
+		SyncAcct::Scope spin_scope(m_site_pop_spin, 0);
 		SpinWait spin;
 		while (spin.Spin()) {
 			m_consumer_tail = m_tail.load(std::memory_order_acquire);
@@ -306,6 +360,8 @@ private:
 				break;
 			}
 		}
+		spin_scope.End();
+		SyncAcct::Scope block_scope(m_site_pop_block, 0);
 		bool available = false;
 		for (;;) {
 			m_consumer_sleeping.store(true, std::memory_order_seq_cst);
@@ -318,11 +374,17 @@ private:
 			if (m_stopped.load(std::memory_order_seq_cst)) {
 				break;
 			}
+			WaitStats::Kernel();
 			m_consumer_signal.wait(signal, std::memory_order_seq_cst);
 		}
 		m_consumer_sleeping.store(false, std::memory_order_relaxed);
 		return available;
 	}
+
+	uint16_t m_site_pop_spin   = 0;
+	uint16_t m_site_pop_block  = 0;
+	uint16_t m_site_push_spin  = 0;
+	uint16_t m_site_push_block = 0;
 
 	const uint64_t          m_capacity;
 	const uint64_t          m_mask;

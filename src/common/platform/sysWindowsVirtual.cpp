@@ -1,3 +1,4 @@
+#include "common/syncAcct.h"
 #include "common/common.h"
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -315,6 +316,9 @@ bool FreeRange(uint64_t address, uint64_t size) {
 }
 
 bool Protect(uint64_t address, uint64_t size, Mode mode) {
+	// Debug (KYTY_SYNC_ACCT): page protection syscalls (arg = size, arg2 = mode).
+	KYTY_SYNC_SITE(s_protect, "os: VirtualProtect (VirtualMemory::Protect)", Tax);
+	SyncAcct::Scope sync_scope(s_protect, size, static_cast<uint64_t>(mode));
 	DWORD old_protect = 0;
 	if (VirtualProtect(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
 	                   GetProtectionFlag(mode), &old_protect) == 0) {

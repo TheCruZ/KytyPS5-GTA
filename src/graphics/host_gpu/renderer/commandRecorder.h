@@ -41,7 +41,7 @@ public:
 
 	// The kinds of records; commands are replayed through their callable, the others are
 	// interpreted by the consumer.
-	enum class RecordKind : uint32_t { Command, Submit };
+	enum class RecordKind : uint32_t { Command, Submit, LaneR, SubmitR };
 
 	struct Entry {
 		using Fn = void (*)(vk::CommandBuffer command, const void* payload);
@@ -172,7 +172,7 @@ class CommandChunkQueue {
 public:
 	using ChunkPtr = std::unique_ptr<CommandStream::Chunk>;
 
-	CommandChunkQueue(): m_chunks(MaxQueued), m_recycled(MaxRecycled) {}
+	CommandChunkQueue(): m_chunks(MaxQueued, "chunks exec->rec"), m_recycled(MaxRecycled, "chunks recycle") {}
 	~CommandChunkQueue() = default;
 	KYTY_CLASS_NO_COPY(CommandChunkQueue);
 
@@ -212,6 +212,11 @@ public:
 	explicit CommandRecorder(CommandStream* stream) noexcept: m_stream(stream) {}
 
 	[[nodiscard]] bool IsDirect() const noexcept { return m_stream == nullptr; }
+	// Debug: records a raw command of a deferred recorder.
+	template <typename F>
+	void RecordRaw(F&& function) const {
+		m_stream->Record(std::forward<F>(function));
+	}
 	[[nodiscard]] bool operator==(std::nullptr_t) const noexcept {
 		return m_stream == nullptr && m_direct == nullptr;
 	}

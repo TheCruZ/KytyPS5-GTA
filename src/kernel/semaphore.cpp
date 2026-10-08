@@ -1,3 +1,4 @@
+#include "common/syncAcct.h"
 #include "kernel/semaphore.h"
 
 #include "common/assert.h"
@@ -291,7 +292,9 @@ int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time)
 		return KERNEL_ERROR_ESRCH;
 	}
 
+	KYTY_SYNC_GAME_WAIT("game: sceKernelWaitSema", sem);
 	auto result = sem->Wait(need, time);
+	sync_game_scope_.End();
 
 	int ret = OK;
 
@@ -333,6 +336,7 @@ int KYTY_SYSV_ABI KernelSignalSema(KernelSema sem, int count) {
 		return KERNEL_ERROR_ESRCH;
 	}
 
+	Common::SyncAcct::NoteWake(sem);
 	auto result = sem->Signal(count);
 
 	int ret = OK;
@@ -624,7 +628,9 @@ int KYTY_SYSV_ABI sem_destroy(void* sem) {
 }
 
 int KYTY_SYSV_ABI sem_wait(void* sem) {
+	KYTY_SYNC_GAME_WAIT("game: sem_wait", sem);
 	const int result = SemTimedwaitImpl(sem, nullptr);
+	sync_game_scope_.End();
 	return (result == OK ? 0 : SetErrnoReturn(result));
 }
 
@@ -654,6 +660,7 @@ int KYTY_SYSV_ABI sem_timedwait(void* sem, const LibKernel::KernelTimespec* abst
 }
 
 int KYTY_SYSV_ABI sem_post(void* sem) {
+	Common::SyncAcct::NoteWake(sem);
 	auto* obj = GetSem(sem);
 	if (obj == nullptr) {
 		return SetErrnoReturn(POSIX_EINVAL);
@@ -697,7 +704,9 @@ int KYTY_SYSV_ABI PthreadSemDestroy(void* sem) {
 }
 
 int KYTY_SYSV_ABI PthreadSemWait(void* sem) {
+	KYTY_SYNC_GAME_WAIT("game: scePthreadSemWait", sem);
 	const int result = Posix::SemTimedwaitImpl(sem, nullptr);
+	sync_game_scope_.End();
 	return (result == OK ? OK : Posix::PosixToKernel(result));
 }
 
@@ -713,11 +722,14 @@ int KYTY_SYSV_ABI PthreadSemTrywait(void* sem) {
 
 int KYTY_SYSV_ABI PthreadSemTimedwait(void* sem, KernelUseconds usec) {
 	uint32_t  micros = usec;
+	KYTY_SYNC_GAME_WAIT("game: scePthreadSemTimedwait", sem);
 	const int result = Posix::SemTimedwaitImpl(sem, &micros);
+	sync_game_scope_.End();
 	return (result == OK ? OK : Posix::PosixToKernel(result));
 }
 
 int KYTY_SYSV_ABI PthreadSemPost(void* sem) {
+	Common::SyncAcct::NoteWake(sem);
 	auto* obj = Posix::GetSem(sem);
 	if (obj == nullptr) {
 		return KERNEL_ERROR_EINVAL;

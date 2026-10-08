@@ -6,10 +6,27 @@
 #include <common/TracyVersion.hpp>
 #include <cstdio>
 #include <tracy/Tracy.hpp>
+#include <string>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace Profiler {
 
 void SetThreadName(const char* name) {
+#ifdef _WIN32
+	// Debug: host thread description for profilers and thread CPU logs.
+	if (name != nullptr) {
+		std::wstring wide;
+		for (const char* c = name; *c != '\0'; c++) {
+			wide.push_back(static_cast<wchar_t>(static_cast<unsigned char>(*c)));
+		}
+		SetThreadDescription(GetCurrentThread(), wide.c_str());
+	}
+#endif
 	if (tracy::ProfilerAvailable() && name != nullptr) {
 		tracy::SetThreadName(name);
 	}

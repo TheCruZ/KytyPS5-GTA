@@ -1,7 +1,12 @@
+#include "common/syncAcct.h"
 #include "graphics/host_gpu/pageManager.h"
 
 #include "common/alignment.h"
 #include "common/virtualMemory.h"
+#if __has_include(<vulkan/vulkan.hpp>) // Debug profiler: not in the standalone tests.
+#define KYTY_PM_PROFILE
+#include "graphics/host_gpu/gpuProfiler.h"
+#endif
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "kernel/memory.h"
 
@@ -67,6 +72,11 @@ constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 class SpinGuard final {
 public:
 	explicit SpinGuard(std::atomic_flag& lock): m_lock(lock) {
+		if (!m_lock.test_and_set(std::memory_order_acquire)) {
+			return;
+		}
+		KYTY_SYNC_SITE(s_spin, "PageManager spinlock contended", Spin);
+		Common::SyncAcct::Scope scope(s_spin, reinterpret_cast<uint64_t>(&lock));
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
 #if defined(__x86_64__) || defined(_M_X64)
 			_mm_pause();
@@ -203,6 +213,14 @@ struct PageManager::Impl {
 	}
 
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
+#ifdef KYTY_PM_PROFILE
+		// Debug: protection changes (system calls) and pages.
+		static const bool gpu_thread_static = GpuProfiler::PhaseEnabled();
+		const bool gpu_thread = gpu_thread_static && GpuProfiler::CurrentPhase() != nullptr;
+		GpuProfiler::AddCount(gpu_thread ? "pm: protect calls (gpu threads)" : "pm: protect calls (other)");
+		GpuProfiler::AddCount(gpu_thread ? "pm: protect pages (gpu threads)" : "pm: protect pages (other)", size / PAGE_SIZE);
+		GpuProfiler::TimedWait timed(gpu_thread ? "pm: protect (gpu threads)" : "pm: protect (other)");
+#endif
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
 			      static_cast<uint32_t>(mode));

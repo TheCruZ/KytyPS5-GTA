@@ -124,6 +124,14 @@ void ShaderWriteHazardBarrier(CommandRecorder        vk_buffer,
 	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
+void ShaderWriteHazardBarrier(CommandRecorder vk_buffer, vk::PipelineStageFlags destination_stages,
+                              vk::PipelineStageFlags source_stages) {
+	EXIT_IF(vk_buffer == nullptr || !destination_stages || !source_stages);
+	const auto barrier = MakeShaderWriteHazardDependency();
+	vk_buffer.pipelineBarrier(source_stages, destination_stages, vk::DependencyFlags {}, 1,
+	                          &barrier, 0, nullptr, 0, nullptr);
+}
+
 void ShaderWriteBarrier(CommandRecorder vk_buffer, vk::PipelineStageFlags source_stages) {
 	EXIT_IF(vk_buffer == nullptr || !source_stages);
 	const auto barrier = MakeShaderWriteDependency();

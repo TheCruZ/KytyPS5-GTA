@@ -17,6 +17,8 @@ vk::MemoryBarrier       MakeShaderWriteDependency();
 vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer);
 bool HasShaderBufferWrites(const ShaderStageRuntime& runtime);
 void ShaderAccessBarrier(CommandRecorder vk_buffer, vk::PipelineStageFlags source_stages);
+void ShaderWriteHazardBarrier(CommandRecorder vk_buffer, vk::PipelineStageFlags destination_stages,
+                              vk::PipelineStageFlags source_stages);
 void ShaderWriteHazardBarrier(CommandRecorder        vk_buffer,
                               vk::PipelineStageFlags destination_stages);
 void ShaderWriteBarrier(CommandRecorder vk_buffer, vk::PipelineStageFlags source_stages);

@@ -1,13 +1,16 @@
+#include "common/syncAcct.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/expSwitch.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/gpuProfiler.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -17,6 +20,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
@@ -114,6 +118,10 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
+const char* PhaseEnabledName(ShaderType stage) {
+	return stage == ShaderType::Compute ? "dispatch: program lookup" : "draw: programs lookup";
+}
+
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
@@ -192,20 +200,35 @@ static bool SameGuestBytes(const void* guest, const uint8_t* recorded, uint32_t 
 	}
 }
 
+// Debug: where resolutions ahead stop holding.
+static void DbgStillValidFail(const char* kind, uint64_t address, uint64_t size) {
+	if (!GpuProfiler::PhaseEnabled()) {
+		return;
+	}
+	extern thread_local uint64_t g_dbg_cs_addr;
+	char tag[128];
+	std::snprintf(tag, sizeof(tag), "svfail %s cs=%llx addr=%llx size=%llu", kind,
+	              static_cast<unsigned long long>(g_dbg_cs_addr),
+	              static_cast<unsigned long long>(address), static_cast<unsigned long long>(size));
+	GpuProfiler::AddWaitString(tag, 0);
+}
+
 bool GuestReadLog::StillValid() const {
 	if (m_failed) {
 		return false;
 	}
 	std::array<uint8_t, StrictCheckBytes> buffer {};
-	// Most entries lie on pages the GPU does not own: decide that once per page.
-	uint64_t checked_page  = UINT64_MAX;
-	bool     checked_owned = false;
+	const auto recorded_bytes = [this](const Entry& entry) { return m_bytes.data() + entry.offset; };
+	uint64_t   checked_page   = UINT64_MAX;
+	bool       checked_owned  = false;
 	for (const auto& entry: m_entries) {
-		const auto* recorded = m_bytes.data() + entry.offset;
+		// GPU-owned pages fault on a direct load, which reads back all the GPU's queued work:
+		// bytes the GPU did not write compare from the backing store.
+		// Most entries lie on pages the GPU does not own: decide that once per page.
+		const auto first_page = entry.address >> 12u;
+		const auto last_page  = (entry.address + entry.size - 1) >> 12u;
+		bool       gpu_owned  = false;
 		if (!entry.strict) {
-			const auto first_page = entry.address >> 12u;
-			const auto last_page  = (entry.address + entry.size - 1) >> 12u;
-			bool       gpu_owned  = false;
 			if (first_page == last_page && first_page == checked_page) {
 				gpu_owned = checked_owned;
 			} else {
@@ -215,14 +238,15 @@ bool GuestReadLog::StillValid() const {
 					checked_owned = gpu_owned;
 				}
 			}
-			// On GPU-owned pages a direct load faults and reads back all the GPU's queued work:
-			// bytes the GPU did not write compare from the backing store.
-			bool around = gpu_owned;
+		}
+		if (gpu_owned) {
+			bool around = true;
 			for (uint32_t done = 0; around && done < entry.size; done += sizeof(buffer)) {
 				const auto bytes = std::min<uint32_t>(entry.size - done, sizeof(buffer));
-				around           = Libs::LibKernel::Memory::TryReadAroundGpuWrites(
-                    entry.address + done, buffer.data(), bytes);
-				if (around && std::memcmp(buffer.data(), recorded + done, bytes) != 0) {
+				around = Libs::LibKernel::Memory::TryReadAroundGpuWrites(entry.address + done,
+				                                                         buffer.data(), bytes);
+				if (around && std::memcmp(buffer.data(), recorded_bytes(entry) + done, bytes) != 0) {
+					DbgStillValidFail("around", entry.address, entry.size);
 					return false;
 				}
 			}
@@ -230,9 +254,21 @@ bool GuestReadLog::StillValid() const {
 				continue;
 			}
 		}
+		const auto* recorded = m_bytes.data() + entry.offset;
 		if (entry.strict) {
 			// As specialization memory is read on the execution thread: GPU-owned bytes fail.
 			// Large reads (the key arrays of bindless tables) are checked from a scratch buffer.
+			if (entry.size > buffer.size() && KYTY_XO(STRICT_NOCOPY) &&
+			    Graphics::GuestGpu::IsGpuThread()) {
+				const int same =
+				    Libs::LibKernel::Memory::CompareGpuCleanBacking(entry.address, recorded, entry.size);
+				if (same == 0) {
+					return false;
+				}
+				if (same == 1) {
+					continue;
+				}
+			}
 			static thread_local std::vector<uint8_t> scratch;
 			uint8_t* bytes = buffer.data();
 			if (entry.size > buffer.size()) {
@@ -242,13 +278,22 @@ bool GuestReadLog::StillValid() const {
 			if (!Libs::LibKernel::Memory::TryReadGpuCleanBacking(entry.address, bytes,
 			                                                     entry.size) ||
 			    std::memcmp(bytes, recorded, entry.size) != 0) {
+				DbgStillValidFail("strict", entry.address, entry.size);
 				return false;
 			}
 		} else if (!SameGuestBytes(reinterpret_cast<const void*>(entry.address), recorded,
 		                           entry.size)) {
 			// A plain load, as the execution thread's own resolution reads: GPU-owned pages
 			// fault and read the GPU's bytes back.
+			if (gpu_owned) {
+				GpuProfiler::AddCount("stillvalid: gpu-dirty read differs");
+				GpuProfiler::AddAddress("stillvalid differs addr", entry.address, entry.size);
+			}
+			DbgStillValidFail(gpu_owned ? "plain gpu" : "plain", entry.address, entry.size);
 			return false;
+		} else if (gpu_owned) {
+			GpuProfiler::AddCount("stillvalid: gpu-dirty read same");
+			GpuProfiler::AddAddress("stillvalid same addr", entry.address, entry.size);
 		}
 	}
 	return true;
@@ -259,6 +304,11 @@ namespace {
 class ProgramLockGuard {
 public:
 	explicit ProgramLockGuard(std::atomic_flag& flag): m_flag(flag) {
+		if (!m_flag.test_and_set(std::memory_order_acquire)) {
+			return;
+		}
+		KYTY_SYNC_SITE(s_prog_guard, "program lock contended", Spin);
+		Common::SyncAcct::Scope sync_scope(s_prog_guard, 0);
 		while (m_flag.test_and_set(std::memory_order_acquire)) {
 			while (m_flag.test(std::memory_order_relaxed)) {
 				Common::SpinPause();
@@ -272,6 +322,63 @@ public:
 private:
 	std::atomic_flag& m_flag;
 };
+
+// KYTY_UNSUPPORTED_SHADER_DIR: writes the ISA, user data and code of each skipped shader, so a
+// play session records what is needed to reproduce the shader offline.
+void DumpUnsupportedShader(uint64_t hash, std::span<const uint32_t> code,
+                           std::span<const uint32_t> user_data, const char* reason,
+                           const char* stage_name = "cs") {
+	static const char* dir = std::getenv("KYTY_UNSUPPORTED_SHADER_DIR");
+	if (dir == nullptr || code.empty()) {
+		return;
+	}
+	std::string text = fmt::format("hash=0x{:016x}\nreason: {}\nuser_data:", hash, reason);
+	for (size_t i = 0; i < user_data.size(); i++) {
+		text += fmt::format("{}{:08x}", i % 8u == 0u ? "\n  " : " ", user_data[i]);
+	}
+	text += "\n\n";
+	try {
+		Common::SoftExitScope soft_exit(true);
+		ShaderRecompiler::Decoder::Program decoded;
+		ShaderRecompiler::Decoder::DecodeProgram(code, decoded);
+		text += ShaderRecompiler::Decoder::ProgramToString(decoded);
+	} catch (const Common::SoftExitError& error) {
+		text += fmt::format("decode failed: {}\n", error.what());
+	}
+	const auto base = fmt::format("{}/{}_{:016x}", dir, stage_name, hash);
+	if (auto* file = std::fopen((base + ".txt").c_str(), "wb")) {
+		std::fwrite(text.data(), 1, text.size(), file);
+		std::fclose(file);
+	}
+	if (auto* file = std::fopen((base + ".bin").c_str(), "wb")) {
+		std::fwrite(code.data(), sizeof(uint32_t), code.size(), file);
+		std::fclose(file);
+	}
+}
+
+// Debug: KYTY_DUMP_SHADER=<hash in hex> writes that shader's ISA and code (like the unsupported
+// shader dumps) to KYTY_UNSUPPORTED_SHADER_DIR when it compiles.
+void DumpRequestedShader(const ShaderParams& params, const char* stage_name) {
+	// A comma-separated list of hashes.
+	static const std::vector<uint64_t> wanted = [] {
+		std::vector<uint64_t> result;
+		const char*           value = std::getenv("KYTY_DUMP_SHADER");
+		while (value != nullptr && *value != '\0') {
+			char* end = nullptr;
+			result.push_back(std::strtoull(value, &end, 16));
+			if (end == value) {
+				break;
+			}
+			value = *end == ',' ? end + 1 : end;
+		}
+		return result;
+	}();
+	if (std::ranges::find(wanted, params.hash) != wanted.end()) {
+		DumpUnsupportedShader(params.hash, params.code,
+		                      std::span(params.user_data).first(params.user_data_count),
+		                      "requested dump", stage_name);
+	}
+}
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
@@ -427,6 +534,8 @@ struct PipelineCache::ProgramCache {
 		// The permutation found last (see FindPermutation()) by the execution thread and by the
 		// others (all under the program lock).
 		std::array<size_t, 2> last_permutation {SIZE_MAX, SIZE_MAX};
+		// Debug (KYTY_SKIP_UNSUPPORTED_SHADERS): a compute program the recompiler rejected.
+		bool skip_dispatch = false;
 	};
 
 	struct ProgramKeyHash {
@@ -591,6 +700,12 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		const auto entry = programs.find(lookup_key);
+		// Debug (KYTY_SKIP_UNSUPPORTED_SHADERS): a rejected compute program resolves on the
+		// execution thread, which skips the dispatch.
+		if (entry != programs.end() && entry->second.skip_dispatch) {
+			ahead.reads.Fail();
+			return {};
+		}
 		if (entry == programs.end() && ahead.stages != ProgramResolution::MaxStages) {
 			QueueCompile(stage, params, input_info, push_data_cursor, nullptr);
 		}
@@ -657,17 +772,39 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
-		ShaderRecompiler::IR::SrtRuntime             runtime {
-		    .user_data                  = user_data,
-		    .shader_base                = params.Base(),
-		    .read_memory                = ReadGuestMemory,
+		if (entry != programs.end() && entry->second.skip_dispatch) {
+			return {};
+		}
+		// Debug: count the guest words an SRT materialization reads (plain reads, same result).
+		static thread_local uint64_t srt_reads     = 0;
+		static thread_local uint64_t srt_last_page = 0;
+		static thread_local uint64_t srt_pages     = 0;
+		const auto counting_read = [](void*, uint64_t address, std::span<uint32_t> values) {
+			srt_reads += values.size();
+			if ((address >> 12u) != srt_last_page) {
+				srt_last_page = address >> 12u;
+				srt_pages++;
+			}
+			return ReadGuestMemory(nullptr, address, values);
+		};
+		ShaderRecompiler::IR::SrtRuntime runtime {
+		    .user_data   = user_data,
+		    .shader_base = params.Base(),
+		    .read_memory = GpuProfiler::PhaseEnabled()
+		                       ? static_cast<ShaderRecompiler::IR::SrtMemoryReader>(counting_read)
+		                       : static_cast<ShaderRecompiler::IR::SrtMemoryReader>(ReadGuestMemory),
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
+		srt_reads     = 0;
+		srt_pages     = 0;
+		srt_last_page = 0;
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
 		}
 		bool source_changed = false;
 		if (entry != programs.end()) {
+			const char* resume = PhaseEnabledName(stage);
+			GpuProfiler::PhaseMark("programs: materialize SRT");
 			auto& cached = entry->second;
 			Permutation* permutation = nullptr;
 			if (cached.call_source) {
@@ -676,6 +813,7 @@ struct PipelineCache::ProgramCache {
 			} else {
 				permutation = cached.FindPermutation(runtime, push_data_cursor);
 			}
+			GpuProfiler::PhaseMark(resume);
 			if (permutation != nullptr) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
@@ -689,60 +827,95 @@ struct PipelineCache::ProgramCache {
 		}
 		const auto [options, stage_name] = MakeCompileOptions(stage, params, input_info);
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
-		const auto push_data_start = push_data_cursor;
-		ShaderRecompiler::ShaderSource source;
-		if (entry == programs.end()) source = ShaderRecompiler::PrepareShaderSource(params.code, options);
-		auto* current = entry == programs.end() ? &source : entry->second.call_source.get();
-		ShaderRecompiler::TranslateResult translated;
-		if (current != nullptr) {
-			if (current->call) {
-				if (entry == programs.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
-				translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
-				translated.program.source_reads = current->reads;
+		DumpRequestedShader(params, stage_name);
+		const auto translate_and_compile = [&]() -> ShaderProgram {
+			GpuProfiler::TimedWait timed("ev: shader translate+compile");
+			const auto push_data_start = push_data_cursor;
+			ShaderRecompiler::ShaderSource source;
+			if (entry == programs.end()) source = ShaderRecompiler::PrepareShaderSource(params.code, options);
+			auto* current = entry == programs.end() ? &source : entry->second.call_source.get();
+			ShaderRecompiler::TranslateResult translated;
+			if (current != nullptr) {
+				if (current->call) {
+					if (entry == programs.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
+					translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
+					translated.program.source_reads = current->reads;
+				} else {
+					translated = ShaderRecompiler::TranslateProgram(current->decoded, options);
+				}
 			} else {
-				translated = ShaderRecompiler::TranslateProgram(current->decoded, options);
+				translated = ShaderRecompiler::TranslateProgram(params.code, options);
 			}
-		} else {
-			translated = ShaderRecompiler::TranslateProgram(params.code, options);
-		}
-		if (entry == programs.end()) {
-			auto retained = source.call ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
-			entry = programs.try_emplace(lookup_key,
-			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
-		} else if (source_changed) {
-			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-			if (const auto* permutation = entry->second.FindPermutation(runtime, push_data_cursor)) {
-				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
-				permutation->program.bindings.AdvancePushData(push_data_cursor);
-				return permutation->handle;
+			if (entry == programs.end()) {
+				auto retained = source.call ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
+				entry = programs.try_emplace(lookup_key,
+				    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
+				EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+				    entry->second.resource_plan, runtime, entry->second.resources,
+				    entry->second.specialization));
+			} else if (source_changed) {
+				entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+				if (const auto* permutation = entry->second.FindPermutation(runtime, push_data_cursor)) {
+					input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
+					permutation->program.bindings.AdvancePushData(push_data_cursor);
+					return permutation->handle;
+				}
 			}
-		}
-		entry->second.permutations.push_back(CompilePermutation(
-		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
-		    entry->second.FunctionCode()));
-		const auto& permutation = entry->second.permutations.back();
-		by_id[permutation.handle.id] = {&entry->first, &permutation};
-		Store(lookup_key, params, input_info, push_data_start, permutation.specialization);
-		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
-		permutation.program.bindings.AdvancePushData(push_data_cursor);
+			entry->second.permutations.push_back(CompilePermutation(
+			    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
+			    entry->second.FunctionCode()));
+			const auto& permutation = entry->second.permutations.back();
+			by_id[permutation.handle.id] = {&entry->first, &permutation};
+			Store(lookup_key, params, input_info, push_data_start, permutation.specialization);
+			input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
+			permutation.program.bindings.AdvancePushData(push_data_cursor);
 
-		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
-		for (const auto& [key, source]: programs) {
-			counts[static_cast<size_t>(key.stage)] += source.permutations.size();
+			std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
+			for (const auto& [key, source]: programs) {
+				counts[static_cast<size_t>(key.stage)] += source.permutations.size();
+			}
+			// Guest geometry shaders are compiled through the host mesh stage.
+			std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu | LS %zu | HS %zu | TES %zu\n",
+			            counts[static_cast<size_t>(ShaderType::Vertex)],
+			            counts[static_cast<size_t>(ShaderType::Pixel)],
+			            counts[static_cast<size_t>(ShaderType::Compute)],
+			            counts[static_cast<size_t>(ShaderType::Mesh)],
+			            counts[static_cast<size_t>(ShaderType::Local)],
+			            counts[static_cast<size_t>(ShaderType::TessellationControl)],
+			            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
+			return permutation.handle;
+		};
+		// KYTY_SKIP_UNSUPPORTED_SHADERS=1: log compute shaders the recompiler rejects and skip
+		// their dispatches, to survey every unsupported shader of a scene in one run.
+		static const bool skip_unsupported = std::getenv("KYTY_SKIP_UNSUPPORTED_SHADERS") != nullptr;
+		if (!skip_unsupported) {
+			return translate_and_compile();
 		}
-		// Guest geometry shaders are compiled through the host mesh stage.
-		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu | LS %zu | HS %zu | TES %zu\n",
-		            counts[static_cast<size_t>(ShaderType::Vertex)],
-		            counts[static_cast<size_t>(ShaderType::Pixel)],
-		            counts[static_cast<size_t>(ShaderType::Compute)],
-		            counts[static_cast<size_t>(ShaderType::Mesh)],
-		            counts[static_cast<size_t>(ShaderType::Local)],
-		            counts[static_cast<size_t>(ShaderType::TessellationControl)],
-		            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
-		return permutation.handle;
+		if (stage != ShaderType::Compute) {
+			// Graphics draws cannot be skipped: record the shader, then fail as before.
+			std::string reason;
+			try {
+				Common::SoftExitScope soft_exit(true);
+				return translate_and_compile();
+			} catch (const Common::SoftExitError& error) {
+				reason = error.what();
+			}
+			Log::WriteToConsoleAndLog(fmt::format("UNSUPPORTED {} shader 0x{:016x}: {}\n",
+			                                      stage_name, params.hash, reason));
+			DumpUnsupportedShader(params.hash, params.code, user_data, reason.c_str(), stage_name);
+			EXIT("%s", reason.c_str());
+		}
+		try {
+			Common::SoftExitScope soft_exit(true);
+			return translate_and_compile();
+		} catch (const Common::SoftExitError& error) {
+			Log::WriteToConsoleAndLog(fmt::format("UNSUPPORTED compute shader 0x{:016x}: {}\n",
+			                                      params.hash, error.what()));
+			DumpUnsupportedShader(params.hash, params.code, user_data, error.what());
+			entry = programs.try_emplace(lookup_key, ShaderRecompiler::IR::ResourcePlan {}, nullptr).first;
+			entry->second.skip_dispatch = true;
+			return {};
+		}
 	}
 
 	explicit ProgramCache(GraphicContext& graphics): graphics(graphics) {
@@ -793,6 +966,11 @@ struct PipelineCache::ProgramCache {
 	std::vector<std::jthread>                      workers;
 
 	void LockPrograms() {
+		if (!program_lock->test_and_set(std::memory_order_acquire)) {
+			return;
+		}
+		KYTY_SYNC_SITE(s_prog_lock, "program lock contended", Spin);
+		Common::SyncAcct::Scope sync_scope(s_prog_lock, 0);
 		while (program_lock->test_and_set(std::memory_order_acquire)) {
 			while (program_lock->test(std::memory_order_relaxed)) {
 				Common::SpinPause();
@@ -839,6 +1017,10 @@ struct PipelineCache::ProgramCache {
 			return false;
 		}
 		const auto key = lookup_key;
+		// Debug: time the execution thread waits for shader compile workers.
+		GpuProfiler::TimedWait timed("ev: shader compile wait");
+		KYTY_SYNC_SITE(s_compile_wait, "shader: wait compile worker", Spin);
+		Common::SyncAcct::Scope sync_scope(s_compile_wait, 0);
 		do {
 			UnlockPrograms();
 			std::this_thread::yield();
@@ -857,6 +1039,7 @@ struct PipelineCache::ProgramCache {
 			Common::SoftExitScope soft_exit(true);
 			const auto [options, stage_name] =
 			    MakeCompileOptions(job.stage, job.params, input_info);
+			DumpRequestedShader(job.params, stage_name);
 			// SWAPPC programs link the functions they call from guest memory: the execution
 			// thread compiles them.
 			auto source = ShaderRecompiler::PrepareShaderSource(job.params.code, options);
@@ -1869,10 +2052,14 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	uint32_t          push_data_cursor = input_info.dispatch_indirect_threads
 	                                         ? ShaderRecompiler::IR::PushData::NoStart
 	                                         : 0u;
+	if (ahead == nullptr) {
+		GpuProfiler::PhaseMark("lookup: program lock");
+	}
 	const ProgramLockGuard lock(m_program_lock);
 	if (ahead != nullptr) {
 		return m_program_cache->GetAhead(params, input_info, push_data_cursor, *ahead);
 	}
+	GpuProfiler::PhaseMark("lookup: get");
 	return m_program_cache->Get(params, input_info, push_data_cursor);
 }
 
@@ -2069,8 +2256,10 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 		}
 		if (!m_async_pending_graphics.contains(key)) {
 			if (!allow_async || m_async_threads.empty() || m_async_failed_graphics.contains(key)) {
+				GpuProfiler::AddCount("pipe async: new pipeline for a draw that cannot skip");
 				break;
 			}
+			GpuProfiler::AddCount("pipe async: queued for a draw");
 			// The driver compiles a new pipeline for up to half a second: the draws that need it
 			// are skipped until a background thread created it.
 			m_async_pending_graphics.insert(key);
@@ -2099,10 +2288,13 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 		if (TakeQueuedAsyncPipeline([&](const AsyncPipelineJob& job) {
 			    return !job.compute && job.key == key;
 		    })) {
+			GpuProfiler::AddCount("pipe async: draw took its queued pipeline");
 			std::lock_guard pending_lock(m_precreated_mutex);
 			m_async_pending_graphics.erase(key);
 			break;
 		}
+		KYTY_SYNC_SITE(s_pipe_wait, "pipeline: wait async creator (graphics)", Spin);
+		Common::SyncAcct::Scope sync_scope(s_pipe_wait, 0);
 		std::this_thread::yield();
 	}
 
@@ -2116,10 +2308,32 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 		     static_cast<void*>(pixel_program.module));
 	}
 
+	if (GpuProfiler::PhaseEnabled()) {
+		// Debug: which part of the key made this pipeline new (keys with one part cleared).
+		static std::array<std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash>, 4> seen;
+		std::array<GraphicsPipelineKey, 4> reduced {key, key, key, key};
+		reduced[0].vertex_input      = {};
+		reduced[1].static_params     = {};
+		reduced[2].rendering         = {};
+		reduced[3].vertex_shader_ids = {};
+		reduced[3].ps_shader_id      = 0;
+		static const char* names[4] = {"pipe new: vertex input only", "pipe new: static params only",
+		                               "pipe new: formats only", "pipe new: shaders only"};
+		const char* reason = "pipe new: other";
+		for (size_t i = 0; i < reduced.size(); i++) {
+			if (!seen[i].insert(reduced[i]).second && reason[10] == 'o') {
+				reason = names[i];
+			}
+		}
+		GpuProfiler::AddCount(reason);
+	}
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
-	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
-	                       ps_input_info, programs, static_params, m_driver_cache);
+	{
+		GpuProfiler::TimedWait timed("ev: vk graphics pipeline");
+		CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
+		                       ps_input_info, programs, static_params, m_driver_cache);
+	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 	m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
 
@@ -2163,6 +2377,8 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 			m_async_pending_compute.erase(compute_program.id);
 			break;
 		}
+		KYTY_SYNC_SITE(s_pipe_wait_cs, "pipeline: wait async creator (compute)", Spin);
+		Common::SyncAcct::Scope sync_scope(s_pipe_wait_cs, compute_program.id);
 		std::this_thread::yield();
 	}
 
@@ -2171,7 +2387,23 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 
 	auto cached = std::make_unique<Pipeline>();
-	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	{
+		GpuProfiler::TimedWait timed("ev: vk compute pipeline");
+		// Debug: the compute pipelines the driver creates, and how long each took.
+		const auto& logged = *input_info.stage.program;
+		std::printf("Compute pipeline: hash=0x%016llx images=%zu buffers=%zu ...\n",
+		            static_cast<unsigned long long>(logged.shader_hash), logged.info.images.size(),
+		            logged.info.buffers.size());
+		std::fflush(stdout);
+		const auto created_at = std::chrono::steady_clock::now();
+		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+		std::printf("Compute pipeline: hash=0x%016llx took %lld ms\n",
+		            static_cast<unsigned long long>(logged.shader_hash),
+		            static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+		                                       std::chrono::steady_clock::now() - created_at)
+		                                       .count()));
+		std::fflush(stdout);
+	}
 	m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);

@@ -1,3 +1,4 @@
+#include "common/syncAcct.h"
 #include "common/threads.h"
 
 #include "common/assert.h"
@@ -230,6 +231,9 @@ void Thread::PinCurrent(int logical_cpu) {
 }
 
 void Thread::SleepMicro(uint32_t micros) {
+	KYTY_SYNC_SITE(s_sleep, "Common::Thread sleep (unscoped)", Block);
+	SyncAcct::Scope sync_scope(SyncAcct::Enabled() && !SyncAcct::InScope() ? SyncAcct::SiteId(s_sleep) : uint16_t {0},
+	                           micros, 0, SyncAcct::Enabled() && !SyncAcct::InScope() ? SyncAcct::CallerPair() : 0);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	SleepHighResolution100ns(static_cast<uint64_t>(micros) * 10);
 #elif defined(KYTY_POSIX_HIGH_RES_SLEEP)
@@ -240,6 +244,9 @@ void Thread::SleepMicro(uint32_t micros) {
 }
 
 void Thread::SleepNano(uint64_t nanos) {
+	KYTY_SYNC_SITE(s_sleep_ns, "Common::Thread sleep (unscoped)", Block);
+	SyncAcct::Scope sync_scope(SyncAcct::Enabled() && !SyncAcct::InScope() ? SyncAcct::SiteId(s_sleep_ns) : uint16_t {0},
+	                           nanos / 1000, 0, SyncAcct::Enabled() && !SyncAcct::InScope() ? SyncAcct::CallerPair() : 0);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	SleepHighResolution100ns((nanos + 99) / 100);
 #elif defined(KYTY_POSIX_HIGH_RES_SLEEP)
@@ -277,6 +284,17 @@ Mutex::~Mutex() {
 
 void Mutex::Lock() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (SyncAcct::Enabled()) {
+		// Debug (KYTY_SYNC_ACCT): contended locks (arg = mutex, arg2 = owner thread id).
+		if (TryEnterCriticalSection(&m_mutex->m_cs) != 0) {
+			return;
+		}
+		KYTY_SYNC_SITE(s_contended, "Common::Mutex contended", Block);
+		SyncAcct::Scope scope(s_contended, reinterpret_cast<uint64_t>(this),
+		                      reinterpret_cast<uint64_t>(m_mutex->m_cs.OwningThread));
+		EnterCriticalSection(&m_mutex->m_cs);
+		return;
+	}
 	EnterCriticalSection(&m_mutex->m_cs);
 #else
 	m_mutex->m_mutex.lock();
@@ -327,6 +345,11 @@ void CondVar::Wait(Mutex* mutex) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	static auto func = ResolveSleepConditionVariableCS();
 	EXIT_NOT_IMPLEMENTED(func == nullptr);
+	// Debug (KYTY_SYNC_ACCT): condition waits no caller scope names.
+	KYTY_SYNC_SITE(s_cv_wait, "Common::CondVar wait (unscoped)", Block);
+	SyncAcct::Scope sync_scope(SyncAcct::Enabled() && !SyncAcct::InScope() ? SyncAcct::SiteId(s_cv_wait) : uint16_t {0},
+	                           reinterpret_cast<uint64_t>(this), 0,
+	                           SyncAcct::Enabled() && !SyncAcct::InScope() ? SyncAcct::CallerPair() : 0);
 	if (g_cond_wait_poll_callback == nullptr) {
 		func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs, INFINITE);
 	} else {
@@ -360,6 +383,10 @@ bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	static auto func = ResolveSleepConditionVariableCS();
 	EXIT_NOT_IMPLEMENTED(func == nullptr);
+	KYTY_SYNC_SITE(s_cv_waitfor, "Common::CondVar waitfor (unscoped)", Block);
+	SyncAcct::Scope sync_scope(SyncAcct::Enabled() && !SyncAcct::InScope() ? SyncAcct::SiteId(s_cv_waitfor) : uint16_t {0},
+	                           micros, reinterpret_cast<uint64_t>(this),
+	                           SyncAcct::Enabled() && !SyncAcct::InScope() ? SyncAcct::CallerPair() : 0);
 	ok = !(func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs, (micros < 1000 ? 1 : micros / 1000)) ==
 	           0 &&
 	       GetLastError() == ERROR_TIMEOUT);

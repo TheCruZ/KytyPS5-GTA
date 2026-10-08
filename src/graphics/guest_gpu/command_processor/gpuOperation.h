@@ -94,9 +94,15 @@ struct GpuOperation {
 	// The command processor processed a WAIT_REG_MEM since the previous operation: the guest may
 	// have written memory the operations before it read.
 	bool after_wait = false;
-	// The guest ordered the operation after the earlier work of its queue (ACQUIRE_MEM or
-	// WAIT_REG_MEM since the operation before).
+	// Local debugging (KYTY_X_GUEST_SYNC): the guest synchronized its queue (ACQUIRE_MEM) since
+	// the operation before on the queue.
 	bool guest_sync = true;
+	// Debug (KYTY_EXEC_TRACE): when the command processor emitted it, and the operation whose
+	// write satisfied a WAIT_REG_MEM before it.
+	uint64_t dbg_emit_ns = 0;
+	uint64_t dbg_dep_seq = 0;
+	uint64_t dbg_rs_ns   = 0;
+	uint64_t dbg_re_ns   = 0;
 	union {
 		DrawIndexArgs       draw_index;
 		DrawAutoArgs        draw_auto;

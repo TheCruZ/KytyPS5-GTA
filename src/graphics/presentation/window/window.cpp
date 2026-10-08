@@ -1,4 +1,11 @@
+#include "common/syncAcct.h"
 #include "graphics/presentation/window.h"
+#include "common/xtToggle.h"
+#include <chrono>
+#include <ctime>
+#include <cstdio>
+#include <cstdlib>
+#include <thread>
 
 #include <SDL3/SDL.h>
 
@@ -24,6 +31,7 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <memory>
@@ -290,6 +298,7 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 	// A new mapping changes how SDL translates the device. SDL sends no release or neutral axis
 	// events for the old mapping, so input held on the active controller would stay stuck.
 	if (f.remapped) {
+		std::printf("Gamepad remapped: id=%d\n", f.id);
 		if (Controller::GetActiveControllerId() == f.id) {
 			Controller::ResetInputState();
 		}
@@ -319,10 +328,15 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 			return;
 		}
 		int id = SDL_GetJoystickID(SDL_GetGamepadJoystick(pad));
+		const char* name = SDL_GetGamepadName(pad);
+		std::printf("Gamepad connected: id=%d name=\"%s\" type=%s\n", id,
+		            name != nullptr ? name : "?",
+		            SDL_GetGamepadStringForType(SDL_GetGamepadType(pad)));
 		Controller::Connect(id);
 	}
 
 	if (f.removed) {
+		std::printf("Gamepad disconnected: id=%d\n", f.id);
 		if (auto* pad = SDL_GetGamepadFromID(f.id); pad != nullptr) {
 			Controller::Disconnect(f.id);
 			SDL_CloseGamepad(pad);
@@ -742,6 +756,57 @@ void WindowContext::Run() {
 	loop.need_exit = false;
 	loop.paused.store(false, std::memory_order_release);
 
+	// Local A/B harness (perf-scene47): flips Common::g_xt_a every KYTY_XT_A seconds.
+	static std::thread xt_thread([this] {
+		const char* value  = std::getenv("KYTY_XT_A");
+		const long  period = value != nullptr ? std::atol(value) : 0;
+		if (period < 0) {
+			Common::g_xt_a = false;
+			std::printf("XTF A forced off\n");
+			return;
+		}
+		if (period == 0) {
+			return;
+		}
+		auto     next   = std::chrono::steady_clock::now();
+		uint64_t frames = loop.presented_frames.load(std::memory_order_relaxed);
+		auto     last   = next;
+		Common::g_xt_a  = false;
+		for (;;) {
+			next += std::chrono::seconds(period);
+			std::this_thread::sleep_until(next);
+			const auto now = std::chrono::steady_clock::now();
+			const auto f   = loop.presented_frames.load(std::memory_order_relaxed);
+			const double secs = std::chrono::duration<double>(now - last).count();
+			const auto wall = std::time(nullptr);
+			std::tm    local {};
+			localtime_s(&local, &wall);
+			static uint64_t last_ei = 0, last_ri = 0, last_rf = 0;
+			const uint64_t  ei = Common::g_xt_exec_idle.load(), ri = Common::g_xt_resolve_idle.load(),
+			               rf = Common::g_xt_resolve_full.load();
+			const double    fr = static_cast<double>(f - frames);
+			// Waits in ms per frame at ~4 GHz TSC (approximate: only relative values matter).
+			std::printf("XTF A %s frames %llu secs %.3f fps %.2f at %02d:%02d:%02d exec_idle %.2f "
+			            "res_idle %.2f res_full %.2f\n",
+			            Common::g_xt_a ? "on" : "off", static_cast<unsigned long long>(f - frames),
+			            secs, fr / secs, local.tm_hour, local.tm_min, local.tm_sec,
+			            static_cast<double>(ei - last_ei) / 3.7e6 / fr,
+			            static_cast<double>(ri - last_ri) / 3.7e6 / fr,
+			            static_cast<double>(rf - last_rf) / 3.7e6 / fr);
+			last_ei = ei;
+			last_ri = ri;
+			last_rf = rf;
+			std::fflush(stdout);
+			frames         = f;
+			last           = now;
+			{
+				KYTY_SYNC_SITE(s_xt, "xt toggle", Point);
+				Common::SyncAcct::Point(s_xt, Common::g_xt_a ? 0 : 1);
+			}
+			Common::g_xt_a = !Common::g_xt_a;
+		}
+	});
+	xt_thread.detach();
 	constexpr uint64_t title_interval_ms = 1000;
 	auto               title_time        = SDL_GetTicks();
 	auto               title_frames      = loop.presented_frames.load(std::memory_order_relaxed);

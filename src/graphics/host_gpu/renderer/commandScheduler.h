@@ -12,12 +12,16 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <deque>
 #include <queue>
 #include <thread>
 #include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
+
+// Debug (sync-wait audit, KYTY_XT_EXP=CBFLUSH): TSC of the execution thread's last submission.
+inline uint64_t g_dbg_last_submit_tsc = 0;
 
 class CommandScheduler {
 public:
@@ -76,6 +80,18 @@ public:
 	// deferred recording (null otherwise). Submissions wait for the copies recorded before them;
 	// the owner of the scheduler drains them before any guest-visible effect.
 	[[nodiscard]] HostCopyQueue* HostCopies() noexcept { return m_host_copies.get(); }
+	// Local debugging (KYTY_X_LANE_R): commands recorded between BeginLaneR() and EndLaneR() run on
+	// the second queue (GraphicContext::rt_queue) after every command recorded before them, and
+	// signal the lane's timeline semaphore; later submissions wait for it only through
+	// WaitLaneR(). BeginLaneR() submits the current command buffer and returns its tick.
+	[[nodiscard]] bool     LaneRAvailable() const noexcept { return m_lane_r_semaphore != nullptr; }
+	uint64_t               BeginLaneR();
+	uint64_t               EndLaneR(uint64_t wait_tick);
+	void                   WaitLaneR(uint64_t value) noexcept {
+		m_lane_r_wait = std::max(m_lane_r_wait, value);
+	}
+	[[nodiscard]] uint64_t LaneRValue() const noexcept { return m_lane_r_value; }
+	void                   WaitLaneRIdle();
 	// Called before each submission, while its command buffer still takes commands.
 	using SubmitHook = void (*)(void* userdata, CommandBuffer& command);
 	void SetSubmitHook(SubmitHook hook, void* userdata) noexcept {
@@ -123,6 +139,20 @@ private:
 		uint64_t                     tick = 0;
 	};
 
+	struct RecordedLaneR {
+		uint64_t wait_tick   = 0;
+		uint64_t value       = 0;
+		uint64_t host_copies = 0;
+	};
+	void SubmitLaneR(vk::CommandBuffer& buffer, const RecordedLaneR& recorded);
+	vk::Semaphore                                    m_lane_r_semaphore = nullptr;
+	uint64_t                                         m_lane_r_value     = 0;
+	uint64_t                                         m_lane_r_wait      = 0;
+	uint64_t                                         m_lane_r_waited    = 0;
+	// Recording thread.
+	vk::CommandPool                                  m_lane_r_pool = nullptr;
+	std::vector<std::pair<vk::CommandBuffer, uint64_t>> m_lane_r_buffers;
+
 	// A submission recorded into the stream: the recording thread submits it in order.
 	struct RecordedSubmit {
 		SubmitInfo info;
@@ -144,6 +174,7 @@ private:
 	                    const RecordedSubmit& recorded);
 	void QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit, uint64_t tick,
 	                 const RecordedSubmit& debug);
+	void ResolveProfiles();
 	void PriorityOperationsThread(std::stop_token stop);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 
@@ -184,6 +215,8 @@ private:
 	void*                          m_submit_hook_data = nullptr;
 	// Replays m_stream when recording is deferred; declared last so it stops first.
 	std::jthread m_recording_thread;
+	std::mutex                                 m_profile_mutex;
+	std::deque<std::pair<uint64_t, uint32_t>> m_profile_pending;
 };
 
 } // namespace Libs::Graphics

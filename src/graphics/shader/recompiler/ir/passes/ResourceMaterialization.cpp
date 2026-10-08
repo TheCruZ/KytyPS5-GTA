@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/assert.h"
+#include "common/expSwitch.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -273,7 +274,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	const auto  descriptor_bytes = dword_count * sizeof(uint32_t);
 	const auto& sources = indirect.sources;
 	const auto* selector = indirect.selector ? &*indirect.selector : nullptr;
-	auto& keys = program.material_keys;
+	auto& keys = program.Scratch().material_keys;
 	const auto children_begin = descriptors.size();
 	const auto root_resource = specializations[resource_index];
 	const auto evaluate_count = [&](uint32_t& count) {
@@ -691,10 +692,11 @@ bool MaterializeImageTable(const ResourcePlan& program,
 			return same_table(old) && old.raw == words && !old.slots.empty();
 		});
 		// The tables this thread built last, by any program: resolutions ahead of execution
-		// materialize into a ring of snapshots, so `previous` rarely holds the table.
+		// land in a ring of snapshots, so `previous` rarely holds the table (GTA V's ray tracing
+		// dispatches rebuilt a 64 k-entry table, ~7 ms, on every resolution).
 		static thread_local std::array<ImageTableSnapshot, 4> built;
 		static thread_local uint32_t                          built_next = 0;
-		const auto cached = reusable != previous.end()
+		const auto cached = reusable != previous.end() || !KYTY_X(TABLE_CACHE)
 		                        ? built.end()
 		                        : std::ranges::find_if(built, [&](const ImageTableSnapshot& old) {
 			                          return same_table(old) && !old.slots.empty() &&
@@ -730,7 +732,9 @@ bool MaterializeImageTable(const ResourcePlan& program,
 				}
 				next.mapping[entry + 1u] = slot->second;
 			}
-			built[built_next++ % built.size()] = next;
+			if (KYTY_X(TABLE_CACHE)) {
+				built[built_next++ % built.size()] = next;
+			}
 		}
 		snapshot.image_tables.push_back(std::move(next));
 		mapping_offsets.push_back(static_cast<uint32_t>(snapshot.flattened_srt.size()));
@@ -1447,7 +1451,7 @@ static bool MaterializeWith(const ResourcePlan& program, const SrtRuntime& runti
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
 		return false;
 	}
-	const auto active = std::span<const uint8_t>(program.active_sources);
+	const auto active = std::span<const uint8_t>(program.Scratch().active_sources);
 	snapshot.uniform_fill = {};
 	const auto& fill = program.uniform_fill;
 	const auto words = fill.fill.words;

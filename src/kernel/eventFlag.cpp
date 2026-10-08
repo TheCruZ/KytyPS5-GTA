@@ -1,3 +1,4 @@
+#include "common/syncAcct.h"
 #include "kernel/eventFlag.h"
 
 #include "common/assert.h"
@@ -297,7 +298,9 @@ int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, 
 	}
 
 	const auto mode   = DecodeEventFlagWaitMode(wait_mode);
+	KYTY_SYNC_GAME_WAIT("game: sceKernelWaitEventFlag", ef);
 	auto       result = ef->Wait(bit_pattern, mode.wait, mode.clear, result_pat, timeout);
+	sync_game_scope_.End();
 
 	int ret = OK;
 
@@ -347,6 +350,7 @@ int KYTY_SYSV_ABI KernelSetEventFlag(KernelEventFlag ef, uint64_t bit_pattern) {
 		return KERNEL_ERROR_ESRCH;
 	}
 
+	Common::SyncAcct::NoteWake(ef);
 	ef->Set(bit_pattern);
 
 	return OK;

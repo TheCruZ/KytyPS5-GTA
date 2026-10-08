@@ -1,4 +1,7 @@
+#include "common/ablation.h"
+#include "common/alignment.h"
 #include "common/assert.h"
+#include "common/expSwitch.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -11,7 +14,9 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "gpu_tiler_shaders/indirect_thread_dispatch_spv.h"
+#include "graphics/host_gpu/gpuProfiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/cacheStats.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -27,9 +32,13 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <unordered_set>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -38,6 +47,32 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+// Debug: the CS address of the dispatch being executed.
+thread_local uint64_t g_dbg_cs_addr = 0;
+thread_local const char* g_dbg_lookup_reason = nullptr;
+// Debug (ablation, fidelity-diff): KYTY_NOGPU_SHADERS=<hex hash>[,...|*] keeps the CPU work of
+// those dispatches but records them with no groups (their GPU work goes away).
+// KYTY_NOGPU_QUEUES=<dec queue>[,...]: the same for every dispatch of those guest queues.
+static bool NoGpuDispatch(uint64_t hash, uint32_t queue) {
+	static const Common::Ablation::HashList list("KYTY_NOGPU_SHADERS");
+	static const Common::Ablation::HashList queues("KYTY_NOGPU_QUEUES_HEX");
+	if ((!list.present && !queues.present) || !Common::Ablation::Started() ||
+	    !(list.Contains(hash) || queues.Contains(queue))) {
+		return false;
+	}
+	GpuProfiler::AddCount("nogpu: dispatches");
+	return true;
+}
+
+static void NoteLookupFallback(uint64_t hash) {
+	if (g_dbg_lookup_reason != nullptr && GpuProfiler::PhaseEnabled()) {
+		char tag[96];
+		std::snprintf(tag, sizeof(tag), "%s %016llx cs=%llx", g_dbg_lookup_reason, static_cast<unsigned long long>(hash), static_cast<unsigned long long>(g_dbg_cs_addr));
+		GpuProfiler::AddWaitString(tag, 0);
+	}
+	g_dbg_lookup_reason = nullptr;
+}
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                  GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
@@ -78,9 +113,15 @@ static bool PrepareIndirectWriteTargets(RenderContext& context, const PreparedBi
 		if (table.address == 0 || table.size <= resource.indirect_table_offset) {
 			continue;
 		}
+		const auto begin = std::chrono::steady_clock::now();
 		prepared |= context.GetIndirectWriteTables().Prepare(
 		    table.address + resource.indirect_table_offset,
 		    table.size - resource.indirect_table_offset);
+		CacheStats::Add(CacheStats::IndirectDispatches);
+		CacheStats::Add(CacheStats::IndirectPrepareUs,
+		                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+		                                          std::chrono::steady_clock::now() - begin)
+		                                          .count()));
 	}
 	return prepared;
 }
@@ -269,7 +310,9 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
+	g_dbg_cs_addr = buffer.GetShaders().GetCs().cs_regs.data_addr;
 	EXIT_IF(buffer.IsInvalid());
+	GpuProfiler::PhaseMark("dispatch: pending ops");
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
@@ -289,7 +332,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
+	GpuProfiler::PhaseMark("dispatch: context lock");
 	Common::LockGuard lock(m_context.GetMutex());
+	GpuProfiler::PhaseMark("dispatch: checks");
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
 		     "groups=%ux%ux%u mode=%u\n",
@@ -338,6 +383,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			input_info.workgroup_counts[axis] = threads / size + (threads % size != 0u);
 		}
 	}
+	GpuProfiler::PhaseMark("dispatch: program lookup");
 	ShaderProgram compute_program;
 	if (!TakeResolvedDispatch(input_info, compute_program)) {
 		compute_program = m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
@@ -350,6 +396,16 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
+	GpuProfiler::SetCurrentShader(program.shader_hash);
+	NoteLookupFallback(program.shader_hash);
+	if (GpuProfiler::Enabled()) {
+		// Debug: which shader runs at a CS address.
+		static std::unordered_set<uint64_t> seen;
+		if (seen.insert(g_dbg_cs_addr ^ program.shader_hash).second && seen.size() < 2000) {
+			std::printf("CSMAP addr=0x%llx hash=0x%016llx\n", static_cast<unsigned long long>(g_dbg_cs_addr),
+			            static_cast<unsigned long long>(program.shader_hash));
+		}
+	}
 	if (resources.specialization_reads.empty()) {
 		// Cached metadata addresses can be reused as ordinary buffers; preserve their guest writes.
 		UpdateComputeMetaClears(input_info, buffer);
@@ -365,6 +421,32 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const bool           known_fill =
 	    ResolveComputeBufferFill(input_info, thread_group_x, thread_group_y, thread_group_z, mode,
 	                             known_fill_descriptor, known_fill_value, known_fill_size);
+	{
+		// Debug: why a dispatch of KYTY_DUMP_SHADER is not a known fill.
+		static const uint64_t wanted = [] {
+			const char* value = std::getenv("KYTY_DUMP_SHADER");
+			return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+		}();
+		static std::atomic<uint32_t> logged {0};
+		if (wanted != 0 && program.shader_hash == wanted &&
+		    logged.fetch_add(1, std::memory_order_relaxed) < 40) {
+			const auto& res  = *input_info.stage.resources;
+			const auto& fill = res.uniform_fill;
+			ShaderBufferResource d {};
+			if (fill.resource < res.buffers.size()) {
+				d = DecodeNativeDescriptor<ShaderBufferResource>(res.buffers[fill.resource]);
+			}
+			std::printf("FillDiag: known=%d kind=%d words=%u gstride=%u value=0x%x base=0x%llx "
+			            "stride=%u fmt=%u nrec=%u swz=%d istride=%u addtid=%d groups=%ux%ux%u "
+			            "mode=0x%x threads=%ux%ux%u dtd=%d\n",
+			            known_fill, static_cast<int>(fill.kind), fill.words, fill.group_stride[0],
+			            fill.value, static_cast<unsigned long long>(d.Base48()), d.Stride(),
+			            static_cast<uint32_t>(d.Format()), d.NumRecords(), d.SwizzleEnabled() ? 1 : 0,
+			            d.IndexStride(), d.AddTid() ? 1 : 0, thread_group_x, thread_group_y,
+			            thread_group_z, mode, input_info.threads_num[0], input_info.threads_num[1],
+			            input_info.threads_num[2], input_info.dispatch_thread_dimensions ? 1 : 0);
+		}
+	}
 
 	if (use_thread_dimensions) {
 		const uint32_t old_x = thread_group_x;
@@ -389,6 +471,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto& pipeline =
 	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
+	GpuProfiler::PhaseMark("dispatch: bindings");
 	PrepareBindings(input_info.stage, bindings);
 	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
 		std::copy(std::begin(input_info.dispatch_threads_num), std::end(input_info.dispatch_threads_num),
@@ -401,20 +484,32 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (program.info.uses_dma) {
 		m_context.CacheDmaBases(input_info.stage);
 		const ShaderStageRuntime* const dma_stage = &input_info.stage;
-		const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
+		const bool reach_synchronized =
+		    DmaFootprintEnabled() && m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
+		GpuProfiler::AddCount(reach_synchronized ? "dma: footprint" : "dma: full sync");
 		m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), !reach_synchronized);
 		if (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0) {
 			// Its results are often read back soon: submit it at once (see CommitWriteTicks()).
 			m_context.GetBufferCache().RequestFlushForReadbacks();
 		}
 	}
+	GpuProfiler::PhaseMark("dispatch: rebind images");
 	RebindImages(bindings);
+	GpuProfiler::PhaseMark("dispatch: rebind buffers");
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
 
 	auto              vk_buffer        = buffer.Handle();
+	GpuProfiler::PhaseMark("dispatch: commit + record");
+	// Local debugging (KYTY_X_LANE_R): ray tracing dispatches (bindless tables) of the
+	// asynchronous compute queues run on the second queue.
+	m_lane_r_begin_pending = KYTY_XO(LANE_R) && m_guest_queue >= 40 &&
+	                         bindings.table_state != nullptr &&
+	                         !MayWriteThroughDeviceAddresses(program) &&
+	                         m_context.GetCommandScheduler().LaneRAvailable();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
+	m_lane_r_begin_pending = false;
 	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
 	    HasShaderBufferWrites(input_info.stage) || indirect_writes;
 	has_storage_writes =
@@ -425,17 +520,32 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 	                }) ||
 	    has_storage_writes;
-	// On the guest's GPU, dispatches of one queue overlap unless the guest orders them (a wait,
-	// a partial flush, an ACQUIRE_MEM; the operations other than dispatches record their own
-	// barriers). Without such an order since the previous direct dispatch of its queue, nothing
-	// was recorded after that one and its barrier is still deferred: the barrier before the
-	// earlier dispatch already ordered everything before it, so neither is needed and the two
-	// overlap. GTA V's ray tracing structure builds run hundreds of such dispatches per frame.
-	const bool chained = std::exchange(m_dispatch_chained, false) && m_deferred_barrier;
+	// A dispatch that follows a direct dispatch of its queue without guest synchronization may
+	// overlap it, as on the guest's GPU: the barrier before the earlier one already ordered
+	// everything before it (see BeginGuestOperation()).
+	const bool unsynced = std::exchange(m_dispatch_unsynced, false);
+	const bool chained  = std::exchange(m_dispatch_chained, false) && m_deferred_barrier;
+	if (chained) {
+		GpuProfiler::AddCount("gsync: chained dispatches");
+	}
+	if (has_storage_writes && chained && unsynced) {
+		// Not ordered after the other queues' deferred dispatches, but after its own queue's
+		// earlier work: everything but other queues' compute... conservatively all but the
+		// pending dispatches is not expressible, so wait for transfers and graphics only.
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
+		                              vk::PipelineStageFlagBits::eTransfer |
+		                              vk::PipelineStageFlagBits::eHost,
+		                          vk::PipelineStageFlagBits::eComputeShader, {}, 1, &barrier, 0,
+		                          nullptr, 0, nullptr);
+	}
 	if (has_storage_writes && !chained) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader,
+		                         HazardSourceStages());
 	}
 	if (Config::GraphicsDebugDumpEnabled()) {
 		const auto sampled_images = std::count_if(
@@ -498,12 +608,30 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	GpuCheckpoint(vk_buffer, GpuCheckpointKind::DispatchBegin, program.shader_hash);
+	if (NoGpuDispatch(program.shader_hash, m_guest_queue)) {
+		vk_buffer.dispatch(0, 0, 0);
+	} else {
+		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	}
+	GpuCheckpoint(vk_buffer, GpuCheckpointKind::DispatchEnd, program.shader_hash);
 
-	// The removed host fence also ordered read-only dispatches before later writers. Recorded
-	// before the next operation, unless that is a dispatch the guest did not order after this one.
-	m_deferred_barrier       = true;
-	m_deferred_barrier_queue = m_guest_queue;
+	// The removed host fence also ordered read-only dispatches before later writers.
+	if (KYTY_X(GUEST_SYNC) && !m_in_lane_r) {
+		// Recorded before the next operation, unless that is a direct dispatch the guest did not
+		// order after this one.
+		m_deferred_barrier       = true;
+		m_deferred_barrier_queue = m_guest_queue;
+		m_deferred_queues |= 1u << (m_guest_queue == 0 ? 0u : ((m_guest_queue - 32u) / 8u + 1u) % 31u);
+	} else {
+		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
+	if (m_in_lane_r) {
+		m_in_lane_r      = false;
+		const auto value = m_context.GetCommandScheduler().EndLaneR(m_lane_r_tick);
+		m_queue_lane_r[m_guest_queue % m_queue_lane_r.size()] = value;
+		GpuProfiler::AddCount("lane r: dispatches");
+	}
 	if (known_fill) {
 		// Recorded after binding, which forgets older fills over the written ranges.
 		m_context.GetBufferCache().NoteKnownFill(known_fill_descriptor.Base48(), known_fill_size,
@@ -568,16 +696,33 @@ struct IndirectThreadPass {
 	vk::Pipeline            pipeline          = nullptr;
 };
 
+static bool GpuIndirectThreadsEnabled() {
+	// Debug (A/B): KYTY_GPU_INDIRECT_THREADS=0 reads the thread counts back as before.
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GPU_INDIRECT_THREADS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+bool GpuIndirectThreadDispatchEnabled() {
+	return GpuIndirectThreadsEnabled();
+}
+
 void RenderExecutor::DispatchIndirectThreads(uint64_t submit_id, CommandBuffer& buffer,
                                              uint64_t args_addr, uint32_t mode,
                                              bool async_compute) {
+	g_dbg_cs_addr = buffer.GetShaders().GetCs().cs_regs.data_addr;
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) == 0);
+	GpuProfiler::PhaseMark("dispatch: pending ops");
 	m_context.GetCommandScheduler().PopPendingOperations();
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
 	                    1, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
+	GpuProfiler::PhaseMark("dispatch: context lock");
 	Common::LockGuard lock(m_context.GetMutex());
+	GpuProfiler::PhaseMark("dispatch: checks");
 	const auto& cs_regs = buffer.GetShaders().GetCs();
 	if (cs_regs.cs_regs.data_addr == 0) {
 		return;
@@ -596,25 +741,41 @@ void RenderExecutor::DispatchIndirectThreads(uint64_t submit_id, CommandBuffer& 
 	}
 	const auto& program = *input_info.stage.program;
 	EXIT_IF(program.bindings.UsesPushData());
+	GpuProfiler::SetCurrentShader(program.shader_hash);
+	NoteLookupFallback(program.shader_hash);
+	if (GpuProfiler::Enabled()) {
+		// Debug: which shader runs at a CS address.
+		static std::unordered_set<uint64_t> seen;
+		if (seen.insert(g_dbg_cs_addr ^ program.shader_hash).second && seen.size() < 2000) {
+			std::printf("CSMAP addr=0x%llx hash=0x%016llx\n", static_cast<unsigned long long>(g_dbg_cs_addr),
+			            static_cast<unsigned long long>(program.shader_hash));
+		}
+	}
 	// Metadata clears are tracked as in the direct path; it does not depend on the size.
 	UpdateComputeMetaClears(input_info, buffer);
+	GpuProfiler::AddCount("indirect thread dispatch on GPU");
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
+	GpuProfiler::PhaseMark("dispatch: bindings");
 	PrepareBindings(input_info.stage, bindings);
 	PreparedBindings* descriptor_stage = &bindings;
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	if (program.info.uses_dma) {
 		m_context.CacheDmaBases(input_info.stage);
 		const ShaderStageRuntime* const dma_stage = &input_info.stage;
-		const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
+		const bool reach_synchronized =
+		    DmaFootprintEnabled() && m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
+		GpuProfiler::AddCount(reach_synchronized ? "dma: footprint" : "dma: full sync");
 		m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), !reach_synchronized);
 		if (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0) {
 			// Its results are often read back soon: submit it at once (see CommitWriteTicks()).
 			m_context.GetBufferCache().RequestFlushForReadbacks();
 		}
 	}
+	GpuProfiler::PhaseMark("dispatch: rebind images");
 	RebindImages(bindings);
+	GpuProfiler::PhaseMark("dispatch: rebind buffers");
 	(void)PrepareIndirectWriteTargets(m_context, bindings);
 	constexpr uint64_t ArgsSize = 3 * sizeof(uint32_t);
 	if (program.bindings.descriptor_counts[static_cast<size_t>(
@@ -679,9 +840,8 @@ void RenderExecutor::DispatchIndirectThreads(uint64_t submit_id, CommandBuffer& 
 	before.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite |
 	                       vk::AccessFlagBits::eHostWrite;
 	before.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
-	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-	                          vk::PipelineStageFlagBits::eComputeShader, {}, 1, &before, 0, nullptr,
-	                          0, nullptr);
+	vk_buffer.pipelineBarrier(HazardSourceStages(), vk::PipelineStageFlagBits::eComputeShader, {}, 1,
+	                          &before, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pass.pipeline);
 	vk_buffer.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pass.pipeline_layout, 0,
 	                               writes);
@@ -697,6 +857,7 @@ void RenderExecutor::DispatchIndirectThreads(uint64_t submit_id, CommandBuffer& 
 	                              vk::PipelineStageFlagBits::eComputeShader,
 	                          {}, 1, &after, 0, nullptr, 0, nullptr);
 
+	GpuProfiler::PhaseMark("dispatch: commit + record");
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
@@ -706,23 +867,34 @@ void RenderExecutor::DispatchIndirectThreads(uint64_t submit_id, CommandBuffer& 
 		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
 	    });
 	if (has_storage_writes) {
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader,
+		                         HazardSourceStages());
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatchIndirect(stream.Handle(), scratch_offset);
+	GpuCheckpoint(vk_buffer, GpuCheckpointKind::DispatchBegin, program.shader_hash);
+	if (NoGpuDispatch(program.shader_hash, m_guest_queue)) {
+		vk_buffer.dispatch(0, 0, 0);
+	} else {
+		vk_buffer.dispatchIndirect(stream.Handle(), scratch_offset);
+	}
+	GpuCheckpoint(vk_buffer, GpuCheckpointKind::DispatchEnd, program.shader_hash);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 }
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
                                       uint64_t args_addr, uint32_t mode, bool async_compute) {
+	g_dbg_cs_addr = buffer.GetShaders().GetCs().cs_regs.data_addr;
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
+	GpuProfiler::PhaseMark("dispatch: pending ops");
 	m_context.GetCommandScheduler().PopPendingOperations();
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
+	GpuProfiler::PhaseMark("dispatch: context lock");
 	Common::LockGuard lock(m_context.GetMutex());
+	GpuProfiler::PhaseMark("dispatch: checks");
 	const auto& cs_regs = buffer.GetShaders().GetCs();
 	if (cs_regs.cs_regs.data_addr == 0) {
 		return;
@@ -735,8 +907,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
 	}
 	buffer.EndRendering();
+	GpuProfiler::SetCurrentShader(input_info.stage.program->shader_hash);
+	NoteLookupFallback(input_info.stage.program->shader_hash);
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
+	GpuProfiler::PhaseMark("dispatch: bindings");
 	PrepareBindings(input_info.stage, bindings);
 	PreparedBindings* descriptor_stage = &bindings;
 	FindBuffers(std::span {&descriptor_stage, 1u});
@@ -746,7 +921,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (program.info.uses_dma) {
 		m_context.CacheDmaBases(input_info.stage);
 		const ShaderStageRuntime* const dma_stage = &input_info.stage;
-		const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
+		const bool reach_synchronized =
+		    DmaFootprintEnabled() && m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
+		GpuProfiler::AddCount(reach_synchronized ? "dma: footprint" : "dma: full sync");
 		m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), !reach_synchronized);
 		if (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0) {
 			// Its results are often read back soon: submit it at once (see CommitWriteTicks()).
@@ -754,12 +931,15 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
+	GpuProfiler::PhaseMark("dispatch: rebind images");
 	RebindImages(bindings);
+	GpuProfiler::PhaseMark("dispatch: rebind buffers");
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
+	GpuProfiler::PhaseMark("dispatch: commit + record");
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const auto vk_buffer = buffer.Handle();
@@ -770,18 +950,28 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
 	    });
 	if (has_storage_writes) {
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader,
+		                         HazardSourceStages());
 	}
 	vk::MemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
-	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
-	                              vk::PipelineStageFlagBits::eComputeShader |
-	                              vk::PipelineStageFlagBits::eTransfer,
+	vk_buffer.pipelineBarrier((HazardSourceStages() & vk::PipelineStageFlagBits::eAllCommands)
+	                              ? vk::PipelineStageFlagBits::eAllGraphics |
+	                                    vk::PipelineStageFlagBits::eComputeShader |
+	                                    vk::PipelineStageFlagBits::eTransfer
+	                              : vk::PipelineStageFlags(vk::PipelineStageFlagBits::eComputeShader |
+	                                                       vk::PipelineStageFlagBits::eTransfer),
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	GpuCheckpoint(vk_buffer, GpuCheckpointKind::DispatchBegin, program.shader_hash);
+	if (NoGpuDispatch(program.shader_hash, m_guest_queue)) {
+		vk_buffer.dispatch(0, 0, 0);
+	} else {
+		vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	}
+	GpuCheckpoint(vk_buffer, GpuCheckpointKind::DispatchEnd, program.shader_hash);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 }

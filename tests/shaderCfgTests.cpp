@@ -15700,6 +15700,22 @@ int main() {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  // Local debugging: KYTY_TRANSLATE_BIN=<cs_hash.bin> translates a dumped compute shader.
+  if (const char *bin = std::getenv("KYTY_TRANSLATE_BIN"); bin != nullptr) {
+    std::FILE *f = std::fopen(bin, "rb");
+    Check(f != nullptr, "cannot open KYTY_TRANSLATE_BIN");
+    std::vector<uint32_t> code(1u << 16u);
+    code.resize(std::fread(code.data(), 4, code.size(), f));
+    std::fclose(f);
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    const char *wave = std::getenv("KYTY_TRANSLATE_WAVE");
+    options.wave_size = wave != nullptr ? static_cast<uint32_t>(std::atoi(wave)) : 32u;
+    options.dump_ir = false;
+    auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    (void)ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+    std::printf("KYTY_TRANSLATE_BIN: translated %zu dwords\n", code.size());
+    return 0;
+  }
   TestRayTracingInstructions();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();

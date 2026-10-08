@@ -1,3 +1,4 @@
+#include "common/syncAcct.h"
 #include "kernel/eventQueue.h"
 
 #include "common/assert.h"
@@ -251,6 +252,12 @@ int KernelEqueuePrivate::TriggerEvent(uintptr_t ident, int16_t filter, void* tri
 			event.triggered = true;
 		}
 
+		Common::SyncAcct::NoteWake(this);
+		KYTY_SYNC_SITE(s_trigger, "equeue trigger", Point);
+		Common::SyncAcct::Point(s_trigger,
+		                        (static_cast<uint64_t>(static_cast<uint16_t>(filter)) << 48u) |
+		                            (static_cast<uint64_t>(ident) & 0xffffffffffffull),
+		                        static_cast<uint64_t>(m_handle));
 		m_cond_var.Signal();
 
 		return OK;
@@ -420,6 +427,10 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 	     (timo == nullptr ? "inf" : fmt::format("{}", *timo).c_str()),
 	     Common::Thread::GetThreadIdUnique());
 
+	// Debug (KYTY_SYNC_ACCT): arg = filter << 48 | ident of the first event delivered.
+	KYTY_SYNC_SITE(s_equeue, "game: sceKernelWaitEqueue", Block);
+	Common::SyncAcct::Scope sync_scope(s_equeue, 0, 0, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+	sync_scope.SetWakerObject(owner.get());
 	if (timo == nullptr) {
 		*out = owner->WaitForEvents(ev, num, 0);
 	}
@@ -432,6 +443,11 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 		}
 	}
 
+	if (*out > 0) {
+		sync_scope.SetArg((static_cast<uint64_t>(static_cast<uint16_t>(ev[0].filter)) << 48u) |
+		                  (static_cast<uint64_t>(ev[0].ident) & 0xffffffffffffull));
+	}
+	sync_scope.End();
 	if (*out == KERNEL_ERROR_EBADF) {
 		return KERNEL_ERROR_EBADF;
 	}

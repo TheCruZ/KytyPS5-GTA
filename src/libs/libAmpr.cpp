@@ -17,6 +17,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -1396,6 +1397,9 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 		return OK;
 	}
 	if (!AprShared::IsValidGuestRange(destination, size, true)) {
+		std::printf("APR read into an invalid guest range: dst=0x%016" PRIx64 " size=0x%" PRIx64
+		            " path=%s\n",
+		            destination, size, host_path.c_str());
 		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
 

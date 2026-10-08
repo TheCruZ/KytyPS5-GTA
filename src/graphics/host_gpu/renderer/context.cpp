@@ -2,6 +2,7 @@
 #include "common/common.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/gpuProfiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -47,6 +48,7 @@ void CommandBuffer::Begin() {
 	auto result = buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	GpuProfiler::BeginCommandBuffer(m_graphics, buffer);
 }
 
 void CommandBuffer::End() const {
@@ -126,6 +128,7 @@ void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
 	}
+	GpuProfiler::AddCount("cmd: end rendering");
 	const auto recorder = Handle();
 	m_context.GetOcclusionQueries().OnEndRendering(recorder);
 	recorder.endRendering();

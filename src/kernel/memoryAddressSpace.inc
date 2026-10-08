@@ -12,6 +12,115 @@ static constexpr uint64_t HOST_USER_MIN            = 0x1000000000ull;
 #endif
 static constexpr uint64_t HOST_USER_MAX = 0xfbffffffffull;
 
+// Local debugging: a lock-free history of the host-level guest map/unmap operations (and, in a
+// second ring, of the page protections), always on. The crash report prints the entries that
+// touched the faulting address (DescribeFaultAddress). Recording costs a relaxed fetch_add and a
+// few stores next to a system call.
+struct MapHistoryEvent {
+	std::atomic<uint64_t> seq {0}; // index + 1 once the entry is complete, 0 while written
+	int64_t               ticks = 0;
+	uint64_t              vaddr = 0;
+	uint64_t              size  = 0;
+	uint64_t              extra = 0;
+	const char*           op    = nullptr;
+	uint32_t              tid   = 0;
+	bool                  ok    = false;
+	char                  thread[20] {};
+};
+
+template <size_t N>
+struct MapHistoryRing {
+	static_assert((N & (N - 1)) == 0);
+	std::atomic<uint64_t>                next {0};
+	std::array<MapHistoryEvent, N>       events;
+
+	void Record(const char* op, uint64_t vaddr, uint64_t size, uint64_t extra, bool ok,
+	            const char* thread) noexcept {
+		const auto index = next.fetch_add(1, std::memory_order_relaxed);
+		auto&      e     = events[index & (N - 1)];
+		e.seq.store(0, std::memory_order_relaxed);
+		std::atomic_signal_fence(std::memory_order_seq_cst);
+		LARGE_INTEGER now {};
+		QueryPerformanceCounter(&now);
+		e.ticks = now.QuadPart;
+		e.vaddr = vaddr;
+		e.size  = size;
+		e.extra = extra;
+		e.op    = op;
+		e.tid   = static_cast<uint32_t>(GetCurrentThreadId());
+		e.ok    = ok;
+		std::memcpy(e.thread, thread, sizeof(e.thread));
+		e.seq.store(index + 1, std::memory_order_release);
+	}
+};
+
+static MapHistoryRing<4096> g_map_history;     // map/unmap/commit/release and guest calls
+static MapHistoryRing<4096> g_protect_history; // host protection changes of mapped guest memory
+
+// The guest thread name, looked up once per host thread (empty for host threads).
+static const char* MapHistoryThreadName() noexcept {
+	thread_local char name[20] {};
+	thread_local bool known = false;
+	if (!known) {
+		if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
+			char full[32] {};
+			if (Libs::LibKernel::PthreadGetname(self, full) == 0 && full[0] != 0) {
+				std::memcpy(name, full, sizeof(name) - 1);
+				known = true;
+			}
+		}
+	}
+	return name;
+}
+
+static void RecordProtectHistory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
+                                 bool ok) noexcept {
+	g_protect_history.Record("protect", vaddr, size, static_cast<uint64_t>(mode), ok,
+	                         MapHistoryThreadName());
+}
+
+// KYTY_TRACE_MAP=<file> also writes every operation to a file.
+static void TraceMap(const char* op, uint64_t vaddr, uint64_t size, uint64_t extra, bool ok) {
+	g_map_history.Record(op, vaddr, size, extra, ok, MapHistoryThreadName());
+	static std::FILE* file = [] {
+		const char* path = std::getenv("KYTY_TRACE_MAP");
+		return path != nullptr ? std::fopen(path, "w") : nullptr;
+	}();
+	if (file == nullptr) {
+		return;
+	}
+	static std::mutex mutex;
+	static const auto start = std::chrono::steady_clock::now();
+	const auto        ms    = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - start)
+                              .count();
+	std::lock_guard lock(mutex);
+	std::fprintf(file, "%8lld %-18s %016" PRIx64 " +%010" PRIx64 " end=%016" PRIx64
+	                   " extra=%" PRIx64 " %s tid=%lu %s\n",
+	             static_cast<long long>(ms), op, vaddr, size, vaddr + size, extra,
+	             ok ? "ok" : "FAIL", static_cast<unsigned long>(GetCurrentThreadId()),
+	             MapHistoryThreadName());
+	std::fflush(file);
+}
+
+// Local debugging (crash report): lock without blocking forever, since the faulting thread may
+// hold the lock. *waited_us tells how long it was busy (an unmap in progress, for example).
+template <typename Mutex>
+static bool TryLockForReport(std::unique_lock<Mutex>& lock, int64_t* waited_us) {
+	const auto start = std::chrono::steady_clock::now();
+	while (!lock.try_lock()) {
+		if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(200)) {
+			*waited_us = 200000;
+			return false;
+		}
+		SwitchToThread();
+	}
+	*waited_us = std::chrono::duration_cast<std::chrono::microseconds>(
+	                 std::chrono::steady_clock::now() - start)
+	                 .count();
+	return true;
+}
+
 static bool GuestFreeRangeContains(uint64_t base, uint64_t range_size, uint64_t candidate,
                                    uint64_t size) {
 	if (UINT64_MAX - base < range_size || candidate < base) {
@@ -661,6 +770,28 @@ public:
 		return true;
 	}
 
+	// Local debugging (crash report): the file views around a guest address.
+	void DescribeForReport(uint64_t vaddr) {
+		std::unique_lock lock(m_mutex, std::defer_lock);
+		int64_t          waited_us = 0;
+		if (!TryLockForReport(lock, &waited_us)) {
+			std::printf("  backing views: lock busy for 200 ms, not inspected\n");
+			return;
+		}
+		std::printf("  backing views (lock busy %lld us, %zu views):\n",
+		            static_cast<long long>(waited_us), m_maps.size());
+		auto it = m_maps.upper_bound(vaddr);
+		for (int i = 0; i < 2 && it != m_maps.begin(); i++) {
+			--it;
+		}
+		for (int i = 0; i < 4 && it != m_maps.end(); i++, ++it) {
+			const auto& e = it->second;
+			std::printf("    %s[%016" PRIx64 ", %016" PRIx64 ") backing=0x%" PRIx64 " mode=%u\n",
+			            vaddr >= e.vaddr && vaddr < e.vaddr + e.size ? "* " : "  ", e.vaddr,
+			            e.vaddr + e.size, e.backing_offset, static_cast<unsigned>(e.mode));
+		}
+	}
+
 private:
 	struct MapEntry {
 		uint64_t            vaddr          = 0;
@@ -720,6 +851,7 @@ private:
 	// Called after every change of m_maps, under m_mutex. The generation is shared by all stores,
 	// so a store recreated at the address of a destroyed one never matches a stale lookup.
 	static void MapsChangedUnlocked() noexcept {
+		Graphics::GpuProfiler::AddCount("bs: maps changed");
 		s_maps_generation.fetch_add(1, std::memory_order_release);
 	}
 
@@ -737,6 +869,7 @@ private:
 		const auto& cached = ThreadLookupCache();
 		if (cached.owner != this ||
 		    cached.generation != s_maps_generation.load(std::memory_order_acquire)) {
+			Graphics::GpuProfiler::AddCount("bs: miss (generation)");
 			return false;
 		}
 		const auto end  = vaddr + size;
@@ -753,6 +886,7 @@ private:
 				return true;
 			}
 		}
+		Graphics::GpuProfiler::AddCount("bs: miss (not cached)");
 		return false;
 	}
 
@@ -822,6 +956,9 @@ private:
 
 	static bool ApplyProtection(void* ptr, uint64_t size, VirtualMemory::Mode mode) {
 		DWORD old_protect = 0;
+		// Debug (KYTY_SYNC_ACCT): page protection syscalls (arg = size, arg2 = mode).
+		KYTY_SYNC_SITE(s_protect, "os: VirtualProtect", Tax);
+		Common::SyncAcct::Scope sync_scope(s_protect, size, static_cast<uint64_t>(mode));
 		return VirtualProtect(ptr, size, GetProtect(mode), &old_protect) != 0;
 	}
 
@@ -1097,7 +1234,9 @@ public:
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
-		return ProtectMappedUnlocked(vaddr, size, mode);
+		const bool      ok = ProtectMappedUnlocked(vaddr, size, mode);
+		RecordProtectHistory(vaddr, size, mode, ok);
+		return ok;
 	}
 
 	bool ProtectTransient(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
@@ -1106,12 +1245,22 @@ public:
 		}
 
 		std::lock_guard lock(m_mutex);
-		return ProtectMappedUnlocked(vaddr, size, mode);
+		const bool      ok = ProtectMappedUnlocked(vaddr, size, mode);
+		RecordProtectHistory(vaddr, size, mode, ok);
+		return ok;
 	}
 
 	bool MapBacking(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                VirtualMemory::Mode               mode,
 	                GuestBackingStore::FailureReason* failure_reason = nullptr) {
+		const bool ok = MapBackingImpl(vaddr, size, backing_offset, mode, failure_reason);
+		TraceMap("map-backing", vaddr, size, backing_offset, ok);
+		return ok;
+	}
+
+	bool MapBackingImpl(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
+	                    VirtualMemory::Mode               mode,
+	                    GuestBackingStore::FailureReason* failure_reason) {
 		std::lock_guard lock(m_mutex);
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		const bool replacing = ContainsMappedUnlocked(vaddr, size, MappingType::Backing);
@@ -1140,6 +1289,12 @@ public:
 	}
 
 	bool UnmapBacking(uint64_t vaddr, uint64_t size) {
+		const bool ok = UnmapBackingImpl(vaddr, size);
+		TraceMap("unmap-backing", vaddr, size, 0, ok);
+		return ok;
+	}
+
+	bool UnmapBackingImpl(uint64_t vaddr, uint64_t size) {
 		std::lock_guard lock(m_mutex);
 		if (!ContainsMappedUnlocked(vaddr, size, MappingType::Backing)) {
 			return false;
@@ -1203,6 +1358,12 @@ public:
 	}
 
 	bool Commit(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+		const bool ok = CommitImpl(vaddr, size, mode);
+		TraceMap("commit", vaddr, size, static_cast<uint64_t>(mode), ok);
+		return ok;
+	}
+
+	bool CommitImpl(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		std::lock_guard lock(m_mutex);
 		if (!ConsumeUnlocked(vaddr, size)) {
 			return false;
@@ -1235,6 +1396,12 @@ public:
 	}
 
 	bool ReleaseCommitted(uint64_t vaddr, uint64_t size) {
+		const bool ok = ReleaseCommittedImpl(vaddr, size);
+		TraceMap("release-committed", vaddr, size, 0, ok);
+		return ok;
+	}
+
+	bool ReleaseCommittedImpl(uint64_t vaddr, uint64_t size) {
 		if (vaddr == 0 || size == 0 || !IsPageAligned(vaddr) || !IsPageAligned(size)) {
 			return false;
 		}
@@ -1266,6 +1433,42 @@ public:
 		EXIT_IF(!RemoveMappedUnlocked(vaddr, size, MappingType::Private));
 		AddFreeUnlocked(vaddr, size);
 		return true;
+	}
+
+	// Local debugging (crash report): the owner's view of a guest address.
+	void DescribeForReport(uint64_t vaddr) {
+		{
+			std::unique_lock lock(m_mutex, std::defer_lock);
+			int64_t          waited_us = 0;
+			if (!TryLockForReport(lock, &waited_us)) {
+				std::printf("  address space: lock busy for 200 ms, not inspected\n");
+			} else {
+				const auto mapped = FindMappedContainingUnlocked(vaddr);
+				const auto free   = FindContaining(vaddr, 1);
+				if (mapped != m_mapped.end()) {
+					std::printf("  address space (lock busy %lld us): mapped %s [%016" PRIx64
+					            ", %016" PRIx64 ")\n",
+					            static_cast<long long>(waited_us),
+					            mapped->second.type == MappingType::Backing ? "backing" : "private",
+					            mapped->second.vaddr, mapped->second.vaddr + mapped->second.size);
+				} else if (free != m_free.end()) {
+					std::printf("  address space (lock busy %lld us): free placeholder [%016" PRIx64
+					            ", %016" PRIx64 ")\n",
+					            static_cast<long long>(waited_us), free->first,
+					            free->first + free->second);
+				} else {
+					std::printf("  address space (lock busy %lld us): neither mapped nor free%s\n",
+					            static_cast<long long>(waited_us),
+					            std::any_of(m_owned.begin(), m_owned.end(),
+					                        [vaddr](const auto& r) {
+						                        return vaddr >= r.first && vaddr < r.first + r.second;
+					                        })
+					                ? " (owned)"
+					                : " (not owned)");
+				}
+			}
+		}
+		m_backing->DescribeForReport(vaddr);
 	}
 
 	bool SelfTest() {

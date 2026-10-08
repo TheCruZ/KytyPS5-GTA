@@ -1,6 +1,7 @@
 #include "kernel/pthread.h"
 
 #include "common/assert.h"
+#include "common/syncAcct.h"
 #include "common/common.h"
 #include "common/dateTime.h"
 #include "common/emulatorConfig.h"
@@ -489,6 +490,7 @@ static void CondWakeWaiter(PthreadCondPrivate* cond, Pthread thread) {
 	}
 
 	cond->waiters.erase(it);
+	Common::SyncAcct::NoteWake(thread);
 	thread->cond_sequence++;
 	// Notify while holding cond->m so the selected waiter cannot exit and be freed first.
 	thread->cond_cv.notify_one();
@@ -983,7 +985,13 @@ static void FreeDetachedThreads(void* /*arg*/) {
 
 	while (true) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(10000));
+		// Debug: correlate with the periodic presentation stalls.
+		const auto begin = std::chrono::steady_clock::now();
 		pthread_pool->FreeDetachedThreads();
+		std::printf("FreeDetachedThreads: %.1f ms\n",
+		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+		                .count());
+		std::fflush(stdout);
 	}
 }
 
@@ -1267,6 +1275,12 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 		return EDEADLK;
 	}
 
+	// Debug (KYTY_SYNC_ACCT): contended guest mutexes (arg = mutex, arg2 = owner thread).
+	KYTY_SYNC_SITE(s_mutex, "game: pthread_mutex contended", Block);
+	Common::SyncAcct::Scope sync_scope(
+	    Common::SyncAcct::Enabled() && mutex->owner != nullptr ? Common::SyncAcct::SiteId(s_mutex) : uint16_t {0},
+	    reinterpret_cast<uint64_t>(mutex), mutex->owner != nullptr ? mutex->owner->host_thread_id : 0,
+	    Common::SyncAcct::Enabled() && mutex->owner != nullptr ? Common::SyncAcct::GuestCaller() : 0);
 	if (timeout_us == nullptr) {
 		while (mutex->owner != nullptr) {
 			mutex->cv.wait_for(lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
@@ -2335,6 +2349,8 @@ static bool RwlockRemoveReader(PthreadRwlock rwlock, Pthread thread) {
 
 static int RwlockLockCooperative(PthreadRwlock rwlock, bool write, KernelUseconds* timeout_us) {
 	EXIT_IF(rwlock == nullptr);
+	KYTY_SYNC_SITE(s_rwlock, "game: pthread_rwlock lock", Block);
+	Common::SyncAcct::Scope sync_scope(s_rwlock, reinterpret_cast<uint64_t>(rwlock), write ? 1 : 0);
 
 	auto* self = g_pthread_self;
 	if (self == nullptr) {
@@ -2720,6 +2736,7 @@ int KYTY_SYSV_ABI PthreadCondBroadcast(PthreadCond* cond) {
 
 	std::lock_guard lock((*cond)->m);
 	for (auto* thread: (*cond)->waiters) {
+		Common::SyncAcct::NoteWake(thread);
 		thread->cond_sequence++;
 		thread->cond_cv.notify_one();
 	}
@@ -2857,6 +2874,11 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 		return KERNEL_ERROR_EPERM;
 	}
 
+	// Debug (KYTY_SYNC_ACCT): arg = cond, arg2 = the thread that woke this one.
+	KYTY_SYNC_SITE(s_cond_wait, __func__, Block);
+	Common::SyncAcct::Scope sync_scope(s_cond_wait, reinterpret_cast<uint64_t>(cond_value), 0,
+	                                   reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+	sync_scope.SetWakerObject(g_pthread_self);
 	std::unique_lock cond_lock(cond_value->m);
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
@@ -2946,6 +2968,11 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 		return KERNEL_ERROR_EPERM;
 	}
 
+	// Debug (KYTY_SYNC_ACCT): arg = cond, arg2 = the thread that woke this one.
+	KYTY_SYNC_SITE(s_cond_wait, __func__, Block);
+	Common::SyncAcct::Scope sync_scope(s_cond_wait, reinterpret_cast<uint64_t>(cond_value), 0,
+	                                   reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+	sync_scope.SetWakerObject(g_pthread_self);
 	std::unique_lock cond_lock(cond_value->m);
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
@@ -3022,6 +3049,11 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 		return KERNEL_ERROR_EPERM;
 	}
 
+	// Debug (KYTY_SYNC_ACCT): arg = cond, arg2 = the thread that woke this one.
+	KYTY_SYNC_SITE(s_cond_wait, __func__, Block);
+	Common::SyncAcct::Scope sync_scope(s_cond_wait, reinterpret_cast<uint64_t>(cond_value), 0,
+	                                   reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+	sync_scope.SetWakerObject(g_pthread_self);
 	std::unique_lock cond_lock(cond_value->m);
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
@@ -3178,6 +3210,17 @@ static void CleanupThread(void* arg) {
 	thread->almost_done = true;
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Debug: the guest thread name as the host thread description (profilers, thread CPU logs).
+static void SetHostThreadName(HANDLE handle, const std::string& name) {
+	std::wstring wide;
+	for (const char c: name) {
+		wide.push_back(static_cast<wchar_t>(static_cast<unsigned char>(c)));
+	}
+	SetThreadDescription(handle, wide.c_str());
+}
+#endif
+
 static void* RunThread(void* arg) {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
@@ -3196,6 +3239,7 @@ static void* RunThread(void* arg) {
 	uint64_t os_thread_id = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	os_thread_id = static_cast<uint64_t>(GetCurrentThreadId());
+	SetHostThreadName(GetCurrentThread(), thread->name);
 #else
 	os_thread_id = GetHostThreadId();
 #endif
@@ -3334,7 +3378,11 @@ int KYTY_SYSV_ABI PthreadJoin(Pthread thread, void** value) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
+	KYTY_SYNC_SITE(s_join, "game: pthread_join", Block);
+	Common::SyncAcct::Scope sync_scope(s_join, reinterpret_cast<uint64_t>(thread), thread->host_thread_id,
+	                                   reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 	int result = pthread_join(thread->p, value);
+	sync_scope.End();
 
 	if (PRINT_NAME_ENABLED) {
 		LOGF("\tthread join: %s, %d\n", thread->name.c_str(), result);
@@ -3604,11 +3652,23 @@ int KYTY_SYSV_ABI PthreadRename(Pthread thread, const char* name) {
 	}
 
 	thread->name = std::string(name);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (thread->host_thread_id != 0) {
+		if (HANDLE handle = OpenThread(THREAD_SET_LIMITED_INFORMATION, FALSE,
+		                               static_cast<DWORD>(thread->host_thread_id));
+		    handle != nullptr) {
+			SetHostThreadName(handle, thread->name);
+			CloseHandle(handle);
+		}
+	}
+#endif
 
 	return OK;
 }
 
 void KYTY_SYSV_ABI PthreadYield() {
+	KYTY_SYNC_SITE(s_yield, "game: yield", Block);
+	Common::SyncAcct::Scope sync_scope(s_yield, 0, 0, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 	SchedulerBackoffOnce();
 }
 
@@ -3840,6 +3900,10 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
+	KYTY_SYNC_SITE(s_usleep, "game: usleep", Block);
+	Common::SyncAcct::Scope sync_scope(s_usleep, microseconds, 0,
+	                                   reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+	Common::SyncAcct::DumpCodeOnce(__builtin_return_address(0));
 	SleepMicroWithSignalPoll(microseconds);
 	return OK;
 }
@@ -3866,7 +3930,11 @@ int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rm
 	uint64_t nanos =
 	    static_cast<uint64_t>(rqtp->tv_sec) * 1000000000ull + static_cast<uint64_t>(rqtp->tv_nsec);
 
+	KYTY_SYNC_SITE(s_nanosleep, "game: nanosleep", Block);
+	Common::SyncAcct::Scope sync_scope(s_nanosleep, nanos, 0,
+	                                   reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 	SleepNanoWithSignalPoll(nanos);
+	sync_scope.End();
 
 	if (rmtp != nullptr) {
 		rmtp->tv_sec  = 0;

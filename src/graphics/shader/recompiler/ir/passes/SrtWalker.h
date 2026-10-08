@@ -180,10 +180,14 @@ struct CompiledSrtPlan {
 	std::vector<std::pair<Value, uint32_t>> roots;
 	// GPU-thread scratch: the memos of a refresh's clean and ordinary walkers, then of nested
 	// EXEC-mask walkers.
-	mutable std::array<Context, 2> top_contexts;
-	mutable std::deque<Context>    nested_contexts;
-	mutable uint32_t               depth   = 0;
-	mutable uint64_t               session = 0;
+	struct ContextLane {
+		std::array<Context, 2> top_contexts;
+		std::deque<Context>    nested_contexts;
+		uint32_t               depth   = 0;
+		uint64_t               session = 0;
+	};
+	// One lane per scratch lane (see t_srt_scratch_lane).
+	mutable std::array<ContextLane, 2> lanes;
 };
 
 // One memoized evaluation session shared by the entire shader resource refresh.

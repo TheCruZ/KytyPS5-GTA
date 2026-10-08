@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
+#include "graphics/host_gpu/gpuProfiler.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -121,6 +122,7 @@ void FaultManager::ProcessUseBuffer(PagesHandler&& handler) {
 
 void FaultManager::Process(Reader& reader, uint64_t bitmap_offset, PagesHandler&& handler) {
 	if (const auto wait_tick = reader.ticks[reader.current]; wait_tick != 0) {
+		GpuProfiler::WaitTagScope tag("gpu-thread: fault ring full");
 		m_scheduler.Wait(wait_tick);
 		m_scheduler.PopPendingOperations();
 	}
@@ -171,7 +173,9 @@ void FaultManager::Process(Reader& reader, uint64_t bitmap_offset, PagesHandler&
 	                             m_fault_process_pipeline_layout, 0, writes);
 	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32;
 	const auto num_workgroups = (num_threads + 63) / 64;
+	GpuProfiler::Region(command, true, "fault buffer scan");
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
+	GpuProfiler::Region(command, false, "fault buffer scan");
 	dependency.pBufferMemoryBarriers = &post_barrier;
 	command.pipelineBarrier2(dependency);
 

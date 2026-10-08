@@ -124,6 +124,10 @@ bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t
 // pointer stays readable for the emulator's lifetime and reads what TryReadBacking() reads.
 [[nodiscard]] const void* FindBackingPointer(uint64_t vaddr, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// As TryReadGpuCleanBacking() followed by a comparison with `expected`, without the copy: 1 when
+// the bytes are GPU clean and equal, 0 when they differ or are not GPU clean, -1 when the backing
+// store has no single view of the range (the caller reads it instead).
+int                    CompareGpuCleanBacking(uint64_t vaddr, const void* expected, uint64_t size);
 // GPU threads: whether a direct load of the range may fault because the GPU owns its pages.
 bool                   MayFaultOnGpuRead(uint64_t vaddr, uint64_t size);
 // Any thread, lock-free: whether a tracking region the range touches may hold bytes the GPU
@@ -157,6 +161,8 @@ void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 [[nodiscard]] bool RetryTransientUnmapFault(uint64_t fault_vaddr, uint64_t window) noexcept;
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+// Local debugging: prints the mapping state and recent map/protect history of a faulting address.
+void DescribeFaultAddress(uint64_t vaddr) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

@@ -38,7 +38,8 @@ public:
 
 	// configure_thread runs first on the copy thread (pinning, priority).
 	explicit HostCopyQueue(std::function<void()> configure_thread = {})
-	    : m_batches(Batches), m_thread([this, configure = std::move(configure_thread)] {
+	    : m_batches(Batches, "copies exec->copy"), m_thread([this, configure = std::move(configure_thread)] {
+		      m_completed.SetDebugName("copies done");
 		      if (configure) {
 			      configure();
 		      }

@@ -1,9 +1,12 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include "common/assert.h"
+#include "graphics/host_gpu/gpuProfiler.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 
 #include <array>
+#include <atomic>
+#include <cstdlib>
 
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
@@ -132,6 +135,89 @@ vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {
 	RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
 	                     "create SPIR-V shader module");
 	return module;
+}
+
+namespace {
+
+struct GpuCheckpointRecord {
+	std::atomic<uint64_t> seq {0};
+	GpuCheckpointKind     kind {};
+	uint64_t              hash_a = 0;
+	uint64_t              hash_b = 0;
+};
+
+constexpr uint64_t                             GpuCheckpointRingSize = 1u << 16u;
+std::atomic_bool                               g_gpu_checkpoints_enabled {false};
+std::atomic<uint64_t>                          g_gpu_checkpoint_seq {0};
+std::array<GpuCheckpointRecord, GpuCheckpointRingSize> g_gpu_checkpoints;
+
+const char* GpuCheckpointKindName(GpuCheckpointKind kind) {
+	switch (kind) {
+		case GpuCheckpointKind::DispatchBegin: return "dispatch-begin";
+		case GpuCheckpointKind::DispatchEnd: return "dispatch-end";
+		case GpuCheckpointKind::DrawBegin: return "draw-begin";
+		case GpuCheckpointKind::DrawEnd: return "draw-end";
+	}
+	return "?";
+}
+
+} // namespace
+
+bool GpuCheckpointsRequested() {
+	return std::getenv("KYTY_GPU_CHECKPOINTS") != nullptr;
+}
+
+void EnableGpuCheckpoints(bool extension_enabled) {
+	g_gpu_checkpoints_enabled = extension_enabled &&
+	                            VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdSetCheckpointNV != nullptr &&
+	                            VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV != nullptr;
+	::printf("GPU checkpoints: %s\n", g_gpu_checkpoints_enabled ? "enabled" : "unavailable");
+}
+
+void GpuCheckpoint(vk::CommandBuffer command, GpuCheckpointKind kind, uint64_t hash_a,
+                   uint64_t hash_b) {
+	GpuProfiler::Mark(command, kind, hash_a, hash_b);
+	if (!g_gpu_checkpoints_enabled.load(std::memory_order_relaxed)) {
+		return;
+	}
+	const auto seq    = g_gpu_checkpoint_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+	auto&      record = g_gpu_checkpoints[seq % GpuCheckpointRingSize];
+	record.kind       = kind;
+	record.hash_a     = hash_a;
+	record.hash_b     = hash_b;
+	record.seq.store(seq, std::memory_order_release);
+	command.setCheckpointNV(reinterpret_cast<const void*>(static_cast<uintptr_t>(seq)));
+}
+
+bool GpuCheckpointDeferredWanted() noexcept {
+	static const bool wanted = [] {
+		const char* value = std::getenv("KYTY_GPU_PROFILE");
+		return value != nullptr && value[0] != 'c';
+	}();
+	return wanted || g_gpu_checkpoints_enabled.load(std::memory_order_relaxed);
+}
+
+void DumpGpuCheckpoints(vk::Queue queue) {
+	if (!g_gpu_checkpoints_enabled.load(std::memory_order_relaxed) || queue == nullptr) {
+		return;
+	}
+	uint32_t count = 0;
+	queue.getCheckpointDataNV(&count, nullptr);
+	std::vector<vk::CheckpointDataNV> data(count);
+	queue.getCheckpointDataNV(&count, data.data());
+	::printf("GPU checkpoints: %u reported, last recorded seq=%llu\n", count,
+	         static_cast<unsigned long long>(g_gpu_checkpoint_seq.load()));
+	for (uint32_t i = 0; i < count; i++) {
+		const auto  seq    = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(data[i].pCheckpointMarker));
+		const auto& record = g_gpu_checkpoints[seq % GpuCheckpointRingSize];
+		const bool  valid  = record.seq.load(std::memory_order_acquire) == seq;
+		::printf("  stage=%s seq=%llu %s hash_a=0x%016llx hash_b=0x%016llx\n",
+		         vk::to_string(data[i].stage).c_str(), static_cast<unsigned long long>(seq),
+		         valid ? GpuCheckpointKindName(record.kind) : "(overwritten)",
+		         static_cast<unsigned long long>(valid ? record.hash_a : 0),
+		         static_cast<unsigned long long>(valid ? record.hash_b : 0));
+	}
+	std::fflush(stdout);
 }
 
 } // namespace Libs::Graphics

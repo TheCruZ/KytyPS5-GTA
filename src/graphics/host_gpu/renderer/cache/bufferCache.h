@@ -3,6 +3,7 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "common/uniqueFunction.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/memoryTracker.h"
@@ -15,6 +16,7 @@
 #include <span>
 #include <unordered_map>
 #include <utility>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -120,6 +122,12 @@ public:
 	// bytes of [vaddr, vaddr + size) that a cached buffer holds become GPU modified, except on
 	// pages the CPU dirtied since, whose upload replaces them.
 	void NoteGpuWrites(uint64_t vaddr, uint64_t size);
+	// The operation being recorded rewrites the range for the GPU's own readers: the guest's CPU
+	// does not read what it writes there (GTA V's refit BLASes, see
+	// CommandProcessor::EmitHleRefit()). Unlike a written ObtainBuffer(), the pages stay CPU
+	// owned: guest reads of other data in them take no readback, and guest memory keeps the
+	// range's previous bytes.
+	void ObtainUnsharedWrite(uint64_t vaddr, uint64_t size);
 	// Calls func(address, size) for the runs of [vaddr, vaddr + size) the CPU may have written
 	// since the previous call over them (see MemoryTracker::ConsumeCpuWrites).
 	template <typename Func>
@@ -139,6 +147,8 @@ public:
 	// fill. Lets CPU-side consumers read the value without draining the GPU.
 	void               NoteKnownFill(uint64_t vaddr, uint64_t size, uint32_t value);
 	[[nodiscard]] bool KnownFill(uint64_t vaddr, uint64_t size, uint32_t& value) const;
+	// Debug: the known fills that overlap a range, as text.
+	[[nodiscard]] std::string DescribeKnownFills(uint64_t vaddr, uint64_t size) const;
 	void               ForgetKnownFills(uint64_t vaddr, uint64_t size);
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	// Uploads the pending CPU writes of the buffers within `ranges`. Unless `all`, visits only the
@@ -149,7 +159,6 @@ public:
 	// Uploads the pending CPU writes of the buffers within each [first, second) span, recorded
 	// together as SynchronizeBuffersInRanges() records them.
 	void SynchronizeBuffersInSpans(std::span<const std::pair<uint64_t, uint64_t>> spans);
-	void FlushUploadBatch();
 	// Advances whenever a buffer is registered: a new buffer may cover CPU-dirty pages that no
 	// earlier synchronization uploaded.
 	[[nodiscard]] uint64_t RegisterEpoch() const { return m_register_epoch; }
@@ -270,6 +279,20 @@ private:
 		std::map<uint64_t, Range> m_ranges;
 	};
 
+	// Asynchronous CPU readback: the GPU thread records and submits the download without
+	// waiting; the faulting thread waits for the tick and then asks the GPU thread to publish
+	// the clean pages. The downloaded bytes stay GPU-dirty until then, so GPU-thread users keep
+	// treating them as GPU-owned while the backing is not yet written.
+	struct PendingReadback {
+		uint64_t                                   begin = 0;
+		uint64_t                                   end   = 0;
+		uint64_t                                   tick  = 0;
+		std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	};
+	void                   ReadMemoryAsync(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] uint64_t PendingReadbackTick(uint64_t vaddr, uint64_t size) const;
+	void                   FinalizeReadbacks();
+
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
 	FaultManager                                      m_fault_manager;
@@ -337,12 +360,13 @@ private:
 	uint64_t                       m_mirror_flush_use = 0;
 	StreamBuffer                                      m_staging_buffer;
 	struct UploadBatch;
-	// SynchronizeBuffersInRanges(): the uploads of one synchronization, recorded together
-	// behind one pair of barriers (see FlushUploadBatch()).
-	bool                                              m_upload_batching   = false;
-	uint64_t                                          m_upload_batch_tick = 0;
-	std::vector<std::pair<vk::Buffer, uint32_t>>      m_upload_batch_buffers;
+	// SynchronizeBuffersInRanges(): the uploads of a synchronization, recorded together behind one
+	// pair of barriers (see FlushUploadBatch()).
+	bool                                              m_upload_batching    = false;
+	uint64_t                                          m_upload_batch_tick  = 0;
+	std::vector<std::pair<vk::Buffer, uint32_t>>      m_upload_batch_dsts;
 	std::vector<vk::BufferCopy>                       m_upload_batch_copies;
+	void                                              FlushUploadBatch();
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
@@ -379,10 +403,13 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	std::vector<PendingReadback> m_pending_readbacks;
 	std::map<uint64_t, std::pair<uint64_t, uint32_t>> m_known_fills;
 	// CPU-dirty epoch of each tracking region as SynchronizeBuffersInRanges last visited it.
 	std::unordered_map<uint64_t, uint64_t>     m_synced_region_epochs;
 	std::vector<std::pair<uint64_t, uint64_t>> m_sync_regions;
+	// GPU writes recorded while readbacks were pending; those bytes stay dirty on finalize.
+	RangeSet m_readback_rewritten;
 };
 
 } // namespace Libs::Graphics

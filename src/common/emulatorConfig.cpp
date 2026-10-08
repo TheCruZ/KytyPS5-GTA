@@ -1,6 +1,9 @@
 #include "common/emulatorConfig.h"
+#include "common/expSwitch.h"
+#include "common/spscQueue.h"
 
 #include "common/assert.h"
+#include "common/spscQueue.h"
 #include "common/threads.h"
 
 #include <algorithm>
@@ -227,6 +230,15 @@ void ConfigureGpuStageThread(GpuStageThread stage) {
 		const char* value = std::getenv("KYTY_GPU_THREAD_PRIORITY");
 		return value == nullptr || std::string_view(value) != "0";
 	}();
+	Common::WaitStats::t_stage = static_cast<int>(stage) + 1;
+	// Local debugging (exec-batch): the command processor, resolve and execution threads hand
+	// operations to each other within a frame; a kernel sleep between them costs a wake-up each.
+	if (KYTY_XO(LONG_SPIN) &&
+	    (stage == GpuStageThread::CommandProcessor || stage == GpuStageThread::Resolve ||
+	     stage == GpuStageThread::Execution)) {
+		const char* value         = std::getenv("KYTY_X_SPIN_US");
+		Common::t_spin_budget_ns = (value != nullptr ? std::strtoll(value, nullptr, 10) : 20000) * 1000;
+	}
 	if (high_priority) {
 		Common::Thread::RaiseCurrentPriority();
 	}

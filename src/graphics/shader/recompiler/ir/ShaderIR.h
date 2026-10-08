@@ -741,12 +741,27 @@ struct ResourcePlan {
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
 	mutable uint32_t                       evaluation_value_count = 0;
-	mutable std::vector<uint8_t>            active_sources;
-	mutable std::vector<uint8_t>            visited_blocks;
-	mutable std::vector<uint8_t>            reachable_blocks;
-	mutable std::vector<uint32_t>           pending_blocks;
-	mutable std::vector<uint32_t>           material_keys;
+	mutable uint32_t                       evaluation_depth       = 0;
+	// Materialization scratch of the compiled walker, one set per scratch lane (see
+	// t_srt_scratch_lane): the execution thread materializes without the program lock.
+	struct MaterialScratch {
+		std::vector<uint8_t>  active_sources;
+		std::vector<uint8_t>  visited_blocks;
+		std::vector<uint8_t>  reachable_blocks;
+		std::vector<uint32_t> pending_blocks;
+		std::vector<uint32_t> material_keys;
+	};
+	mutable std::array<MaterialScratch, 2> material_scratch;
+	[[nodiscard]] MaterialScratch&          Scratch() const;
 };
+
+// The scratch lane of the calling thread's SRT walks: 1 on the execution thread, which
+// materializes without the program lock, 0 on the threads that hold it.
+inline thread_local uint32_t t_srt_scratch_lane = 0;
+
+inline ResourcePlan::MaterialScratch& ResourcePlan::Scratch() const {
+	return material_scratch[t_srt_scratch_lane];
+}
 
 struct Program: ResourcePlan {
 	Program() = default;

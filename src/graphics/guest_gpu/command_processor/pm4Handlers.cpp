@@ -2,6 +2,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
+#include "graphics/host_gpu/gpuProfiler.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -1303,7 +1304,7 @@ KYTY_HW_UC_PARSER(HwUcSetGdsOaRegisters) {
 
 KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
-	cp.NoteAcquireMem();
+	cp.NoteGuestSync();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0055800 && cmd_id != 0xc0061050);
 	return (cmd_id == 0xc0061050 ? 7 : 6);
@@ -2309,6 +2310,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
+		Graphics::GpuProfiler::AddCount("submit: release_mem data_sel 1");
 		if (interrupt_selector == 0x01 || interrupt_selector == 0x02) {
 			cp.BufferFlush();
 		} else {
@@ -2332,6 +2334,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
 		if (interrupt_selector == 0x01) {
+			Graphics::GpuProfiler::AddCount("submit: release_mem data_sel 5 interrupt");
 			cp.BufferFlush();
 		}
 

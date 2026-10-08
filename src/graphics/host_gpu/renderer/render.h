@@ -210,8 +210,8 @@ public:
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode, bool async_compute);
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode, bool async_compute);
-	// DISPATCH_INDIRECT with USE_THREAD_DIMENSIONS: converts the thread counts, which GPU work
-	// writes, on the GPU instead of reading them back.
+	// DISPATCH_INDIRECT with USE_THREAD_DIMENSIONS whose arguments are GPU-written: converts
+	// the thread counts on the GPU instead of reading them back.
 	void DispatchIndirectThreads(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                             uint32_t mode, bool async_compute);
 
@@ -247,11 +247,15 @@ public:
 	// Execution thread: the context register snapshot of the operation about to execute (0 for
 	// live registers); operations with the same id see the same context registers.
 	void UseContextId(uint64_t context_id) noexcept { m_context_id = context_id; }
-	// Execution thread: an operation of guest queue `queue` is about to execute. The barrier
-	// after a direct dispatch is deferred to the next operation, unless that is a direct dispatch
-	// of the same queue the guest did not order after it (see DispatchDirect()).
-	void BeginGuestOperation(uint32_t queue, bool dispatch_direct, bool guest_sync);
-	// Records the barrier a direct dispatch deferred, if any.
+	// Local debugging (KYTY_X_LANE_R): the guest queue and sequence of the operation about to
+	// execute, and the sequence of the write that satisfied its WAIT_REG_MEM (0 if none): orders
+	// it after the work of the second queue it depends on.
+	void LaneROperation(uint32_t queue, uint64_t sequence, uint64_t dependency) noexcept;
+	// Local debugging (KYTY_X_GUEST_SYNC): the barrier after a direct dispatch is deferred; a
+	// direct dispatch that follows it on the same guest queue without guest synchronization
+	// (ACQUIRE_MEM, WAIT_REG_MEM, any other operation) overlaps it.
+	void BeginGuestOperation(uint32_t queue, bool dispatch_direct, bool guest_sync,
+	                         bool draw = false, bool after_wait = true);
 	void FlushDeferredDispatchBarrier();
 	// Execution thread: an operation other than a draw is about to execute (see
 	// RenderTargetMemo).
@@ -566,11 +570,27 @@ private:
 	std::vector<ChangedTableSlot>                      m_table_changed_slots;
 	// RebindReusedTables(): the elements whose binding changed, one byte per element.
 	std::vector<uint8_t>                               m_table_flags;
-	// See BeginGuestOperation().
-	uint32_t                                           m_guest_queue             = 0;
-	bool                                               m_deferred_barrier        = false;
-	uint32_t                                           m_deferred_barrier_queue  = 0;
-	bool                                               m_dispatch_chained        = false;
+	// KYTY_X_LANE_R (see LaneROperation()).
+	struct LaneROp {
+		uint64_t sequence = 0;
+		uint32_t queue    = 0;
+	};
+	std::array<LaneROp, 4096> m_lane_r_ops {};
+	std::array<uint64_t, 64>  m_queue_lane_r {};
+	uint32_t                  m_guest_queue          = 0;
+	bool                      m_lane_r_begin_pending = false;
+	bool                      m_in_lane_r            = false;
+	uint64_t                  m_lane_r_tick          = 0;
+	bool                      m_deferred_barrier       = false;
+	uint32_t                  m_deferred_barrier_queue = 0;
+	bool                      m_dispatch_chained       = false;
+	// KYTY_X_QUEUE_OVERLAP: the guest queues with deferred dispatch barriers, and whether the
+	// current dispatch need not wait for other queues' work.
+	uint32_t                  m_deferred_queues        = 0;
+	// KYTY_X_ASYNC_NARROW: the operation waited for no label (see HazardSourceStages()).
+	bool                      m_operation_after_wait   = true;
+	[[nodiscard]] vk::PipelineStageFlags HazardSourceStages() const;
+	bool                      m_dispatch_unsynced      = false;
 	// Reused by every draw; see AcquireDrawRenderState().
 	std::unique_ptr<DrawRenderStorage, void (*)(DrawRenderStorage*)> m_draw_state {nullptr,
 	                                                                               nullptr};
@@ -599,6 +619,8 @@ private:
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
 };
+
+[[nodiscard]] bool GpuIndirectThreadDispatchEnabled();
 
 [[nodiscard]] bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
                                             uint32_t group_y, uint32_t group_z, uint32_t mode,

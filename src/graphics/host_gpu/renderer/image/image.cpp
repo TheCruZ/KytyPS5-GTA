@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/gpuProfiler.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 
 #include "common/assert.h"
@@ -263,8 +264,10 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	dependency.pImageMemoryBarriers     = image_barriers.data();
 	auto command                        = m_scheduler.Current().Handle();
 	command.pipelineBarrier2(dependency);
+	GpuProfiler::Region(command, true, "image upload (buffer->image)");
 	command.copyBufferToImage(buffer, backing.image, vk::ImageLayout::eTransferDstOptimal,
 	                          static_cast<uint32_t>(copies.size()), copies.data());
+	GpuProfiler::Region(command, false, "image upload (buffer->image)");
 	buffer_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
 	buffer_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead;
 	buffer_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
@@ -303,8 +306,10 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
 	dependency.pImageMemoryBarriers     = image_barriers.data();
 	auto command                        = m_scheduler.Current().Handle();
 	command.pipelineBarrier2(dependency);
+	GpuProfiler::Region(command, true, "image download (image->buffer)");
 	command.copyImageToBuffer(backing.image, vk::ImageLayout::eTransferSrcOptimal, buffer,
 	                          static_cast<uint32_t>(copies.size()), copies.data());
+	GpuProfiler::Region(command, false, "image download (image->buffer)");
 	buffer_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eCopy;
 	buffer_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
 	buffer_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
@@ -384,9 +389,11 @@ void Image::CopyImage(Image& source) {
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+	GpuProfiler::Region(command, true, "image copy A");
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 	                  vk::ImageLayout::eTransferDstOptimal, static_cast<uint32_t>(copies.size()),
 	                  copies.data());
+	GpuProfiler::Region(command, false, "image copy A");
 	Transit(vk::ImageLayout::eGeneral,
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
@@ -435,8 +442,10 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 		                         resolved_destination_range.base_level,
 		                         resolved_destination_range.base_layer, layers};
 		region.extent         = resolve_extent;
+		GpuProfiler::Region(command, true, "image copy resolve");
 		command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 		                  vk::ImageLayout::eTransferDstOptimal, region);
+		GpuProfiler::Region(command, false, "image copy resolve");
 	} else {
 		vk::ImageResolve region {};
 		region.srcSubresource = {vk::ImageAspectFlagBits::eColor, resolved_source_range.base_level,
@@ -535,9 +544,11 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 				barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead;
 				barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
 				command.pipelineBarrier2(dependency);
+				GpuProfiler::Region(command, true, "image reinterpret download");
 				command.copyImageToBuffer(source.backing.image,
 				                          vk::ImageLayout::eTransferSrcOptimal, buffer.Handle(),
 				                          source_copy);
+				GpuProfiler::Region(command, false, "image reinterpret download");
 				if (source_transform != target_transform) {
 					const TileManager::Result bytes {buffer.Handle(), 0, copy_size};
 					if (source_transform != ColorTransform::None) {
@@ -587,8 +598,10 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
+	GpuProfiler::Region(command, true, "image copy B");
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 	                  vk::ImageLayout::eTransferDstOptimal, copy_count, copies.data());
+	GpuProfiler::Region(command, false, "image copy B");
 	Transit(vk::ImageLayout::eGeneral,
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }

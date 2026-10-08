@@ -1,3 +1,5 @@
+#include "common/syncAcct.h"
+#include "common/ablation.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
 #include "common/assert.h"
@@ -15,6 +17,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/gpuProfiler.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -601,9 +604,16 @@ void RenderExecutor::CaptureRenderTargetKey(const HW::Context& hw, uint32_t mrt_
 bool RenderExecutor::RenderTargetMemoCurrent() {
 	const auto& memo  = *m_render_target_memo;
 	auto&       cache = m_context.GetTextureCache();
-	if (memo.tick != m_context.GetCommandScheduler().CurrentTick() ||
-	    memo.image_set_epoch != cache.ImageSetEpoch() ||
-	    memo.gpu_write_generation != m_context.GetBufferCache().GpuWriteGeneration()) {
+	if (memo.tick != m_context.GetCommandScheduler().CurrentTick()) {
+		GpuProfiler::AddCount("rt memo miss: tick");
+		return false;
+	}
+	if (memo.image_set_epoch != cache.ImageSetEpoch()) {
+		GpuProfiler::AddCount("rt memo miss: image set");
+		return false;
+	}
+	if (memo.gpu_write_generation != m_context.GetBufferCache().GpuWriteGeneration()) {
+		GpuProfiler::AddCount("rt memo miss: gpu writes");
 		return false;
 	}
 	for (uint32_t i = 0; i < memo.image_count; i++) {
@@ -611,6 +621,7 @@ bool RenderExecutor::RenderTargetMemoCurrent() {
 		const auto* image = cache.m_slot_images.try_get(state.id);
 		if (image == nullptr || !image->registered || image->binding.needs_rebind ||
 		    ImageLookupState::Of(state.id, *image) != state) {
+			GpuProfiler::AddCount("rt memo miss: image state");
 			return false;
 		}
 	}
@@ -618,6 +629,7 @@ bool RenderExecutor::RenderTargetMemoCurrent() {
 	for (uint32_t i = 0; i < memo.metadata_count; i++) {
 		const auto& metadata = memo.metadata[i];
 		if (buffers.CpuDirtyEpoch(metadata.range.address, metadata.range.size) != metadata.epoch) {
+			GpuProfiler::AddCount("rt memo miss: metadata epoch");
 			return false;
 		}
 	}
@@ -631,6 +643,7 @@ bool RenderExecutor::TryReuseRenderTargets(const HW::Context& hw, uint32_t mrt_m
 	}
 	auto& memo = *m_render_target_memo;
 	if (memo.mrt_mask != mrt_mask || memo.slice_offset != slice_offset) {
+		GpuProfiler::AddCount("rt memo miss: mrt");
 		return false;
 	}
 	// Operations with the same context snapshot have the same registers.
@@ -646,11 +659,21 @@ bool RenderExecutor::TryReuseRenderTargets(const HW::Context& hw, uint32_t mrt_m
 		    memo.depth_wanted != DepthStencilTargetWanted(hw) ||
 		    !SameBytes(memo.depth_values[0], depth_clear) ||
 		    memo.stencil_clear != hw.GetStencilClearValue()) {
+			GpuProfiler::AddCount("rt memo miss: depth regs");
+			if (GpuProfiler::PhaseEnabled()) {
+				// Debug: which register group differs.
+				GpuProfiler::AddCount(memo.target_mask != hw.GetRenderTargetMask() ? "rt miss: target mask"
+				                      : !SameBytes(memo.depth, hw.GetDepthRenderTarget()) ? "rt miss: depth target"
+				                      : !SameBytes(memo.render_control, hw.GetRenderControl()) ? "rt miss: render control"
+				                      : memo.depth_wanted != DepthStencilTargetWanted(hw) ? "rt miss: depth wanted"
+				                      : "rt miss: clear values");
+			}
 			return false;
 		}
 		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 			if ((mrt_mask & (1u << slot)) != 0 &&
 			    !SameBytes(memo.targets[slot], hw.GetRenderTarget(slot))) {
+				GpuProfiler::AddCount("rt memo miss: color regs");
 				return false;
 			}
 		}
@@ -683,6 +706,7 @@ void RenderExecutor::StoreRenderTargetMemo(const RenderColorInfo* colors, uint32
 	memo.pending = false;
 	// Clears consume their state; the next draw acquires its targets itself.
 	if (depth.depth_clear_enable || depth.depth_load_clear_enable || depth.stencil_clear_enable) {
+		GpuProfiler::AddCount("rt memo store: clear");
 		return;
 	}
 	auto& cache             = m_context.GetTextureCache();
@@ -750,6 +774,10 @@ DrawRenderState& RenderExecutor::AcquireDrawRenderState(bool tessellation, bool&
 	// read still has the same bytes.
 	auto* resolved = std::exchange(m_resolved_draw, nullptr);
 	shaders_resolved = resolved != nullptr && resolved->programs.reads.StillValid();
+	// Debug: how many draws use a resolution ahead of execution.
+	GpuProfiler::AddCount(shaders_resolved      ? "resolve: used"
+	                      : resolved != nullptr ? "resolve: stale"
+	                                            : "resolve: none");
 	if (shaders_resolved) {
 		return resolved->storage.state;
 	}
@@ -798,6 +826,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		// update them: the memo no longer describes the draw before.
 		m_render_target_memo->valid = false;
 	}
+	GpuProfiler::PhaseMark("acq: colors");
 	const bool store =
 	    memo == nullptr && m_render_target_memo != nullptr && m_render_target_memo->pending;
 	std::array<vk::ImageView, RENDER_COLOR_ATTACHMENTS_MAX> color_views {};
@@ -841,6 +870,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.image_view   = image_view;
 		attachment.image_layout = layout;
 	}
+	GpuProfiler::PhaseMark("acq: depth");
 	if (depth.image_id) {
 		const auto owner = cache.m_slot_images.try_get(depth.image_id);
 		if (owner == nullptr || !owner->registered || owner->binding.needs_rebind) {
@@ -882,6 +912,13 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 				const auto info     = native->info;
 				const auto feedback = DepthFeedbackAspects(draw_writes, depth.desc.view_info, info);
 				if (feedback && !feedback_loops) {
+					GpuProfiler::AddCount("depth feedback copies");
+					static std::atomic<uint32_t> logged {0};
+					if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+						std::printf("Depth feedback copy: aspects=0x%x levels %u+%u layers %u+%u\n",
+						            static_cast<uint32_t>(info.aspect), info.base_level, info.level_count,
+						            info.base_layer, info.layer_count);
+					}
 					// The host cannot sample an attachment the draw writes: sample a copy of the
 					// depth image from before the draw instead.
 					std::vector<ImageViewInfo> mip_infos;
@@ -1109,11 +1146,14 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	for (uint32_t i = 0; i < merged_count; i++) {
 		auto& range = merged_ranges[i];
 		// PPSA20298
+		GpuProfiler::PhaseMark("vb: clamp");
 		const auto size =
 		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
+		GpuProfiler::PhaseMark("vb: obtain buffer");
 		range.acquired_end = range.base_address + size;
 		std::tie(range.buffer, range.buffer_offset) =
 		    cache.ObtainBuffer(range.base_address, size, false);
+		GpuProfiler::PhaseMark("draw: vertex/index buffers");
 	}
 
 	// Rebuild slot bindings, offsetting non-empty slots into their acquired merged range.
@@ -1273,9 +1313,11 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
 	}
+	GpuProfiler::PhaseMark("draw: programs lookup");
 	RefreshShaderPrograms(buffer.GetContext().GetPipelineCache(), buffer.GetRegisters(),
 	                      buffer.GetShaders(), buffer.GetUserConfig(), color_output_mask, state,
 	                      nullptr);
+	GpuProfiler::PhaseMark("draw: render targets");
 }
 
 static bool PixelShaderActive(const HW::Context& ctx, const HW::Shader& shaders,
@@ -1294,11 +1336,15 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(const HW::Context
 	auto& ring = *m_resolved_ring;
 	auto& draw = ring.draws[ring.next];
 	// The execution thread releases resolutions in order.
+	KYTY_SYNC_SITE(s_ring_draw, "resolve: resolved ring slot busy (wait exec)", Spin);
+	Common::SyncAcct::Scope ring_scope(
+	    Common::SyncAcct::Enabled() && draw.busy.load(std::memory_order_acquire) ? Common::SyncAcct::SiteId(s_ring_draw) : uint16_t {0}, 0);
 	for (Common::SpinWait wait; draw.busy.load(std::memory_order_acquire);) {
 		if (!wait.Spin()) {
 			std::this_thread::yield();
 		}
 	}
+	ring_scope.End();
 	ring.next   = (ring.next + 1) % ResolvedDrawRing::Size;
 	draw.compute_program = {};
 	auto& state = draw.storage.state;
@@ -1333,11 +1379,15 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDispatchAhead(const HW::Con
 	auto& ring = *m_resolved_ring;
 	auto& slot = ring.draws[ring.next];
 	// The execution thread releases resolutions in order.
+	KYTY_SYNC_SITE(s_ring_slot, "resolve: resolved ring slot busy (wait exec)", Spin);
+	Common::SyncAcct::Scope ring_scope(
+	    Common::SyncAcct::Enabled() && slot.busy.load(std::memory_order_acquire) ? Common::SyncAcct::SiteId(s_ring_slot) : uint16_t {0}, 0);
 	for (Common::SpinWait wait; slot.busy.load(std::memory_order_acquire);) {
 		if (!wait.Spin()) {
 			std::this_thread::yield();
 		}
 	}
+	ring_scope.End();
 	ring.next = (ring.next + 1) % ResolvedDrawRing::Size;
 	slot.programs.Reset();
 	ValueInitialize(slot.compute);
@@ -1372,11 +1422,15 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveIndirectDispatchAhead(
 	auto& ring = *m_resolved_ring;
 	auto& slot = ring.draws[ring.next];
 	// The execution thread releases resolutions in order.
+	KYTY_SYNC_SITE(s_ring_slot, "resolve: resolved ring slot busy (wait exec)", Spin);
+	Common::SyncAcct::Scope ring_scope(
+	    Common::SyncAcct::Enabled() && slot.busy.load(std::memory_order_acquire) ? Common::SyncAcct::SiteId(s_ring_slot) : uint16_t {0}, 0);
 	for (Common::SpinWait wait; slot.busy.load(std::memory_order_acquire);) {
 		if (!wait.Spin()) {
 			std::this_thread::yield();
 		}
 	}
+	ring_scope.End();
 	ring.next = (ring.next + 1) % ResolvedDrawRing::Size;
 	slot.programs.Reset();
 	ValueInitialize(slot.compute);
@@ -1399,10 +1453,16 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveIndirectDispatchAhead(
 bool RenderExecutor::TakeResolvedDispatch(ShaderComputeInputInfo& input_info,
                                           ShaderProgram&          program) {
 	auto* resolved = std::exchange(m_resolved_draw, nullptr);
+	GpuProfiler::PhaseMark("lookup: still valid");
 	if (resolved == nullptr || !resolved->compute_program ||
 	    !resolved->programs.reads.StillValid()) {
+		GpuProfiler::AddCount(resolved == nullptr ? "lookup: no resolution" : !resolved->compute_program ? "lookup: no program" : "lookup: not valid");
+		extern thread_local const char* g_dbg_lookup_reason;
+		g_dbg_lookup_reason = resolved == nullptr ? "lookup no resolution" : !resolved->compute_program ? "lookup no program" : "lookup not valid";
+		GpuProfiler::PhaseMark("dispatch: program lookup");
 		return false;
 	}
+	GpuProfiler::PhaseMark("dispatch: program lookup");
 	input_info = resolved->compute;
 	program    = resolved->compute_program;
 	return true;
@@ -1413,10 +1473,13 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_
                                             uint32_t            render_target_slice_offset,
                                             DrawRenderState&    state) {
 	const auto color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
+	GpuProfiler::PhaseMark("draw: refresh shaders");
 	if (!shaders_resolved) {
 		state.ps_active =
 		    PixelShaderActive(buffer.GetRegisters(), buffer.GetShaders(), color_output_mask);
 		RefreshShaders(buffer, draw, color_output_mask, state);
+	} else {
+		GpuProfiler::PhaseMark("draw: render targets");
 	}
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
@@ -1427,8 +1490,10 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_
 		}
 	}
 	mrt_mask &= color_output_mask;
+	GpuProfiler::PhaseMark("rt: try reuse");
 	m_render_targets_reused =
 	    TryReuseRenderTargets(buffer.GetRegisters(), mrt_mask, render_target_slice_offset, state);
+	GpuProfiler::PhaseMark("rt: after reuse");
 	if (!m_render_targets_reused) {
 		state.colors = state.color_info;
 		state.depth  = &state.depth_info;
@@ -1451,6 +1516,10 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_
 		ResolveRenderDepthTarget(buffer, state.depth_info);
 	}
 
+	// Debug: how often a draw acquires its render targets.
+	if (!m_render_targets_reused) {
+		GpuProfiler::AddCount("rt memo: acquired");
+	}
 	if (state.color_count == 0 && !state.depth->image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.colors[0], *state.depth, buffer, draw.index_count, 0);
 		return false;
@@ -1733,9 +1802,31 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 
+	{
+		// Debug (fidelity-diff): KYTY_DRAW_HIST=1 counts draws per VS/PS pair (phase events);
+		// KYTY_ABL_SKIP_DRAW_SHADERS=<vs or ps hash>[,...] drops those draws from here on.
+		const auto dh_vs = state.vertex_info[0].stage.program->shader_hash;
+		const auto dh_ps = state.ps_active && state.ps_input_info.stage.program != nullptr
+		                       ? state.ps_input_info.stage.program->shader_hash
+		                       : 0;
+		static const bool hist = std::getenv("KYTY_DRAW_HIST") != nullptr;
+		if (hist && GpuProfiler::PhaseEnabled()) {
+			char tag[64];
+			std::snprintf(tag, sizeof(tag), "dh %016llx %016llx", static_cast<unsigned long long>(dh_vs),
+			              static_cast<unsigned long long>(dh_ps));
+			GpuProfiler::AddWaitString(tag, 0);
+		}
+		static const Common::Ablation::HashList skip_draws("KYTY_ABL_SKIP_DRAW_SHADERS");
+		if (skip_draws.present && Common::Ablation::Started() &&
+		    (skip_draws.Contains(dh_vs) || skip_draws.Contains(dh_ps))) {
+			GpuProfiler::AddCount("skip: draws by shader");
+			return;
+		}
+	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
+	GpuProfiler::PhaseMark("draw: pipeline");
 	auto* const pipeline_ptr = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.colors, state.color_count}, *state.depth, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
@@ -1743,6 +1834,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    Config::AsyncPipelinesEnabled() && DrawOnlyChangesPicture(m_context, state, vertex_stages));
 	if (pipeline_ptr == nullptr) {
 		// Skipped until a background thread created the pipeline.
+		GpuProfiler::AddCount("draw: skipped for a pipeline in creation");
 		return;
 	}
 	auto& pipeline = *pipeline_ptr;
@@ -1755,6 +1847,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                              index_source.guest_element_size);
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
+	GpuProfiler::PhaseMark("draw: prepare bindings");
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
@@ -1768,7 +1861,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		descriptor_stages[stage_count++] = &*bindings.pixel;
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
+	GpuProfiler::PhaseMark("draw: graphics bindings");
 	PrepareGraphicsBindings(stages, std::span {state.colors, state.color_count});
+	GpuProfiler::PhaseMark("draw: vertex/index buffers");
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
@@ -1782,6 +1877,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		indirect_args = PrepareIndirectArgs(buffer, *emit.indirect, draw.IsIndexed());
 	}
 	vk::ImageAspectFlags feedback_aspects;
+	GpuProfiler::PhaseMark("draw: acquire render targets");
 	const auto rendering = AcquireRenderTargets(buffer, state.colors, state.color_count,
 	                                            *state.depth, feedback_aspects, stages);
 
@@ -1789,6 +1885,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
 	auto vk_buffer = buffer.Handle();
+	GpuProfiler::PhaseMark("draw: commit + record");
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
@@ -1813,11 +1910,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
 
+	GpuProfiler::PhaseMark("draw: dynamic state");
 	auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
 	UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), *state.depth,
 	                           rendering);
 	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
 	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
+	GpuProfiler::PhaseMark("draw: begin + draw");
 
 	LogDrawPhase(draw.Name(), "BeginRendering");
 	if (!draw.IsIndexed()) {
@@ -1828,13 +1927,25 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
-	if (mesh_active) {
+	const auto vs_hash = state.vertex_info[0].stage.program->shader_hash;
+	const auto ps_hash = state.ps_active && state.ps_input_info.stage.program != nullptr
+	                         ? state.ps_input_info.stage.program->shader_hash
+	                         : 0;
+	GpuCheckpoint(vk_buffer, GpuCheckpointKind::DrawBegin, vs_hash, ps_hash);
+	// Debug (ablation, fidelity-diff): KYTY_NOGPU_DRAW_SHADERS=<vs or ps hash>[,...|*] keeps the
+	// CPU work of those draws but does not record the draw command.
+	static const Common::Ablation::HashList nogpu_draws("KYTY_NOGPU_DRAW_SHADERS");
+	if (nogpu_draws.present && Common::Ablation::Started() &&
+	    (nogpu_draws.Contains(vs_hash) || nogpu_draws.Contains(ps_hash))) {
+		GpuProfiler::AddCount("nogpu: draws");
+	} else if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else if (emit.indirect != nullptr) {
 		EmitIndirectDraws(vk_buffer, draw, *emit.indirect, indirect_args);
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
+	GpuCheckpoint(vk_buffer, GpuCheckpointKind::DrawEnd, vs_hash, ps_hash);
 
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
@@ -1853,6 +1964,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
 	}
 	LogDrawPhase(draw.Name(), "DrawComplete");
+	GpuProfiler::PhaseMark("draw: tail");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);
 	}
@@ -1911,7 +2023,9 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
+	GpuProfiler::PhaseMark("draw: pending ops");
 	m_context.GetCommandScheduler().PopPendingOperations();
+	GpuProfiler::SetCurrentShader(1);
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -1919,11 +2033,14 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    args.index_count, 0, 1, args.instance_count,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
+	GpuProfiler::PhaseMark("draw: context lock");
 	Common::LockGuard lock(m_context.GetMutex());
+	GpuProfiler::PhaseMark("draw: checks");
 	if (args.index_count == 0 || args.instance_count == 0) {
 		return;
 	}
 
+	GpuProfiler::PhaseMark("chk: special ops");
 	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
 	    DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
@@ -1932,6 +2049,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
+	GpuProfiler::PhaseMark("chk: shader + regs");
 	if (!DrawHasValidVertexShader(sh_ctx)) {
 		return;
 	}
@@ -1962,6 +2080,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		m_checked_context_id = m_context_id;
 	}
 
+	GpuProfiler::PhaseMark("chk: topology + index");
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, topology)) {
 		return;
@@ -2005,9 +2124,11 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance};
+	GpuProfiler::PhaseMark("chk: acquire state");
 	bool               shaders_resolved = false;
 	auto& state = AcquireDrawRenderState(ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch,
 	                                     shaders_resolved);
+	GpuProfiler::PhaseMark("chk: prepare state");
 	if (!PrepareDrawRenderState(buffer, shaders_resolved, draw, args.render_target_slice_offset,
 	                            state)) {
 		ResetBindings();
@@ -2017,6 +2138,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
 	                     args.index_addr);
 
+	GpuProfiler::PhaseMark("chk: offsets");
 	const bool indirect = args.offset_source == DrawOffsetSource::IndirectArgs;
 	const auto [vertex_offset, instance_offset] =
 	    indirect ? std::pair<int32_t, uint32_t> {0, args.first_instance}
@@ -2040,6 +2162,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
+	GpuProfiler::PhaseMark("draw: pending ops");
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
@@ -2048,7 +2171,9 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                    args.vertex_count, 0, args.first_vertex, args.instance_count,
 	                    args.first_instance);
 
+	GpuProfiler::PhaseMark("draw: context lock");
 	Common::LockGuard lock(m_context.GetMutex());
+	GpuProfiler::PhaseMark("draw: checks");
 	if (args.vertex_count == 0 || args.instance_count == 0) {
 		return;
 	}

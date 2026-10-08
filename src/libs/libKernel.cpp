@@ -1,3 +1,4 @@
+#include "common/syncAcct.h"
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -2102,6 +2103,7 @@ static void LogExperimentalSyncOnAddress(std::atomic_bool& logged, const char* f
 
 int KYTY_SYSV_ABI KernelSyncOnAddressWait(volatile uint32_t* address, uint32_t expected,
                                           const uint32_t* timeout_micros) {
+	KYTY_SYNC_GAME_WAIT("game: sceKernelSyncOnAddressWait", address);
 	return LibKernel::SyncOnAddress::Wait32(address, expected, timeout_micros,
 	                                        LibKernel::KernelDispatchPendingSignalForCurrentThread);
 }
@@ -2123,6 +2125,7 @@ int KYTY_SYSV_ABI KernelSyncOnAddressWait64(volatile uint64_t* address, uint64_t
 }
 
 int KYTY_SYSV_ABI KernelSyncOnAddressWake(volatile void* address, int32_t count) {
+	Common::SyncAcct::NoteWake(const_cast<const void*>(address));
 	return LibKernel::SyncOnAddress::Wake(address, count);
 }
 

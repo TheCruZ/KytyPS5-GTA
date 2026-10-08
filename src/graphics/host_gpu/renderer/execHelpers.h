@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_EXECHELPERS_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_EXECHELPERS_H_
 
+#include "common/syncAcct.h"
 #include "common/common.h"
 #include "common/spscQueue.h"
 
@@ -66,6 +67,8 @@ public:
 			m_generation.notify_all();
 		}
 		Work();
+		KYTY_SYNC_SITE(s_helpers, "exec helpers: issuer waits for helpers", Spin);
+		Common::SyncAcct::Scope sync_scope(s_helpers, Helpers);
 		for (Common::SpinWait spin; m_finished.load(std::memory_order_acquire) != Helpers;) {
 			if (!spin.Spin()) {
 				std::this_thread::yield();
@@ -93,12 +96,16 @@ private:
 		for (;;) {
 			uint64_t generation = m_generation.load(std::memory_order_acquire);
 			if (generation == seen) {
+				KYTY_SYNC_SITE(s_helper_idle, "exec helper: idle spin", Spin);
+				Common::SyncAcct::Scope idle_scope(s_helper_idle, 0);
 				Common::SpinWait spin;
 				while ((generation = m_generation.load(std::memory_order_acquire)) == seen) {
 					if (!spin.Spin()) {
 						m_sleepers.fetch_add(1, std::memory_order_seq_cst);
 						generation = m_generation.load(std::memory_order_seq_cst);
 						if (generation == seen) {
+							KYTY_SYNC_SITE(s_helper_sleep, "exec helper: idle sleep", Block);
+							Common::SyncAcct::Scope sleep_scope(s_helper_sleep, 0);
 							m_generation.wait(seen, std::memory_order_seq_cst);
 						}
 						m_sleepers.fetch_sub(1, std::memory_order_relaxed);

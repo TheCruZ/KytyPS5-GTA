@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdio>
 #include <mutex>
 #include <vector>
 
@@ -121,6 +122,28 @@ void GraphicContext::LogMemoryBudget() const {
 		     static_cast<uint64_t>(budgets[i].statistics.allocationBytes),
 		     static_cast<uint64_t>(budgets[i].statistics.blockBytes));
 	}
+}
+
+// Debug: Vulkan memory objects per heap (every WDDM allocation costs residency work).
+void GraphicContext::LogAllocationCounts() const {
+	if (allocator == nullptr) {
+		return;
+	}
+	const auto& properties = GetPhysicalDeviceMemoryProperties();
+	VmaBudget   budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	for (uint32_t i = 0; i < properties.memoryHeapCount; i++) {
+		if (budgets[i].statistics.blockCount == 0) {
+			continue;
+		}
+		std::printf("VMA heap %u: memory objects=%u allocations=%u block MiB=%" PRIu64
+		            " usage MiB=%" PRIu64 " budget MiB=%" PRIu64 "\n",
+		            i, budgets[i].statistics.blockCount, budgets[i].statistics.allocationCount,
+		            static_cast<uint64_t>(budgets[i].statistics.blockBytes >> 20u),
+		            static_cast<uint64_t>(budgets[i].usage >> 20u),
+		            static_cast<uint64_t>(budgets[i].budget >> 20u));
+	}
+	std::fflush(stdout);
 }
 
 uint64_t GraphicContext::GetDeviceMemoryUsage() const {

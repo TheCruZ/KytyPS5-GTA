@@ -1,14 +1,27 @@
+#include "common/syncAcct.h"
+#include <cinttypes>
+#include <cstdio>
 #include "graphics/host_gpu/renderer/renderContext.h"
+
+#include "common/ablation.h"
+#include "graphics/host_gpu/gpuProfiler.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/cache/cacheStats.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/shader/shaderBindings.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace Libs::Graphics {
@@ -60,6 +73,11 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 }
 
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+	GpuProfiler::TimedWait timed(access == PageFaultAccess::Write ? "ev: guest write fault"
+	                                                              : "ev: guest read fault");
+	KYTY_SYNC_SITE(s_wfault, "fault: GPU-tracked page write", Tax);
+	KYTY_SYNC_SITE(s_rfault, "fault: GPU-tracked page read (readback)", Tax);
+	Common::SyncAcct::Scope sync_scope(access == PageFaultAccess::Write ? s_wfault : s_rfault, fault_vaddr);
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
@@ -67,13 +85,27 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		// Cache tracking may still protect a page whose range left the GPU-mapped set; that
 		// fault is ours to resolve, not a guest access violation.
 		if (!GuestRange {fault_vaddr, fault_size}.Valid() || !m_page_manager.IsWatched(fault_vaddr)) {
+			std::printf("HandleFault: untracked fault 0x%016" PRIx64
+			            " outside the GPU-mapped ranges (access=%u backing=%d)\n",
+			            fault_vaddr, static_cast<uint32_t>(access),
+			            LibKernel::Memory::IsBackingReadable(fault_vaddr, 1) ? 1 : 0);
+			std::fflush(stdout);
 			return false;
+		}
+		static std::atomic_uint32_t logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			std::printf("HandleFault: tracked page 0x%016" PRIx64
+			            " is outside the GPU-mapped ranges (access=%u)\n",
+			            fault_vaddr, static_cast<uint32_t>(access));
+			std::fflush(stdout);
 		}
 	}
 	if (access == PageFaultAccess::Write && GuestGpu::IsGpuThread()) {
 		// A write of the command stream: device-address readers after it must see it.
 		m_bda_generation++;
 	}
+	CacheStats::Add(access == PageFaultAccess::Write ? CacheStats::WriteFaults
+	                                                 : CacheStats::ReadFaults);
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateFaultedPage(fault_vaddr);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
@@ -145,6 +177,9 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
+	GpuProfiler::TimedWait timed("ev: unmap");
+	KYTY_SYNC_SITE(s_unmap, "game: GPU unmap (urgent, waits exec)", Work);
+	Common::SyncAcct::Scope sync_scope(s_unmap, vaddr, size);
 	if (CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported memory unmap from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
@@ -163,8 +198,15 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		                   (m_buffer_cache.IsRegionGpuModified(vaddr, size) ||
 		                    m_texture_cache.HasImagesInRegion(vaddr, size) ||
 		                    m_command_scheduler.HasPendingGuestOperations(vaddr, size));
+		if (drain && GpuProfiler::PhaseEnabled()) {
+			// Debug: why unmaps drain the GPU.
+			GpuProfiler::AddCount(m_buffer_cache.IsRegionGpuModified(vaddr, size) ? "unmap drain: gpu pages" : "unmap drain: no gpu pages");
+			GpuProfiler::AddCount(m_texture_cache.HasImagesInRegion(vaddr, size) ? "unmap drain: images" : "unmap drain: no images");
+			GpuProfiler::AddCount(m_command_scheduler.HasPendingGuestOperations(vaddr, size) ? "unmap drain: guest ops" : "unmap drain: no guest ops");
+		}
 		if (drain) {
 			const auto tick = m_command_scheduler.CurrentTick();
+			GpuProfiler::WaitTagScope tag("unmap Finish");
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
 		}
@@ -185,12 +227,27 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	// execution thread writes after the operations before them. The operations queued since do not
 	// use the range, so the unmap runs before them instead of making the guest wait for them;
 	// streaming games unmap many times per frame, holding their own locks.
-	m_gpu->SendUrgentCommandSync(unmap);
+	static const bool urgent = [] {
+		const char* env = std::getenv("KYTY_URGENT_UNMAP");
+		return env == nullptr || env[0] != '0';
+	}();
+	if (urgent) {
+		m_gpu->SendUrgentCommandSync(unmap);
+	} else {
+		m_gpu->SendCommandSync(unmap);
+	}
 }
 
 void RenderContext::CacheDmaBases(const ShaderStageRuntime& runtime) {
 	const auto&      program   = *runtime.program;
 	const auto&      user_data = runtime.resources->user_data;
+	if (GpuProfiler::PhaseEnabled()) {
+		// Debug (rain-perf): which programs use device addresses.
+		char tag[64];
+		std::snprintf(tag, sizeof(tag), "dma prog %016llx st%u", static_cast<unsigned long long>(program.shader_hash),
+		              static_cast<unsigned>(program.stage));
+		GpuProfiler::AddWaitString(tag, 0);
+	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	for (const auto reg: program.info.dma_base_registers) {
 		const auto index = static_cast<uint64_t>(reg) - program.user_data_base;
@@ -206,6 +263,26 @@ void RenderContext::CacheDmaBases(const ShaderStageRuntime& runtime) {
 		// DMA reaches only memory with a cached buffer; any other access records a fault and
 		// reads zero, and the buffer arrives after the shader has run. That loses data the guest
 		// writes for a single dispatch, such as the glyph bitmaps GTA V copies into its font atlas.
+		{
+			// Debug (rain-perf): the DMA bases of the first draws.
+			static std::unordered_map<uint64_t, int> printed;
+			if (GpuProfiler::PhaseEnabled() && printed[program.shader_hash]++ < 3) {
+				std::printf("DMA base: prog %016llx reg %u base 0x%llx (user data %zu dwords) "
+				            "bounded %d windows %zu tables %zu\n",
+				            static_cast<unsigned long long>(program.shader_hash), reg,
+				            static_cast<unsigned long long>(base), user_data.size(),
+				            program.info.dma_bounded ? 1 : 0, program.info.dma_windows.size(),
+				            program.info.dma_tables.size());
+				for (const auto& w: program.info.dma_windows) {
+					std::printf("  window reg %u [%lld, %llu)\n", w.base_register,
+					            static_cast<long long>(w.first), static_cast<unsigned long long>(w.last));
+				}
+				for (const auto& t: program.info.dma_tables) {
+					std::printf("  table reg %u imm %lld bits 0x%x\n", t.base_register,
+					            static_cast<long long>(t.immediate), t.offset_bits);
+				}
+			}
+		}
 		m_mapped_ranges.ForEachInRange(base, BufferCache::CACHING_PAGESIZE,
 		                               [this](uint64_t start, uint64_t end) {
 			                               (void)m_buffer_cache.FindBuffer(start, end - start);
@@ -282,7 +359,23 @@ bool RenderContext::SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* 
 		}
 	}
 	lock.unlock();
+	GpuProfiler::AddCount("dma: footprint spans", m_dma_spans.size());
+	const auto dbg_start = std::chrono::steady_clock::now();
 	m_buffer_cache.SynchronizeBuffersInSpans(m_dma_spans);
+	if (GpuProfiler::PhaseEnabled()) {
+		// Debug (rain-perf): cost and reach of the footprint synchronization per program.
+		uint64_t bytes = 0;
+		for (const auto& [first, last]: m_dma_spans) bytes += last - first;
+		char tag[96];
+		std::snprintf(tag, sizeof(tag), "dma fp %016llx", static_cast<unsigned long long>(
+		                                                     stages.empty() ? 0 : stages[0]->program->shader_hash));
+		GpuProfiler::AddWaitString(tag, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                                         std::chrono::steady_clock::now() - dbg_start)
+		                                                         .count()));
+		std::snprintf(tag, sizeof(tag), "dma fp bytes %016llx", static_cast<unsigned long long>(
+		                                                           stages.empty() ? 0 : stages[0]->program->shader_hash));
+		GpuProfiler::AddWaitString(tag, bytes); // "ms/frame" = MB/frame
+	}
 	return true;
 }
 
@@ -295,6 +388,7 @@ void RenderContext::PrepareBda(bool may_write, bool full_sync) {
 	if (may_write) {
 		m_buffer_cache.NoteDeviceAddressUse();
 	}
+	const auto       begin = std::chrono::steady_clock::now();
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	// Nothing to upload when no page became CPU dirty, no buffer was registered and no range was
 	// mapped since the last synchronization started.
@@ -307,19 +401,88 @@ void RenderContext::PrepareBda(bool may_write, bool full_sync) {
 	// unless the execution thread itself wrote them for the command stream (labels, CP writes)
 	// or the buffers or mappings changed.
 	const bool same_layout = epochs[1] == m_bda_sync_epochs[1] && epochs[2] == m_bda_sync_epochs[2];
-	if (full_sync && epochs != m_bda_sync_epochs &&
+	// Debug (rain-perf ablation): no BDA synchronization (device-address reads see stale data).
+	if (full_sync && epochs != m_bda_sync_epochs && !KYTY_ABL_AT(NO_BDA_SYNC) &&
 	    (!same_layout || m_bda_synced_generation != m_bda_generation)) {
 		m_bda_synced_generation = m_bda_generation;
 		// A new buffer or mapped range may cover CPU-dirty pages that earlier passes skipped.
 		const bool all = epochs[1] != m_bda_sync_epochs[1] || epochs[2] != m_bda_sync_epochs[2];
+		// Debug: cost of full and incremental passes.
+		GpuProfiler::TimedWait timed_sync(all ? (epochs[2] != m_bda_sync_epochs[2] ? "bda: full sync (mapping)" : "bda: full sync (new buffer)")
+		                                      : "bda: incremental sync");
 		m_buffer_cache.SynchronizeBuffersInRanges(m_mapped_ranges, all);
 		m_bda_sync_epochs = epochs;
 	}
 	m_fault_process_pending = true;
 	m_use_scan_pending      = true;
+	CacheStats::Add(CacheStats::BdaSyncs);
+	CacheStats::Add(CacheStats::BdaSyncUs,
+	                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+	                                          std::chrono::steady_clock::now() - begin)
+	                                          .count()));
+}
+
+static void PrintCacheStats() {
+	static const bool enabled = std::getenv("KYTY_CACHE_STATS") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	static auto last = std::chrono::steady_clock::now();
+	const auto  now  = std::chrono::steady_clock::now();
+	if (now - last < std::chrono::seconds(5)) {
+		return;
+	}
+	const auto seconds = std::chrono::duration<double>(now - last).count();
+	last               = now;
+	// Deltas from a snapshot: the hitch report of the phase profiler reads the same counters.
+	static uint64_t previous[CacheStats::Count] {};
+	uint64_t        values[CacheStats::Count] {};
+	for (uint32_t i = 0; i < CacheStats::Count; i++) {
+		const auto value = CacheStats::g_counters[i].load(std::memory_order_relaxed);
+		values[i]        = value - previous[i];
+		previous[i]      = value;
+	}
+	std::printf("CacheStats %.1fs: submits=%" PRIu64 " wfaults=%" PRIu64 " rfaults=%" PRIu64
+	            " readbacks=%" PRIu64 " readback_wait_ms=%" PRIu64 " bda_syncs=%" PRIu64
+	            " bda_sync_ms=%" PRIu64 " bda_buffers=%" PRIu64 " tex_uploads=%" PRIu64
+	            " tex_upload_mb=%" PRIu64 " tex_gc_frees=%" PRIu64 " tex_gc_dropped_gpu=%" PRIu64
+	            " buf_gc_frees=%" PRIu64 " indirect_targets=%" PRIu64 " indirect_dispatches=%" PRIu64
+	            " indirect_prepare_ms=%" PRIu64 " readbacks_in_indirect=%" PRIu64
+	            " tex_uploads_from_buffer=%" PRIu64 " tex_uploads_in_indirect=%" PRIu64 "\n",
+	            seconds, values[CacheStats::Submissions], values[CacheStats::WriteFaults],
+	            values[CacheStats::ReadFaults], values[CacheStats::ReadbackDownloads],
+	            values[CacheStats::ReadbackWaitUs] / 1000, values[CacheStats::BdaSyncs],
+	            values[CacheStats::BdaSyncUs] / 1000, values[CacheStats::BdaSyncBuffers],
+	            values[CacheStats::TextureUploads], values[CacheStats::TextureUploadBytes] >> 20u,
+	            values[CacheStats::TextureGcFrees], values[CacheStats::TextureGcGpuDataDropped],
+	            values[CacheStats::BufferGcFrees], values[CacheStats::IndirectTargets],
+	            values[CacheStats::IndirectDispatches], values[CacheStats::IndirectPrepareUs] / 1000,
+	            values[CacheStats::ReadbackIndirect], values[CacheStats::TextureUploadsFromBuffer],
+	            values[CacheStats::TextureUploadsInIndirect]);
+	std::printf("CacheStats marked: fill=%" PRIu64 " copy=%" PRIu64 " storage=%" PRIu64
+	            " storage_dynamic=%" PRIu64 " indirect=%" PRIu64 " | readbacks storage=%" PRIu64
+	            " dynamic=%" PRIu64 " dma=%" PRIu64 " | storage_over_gpu_image w=%" PRIu64
+	            " rmw=%" PRIu64 "\n",
+	            values[CacheStats::ImagesMarkedFill], values[CacheStats::ImagesMarkedCopy],
+	            values[CacheStats::ImagesMarkedStorage],
+	            values[CacheStats::ImagesMarkedStorageDynamic],
+	            values[CacheStats::ImagesMarkedIndirect], values[CacheStats::ReadbackStorage],
+	            values[CacheStats::ReadbackDynamic], values[CacheStats::ReadbackDma],
+	            values[CacheStats::StorageWriteOverGpuImage],
+	            values[CacheStats::StorageRmwOverGpuImage]);
+	std::fflush(stdout);
 }
 
 void RenderContext::RunGarbageCollector() {
+	CacheStats::Add(CacheStats::Submissions);
+	PrintCacheStats();
+	if (GpuProfiler::PhaseEnabled()) {
+		static auto last = std::chrono::steady_clock::now();
+		if (std::chrono::steady_clock::now() - last > std::chrono::seconds(10)) {
+			last = std::chrono::steady_clock::now();
+			m_graphics.LogAllocationCounts();
+		}
+	}
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();

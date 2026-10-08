@@ -1,6 +1,8 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 
+#include "common/syncAcct.h"
+#include "common/ablation.h"
 #include "common/assert.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
@@ -36,6 +38,12 @@ class TrackingSpinLock final {
 public:
 	void lock() noexcept {
 		const auto thread = CurrentThread();
+		if (!m_lock.test_and_set(std::memory_order_acquire)) {
+			m_owner.store(thread, std::memory_order_relaxed);
+			return;
+		}
+		KYTY_SYNC_SITE(s_spin, "RegionManager spinlock contended", Spin);
+		Common::SyncAcct::Scope scope(s_spin, reinterpret_cast<uint64_t>(this), m_owner.load(std::memory_order_relaxed));
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
 			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
 #if defined(__x86_64__) || defined(_M_X64)
@@ -159,7 +167,10 @@ public:
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
 				m_has_cpu_dirty.store(m_cpu_dirty.Any(), std::memory_order_release);
-				UpdateProtection<true, false>();
+				// Debug (rain-perf ablation): keep uploaded pages writable (later CPU writes are lost).
+				if (!KYTY_ABL_AT(NO_REPROTECT)) {
+					UpdateProtection<true, false>();
+				}
 			} else {
 				UpdateProtection<false, true>();
 			}

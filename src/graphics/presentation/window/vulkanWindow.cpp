@@ -1,3 +1,4 @@
+#include "common/expSwitch.h"
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 
@@ -26,6 +27,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
@@ -419,6 +421,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
 	const float queue_priority = 1.0f;
+	static const float queue_priorities[2] = {1.0f, 1.0f};
 	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {};
 	auto& queue_create_info            = queue_create_infos[0];
 	queue_create_info.queueFamilyIndex = queue_family;
@@ -427,6 +430,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	// A transfer-only family serves buffer readbacks (GraphicContext::readback_queue).
 	uint32_t   queue_create_count = 1;
 	const auto families           = physical_device.getQueueFamilyProperties();
+	// Local debugging (KYTY_X_LANE_R): a second queue of the graphics family.
+	if (KYTY_XO(LANE_R) && families[queue_family].queueCount >= 2) {
+		queue_create_info.queueCount       = 2;
+		queue_create_info.pQueuePriorities = queue_priorities;
+	}
 	graphics.readback_family      = static_cast<uint32_t>(-1);
 	for (uint32_t family = 0; family < families.size(); family++) {
 		const auto flags = families[family].queueFlags;
@@ -579,7 +587,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
-	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
+	    feedback_dynamic.attachmentFeedbackLoopDynamicState &&
+	    std::getenv("KYTY_NO_FEEDBACK_LOOP") == nullptr; // Debug: the path of hosts without it.
 	graphics.maintenance8_enabled = maintenance8_extension && maintenance8.maintenance8;
 	LOGF("Vulkan maintenance8 support: %s\n",
 	     graphics.maintenance8_enabled ? "true" : "false");
@@ -840,6 +849,16 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 		default: severity_str = "?";
 	}
 
+	// KYTY_VALIDATION_NONFATAL logs validation errors instead of exiting, so one run can
+	// collect every distinct error (combine with the layer's duplicate_message_limit).
+	static const bool nonfatal = std::getenv("KYTY_VALIDATION_NONFATAL") != nullptr;
+	if (nonfatal && !skip && !debug_printf) {
+		// LOGF only reaches a printf log; keep the messages in the run's stdout.
+		std::printf("[Vulkan][%s][%u]: %s\n", severity_str, static_cast<uint32_t>(message_types),
+		            callback_data->pMessage);
+		std::fflush(stdout);
+		error = false;
+	}
 	if (error) {
 		EXIT_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
 		           static_cast<uint32_t>(message_types), callback_data->pMessage);
@@ -1053,6 +1072,7 @@ void WindowContext::CreateVulkan() {
 	graphic_ctx.supports_block_texel_view = block_texel_view_props.result == vk::Result::eSuccess;
 	LOGF("Block Texel View support: %s\n", graphic_ctx.supports_block_texel_view ? "Yes" : "No");
 
+	bool gpu_checkpoints = false;
 	{
 		auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(
 		    "vkEnumerateDeviceExtensionProperties",
@@ -1081,6 +1101,11 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
 		}
+		gpu_checkpoints = GpuCheckpointsRequested() &&
+		    HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+		if (gpu_checkpoints) {
+			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+		}
 	}
 
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
@@ -1088,8 +1113,15 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not create device");
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	if (GpuCheckpointsRequested()) {
+		EnableGpuCheckpoints(gpu_checkpoints);
+	}
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	if (KYTY_XO(LANE_R) &&
+	    graphic_ctx.physical_device.getQueueFamilyProperties()[graphic_ctx.queue_family].queueCount >= 2) {
+		graphic_ctx.device.getQueue(graphic_ctx.queue_family, 1, &graphic_ctx.rt_queue);
+	}
 	if (graphic_ctx.readback_family != static_cast<uint32_t>(-1)) {
 		graphic_ctx.device.getQueue(graphic_ctx.readback_family, 0, &graphic_ctx.readback_queue);
 	}

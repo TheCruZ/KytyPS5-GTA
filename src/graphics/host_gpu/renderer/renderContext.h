@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/expSwitch.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
@@ -18,10 +19,10 @@
 #include "kernel/eventQueue.h"
 
 #include <array>
+#include <cstdlib>
 #include <memory>
 #include <shared_mutex>
 #include <span>
-#include <utility>
 #include <vector>
 
 namespace Libs::VideoOut {
@@ -29,6 +30,17 @@ class VideoOutDriver;
 }
 
 namespace Libs::Graphics {
+
+// Debug (rain-perf): KYTY_DMA_FOOTPRINT=0 uploads all cached memory before every operation with
+// device-address reads, as before SynchronizeDmaFootprint().
+inline bool DmaFootprintEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DMA_FOOTPRINT");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled && KYTY_XT(DMAFP);
+}
+
 
 class GuestGpu;
 

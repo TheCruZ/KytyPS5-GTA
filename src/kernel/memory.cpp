@@ -1,3 +1,7 @@
+#include "common/syncAcct.h"
+#include "common/expSwitch.h"
+#include "common/ablation.h"
+#include "graphics/host_gpu/gpuProfiler.h"
 #include "kernel/memory.h"
 
 #include "common/assert.h"
@@ -7,6 +11,7 @@
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -555,6 +560,33 @@ public:
 		return true;
 	}
 
+	// Local debugging (crash report): Query without blocking forever, since the faulting thread
+	// may hold the lock. Returns -1 when the lock stayed busy, else whether a range was found;
+	// *waited_us is how long the lock was busy.
+	int TryQueryForReport(uint64_t addr, Range* out, int64_t* waited_us) {
+		const auto start = std::chrono::steady_clock::now();
+		while (!m_mutex.TryLock()) {
+			if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(200)) {
+				*waited_us = 200000;
+				return -1;
+			}
+			SwitchToThread();
+		}
+		*waited_us = std::chrono::duration_cast<std::chrono::microseconds>(
+		                 std::chrono::steady_clock::now() - start)
+		                 .count();
+		int found = 0;
+		auto next = std::upper_bound(
+		    m_ranges.begin(), m_ranges.end(), addr,
+		    [](uint64_t value, const Range& range) { return value < range.start; });
+		if (next != m_ranges.begin() && addr < End(std::prev(next)->start, std::prev(next)->size)) {
+			*out  = *std::prev(next);
+			found = 1;
+		}
+		m_mutex.Unlock();
+		return found;
+	}
+
 	bool QuerySpan(uint64_t start, uint64_t size, std::vector<Range>* out) {
 		EXIT_IF(out == nullptr);
 
@@ -1072,12 +1104,29 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 		// for most reads.
 		auto& buffers = GetGpuResources().GetBufferCache();
 		if (!Graphics::GuestGpu::IsGpuThread() ||
-		    (buffers.MayBeGpuModified(vaddr, size) && buffers.HasGpuDirtyBytes(vaddr, size)) ||
+		    ((!KYTY_XT(RP_B6) || buffers.MayBeGpuModified(vaddr, size)) &&
+		     buffers.HasGpuDirtyBytes(vaddr, size)) ||
 		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
 			return false;
 		}
 	}
 	return TryReadBacking(vaddr, data, size);
+}
+
+int CompareGpuCleanBacking(uint64_t vaddr, const void* expected, uint64_t size) {
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
+		if (!Graphics::GuestGpu::IsGpuThread() ||
+		    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
+		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+			return 0;
+		}
+	}
+	// Only the execution thread unmaps guest memory (urgent commands), so the view stays.
+	const void* backing = FindBackingPointer(vaddr, size);
+	if (backing == nullptr) {
+		return -1;
+	}
+	return std::memcmp(backing, expected, size) == 0 ? 1 : 0;
 }
 
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -1087,6 +1136,11 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 		}
 		auto& buffers = GetGpuResources().GetBufferCache();
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+			// Debug (ablation, fidelity-diff): KYTY_ABL_STALE_READS=1 reads the stale backing.
+			if (KYTY_ABL(STALE_READS)) {
+				Graphics::GpuProfiler::AddCount("abl: stale read");
+				return TryReadBacking(vaddr, data, size);
+			}
 			if (buffers.TryReadMirroredGpuWrites(vaddr, data, size)) {
 				return true;
 			}
@@ -1110,6 +1164,14 @@ bool MayFaultOnGpuRead(uint64_t vaddr, uint64_t size) {
 }
 
 bool TryReadAroundGpuWrites(uint64_t vaddr, void* data, uint64_t size) {
+	// Debug (A/B): KYTY_READ_AROUND=0 loads directly as before.
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READ_AROUND");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!enabled) {
+		return false;
+	}
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
 	    !Graphics::GuestGpu::IsGpuThread()) {
 		return false;
@@ -1121,6 +1183,10 @@ bool TryReadAroundGpuWrites(uint64_t vaddr, void* data, uint64_t size) {
 		return false;
 	}
 	if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+		if (KYTY_ABL(STALE_READS)) {
+			Graphics::GpuProfiler::AddCount("abl: stale read");
+			return TryReadBacking(vaddr, data, size);
+		}
 		return buffers.TryReadMirroredGpuWrites(vaddr, data, size);
 	}
 	return TryReadBacking(vaddr, data, size);
@@ -1223,6 +1289,111 @@ static bool IsInPrtAperture(uint64_t address, uint64_t size = 1) {
 	}
 
 	return false;
+}
+
+// Local debugging: everything the emulator knows about a faulting guest address, for the crash
+// report: host page state, the guest range, the address-space owner and file views, and the
+// recent map/unmap/protect history around it.
+template <size_t N>
+static void PrintMapHistory(const MapHistoryRing<N>& ring, const char* title, uint64_t lo,
+                            uint64_t hi, uint64_t page, int max_lines, int64_t now,
+                            int64_t frequency) {
+	const auto last  = ring.next.load(std::memory_order_acquire);
+	int        lines = 0;
+	std::printf("  %s (%" PRIu64 " recorded, newest first, [%016" PRIx64 ", %016" PRIx64
+	            "), * = touches the faulting page):\n",
+	            title, last, lo, hi);
+	for (uint64_t i = last; i > 0 && last - i < N && lines < max_lines; i--) {
+		const auto& e = ring.events[(i - 1) & (N - 1)];
+		if (e.seq.load(std::memory_order_acquire) != i || e.op == nullptr) {
+			continue;
+		}
+		const auto end = e.vaddr + e.size;
+		if (hi != 0 && (end <= lo || e.vaddr >= hi)) {
+			continue;
+		}
+		const bool touches = e.vaddr < page + 0x4000 && end > page;
+		std::printf("    %s%10.3f ms ago tid=%-6u %-19s %-18s [%016" PRIx64 ", %016" PRIx64
+		            ") extra=0x%" PRIx64 "%s\n",
+		            touches ? "* " : "  ",
+		            static_cast<double>(now - e.ticks) * 1000.0 / static_cast<double>(frequency),
+		            e.tid, e.thread[0] != 0 ? e.thread : "-", e.op, e.vaddr, end, e.extra,
+		            e.ok ? "" : " FAIL");
+		lines++;
+	}
+}
+
+void DescribeFaultAddress(uint64_t vaddr) noexcept {
+	const auto page = vaddr & ~uint64_t {0x3fff};
+	std::printf("--- Fault address 0x%016" PRIx64 " (current tid=%lu) ---\n", vaddr,
+	            static_cast<unsigned long>(GetCurrentThreadId()));
+	MEMORY_BASIC_INFORMATION mbi {};
+	if (VirtualQuery(reinterpret_cast<const void*>(vaddr), &mbi, sizeof(mbi)) != 0) {
+		std::printf("  host now: region [%016" PRIx64 ", %016" PRIx64 ") state=%s type=%s"
+		            " protect=0x%lx alloc_base=%016" PRIx64 " alloc_protect=0x%lx\n",
+		            reinterpret_cast<uint64_t>(mbi.BaseAddress),
+		            reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize,
+		            mbi.State == MEM_COMMIT    ? "commit"
+		            : mbi.State == MEM_RESERVE ? "reserve"
+		                                       : "free",
+		            mbi.Type == MEM_MAPPED    ? "mapped"
+		            : mbi.Type == MEM_PRIVATE ? "private"
+		            : mbi.Type == MEM_IMAGE   ? "image"
+		                                      : "-",
+		            static_cast<unsigned long>(mbi.Protect),
+		            reinterpret_cast<uint64_t>(mbi.AllocationBase),
+		            static_cast<unsigned long>(mbi.AllocationProtect));
+	}
+	uint64_t range_lo = 0;
+	uint64_t range_hi = 0;
+	if (g_virtual_ranges != nullptr) {
+		VirtualRanges::Range range {};
+		int64_t              waited_us = 0;
+		const int            found     = g_virtual_ranges->TryQueryForReport(vaddr, &range, &waited_us);
+		if (found < 0) {
+			std::printf("  guest range: lock busy for 200 ms, not inspected\n");
+		} else if (found == 0) {
+			std::printf("  guest range (lock busy %lld us): none (unmapped in the guest)\n",
+			            static_cast<long long>(waited_us));
+		} else {
+			range_lo = range.start;
+			range_hi = range.start + range.size;
+			std::printf("  guest range (lock busy %lld us): [%016" PRIx64 ", %016" PRIx64
+			            ") type=%s offset=0x%" PRIx64 " prot=0x%x mtype=%d name=\"%s\"\n",
+			            static_cast<long long>(waited_us), range.start, range.start + range.size,
+			            std::string(magic_enum::enum_name(range.type)).c_str(), range.offset,
+			            range.protection, range.memory_type, range.name);
+		}
+	}
+	if (g_guest_address_space != nullptr) {
+		g_guest_address_space->DescribeForReport(vaddr);
+	}
+	for (int i = 0; i <= PRT_APERTURE_MAX_INDEX; i++) {
+		const auto& aperture = g_prt_apertures[i];
+		if (aperture.size != 0 && vaddr >= aperture.address &&
+		    vaddr - aperture.address < aperture.size) {
+			std::printf("  inside PRT aperture %d [%016" PRIx64 ", %016" PRIx64 ")\n", i,
+			            aperture.address, aperture.address + aperture.size);
+		}
+	}
+	LARGE_INTEGER now {};
+	LARGE_INTEGER frequency {};
+	QueryPerformanceCounter(&now);
+	QueryPerformanceFrequency(&frequency);
+	// Near the fault: a partial unmap elsewhere in the same view matters too.
+	const auto lo = page >= 0x400000 ? page - 0x400000 : 0;
+	const auto hi = page + 0x400000;
+	PrintMapHistory(g_map_history, "map history near the fault", lo, hi, page, 48, now.QuadPart,
+	                frequency.QuadPart);
+	if (range_hi != 0 && (range_lo < lo || range_hi > hi)) {
+		PrintMapHistory(g_map_history, "map history in the guest range", range_lo, range_hi, page,
+		                24, now.QuadPart, frequency.QuadPart);
+	}
+	PrintMapHistory(g_map_history, "latest map history", 0, 0, page, 16, now.QuadPart,
+	                frequency.QuadPart);
+	PrintMapHistory(g_protect_history, "protect history near the fault", lo, hi, page, 24,
+	                now.QuadPart, frequency.QuadPart);
+	std::fflush(stdout);
 }
 
 bool IsBackingReadable(uint64_t vaddr, uint64_t size) {
@@ -2912,6 +3083,7 @@ static int UnmapMemory(uint64_t vaddr, size_t len) {
 
 int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 	PRINT_NAME();
+	TraceMap("guest-munmap", vaddr, len, 0, true);
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 	return UnmapMemory(vaddr, len);
 }
@@ -3318,6 +3490,8 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 
 	bool fixed        = ((flags & GUEST_MAP_FIXED) != 0);
 	bool no_overwrite = ((flags & GUEST_MAP_NO_OVERWRITE) != 0);
+	TraceMap(fixed ? "guest-mapdirect-fix" : "guest-mapdirect", reinterpret_cast<uint64_t>(*addr),
+	         len, static_cast<uint64_t>(direct_memory_start), true);
 
 	VirtualMemory::Mode mode     = VirtualMemory::Mode::NoAccess;
 	GpuAccessMode       gpu_mode = GpuAccessMode::NoAccess;

@@ -12,6 +12,8 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/gpuProfiler.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -669,6 +671,44 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
+#if defined(_WIN32)
+		if (Libs::Graphics::GpuProfiler::Enabled() && info->native_context != nullptr) {
+			// Attribute tracked-page faults to the emulator code that touched guest memory.
+			const bool gpu_thread = Libs::Graphics::GuestGpu::IsGpuThread();
+			static const auto image_base =
+			    reinterpret_cast<uint64_t>(GetModuleHandleA(nullptr));
+			CONTEXT context = *static_cast<CONTEXT*>(info->native_context);
+			static const char* const gpu_tags[] = {"gpu-thread fault frame 0",
+			                                       "gpu-thread fault frame 1",
+			                                       "gpu-thread fault frame 2",
+			                                       "gpu-thread fault frame 3",
+			                                       "gpu-thread fault frame 4"};
+			static const char* const other_tags[] = {"other-thread fault frame 0",
+			                                         "other-thread fault frame 1",
+			                                         "other-thread fault frame 2",
+			                                         "other-thread fault frame 3",
+			                                         "other-thread fault frame 4"};
+			for (int frame = 0; frame < 5; frame++) {
+				const auto rip = static_cast<uint64_t>(context.Rip);
+				Libs::Graphics::GpuProfiler::AddAddress(
+				    gpu_thread ? gpu_tags[frame] : other_tags[frame],
+				    rip >= image_base && rip < image_base + 0x10000000 ? rip - image_base
+				                                                      : rip | (1ull << 63u));
+				DWORD64 image = 0;
+				auto*   entry = RtlLookupFunctionEntry(context.Rip, &image, nullptr);
+				if (entry == nullptr) {
+					break;
+				}
+				void*   handler_data = nullptr;
+				DWORD64 frame_base   = 0;
+				RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, context.Rip, entry, &context,
+				                 &handler_data, &frame_base, nullptr);
+				if (context.Rip == 0) {
+					break;
+				}
+			}
+		}
+#endif
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			return true;
 		}
@@ -704,12 +744,89 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			std::printf("\n");
 		}
 		if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
+			int        count = 32;
 			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
+			while (count < 256 && IsReadableRange(info->rsp, (count + 32) * sizeof(uint64_t))) {
+				count += 32;
+			}
 			std::printf("stack:");
-			for (int i = 0; i < 32; i++) {
+			for (int i = 0; i < count; i++) {
 				std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
 			}
 			std::printf("\n");
+		}
+		// The memory registers point at often holds the corrupted state (structs, buffers).
+		const std::pair<const char*, uint64_t> registers[] = {
+		    {"rax", info->rax}, {"rbx", info->rbx}, {"rcx", info->rcx}, {"rdx", info->rdx},
+		    {"rsi", info->rsi}, {"rdi", info->rdi}, {"rbp", info->rbp}, {"r8", info->r8},
+		    {"r9", info->r9},   {"r10", info->r10}, {"r11", info->r11}, {"r12", info->r12},
+		    {"r13", info->r13}, {"r14", info->r14}, {"r15", info->r15}};
+		for (const auto& [name, value]: registers) {
+			constexpr int Bytes = 0x100;
+			if (value < 0x10000u || !IsReadableRange(value, Bytes)) {
+				continue;
+			}
+			const auto* bytes = reinterpret_cast<const uint64_t*>(value);
+			std::printf("[%s] %016" PRIx64 ":", name, value);
+			for (int i = 0; i < Bytes / 8; i++) {
+				std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", bytes[i]);
+			}
+			std::printf("\n");
+		}
+		const auto dump = [](const char* label, uint64_t address, uint64_t size) {
+			size = std::min<uint64_t>(size, 0x10000u) & ~uint64_t {7};
+			if (address < 0x10000u || size == 0 || !IsReadableRange(address, size)) {
+				return false;
+			}
+			const auto* words = reinterpret_cast<const uint64_t*>(address);
+			std::printf("[%s] %016" PRIx64 " (+0x%" PRIx64 "):", label, address, size);
+			for (uint64_t i = 0; i < size / 8; i++) {
+				if (i % 4 == 0) {
+					std::printf("\n  +%04" PRIx64 ":", i * 8);
+				}
+				std::printf(" %016" PRIx64, words[i]);
+			}
+			std::printf("\n");
+			return true;
+		};
+		// Memory that stack words point at: callers' structs (jobs, streams, queues).
+		if (IsReadableRange(info->rsp, 64 * sizeof(uint64_t))) {
+			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
+			std::vector<uint64_t> seen;
+			for (int i = 0; i < 256 && seen.size() < 32 &&
+			                IsReadableRange(info->rsp + i * 8u, sizeof(uint64_t));
+			     i++) {
+				const auto value = stack[i] & ~uint64_t {7};
+				if (std::ranges::find(seen, value) != seen.end()) {
+					continue;
+				}
+				char label[32];
+				std::snprintf(label, sizeof(label), "stack+0x%x", i * 8);
+				if (dump(label, value, 0xc0)) {
+					seen.push_back(value);
+				}
+			}
+		}
+		if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+			Libs::LibKernel::Memory::DescribeFaultAddress(info->access_violation_vaddr);
+		}
+		// KYTY_FAULT_DUMP=addr:size[,addr:size...] (hex) adds fixed regions, such as a game's
+		// global subsystem objects.
+		if (const char* extra = std::getenv("KYTY_FAULT_DUMP"); extra != nullptr) {
+			const char* p = extra;
+			while (*p != 0) {
+				char*      end     = nullptr;
+				const auto address = std::strtoull(p, &end, 16);
+				uint64_t   size    = 0x100;
+				if (end != nullptr && *end == ':') {
+					size = std::strtoull(end + 1, &end, 16);
+				}
+				(void)dump("KYTY_FAULT_DUMP", address, size);
+				if (end == nullptr || end == p) {
+					break;
+				}
+				p = *end == ',' ? end + 1 : end;
+			}
 		}
 		std::fflush(stdout);
 	}

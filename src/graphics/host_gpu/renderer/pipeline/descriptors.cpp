@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/expSwitch.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -10,6 +11,9 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/host_gpu/renderer/cache/cacheStats.h"
+#include "graphics/host_gpu/renderer/execHelpers.h"
+#include "graphics/host_gpu/gpuProfiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -19,7 +23,6 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
-#include "graphics/host_gpu/renderer/execHelpers.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -158,6 +161,22 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
 	if (resource.written) {
+		CacheStats::t_invalidate_source = CacheStats::ImagesMarkedStorage;
+		if (CacheStats::g_enabled) {
+			CacheStats::g_storage_written.Add(address, size);
+		}
+		static const bool stats = std::getenv("KYTY_CACHE_STATS") != nullptr;
+		if (stats && context.GetTextureCache().IsRegionGpuModified(address, size)) {
+			CacheStats::Add(resource.read ? CacheStats::StorageRmwOverGpuImage
+			                              : CacheStats::StorageWriteOverGpuImage);
+			static uint32_t logged = 0;
+			if (logged++ < 20) {
+				std::printf("CacheStats storage write over GPU image addr=0x%016" PRIx64
+				            " size=0x%" PRIx64 " read=%d formatted=%d atomic=%d\n",
+				            address, size, resource.read,
+				            resource.formatted, resource.atomic);
+			}
+		}
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
 	}
 	return result;
@@ -795,6 +814,12 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                          : texture_cache.FindImage(desc, shader_conversion);
 	if (!id) {
 		// Only speculative lookups decline: the table binds this element as a null image.
+		static std::atomic_uint reported = 0;
+		if (reported.fetch_add(1) < 8u) {
+			std::printf("bindless table texture 0x%016" PRIx64 " format=%u aliases a depth "
+			            "image; bound as null\n",
+			            desc.info.data.address, static_cast<uint32_t>(desc.info.guest_format));
+		}
 		return {id, nullptr, std::move(desc)};
 	}
 	auto*      image               = &texture_cache.GetImage(id);
@@ -1006,6 +1031,8 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 	auto& command_buffer = context.GetCommandScheduler().Current();
 	EXIT_IF(command_buffer.IsInvalid());
 	auto&      cache  = context.GetBufferCache();
+	GpuProfiler::AddCount("native upload");
+	GpuProfiler::AddCount("native upload bytes", data.size_bytes());
 	const auto offset = cache.StreamUpload(data.data(), data.size_bytes(), 256);
 	auto&      buffer = cache.GetUtilityBuffer(MemoryUsage::Stream);
 	return {buffer.Handle(), offset, data.size_bytes()};
@@ -1264,6 +1291,7 @@ void RenderExecutor::FinishTableBindings(TableBindingState& state,
 	if (state.generation != m_table_generation ||
 	    state.elements.size() != m_table_image_infos.size() ||
 	    state.values.size() != prepared.table_slots.size()) {
+		GpuProfiler::AddCount(state.generation != m_table_generation ? "tbl finish: generation" : "tbl finish: sizes");
 		UnpinTableBindings(state);
 		return;
 	}
@@ -1303,7 +1331,16 @@ bool RenderExecutor::ReuseTableBindings(const ShaderRecompiler::IR::CompiledShad
                                         const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
                                         TableBindingState& state, uint64_t stamp,
                                         PreparedBindings& prepared) {
+	// Debug (A/B): KYTY_TABLE_REUSE=0 resolves the tables slot by slot every time.
+	static const bool reuse_enabled = [] {
+		const char* value = std::getenv("KYTY_TABLE_REUSE");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!reuse_enabled) {
+		return false;
+	}
 	if (!state.valid || state.generation != m_table_generation) {
+		GpuProfiler::AddCount(!state.valid ? "tbl no: invalid" : "tbl no: generation");
 		return false;
 	}
 	// The same tables with the same T# in every slot.
@@ -1381,12 +1418,12 @@ void RenderExecutor::RebindReusedTables(PreparedBindings& prepared) {
 	};
 	// The elements PrepareBindings() marked, and those whose image is no longer bound as the
 	// state records: removed, replaced, dirty, with another view or in another layout.
+	// The check only reads the elements and their images: the helper threads take part.
 	const auto unchanged = [&](uint32_t index) {
 		const auto& element = state.elements[index];
 		const auto& texture = element.resolution->texture;
 		const auto& view    = element.resolution->view;
 		const auto* image   = texture_cache.m_slot_images.try_get(texture.image_id);
-		// Null images are acquired again every time (their view stays the same).
 		return image != nullptr && !image->binding.needs_rebind &&
 		       texture.image_id == element.pinned && texture.image_view != nullptr &&
 		       texture.image_view == state.infos[index].imageView &&
@@ -1396,21 +1433,59 @@ void RenderExecutor::RebindReusedTables(PreparedBindings& prepared) {
 		         ImageLookupState::Of(texture.image_id, *image) == view.state)) &&
 		       TableImageReady(*image, texture);
 	};
-	// The check only reads the elements and their images (thousands, scattered in memory):
-	// helper threads take part, each flagging the elements of its chunks.
 	const auto element_count = static_cast<uint32_t>(state.elements.size());
-	m_table_flags.assign(element_count, 0);
-	GetExecHelpers().ParallelFor(element_count, 256, [&](uint32_t begin, uint32_t end) {
-		for (uint32_t index = begin; index < end; index++) {
-			if (state.marks[index] != state.mark_stamp && !unchanged(index)) {
-				m_table_flags[index] = 1;
+	const bool parallel      = KYTY_X(TBL_PAR) && element_count >= 2048;
+	if (parallel) {
+		m_table_flags.assign(element_count, 0);
+		GetExecHelpers().ParallelFor(element_count, 256, [&](uint32_t begin, uint32_t end) {
+			for (uint32_t index = begin; index < end; index++) {
+				if (state.marks[index] != state.mark_stamp && !unchanged(index)) {
+					m_table_flags[index] = 1;
+				}
+			}
+		});
+		for (uint32_t index = 0; index < element_count; index++) {
+			if (m_table_flags[index] != 0) {
+				MarkTableElement(state, index);
 			}
 		}
-	});
-	for (uint32_t index = 0; index < element_count; index++) {
-		if (m_table_flags[index] != 0) {
-			MarkTableElement(state, index);
+	}
+	for (uint32_t index = 0; !parallel && index < state.elements.size(); index++) {
+		if (state.marks[index] == state.mark_stamp) {
+			continue;
 		}
+		const auto& element = state.elements[index];
+		const auto& texture = element.resolution->texture;
+		const auto& view    = element.resolution->view;
+		const auto* image   = texture_cache.m_slot_images.try_get(texture.image_id);
+		// Null images are acquired again every time (their view stays the same).
+		if (image != nullptr && !image->binding.needs_rebind &&
+		    texture.image_id == element.pinned && texture.image_view != nullptr &&
+		    texture.image_view == state.infos[index].imageView &&
+		    texture.layout == state.infos[index].imageLayout &&
+		    (image->info.data.Empty() ||
+		     (image->registered && view.valid &&
+		      ImageLookupState::Of(texture.image_id, *image) == view.state)) &&
+		    TableImageReady(*image, texture)) {
+			continue;
+		}
+		if (GpuProfiler::PhaseEnabled()) {
+			const char* why = image == nullptr ? "tbl visit: no image"
+			    : !image->registered ? "tbl visit: unregistered"
+			    : image->binding.needs_rebind ? "tbl visit: needs rebind"
+			    : !view.valid ? (image->info.data.Empty() ? "tbl visit: view invalid (null)" : image->IsCpuDirty() ? "tbl visit: view invalid (cpu dirty)" : "tbl visit: view invalid")
+			    : texture.image_id != element.pinned ? "tbl visit: pin"
+			    : texture.image_view != state.infos[index].imageView ? "tbl visit: view changed"
+			    : !(ImageLookupState::Of(texture.image_id, *image) == view.state) ? "tbl visit: state"
+			    : image->binding.is_bound ? "tbl visit: bound"
+			    : !image->backing.subresource_states.empty() ? "tbl visit: subresources"
+			    : texture.desc.type == TextureCache::BindingType::Storage ? "tbl visit: storage"
+			    : image->backing.state.access_mask != vk::AccessFlagBits2::eShaderRead ? "tbl visit: access"
+			    : texture.layout != image->backing.state.layout ? "tbl visit: binding layout"
+			    : "tbl visit: layout/stage";
+			GpuProfiler::AddCount(why);
+		}
+		MarkTableElement(state, index);
 	}
 	size_t visited = 0;
 	for (;;) {
@@ -1469,10 +1544,33 @@ void RenderExecutor::RebindReusedTables(PreparedBindings& prepared) {
 		}
 	}
 	prepared.table_visits = m_table_marked;
+	GpuProfiler::AddCount("tbl: visits (rebind)", m_table_marked.size());
+}
+
+void RenderExecutor::LaneROperation(uint32_t queue, uint64_t sequence,
+                                    uint64_t dependency) noexcept {
+	m_guest_queue = queue;
+	m_lane_r_ops[sequence % m_lane_r_ops.size()] = {sequence, queue};
+	auto& scheduler = m_context.GetCommandScheduler();
+	if (!scheduler.LaneRAvailable() || scheduler.LaneRValue() == 0) {
+		return;
+	}
+	// The queue's own earlier operations on the second queue come first.
+	uint64_t need = m_queue_lane_r[queue % m_queue_lane_r.size()];
+	if (dependency != 0) {
+		const auto& op = m_lane_r_ops[dependency % m_lane_r_ops.size()];
+		need = std::max(need, op.sequence == dependency ? m_queue_lane_r[op.queue % m_queue_lane_r.size()]
+		                                                : scheduler.LaneRValue());
+	}
+	if (need != 0) {
+		scheduler.WaitLaneR(need);
+	}
 }
 
 void RenderExecutor::FlushDeferredDispatchBarrier() {
-	m_dispatch_chained = false;
+	m_dispatch_chained  = false;
+	m_dispatch_unsynced = false;
+	m_deferred_queues   = 0;
 	if (!m_deferred_barrier) {
 		return;
 	}
@@ -1481,10 +1579,46 @@ void RenderExecutor::FlushDeferredDispatchBarrier() {
 	                    vk::PipelineStageFlagBits::eComputeShader);
 }
 
-void RenderExecutor::BeginGuestOperation(uint32_t queue, bool dispatch_direct, bool guest_sync) {
-	m_guest_queue = queue;
-	if (m_deferred_barrier && dispatch_direct && !guest_sync && queue == m_deferred_barrier_queue) {
+// What a dispatch's barrier before it must wait for. A dispatch of an asynchronous compute queue
+// that waited for no label is ordered after its own queue's earlier work (dispatches, whose
+// barriers after them were recorded, and the renderer's transfers) but not after the graphics
+// queue's draws: the guest's GPU runs them concurrently.
+vk::PipelineStageFlags RenderExecutor::HazardSourceStages() const {
+	if (KYTY_XO(ASYNC_NARROW) && m_guest_queue != 0 && !m_operation_after_wait) {
+		return vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer |
+		       vk::PipelineStageFlagBits::eHost;
+	}
+	return vk::PipelineStageFlagBits::eAllCommands;
+}
+
+static uint32_t GuestQueueBit(uint32_t queue) {
+	return 1u << (queue == 0 ? 0u : ((queue - 32u) / 8u + 1u) % 31u);
+}
+
+void RenderExecutor::BeginGuestOperation(uint32_t queue, bool dispatch_direct, bool guest_sync,
+                                         bool draw, bool after_wait) {
+	m_dispatch_chained     = false;
+	m_dispatch_unsynced    = false;
+	m_operation_after_wait = after_wait;
+	if (!m_deferred_barrier) {
+		return;
+	}
+	const bool pending_here = (m_deferred_queues & GuestQueueBit(queue)) != 0 ||
+	                          (!KYTY_XO(QUEUE_OVERLAP) && queue == m_deferred_barrier_queue);
+	if (!guest_sync && dispatch_direct && pending_here) {
 		m_dispatch_chained = true;
+		return;
+	}
+	// Queues the guest did not synchronize run concurrently on its GPU: a draw, or a direct
+	// dispatch of another queue, need not wait for the deferred dispatches. Only a wait for a
+	// label orders queues; an ACQUIRE_MEM orders its own queue's work.
+	if (KYTY_XO(QUEUE_OVERLAP) && !after_wait && !pending_here && (draw || dispatch_direct) &&
+	    queue != m_deferred_barrier_queue) {
+		if (dispatch_direct) {
+			m_dispatch_chained  = true;
+			m_dispatch_unsynced = true;
+		}
+		GpuProfiler::AddCount(draw ? "overlap: draws" : "overlap: dispatches");
 		return;
 	}
 	FlushDeferredDispatchBarrier();
@@ -1594,6 +1728,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		prepared.table_state  = table_state;
 		prepared.tables_reused =
 		    ReuseTableBindings(program, snapshot, *table_state, stamp, prepared);
+		GpuProfiler::AddCount(prepared.tables_reused ? "tbl: reused" : "tbl: resolved");
+		GpuProfiler::AddCount("tbl: visits (prepare)", prepared.table_visits.size());
 		if (!prepared.tables_reused) {
 			// Resolved slot by slot below; the state records what this binding finds.
 			UnpinTableBindings(*table_state);
@@ -1717,7 +1853,9 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages, bool
 					size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
 				}
 			}
+			GpuProfiler::PhaseMark("gb: clamp");
 			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+			GpuProfiler::PhaseMark("gb: find buffers");
 			// Without device-address reads, ObtainBuffer() finds the buffer when it needs one
 			// (draws stream most small buffers from CPU-dirty pages without it).
 			source = {address, size, find_buffers ? cache.FindBuffer(address, size) : NULL_BUFFER_ID};
@@ -1812,6 +1950,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
 		image.usage.storage |= storage;
 		if (binding.lookup != nullptr && !binding.reused) {
+			GpuProfiler::AddCount("tex memo: recorded");
 			auto& found           = binding.lookup->found;
 			found.id              = binding.image_id;
 			found.desc            = binding.desc;
@@ -1865,12 +2004,12 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	bool                                     dma_write = false;
 	std::array<const ShaderStageRuntime*, 4> dma_stages {};
 	uint32_t                                 dma_stage_count = 0;
-	// Operations with device-address reads need their buffers before the BDA synchronization.
-	FindBuffers(stages, std::ranges::any_of(stages, [](const auto* stage) {
-		            return stage->runtime->program->info.uses_dma;
-	            }));
+	FindBuffers(stages, !KYTY_XT(RP_B6) || std::ranges::any_of(stages, [](const auto* stage) {
+		                    return stage->runtime->program->info.uses_dma;
+	                    }));
 	for (auto* stage: stages) {
 		if (stage->runtime->program->info.uses_dma) {
+			GpuProfiler::PhaseMark("gb: dma bases");
 			m_context.CacheDmaBases(*stage->runtime);
 			dma_write |= stage->runtime->program->has_address_writes;
 			EXIT_IF(dma_stage_count == dma_stages.size());
@@ -1878,14 +2017,19 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		}
 	}
 	if (dma_stage_count != 0) {
+		GpuProfiler::PhaseMark("gb: bda");
 		// Only operations whose device-address reach is unknown upload all cached memory.
 		const bool reach_synchronized =
+		    DmaFootprintEnabled() &&
 		    m_context.SynchronizeDmaFootprint(std::span {dma_stages.data(), dma_stage_count});
+		GpuProfiler::AddCount(reach_synchronized ? "dma: footprint" : "dma: full sync");
 		m_context.PrepareBda(dma_write, !reach_synchronized);
 	}
+	GpuProfiler::PhaseMark("gb: stale images");
 	for (auto* stage: stages) {
 		RebindImages(*stage);
 	}
+	GpuProfiler::PhaseMark("gb: acquire views");
 	auto& cache = m_context.GetTextureCache();
 	for (auto& target: colors) {
 		EXIT_IF(!target.image_id);
@@ -1904,11 +2048,13 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 			BindRenderTarget(target.image_id);
 		}
 	}
+	GpuProfiler::PhaseMark("gb: rebind buffers");
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
 	// after image identities are final; attachment layout transitions follow buffer alias copies.
 	for (auto* stage: stages) {
 		RebindBuffers(*stage);
 	}
+	GpuProfiler::PhaseMark("draw: graphics bindings");
 }
 
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
@@ -1916,6 +2062,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
+	// Debug: split of the commit; the caller's phase resumes at the end.
+	const char* resume_phase = GpuProfiler::PhaseEnabled() ? GpuProfiler::CurrentPhase() : nullptr;
+	GpuProfiler::PhaseMark("cmt: checks");
 	auto   vk_buffer        = buffer.Handle();
 	size_t image_descriptor_count = 0;
 	size_t write_count      = 0;
@@ -2000,7 +2149,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 		for (size_t read = 0; read < reads.size(); ++read) {
 			const auto [address, size] = reads[read];
-			if (address >= written_end || address + size <= written_first) {
+			if (KYTY_XT(RP_B6) && (address >= written_end || address + size <= written_first)) {
 				continue;
 			}
 			for (const auto& [written_address, written_size]: m_written_image_ranges) {
@@ -2021,6 +2170,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 		}
 	}
+	GpuProfiler::PhaseMark("cmt: transit");
 	m_descriptor_images.resize(image_descriptor_count);
 	m_descriptor_writes.clear();
 	m_descriptor_writes.reserve(write_count);
@@ -2100,7 +2250,14 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				transit(table_state->elements[index].resolution->texture);
 			}
 		}
+		if (m_lane_r_begin_pending) {
+			// Everything recorded so far (uploads, transitions) runs on the first queue first.
+			m_lane_r_begin_pending = false;
+			m_lane_r_tick          = m_context.GetCommandScheduler().BeginLaneR();
+			m_in_lane_r            = true;
+		}
 
+		GpuProfiler::PhaseMark("cmt: writes");
 		std::array<size_t, ShaderRecompiler::IR::ImageBindingCount> image_starts {};
 		for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
 			const auto index = std::countr_zero(mask);
@@ -2229,11 +2386,38 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 	}
 
+	GpuProfiler::PhaseMark("cmt: push");
 	if (has_push_data) {
 		vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages, 0, sizeof(push_data),
 		                        push_data.dwords.data());
 	}
 
+	if (GpuProfiler::PhaseEnabled() && !m_descriptor_writes.empty()) {
+		// Debug (rain-perf): how often a draw pushes the same descriptors as the one before.
+		uint64_t h = reinterpret_cast<uint64_t>(static_cast<VkPipelineLayout>(pipeline.pipeline_layout));
+		const auto mix = [&](const void* data, size_t bytes) {
+			const auto* b = static_cast<const uint8_t*>(data);
+			for (size_t i = 0; i < bytes; i++) h = (h ^ b[i]) * 0x100000001b3ull;
+		};
+		for (const auto& w: m_descriptor_writes) {
+			mix(&w.dstBinding, sizeof(w.dstBinding));
+			mix(&w.descriptorCount, sizeof(w.descriptorCount));
+		}
+		mix(m_descriptor_images.data(), m_descriptor_images.size() * sizeof(m_descriptor_images[0]));
+		static uint64_t last_h = 0;
+		static uint64_t last_bufless = 0;
+		uint64_t        hb     = reinterpret_cast<uint64_t>(static_cast<VkPipelineLayout>(pipeline.pipeline_layout));
+		{
+			const auto* b = reinterpret_cast<const uint8_t*>(m_descriptor_images.data());
+			for (size_t i = 0; i < m_descriptor_images.size() * sizeof(m_descriptor_images[0]); i++)
+				hb = (hb ^ b[i]) * 0x100000001b3ull;
+		}
+		GpuProfiler::AddCount(h == last_h ? "dup: same descriptors" : "dup: new descriptors");
+		GpuProfiler::AddCount(hb == last_bufless ? "dup: same images" : "dup: new images");
+		GpuProfiler::AddCount("dup: image infos", m_descriptor_images.size());
+		last_h       = h;
+		last_bufless = hb;
+	}
 	if (!m_descriptor_writes.empty()) {
 		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
 		if (pipeline.uses_push_descriptors) {
@@ -2251,6 +2435,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
 			                             0, nullptr);
 		}
+	}
+	if (resume_phase != nullptr) {
+		GpuProfiler::PhaseMark(resume_phase);
 	}
 }
 
