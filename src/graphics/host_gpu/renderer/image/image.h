@@ -196,6 +196,9 @@ public:
 	uint64_t         dcc_clear_checked_tick  = UINT64_MAX;
 	uint32_t         dcc_clear_checked_first = 0;
 	uint32_t         dcc_clear_checked_count = 0;
+	// The LRU clock value of the image's last LRU touch (as in the texture cache's LRU list,
+	// without loading its entry).
+	uint64_t         lru_tick           = 0;
 
 private:
 	friend struct ImageTestAccess;

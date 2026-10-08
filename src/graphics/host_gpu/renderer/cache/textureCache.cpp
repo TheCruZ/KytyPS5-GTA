@@ -345,7 +345,8 @@ void TextureCache::RegisterImage(ImageId id) {
 	});
 	image.registered = true;
 	NoteBindlessStateChange(image);
-	image.lru_id     = m_lru_cache.Insert(id, LruClock());
+	image.lru_tick   = LruClock();
+	image.lru_id     = m_lru_cache.Insert(id, image.lru_tick);
 	m_total_used_memory += image.AccountedSize();
 }
 
@@ -566,9 +567,17 @@ void TextureCache::UnpinImage(ImageId id) {
 }
 
 void TextureCache::TouchImage(Image& image) {
-	image.frame_accessed_last = m_graphics.presented_frames.load(std::memory_order_relaxed);
+	// One load of the frame counter for both uses (LruClock() adds the garbage-collection ticks).
+	const auto frames = m_graphics.presented_frames.load(std::memory_order_relaxed);
+	if (image.frame_accessed_last != frames) {
+		image.frame_accessed_last = frames;
+	}
+	// Draws touch the same images many times per clock value: only the first touch moves the entry.
 	if (image.registered) {
-		m_lru_cache.Touch(image.lru_id, LruClock());
+		if (const auto clock = frames + m_gc_tick / 512; image.lru_tick < clock) {
+			image.lru_tick = clock;
+			m_lru_cache.Touch(image.lru_id, clock);
+		}
 	}
 }
 
