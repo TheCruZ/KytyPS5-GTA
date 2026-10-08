@@ -282,7 +282,7 @@ public:
 			current += bytes;
 		}
 
-		RememberMapping(first->second, end);
+		RememberMapping(first->second, vaddr, end);
 		current = vaddr;
 		for (auto mapping = first; current < end; ++mapping) {
 			const auto& entry  = mapping->second;
@@ -332,7 +332,7 @@ public:
 			current += bytes;
 		}
 
-		RememberMapping(first->second, end);
+		RememberMapping(first->second, vaddr, end);
 		current = vaddr;
 		for (auto mapping = first; current < end; ++mapping) {
 			const auto& entry  = mapping->second;
@@ -366,7 +366,7 @@ public:
 		    !RangeOk(entry.backing_offset + vaddr - entry.vaddr, size)) {
 			return nullptr;
 		}
-		RememberMapping(entry, end);
+		RememberMapping(entry, vaddr, end);
 		return m_backing_base + entry.backing_offset + (vaddr - entry.vaddr);
 	}
 
@@ -685,12 +685,22 @@ private:
 		}
 	}
 #endif
+	// The mapping of each 64 KB of guest addresses that a transfer started in, direct mapped:
+	// GPU threads stream thousands of small buffers per frame from rings spread over more
+	// mappings than the round-robin entries hold.
+	static constexpr uint32_t SlotBits  = 16;
+	static constexpr size_t   SlotCount = 1024;
 	struct LookupCache {
-		const GuestBackingStore* owner      = nullptr;
-		uint64_t                 generation = 0;
-		uint32_t                 next       = 0;
-		std::array<MapEntry, 4>  entries {};
+		const GuestBackingStore*         owner      = nullptr;
+		uint64_t                         generation = 0;
+		uint32_t                         next       = 0;
+		std::array<MapEntry, 4>          entries {};
+		std::array<MapEntry, SlotCount>  slots {};
 	};
+
+	[[nodiscard]] static size_t SlotOf(uint64_t vaddr) noexcept {
+		return static_cast<size_t>(vaddr >> SlotBits) % SlotCount;
+	}
 
 	static LookupCache& ThreadLookupCache() noexcept {
 		thread_local LookupCache cache;
@@ -719,7 +729,13 @@ private:
 		    cached.generation != s_maps_generation.load(std::memory_order_acquire)) {
 			return false;
 		}
-		const auto end = vaddr + size;
+		const auto end  = vaddr + size;
+		const auto& slot = cached.slots[SlotOf(vaddr)];
+		if (vaddr >= slot.vaddr && end <= slot.vaddr + slot.size && slot.size != 0) {
+			transfer(m_backing_base + slot.backing_offset + (vaddr - slot.vaddr),
+			         static_cast<size_t>(size));
+			return true;
+		}
 		for (const auto& entry: cached.entries) {
 			if (vaddr >= entry.vaddr && end <= entry.vaddr + entry.size) {
 				transfer(m_backing_base + entry.backing_offset + (vaddr - entry.vaddr),
@@ -732,16 +748,21 @@ private:
 
 	// Called under m_mutex (shared or exclusive) after a lookup: remembers a mapping that holds
 	// the whole transfer [entry.vaddr <= vaddr, end].
-	void RememberMapping(const MapEntry& entry, uint64_t end) {
+	void RememberMapping(const MapEntry& entry, uint64_t vaddr, uint64_t end) {
 		if (end > entry.vaddr + entry.size || !RangeOk(entry.backing_offset, entry.size)) {
 			return;
 		}
 		auto&      cached     = ThreadLookupCache();
 		const auto generation = s_maps_generation.load(std::memory_order_relaxed);
 		if (cached.owner != this || cached.generation != generation) {
-			cached = {this, generation};
+			cached.owner      = this;
+			cached.generation = generation;
+			cached.next       = 0;
+			cached.entries.fill({});
+			cached.slots.fill({});
 		}
 		cached.entries[cached.next++ % cached.entries.size()] = entry;
+		cached.slots[SlotOf(vaddr)]                           = entry;
 	}
 
 	bool FindContainingUnlocked(uint64_t vaddr, uint64_t size, MapEntry* out) const {
