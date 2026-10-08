@@ -1991,19 +1991,19 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
 		         shader_stage != vk::ShaderStageFlagBits::eCompute));
 	}
-	// The image and attachment ranges the draw writes, collected once for the scalar read checks
-	// below (most bound images are only sampled).
-	bool written_images_collected = false;
+	// The image, attachment and buffer ranges the draw writes, collected once for the scalar read
+	// checks below (most bound images are only sampled, and draws rarely write buffers).
+	bool written_ranges_collected = false;
 	for (const auto* reader: prepared_bindings) {
 		const auto& reads = reader->runtime->resources->specialization_reads;
 		if (reads.empty()) continue;
-		for (const auto* writer: prepared_bindings) {
-			if (writer->runtime->module->info.has_address_writes) {
-				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
+		if (!written_ranges_collected) {
+			written_ranges_collected = true;
+			for (const auto* writer: prepared_bindings) {
+				if (writer->runtime->module->info.has_address_writes) {
+					EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
+				}
 			}
-		}
-		if (!written_images_collected) {
-			written_images_collected = true;
 			m_written_image_ranges.clear();
 			for (const auto id: m_bound_images) {
 				const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
@@ -2016,14 +2016,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					}
 				}
 			}
-		}
-		for (size_t read = 0; read < reads.size(); ++read) {
-			const auto [address, size] = reads[read];
-			for (const auto& [written_address, written_size]: m_written_image_ranges) {
-				if (ImageRangeOverlaps(address, size, written_address, written_size)) {
-					EXIT("scalar resource reads overlap an image or attachment write\n");
-				}
-			}
+			m_written_buffer_ranges.clear();
 			for (const auto* writer: prepared_bindings) {
 				const auto& program = writer->runtime->module->info;
 				for (uint32_t index = 0; index < program.info.buffers.size(); ++index) {
@@ -2034,15 +2027,29 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					const bool linear = (resource.packed_stride & ((1u << 14u) | (1u << 20u))) == 0u;
 					const auto written_size =
 					    linear ? std::min<uint64_t>(written.size, resource.write_extent) : written.size;
-					// A flattened scalar load issued before the shader's own writes to the
-					// buffer may observe its dispatch-time snapshot on hardware.
-					if (written_size != 0 &&
-					    ImageRangeOverlaps(address, size, written.address, written_size) &&
-					    (writer != reader ||
-					     ShaderRecompiler::IR::SpecializationReadFollowsBufferWrite(
-					         program, *reader->runtime->resources, read, index))) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
+					if (written_size != 0) {
+						m_written_buffer_ranges.push_back(
+						    {written.address, written_size, writer, index});
 					}
+				}
+			}
+		}
+		for (size_t read = 0; read < reads.size(); ++read) {
+			const auto [address, size] = reads[read];
+			for (const auto& [written_address, written_size]: m_written_image_ranges) {
+				if (ImageRangeOverlaps(address, size, written_address, written_size)) {
+					EXIT("scalar resource reads overlap an image or attachment write\n");
+				}
+			}
+			for (const auto& written: m_written_buffer_ranges) {
+				// A flattened scalar load issued before the shader's own writes to the buffer may
+				// observe its dispatch-time snapshot on hardware.
+				if (ImageRangeOverlaps(address, size, written.address, written.size) &&
+				    (written.writer != reader ||
+				     ShaderRecompiler::IR::SpecializationReadFollowsBufferWrite(
+				         reader->runtime->module->info, *reader->runtime->resources, read,
+				         written.resource))) {
+					EXIT("scalar resource reads overlap a shader buffer write\n");
 				}
 			}
 		}
