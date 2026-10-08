@@ -406,7 +406,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const bool indirect_writes = PrepareIndirectWriteTargets(m_context, bindings);
 	if (program.info.uses_dma) {
 		m_context.CacheDmaBases(input_info.stage);
-		m_context.PrepareBda(MayWriteThroughDeviceAddresses(program));
+		const ShaderStageRuntime* const dma_stage = &input_info.stage;
+		const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
+		m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), !reach_synchronized);
 		if (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0) {
 			// Its results are often read back soon: submit it at once (see CommitWriteTicks()).
 			m_context.GetBufferCache().RequestFlushForReadbacks();
@@ -636,7 +638,9 @@ void RenderExecutor::DispatchIndirectThreads(uint64_t submit_id, CommandBuffer& 
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	if (program.info.uses_dma) {
 		m_context.CacheDmaBases(input_info.stage);
-		m_context.PrepareBda(MayWriteThroughDeviceAddresses(program));
+		const ShaderStageRuntime* const dma_stage = &input_info.stage;
+		const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
+		m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), !reach_synchronized);
 		if (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0) {
 			// Its results are often read back soon: submit it at once (see CommitWriteTicks()).
 			m_context.GetBufferCache().RequestFlushForReadbacks();
@@ -780,7 +784,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	const bool indirect_writes = PrepareIndirectWriteTargets(m_context, bindings);
 	if (program.info.uses_dma) {
 		m_context.CacheDmaBases(input_info.stage);
-		m_context.PrepareBda(MayWriteThroughDeviceAddresses(program));
+		const ShaderStageRuntime* const dma_stage = &input_info.stage;
+		const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
+		m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), !reach_synchronized);
 		if (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0) {
 			// Its results are often read back soon: submit it at once (see CommitWriteTicks()).
 			m_context.GetBufferCache().RequestFlushForReadbacks();
