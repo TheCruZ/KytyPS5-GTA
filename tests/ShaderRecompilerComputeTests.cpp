@@ -564,6 +564,11 @@ struct RenderExecutorTestAccess {
     executor.ResolveRenderColorTarget(buffer, color, 0, slot);
   }
 
+  static bool ResolveColorTargets(RenderExecutor &executor,
+                                  CommandBuffer &buffer) {
+    return executor.ResolveColorTargets(buffer, 0);
+  }
+
   static void BindRenderTarget(RenderExecutor &executor, ImageId id) {
     executor.BindRenderTarget(id);
   }
@@ -11489,14 +11494,39 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
-  void CheckColorResolvePlacedTarget() {
-    constexpr const char *name = "ColorResolvePlacedTarget";
+  // GTA V renders its reflection cube one face at a time into a 4x MSAA target
+  // and resolves each face by pointing CB_COLOR1 at that face's slice of the
+  // cube (a single-slice view at base + face * slice size). The texture cache
+  // finds the cube for that address and moves the view to the face; the resolve
+  // must write that layer, not the register view's slice 0.
+  void CheckRenderExecutorResolveIntoArrayLayer() {
+    constexpr const char *name = "RenderExecutorResolveIntoArrayLayer";
     constexpr uintptr_t base = 0x0000000209000000ull;
-    constexpr uint64_t destination = base + 0x100000;
-    constexpr uint32_t extent = 256;
+    constexpr uint32_t width = 128;
+    constexpr uint32_t height = 128;
+    constexpr uint32_t bytes_per_element = 4;
+    constexpr uint32_t layers = 6;
+    constexpr uint32_t face = 3;
     constexpr uint64_t allocation_alignment = 0x10000;
-    constexpr uint64_t allocation_size = 0x200000;
     EnsureRuntimeContext();
+
+    const auto pitch = TileGetRenderTargetPitch(width, bytes_per_element, 0);
+    const auto ms_pitch = TileGetRenderTargetPitch(width, bytes_per_element, 1);
+    TileSizeAlign layout{};
+    TileSizeAlign ms_layout{};
+    Require(name, "tile layout",
+            pitch != 0 && ms_pitch != 0 &&
+                TileGetRenderTargetSize(width, height, pitch, bytes_per_element,
+                                        layout, 0) &&
+                TileGetRenderTargetSize(width, height, ms_pitch,
+                                        bytes_per_element, ms_layout, 1) &&
+                layout.size == allocation_alignment && ms_layout.size != 0,
+            "render-target layouts are unavailable");
+    const uint64_t slice_size = layout.size;
+    const uint64_t source_offset = slice_size * layers;
+    const uint64_t allocation_size =
+        source_offset + ((ms_layout.size + allocation_alignment - 1) &
+                         ~(allocation_alignment - 1));
 
     int64_t direct_offset = -1;
     Require(name, "direct allocation",
@@ -11511,68 +11541,88 @@ public:
                 allocation_alignment) == 0 &&
                 mapped == reinterpret_cast<void *>(base),
             "resolve fixed mapping failed");
+    std::memset(mapped, 0, allocation_size);
 
-    for (const bool mip : {false, true}) {
-      std::memset(mapped, 0, allocation_size);
+    {
       RenderContext context(m_runtime_context);
       auto &scheduler = context.GetCommandScheduler();
       HW::Context registers{};
       HW::UserConfig user_config{};
       HW::Shader shaders{};
-      const auto set_target = [&](uint32_t slot, uint64_t address, uint32_t side,
-                                  uint32_t layers, uint32_t levels) {
-        registers.SetColorBase(slot, {.addr = address});
-        registers.SetColorInfo(slot, {.format = Prospero::ChannelLayout::k8_8_8_8,
-                                      .channel_type = Prospero::ChannelType::kUNorm,
-                                      .channel_order = Prospero::ChannelOrder::kStandard});
-        registers.SetColorView(slot, {.last_array_slice_index = layers - 1});
-        registers.SetColorAttrib2(slot, {.height = side - 1, .width = side - 1,
-                                         .num_mip_levels = levels - 1});
-        registers.SetColorAttrib3(slot, {.tile_mode = Prospero::TileMode::kRenderTarget,
-                                         .dimension = 1,
-                                         .metadata_pipe_aligned = true});
-      };
-      set_target(1, destination, extent, mip ? 1 : 2, mip ? 2 : 1);
-      registers.SetRenderTargetMask(0xff);
+      const HW::ColorInfo color_info{
+          .format = Prospero::ChannelLayout::k8_8_8_8,
+          .channel_type = Prospero::ChannelType::kUNorm,
+          .channel_order = Prospero::ChannelOrder::kStandard};
+      const HW::ColorAttrib3 color_attrib3{
+          .tile_mode = Prospero::TileMode::kRenderTarget,
+          .dimension = 1,
+          .metadata_pipe_aligned = true};
+      // The whole array first, as a layered target: the cube the faces resolve
+      // into.
+      registers.SetColorBase(0, {.addr = base});
+      registers.SetColorInfo(0, color_info);
+      registers.SetColorView(0, {.base_array_slice_index = 0,
+                                 .last_array_slice_index = layers - 1});
+      registers.SetColorAttrib2(0, {.height = height - 1, .width = width - 1});
+      registers.SetColorAttrib3(0, color_attrib3);
+      registers.SetRenderTargetMask(0x0f);
       scheduler.Begin(registers, user_config, shaders);
-      auto &executor = context.GetRenderExecutor();
-      context.MapMemory(base, allocation_size);
 
-      RenderColorInfo whole{};
-      RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(),
-                                                         whole, 1);
-      const auto &layout = whole.desc.info.mip_layout;
-      const auto side = mip ? extent / 2 : extent;
-      set_target(1, destination + (mip ? layout[1].offset : layout[0].size / 2), side, 1, 1);
-      set_target(0, base, side, 1, 1);
-      RenderColorInfo placed{};
-      RenderColorInfo source{};
-      RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(),
-                                                         placed, 1);
-      RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(),
-                                                         source, 0);
-      vk::ClearValue red{};
-      red.color.float32 = std::array{1.0f, 0.0f, 0.0f, 1.0f};
-      TextureCacheTestAccess::ClearImage(context.GetTextureCache(), scheduler.Current(),
-                                         source.image_id,
-                                         {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, red);
-      // Deleted Vulkan images are pooled and reused with their old contents: the subresource
-      // the resolve must leave alone starts out zero.
-      TextureCacheTestAccess::ClearImage(context.GetTextureCache(), scheduler.Current(),
-                                         whole.image_id,
-                                         {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+      auto &resources = context;
+      auto &texture_cache = resources.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      resources.MapMemory(base, allocation_size);
+
+      RenderColorInfo array_color{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(
+          executor, scheduler.Current(), array_color, 0);
+      Require(name, "layered target",
+              array_color.image_id &&
+                  texture_cache.GetImage(array_color.image_id).backing.layers ==
+                      layers,
+              "the layered target did not create a 6-layer image");
+      RenderExecutorTestAccess::ResetBindings(executor);
+
+      // Slot 0: the 2x MSAA source. Slot 1: one face, addressed by its own
+      // base.
+      registers.SetColorBase(0, {.addr = base + source_offset});
+      registers.SetColorView(0, {});
+      registers.SetColorAttrib(0, {.num_samples = 1, .num_fragments = 1});
+      registers.SetColorBase(1, {.addr = base + face * slice_size});
+      registers.SetColorInfo(1, color_info);
+      registers.SetColorView(1, {});
+      registers.SetColorAttrib2(1, {.height = height - 1, .width = width - 1});
+      registers.SetColorAttrib3(1, color_attrib3);
       registers.SetColorControl({.mode = 3});
+      registers.SetRenderTargetMask(0xff);
+      RenderColorInfo face_color{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(
+          executor, scheduler.Current(), face_color, 1);
+      Require(
+          name, "face lookup",
+          face_color.image_id == array_color.image_id &&
+              face_color.guest_array_layer == 0 &&
+              face_color.desc.view_info.base_layer == face,
+          "the face address did not resolve to its layer of the array image");
+      RenderExecutorTestAccess::ResetBindings(executor);
+
       Require(name, "resolve",
-              RenderExecutorTestAccess::ResolveColorTargets(executor, scheduler.Current()),
-              "the resolve draw was not consumed");
-      Require(name, "placed subresource",
-              ReadCachedTexel(name, context, whole.image_id, {}, {1, 1, 1}, mip ? 0 : 1,
-                              mip ? 1 : 0) == std::vector<u32>{0xff0000ffu} &&
-                  ReadCachedTexel(name, context, whole.image_id) == std::vector<u32>{0u},
-              "the resolve wrote the register level and layer, not the placed ones");
+              RenderExecutorTestAccess::ResolveColorTargets(
+                  executor, scheduler.Current()),
+              "the MSAA resolve was not executed");
+      const auto &array_image = texture_cache.GetImage(array_color.image_id);
+      const auto &states = array_image.backing.subresource_states;
+      bool only_face = states.size() == layers;
+      for (uint32_t layer = 0; only_face && layer < layers; layer++) {
+        only_face = (states[layer].layout ==
+                     vk::ImageLayout::eTransferDstOptimal) == (layer == face);
+      }
+      Require(name, "resolved layer", only_face,
+              "the resolve did not write only the addressed layer of the array "
+              "image");
 
       RenderExecutorTestAccess::ResetBindings(executor);
-      context.UnmapMemory(base, allocation_size);
+      resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
     }
 
@@ -54859,6 +54909,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorDiscovery();
     vulkan.CheckRenderExecutorColor1DArrayDiscovery();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
+    vulkan.CheckRenderExecutorResolveIntoArrayLayer();
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
@@ -55225,6 +55276,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColor1DArrayDiscovery();
     vulkan.CheckColorResolvePlacedTarget();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
+    vulkan.CheckRenderExecutorResolveIntoArrayLayer();
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
     vulkan.CheckDepthBitsCopy();
