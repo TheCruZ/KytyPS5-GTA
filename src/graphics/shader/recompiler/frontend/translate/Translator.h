@@ -114,6 +114,9 @@ private:
 	IR::U32       WidenSubdword(IR::Value value, uint32_t bits, bool sign);
 	IR::Value     NarrowSubdword(IR::U32 value, uint32_t bits);
 	void          S_LOAD(const Decoder::Instruction& inst, bool raw);
+	// What S_LOAD_DWORDX<count> from the SGPR pair `base` + `offset` loads (count <= 4), without
+	// writing registers.
+	std::array<IR::U32, 4> LoadScalarAddressDwords(uint32_t base, uint32_t offset, uint32_t count, uint32_t pc);
 	void          BUFFER_LOAD(const Decoder::Instruction& inst);
 	void          BUFFER_STORE(const Decoder::Instruction& inst);
 	void          BUFFER_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
@@ -278,6 +281,7 @@ private:
 	void EmitVector(const Decoder::Instruction& inst);
 	void EmitInterpolation(const Decoder::Instruction& inst);
 	void EmitMemory(const Decoder::Instruction& inst);
+	void EmitRayTracing(const Decoder::Instruction& inst);
 	static void FailMissingTranslation(const Decoder::Instruction& inst);
 
 	IR::Program&      program;

@@ -759,6 +759,18 @@ enum class Opcode {
 	S_CLAUSE,
 	S_ENDPGM,
 	EXP,
+	// Pseudo instructions of the native ray tracing patch (see RayTracingPatch.h); they never
+	// come from guest code.
+	RT_INIT,
+	RT_SELECT,
+	RT_REUSE,
+	RT_SETUP,
+	RT_LEAF,
+	RT_RESOLVE,
+	RT_EXIT_CHECK,
+	RT_COMMIT,
+	RT_EXIT,
+	RT_ALPHA,
 	COUNT
 };
 
@@ -881,6 +893,9 @@ struct Instruction {
 	bool           image_r128                                   = false;
 	bool           image_cube                                   = false; // DIM is CUBE.
 	uint32_t       branch_target                                = 0;
+	// The pc the instruction had in the guest code when a rewrite moved it (see
+	// RayTracingPatch); S_GETPC_B64 returns the address after it. UINT32_MAX: not moved.
+	uint32_t       guest_pc                                     = UINT32_MAX;
 	struct {
 		uint32_t target = 0;
 		uint32_t en     = 0;
@@ -927,6 +942,14 @@ struct Program {
 	std::vector<InlinedCallBody> call_bodies;
 	std::vector<LongBranch>      long_branches; // ascending pc
 	std::vector<RuntimeLiteral>  runtime_literals; // ascending pc
+	// The guest TLAS of the native ray tracing patch (see RayTracingPatch.h), when applied: the
+	// header address is the 64-bit value at user data pointer `user_sgpr` + `header_offset`.
+	struct RayTracingSource {
+		uint32_t user_sgpr     = 0;
+		uint32_t header_offset = 0;
+		uint32_t root          = 0;
+		bool     valid         = false;
+	} ray_tracing_source;
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.

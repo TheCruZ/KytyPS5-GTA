@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
+#include "graphics/shader/recompiler/frontend/decode/RayTracingPatch.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -490,6 +491,18 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 		handoff.src_count = 0;
 	} else {
 		Decoder::DecodeProgram(code, source.decoded);
+		if (options.native_ray_tracing) {
+			Decoder::RayTracingPatch patch;
+			if (Decoder::DeriveRayTracingPatch(source.decoded, patch) &&
+			    Decoder::ApplyRayTracingPatch(patch, source.decoded)) {
+				LOGF("%s native ray tracing patch: hash=0x%016" PRIx64 " sites=%" PRIu64
+				     " alpha=%" PRIu64 "\n",
+				     StageName(options.stage), options.shader_hash,
+				     static_cast<uint64_t>(patch.sites.size()),
+				     static_cast<uint64_t>(std::ranges::count_if(
+				         patch.sites, [](const auto& site) { return site.alpha.valid; })));
+			}
+		}
 	}
 	if (source.decoded.has_swap_pc) {
 		PrepareCallTargets(source, options);
@@ -587,6 +600,12 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
 	for (const auto& body: decoded.call_bodies)
 		ir.inlined_call_entries.push_back(body.begin);
+	// The TLAS of the native ray tracing patch (see NativeRayTracing::FindTlasSource()).
+	if (decoded.ray_tracing_source.valid) {
+		ir.info.ray_query_user_sgpr     = decoded.ray_tracing_source.user_sgpr;
+		ir.info.ray_query_header_offset = decoded.ray_tracing_source.header_offset;
+		ir.info.ray_query_root          = decoded.ray_tracing_source.root;
+	}
 	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     stage, options.shader_hash,

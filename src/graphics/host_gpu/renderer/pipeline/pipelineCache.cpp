@@ -14,12 +14,14 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/nativeRayTracing.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
+#include "graphics/shader/recompiler/frontend/decode/RayTracingPatch.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/shaderCompiler.h"
@@ -88,6 +90,15 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
 		case 1: return vk::PolygonMode::eLine;
 		case 2: return vk::PolygonMode::eFill;
 		default: EXIT("Pipeline: invalid polygon mode %u\n", polygon_mode);
+	}
+}
+
+// Compute programs compiled with the native ray tracing patching on (see RayTracingPatch.h: the
+// compiler patches the ones whose traversal loops it recognizes) differ from the stored software
+// ones: they get their own program keys.
+void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key) {
+	if (stage == ShaderType::Compute && NativeRayTracing::PatchShaders()) {
+		key.push_back(0x52545041u);
 	}
 }
 
@@ -901,6 +912,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	m_lookup_key.hash            = params.hash;
 	m_lookup_key.user_data_count = params.user_data_count;
 	BuildStageStaticKey(input_info, m_lookup_key.static_state);
+	AppendNativeRayTracingKey(options.stage, m_lookup_key.static_state);
 	auto entry = m_program_cache.find(m_lookup_key);
 	const auto bind = [&](const ShaderModule& module) {
 		input_info.stage = {.module = &module, .resources = &entry->second.resources};
@@ -945,6 +957,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	options.back_code       = params.back_code;
 	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
+	options.native_ray_tracing = NativeRayTracing::PatchShaders();
 	ShaderRecompiler::ShaderSource source;
 	if (entry == m_program_cache.end()) {
 		DumpShader(params.code, fmt::format("original/{}_{:016x}.bin",
@@ -1545,6 +1558,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	m_ahead_key.hash            = params.hash;
 	m_ahead_key.user_data_count = params.user_data_count;
 	BuildStageStaticKey(input_info, m_ahead_key.static_state);
+	AppendNativeRayTracingKey(m_ahead_key.stage, m_ahead_key.static_state);
 	const auto entry = m_program_cache.find(m_ahead_key);
 	if (entry == m_program_cache.end() && ahead.stages != ProgramResolution::MaxStages) {
 		QueueCompile(params, input_info, push_data_cursor, nullptr);
@@ -1714,6 +1728,7 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 		options.back_code       = job.params.back_code;
 		options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 		options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
+		options.native_ray_tracing = NativeRayTracing::PatchShaders();
 		// SWAPPC programs link the functions they call from guest memory: the execution thread
 		// compiles them.
 		auto source = ShaderRecompiler::PrepareShaderSource(job.params.code, options);
