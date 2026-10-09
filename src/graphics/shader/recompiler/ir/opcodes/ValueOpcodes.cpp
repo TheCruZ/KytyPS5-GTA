@@ -94,7 +94,15 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::SetTessellationAttribute:
 		case ValueOpcode::MeshAllocate:
 		case ValueOpcode::StoreCompletion:
-		case ValueOpcode::Barrier: return true;
+		case ValueOpcode::Barrier:
+		// The ray queries keep per-lane state between these operations.
+		case ValueOpcode::RayQueryInit:
+		case ValueOpcode::RayQueryNext:
+		case ValueOpcode::RayQueryMatch:
+		case ValueOpcode::RayQuerySelectedLeaf:
+		case ValueOpcode::RayQueryResult:
+		case ValueOpcode::RayQueryFlag:
+		case ValueOpcode::RayQueryMark: return true;
 		default: return false;
 	}
 }

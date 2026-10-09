@@ -23,6 +23,8 @@ struct CompileOptions {
 	bool                        early_dump                 = false;
 	bool                        maintenance8_enabled       = false;
 	const char*                 dump_label                 = nullptr;
+	// Replace known guest BVH traversal loops with host ray queries (see RayTracingPatch.h).
+	bool                        native_ray_tracing         = false;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;

@@ -728,6 +728,17 @@ enum class Opcode {
 	S_INST_PREFETCH,
 	S_ENDPGM,
 	EXP,
+	// Pseudo instructions of the native ray tracing patch (see RayTracingPatch.h); they never
+	// come from guest code.
+	RT_INIT,
+	RT_SELECT,
+	RT_REUSE,
+	RT_SETUP,
+	RT_LEAF,
+	RT_RESOLVE,
+	RT_EXIT_CHECK,
+	RT_COMMIT,
+	RT_EXIT,
 	COUNT
 };
 

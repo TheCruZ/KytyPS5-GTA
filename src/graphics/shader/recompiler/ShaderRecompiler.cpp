@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
+#include "graphics/shader/recompiler/frontend/decode/RayTracingPatch.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
@@ -593,6 +594,14 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 		handoff.src_count = 0;
 	} else {
 		Decoder::DecodeProgram(code, source.decoded);
+		if (options.native_ray_tracing) {
+			if (const auto* patch = Decoder::FindRayTracingPatch(options.shader_hash);
+			    patch != nullptr && Decoder::ApplyRayTracingPatch(*patch, source.decoded)) {
+				LOGF("%s native ray tracing patch: hash=0x%016" PRIx64 " sites=%" PRIu64 "\n",
+				     GetDumpLabel(options), options.shader_hash,
+				     static_cast<uint64_t>(patch->sites.size()));
+			}
+		}
 	}
 	if (source.decoded.has_swap_pc) {
 		PrepareCallTarget(source, options);

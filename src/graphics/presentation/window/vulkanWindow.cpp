@@ -697,6 +697,27 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
 	}
+	vk::PhysicalDeviceAccelerationStructureFeaturesKHR acceleration_structure {};
+	vk::PhysicalDeviceRayQueryFeaturesKHR              ray_query {};
+	if (HasExtension(device_extensions, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+	    HasExtension(device_extensions, VK_KHR_RAY_QUERY_EXTENSION_NAME)) {
+		vk::PhysicalDeviceAccelerationStructureFeaturesKHR supported_acceleration {};
+		vk::PhysicalDeviceRayQueryFeaturesKHR              supported_query {};
+		supported_acceleration.pNext = &supported_query;
+		vk::PhysicalDeviceFeatures2 query {};
+		query.pNext = &supported_acceleration;
+		physical_device.getFeatures2(&query);
+		if (supported_acceleration.accelerationStructure && supported_query.rayQuery) {
+			acceleration_structure.accelerationStructure = VK_TRUE;
+			ray_query.rayQuery                           = VK_TRUE;
+			acceleration_structure.pNext                 = &ray_query;
+			ray_query.pNext                              = const_cast<void*>(create_info.pNext);
+			create_info.pNext                            = &acceleration_structure;
+			graphics.native_ray_tracing_enabled          = true;
+		}
+	}
+	LOGF("Vulkan native ray tracing: %s\n", graphics.native_ray_tracing_enabled ? "true" : "false");
+	NativeRayTracing::SetDeviceSupport(graphics.native_ray_tracing_enabled);
 	create_info.pQueueCreateInfos       = queue_create_infos.data();
 	create_info.queueCreateInfoCount    = queue_create_count;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
@@ -1080,6 +1101,14 @@ void WindowContext::CreateVulkan() {
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+		}
+		// Host ray tracing of guest BVHs (see NativeRayTracing).
+		if (HasExtension(available_extensions, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+		    HasExtension(available_extensions, VK_KHR_RAY_QUERY_EXTENSION_NAME) &&
+		    HasExtension(available_extensions, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+			device_extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+			device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
 		}
 	}
 

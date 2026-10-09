@@ -20,6 +20,8 @@
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
+#include "graphics/host_gpu/renderer/nativeRayTracing.h"
+#include "graphics/shader/recompiler/frontend/decode/RayTracingPatch.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
@@ -77,6 +79,15 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
 		case 1: return vk::PolygonMode::eLine;
 		case 2: return vk::PolygonMode::eFill;
 		default: EXIT("Pipeline: invalid polygon mode %u\n", polygon_mode);
+	}
+}
+
+// Programs with the native ray tracing patch (see RayTracingPatch.h) differ from the stored
+// software ones: they get their own program keys.
+void AppendNativeRayTracingKey(ShaderType stage, uint64_t hash, std::vector<uint32_t>& key) {
+	if (stage == ShaderType::Compute && NativeRayTracing::PatchShaders() &&
+	    ShaderRecompiler::Decoder::FindRayTracingPatch(hash) != nullptr) {
+		key.push_back(0x52545041u);
 	}
 }
 
@@ -532,6 +543,7 @@ struct PipelineCache::ProgramCache {
 		options.early_dump  = options.dump_ir;
 		options.dump_label  = label;
 		options.input_info  = stage_input;
+		options.native_ray_tracing = NativeRayTracing::PatchShaders();
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
@@ -590,6 +602,7 @@ struct PipelineCache::ProgramCache {
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
+		AppendNativeRayTracingKey(stage, params.hash, lookup_key.static_state);
 		const auto entry = programs.find(lookup_key);
 		if (entry == programs.end() && ahead.stages != ProgramResolution::MaxStages) {
 			QueueCompile(stage, params, input_info, push_data_cursor, nullptr);
@@ -656,6 +669,7 @@ struct PipelineCache::ProgramCache {
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
+		AppendNativeRayTracingKey(stage, params.hash, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
 		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
