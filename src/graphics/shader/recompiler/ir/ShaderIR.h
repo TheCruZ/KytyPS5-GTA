@@ -653,6 +653,9 @@ struct ShaderInfo {
 	bool                            bvh                           = false;
 	bool                            bvh8                          = false;
 	bool                            bvh_stack                     = false;
+	// Native ray tracing: ray query pseudo-instructions and the sites they belong to.
+	bool                            ray_query                     = false;
+	uint32_t                        ray_query_sites               = 0;
 	bool                            subgroup_ballot               = false;
 	bool                            subgroup_vote                 = false;
 	bool                            subgroup_barrier              = false;

@@ -5,6 +5,7 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
@@ -9072,6 +9073,39 @@ void TestTypedSpirvSerialization() {
                       0x80000000u);
 }
 
+// A hack mark is ten whole instructions, emitted in place (a ray query wave that drops its
+// candidates) or as words to insert after the program (a loop that reads uncached device
+// addresses): AddFunction() takes a single instruction.
+void TestHackMarkInstructions() {
+  using namespace ShaderRecompiler;
+  IR::Program program;
+  program.stage = ShaderType::Compute;
+  program.shader_hash = 0x0b41af19bddf132cull;
+  Spirv::Emitter::EmitterState state(program, {}, Spirv::DefaultProfile);
+  state.fault_buffer_variable = state.builder.AllocateId();
+  Spirv::Emitter::EmitHackMark(state, HackMark::RayQueryRounds);
+  const auto inserted = Spirv::Emitter::HackMarkWords(state, HackMark::RayQueryRounds);
+  const auto count_instructions = [](std::span<const uint32_t> words,
+                                     std::map<uint32_t, uint32_t> &opcodes) {
+    for (size_t at = 0; at < words.size();) {
+      const auto count = words[at] >> spv::WordCountShift;
+      Check(count != 0 && at + count <= words.size(),
+            "a hack mark instruction has a wrong word count");
+      opcodes[words[at] & spv::OpCodeMask]++;
+      at += count;
+    }
+  };
+  const auto module = state.builder.Build();
+  for (const auto &words :
+       {std::vector<uint32_t>(module.begin() + 5, module.end()), inserted}) {
+    std::map<uint32_t, uint32_t> opcodes;
+    count_instructions(words, opcodes);
+    Check(opcodes[spv::OpAccessChain] == 5 && opcodes[spv::OpAtomicOr] == 4 &&
+              opcodes[spv::OpAtomicIAdd] == 1,
+          "a hack mark is not five access chains and five atomics");
+  }
+}
+
 void TestDeferredSpirvPhiPatching() {
   ShaderRecompiler::Spirv::Builder builder;
   const auto type = builder.Type(spv::OpTypeInt, 32u, 0u);
@@ -13866,6 +13900,7 @@ int main() {
   TestShaderFeatureCollection();
   TestTypedSpirvSerialization();
   TestDeferredSpirvPhiPatching();
+  TestHackMarkInstructions();
   TestCompilerStageInputOwnership();
   TestSpirvRepeatedEmission();
   TestSpirvConditionVotes();
