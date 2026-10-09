@@ -458,8 +458,8 @@ void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto op = inst.GetOpcode();
 	if (ctx.half != 0 &&
 	    (op == Op::Ballot || op == Op::ReadFirstLane || op == Op::SubgroupUMinU32 ||
-	     op == Op::SubgroupUMaxU32 || op == Op::SubgroupOrU32 || op == Op::ReadConstBuffer ||
-	     op == Op::ReadRealtimeClock || op == Op::ReadCallWord ||
+	     op == Op::SubgroupUMaxU32 || op == Op::SubgroupOrU32 || op == Op::RayQueryNext ||
+	     op == Op::ReadConstBuffer || op == Op::ReadRealtimeClock || op == Op::ReadCallWord ||
 	     (op == Op::LoadAddressU32 && ctx.Memory(inst).kind == IR::ResourceKind::ScalarAddress))) {
 		// Whole-wave results, clocks and SMEM loads (SGPR operands, no EXEC) match in both halves.
 		ctx.Define(inst, ctx.other_half->Result(inst));
@@ -1155,6 +1155,7 @@ void EmitProgram(EmitterState& state) {
 			    state.scratch_variable[half], spv::StorageClassFunction);
 		}
 	}
+	DeclareRayQueryVariables(state);
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(spv::OpVariable,
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
@@ -1185,6 +1186,7 @@ void EmitProgram(EmitterState& state) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
 	}
+	InitializeRayQueryVariables(state);
 	EmitMemoryBindings(state);
 	if (program.blocks.empty()) {
 		EmitReturn(ctx);

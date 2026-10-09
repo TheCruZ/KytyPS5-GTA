@@ -18,6 +18,15 @@ void Translator::TranslateInstruction(const Decoder::Instruction& inst) {
 			EXIT("decoded opcode has no IR translation at pc 0x%08x", inst.pc);
 		case Decoder::Opcode::UNSUPPORTED:
 			EXIT("unsupported decoded instruction: %s", Decoder::InstructionToString(inst).c_str());
+		case Decoder::Opcode::RT_INIT:
+		case Decoder::Opcode::RT_SELECT:
+		case Decoder::Opcode::RT_REUSE:
+		case Decoder::Opcode::RT_SETUP:
+		case Decoder::Opcode::RT_LEAF:
+		case Decoder::Opcode::RT_RESOLVE:
+		case Decoder::Opcode::RT_EXIT_CHECK:
+		case Decoder::Opcode::RT_COMMIT:
+		case Decoder::Opcode::RT_EXIT: return EmitRayTracing(inst);
 		default: break;
 	}
 
