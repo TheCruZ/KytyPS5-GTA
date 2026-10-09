@@ -596,6 +596,29 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	     robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false",
 	     graphics.robust_buffer_access_enabled ? "robustBufferAccess2" : "shader checks");
 
+	// Host ray tracing of guest BVHs (see NativeRayTracing).
+	vk::PhysicalDeviceAccelerationStructureFeaturesKHR acceleration_structure {};
+	vk::PhysicalDeviceRayQueryFeaturesKHR              ray_query {};
+	if (HasExtension(available_extensions, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+	    HasExtension(available_extensions, VK_KHR_RAY_QUERY_EXTENSION_NAME) &&
+	    HasExtension(available_extensions, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME)) {
+		vk::StructureChain<vk::PhysicalDeviceFeatures2,
+		                   vk::PhysicalDeviceAccelerationStructureFeaturesKHR,
+		                   vk::PhysicalDeviceRayQueryFeaturesKHR>
+		    query;
+		physical_device.getFeatures2(&query.get());
+		if (query.get<vk::PhysicalDeviceAccelerationStructureFeaturesKHR>().accelerationStructure &&
+		    query.get<vk::PhysicalDeviceRayQueryFeaturesKHR>().rayQuery) {
+			device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+			device_extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+			device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+			acceleration_structure.accelerationStructure = VK_TRUE;
+			ray_query.rayQuery                           = VK_TRUE;
+			graphics.native_ray_tracing_enabled          = true;
+		}
+	}
+	LOGF("Vulkan native ray tracing: %s\n", graphics.native_ray_tracing_enabled ? "true" : "false");
+	NativeRayTracing::SetDeviceSupport(graphics.native_ray_tracing_enabled);
 	const float                              queue_priority = 1.0f;
 	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {};
 	queue_create_infos[0] = {
@@ -634,7 +657,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    barycentric,
 	    vk::PhysicalDeviceMeshShaderFeaturesEXT {.taskShader = VK_TRUE, .meshShader = VK_TRUE},
 	    feedback_layout, feedback_dynamic, provoking_vertex, image_atomic_int64, maintenance8,
-	    shader_clock, conditional_rendering,
+	    shader_clock, conditional_rendering, acceleration_structure, ray_query,
 	    // The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates
 	    // its PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when
 	    // a depth- or stencil-writing fragment shader needs an epilog.
@@ -661,6 +684,10 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	if (!graphics.shader_image_int64_atomics_enabled) {
 		create.unlink<vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT>();
+	}
+	if (!graphics.native_ray_tracing_enabled) {
+		create.unlink<vk::PhysicalDeviceAccelerationStructureFeaturesKHR>();
+		create.unlink<vk::PhysicalDeviceRayQueryFeaturesKHR>();
 	}
 	if (!graphics.maintenance8_enabled) create.unlink<vk::PhysicalDeviceMaintenance8FeaturesKHR>();
 	if (graphics.device_clock_period_ps == 0u) {
