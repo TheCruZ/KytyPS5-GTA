@@ -235,8 +235,9 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (ctx.half != 0 && (inst.GetOpcode() == IR::ValueOpcode::Ballot ||
 	                     inst.GetOpcode() == IR::ValueOpcode::ReadFirstLane ||
-	                     inst.GetOpcode() == IR::ValueOpcode::SubgroupUMinU32)) {
-		// These operations combine both emulated halves into one whole-wave result.
+	                     inst.GetOpcode() == IR::ValueOpcode::SubgroupUMinU32 ||
+	                     inst.GetOpcode() == IR::ValueOpcode::RayQueryNext)) {
+		// These operations already combine both emulated halves into one whole-wave result.
 		ctx.Define(inst, ctx.other_half->Result(inst));
 		return;
 	}
@@ -759,6 +760,7 @@ void EmitProgram(EmitterState& state) {
 			    state.scratch_variable[half], spv::StorageClassFunction);
 		}
 	}
+	DeclareRayQueryVariables(state);
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(spv::OpVariable,
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
@@ -793,6 +795,7 @@ void EmitProgram(EmitterState& state) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
 	}
+	InitializeRayQueryVariables(state);
 	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
 		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
 		const auto group_y = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 1);

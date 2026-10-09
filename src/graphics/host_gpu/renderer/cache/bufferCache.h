@@ -31,8 +31,11 @@ public:
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
 	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
+	// The entry after the last page holds the device address of the native ray tracing context
+	// (see NativeRayTracing::ContextAddress()), 0 without one.
+	static constexpr uint64_t NATIVE_RT_CONTEXT_PAGE = CACHING_NUMPAGES;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
-	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	    (CACHING_NUMPAGES + 1) * sizeof(vk::DeviceAddress);
 	// The fault buffer holds three bitmaps of CACHING_NUMPAGES bits: pages that device-address
 	// accesses found without a cached buffer, pages that V#-table stores wrote, and pages that
 	// device-address accesses found cached (their buffers are in use).

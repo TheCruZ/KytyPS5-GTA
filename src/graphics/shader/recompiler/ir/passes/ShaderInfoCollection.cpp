@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/ir/RayQuery.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
@@ -529,6 +530,16 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		case ValueOpcode::StoreCompletion: info.subgroup_barrier = true; break;
 		case ValueOpcode::DataCacheInvalidate: info.coherent_buffers = true; break;
 		case ValueOpcode::BvhIntersect: info.bvh = true; break;
+		case ValueOpcode::RayQueryInit:
+		case ValueOpcode::RayQueryNext:
+		case ValueOpcode::RayQueryMatch:
+		case ValueOpcode::RayQuerySelectedLeaf:
+		case ValueOpcode::RayQueryResult:
+		case ValueOpcode::RayQueryFlag:
+		case ValueOpcode::RayQueryMark:
+			info.ray_query = true;
+			info.ray_query_sites |= 1u << RayQuerySite(inst.Flags<uint32_t>());
+			break;
 		case ValueOpcode::ConditionRef:
 			info.subgroup_vote |=
 			    inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction;
@@ -592,6 +603,8 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	for (auto& buffer: info.buffers) buffer.live = false;
 	info.has_bitwise_xor = info.uses_lds = info.uses_gds = info.uses_flattened_srt =
 	    info.uses_dispatch_threads = info.uses_swizzle = false;
+	info.ray_query       = false;
+	info.ray_query_sites = 0;
 	info.bvh = info.subgroup_ballot = info.subgroup_vote = info.subgroup_barrier =
 	    info.subgroup_shuffle = info.subgroup_arithmetic =
 	    info.subgroup_local_invocation_id = info.compute_derivatives = info.image_gather_extended =

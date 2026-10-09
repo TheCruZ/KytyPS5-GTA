@@ -1,0 +1,128 @@
+#include "graphics/shader/recompiler/frontend/translate/Translator.h"
+#include "graphics/shader/recompiler/ir/RayQuery.h"
+
+// The pseudo instructions of the native ray tracing patch (see RayTracingPatch.h).
+
+namespace Libs::Graphics::ShaderRecompiler::Frontend {
+
+namespace {
+
+Decoder::Operand VectorOperand(uint32_t reg) {
+	Decoder::Operand operand;
+	operand.kind = Decoder::OperandKind::Vgpr;
+	operand.reg  = reg;
+	return operand;
+}
+
+Decoder::Operand ExecOperand() {
+	Decoder::Operand operand;
+	operand.kind = Decoder::OperandKind::ExecLo;
+	return operand;
+}
+
+} // namespace
+
+void Translator::EmitRayTracing(const Decoder::Instruction& inst) {
+	using Flag = IR::RayQueryFlagKind;
+	using Mark = IR::RayQueryMarkKind;
+	const auto site = inst.offset;
+	if (site >= IR::MaxRayQuerySites) {
+		EXIT("ray tracing patch site %u out of range at pc 0x%08x", site, inst.pc);
+	}
+	const auto flags = [site](auto variant) {
+		return IR::RayQueryFlags(site, static_cast<uint32_t>(variant));
+	};
+	const auto flag = [&](Flag kind) {
+		return IR::U1(ir.Emit(IR::ValueOpcode::RayQueryFlag, {}, flags(kind)));
+	};
+	const auto mark = [&](Mark kind, IR::U1 value) {
+		ir.Emit(IR::ValueOpcode::RayQueryMark, {value}, flags(kind));
+	};
+	const auto any_lane = [&](IR::U1 lanes) {
+		const auto mask = BallotMask(lanes);
+		return ir.INotEqual(ir.BitwiseOr(mask[0], mask[1]), IR::U32(IR::Value(0u)));
+	};
+
+	switch (inst.opcode) {
+		case Decoder::Opcode::RT_INIT: {
+			std::array<IR::U32, 8> ray;
+			for (uint32_t i = 0; i < 8; i++) {
+				ray[i] = ReadU32(VectorOperand(inst.image_nsa_addr[i]));
+			}
+			const auto header    = ReadU32Pair(inst.src0);
+			const auto alpha_off = ReadU32(inst.src1);
+			const auto native    = IR::U1(ir.Emit(
+                IR::ValueOpcode::RayQueryInit,
+                {ray[0], ray[1], ray[2], ray[3], ray[4], ray[5], ray[6], ray[7], header[0], header[1],
+                 alpha_off, ir.GetExec()},
+                flags(0u)));
+			// The same in every lane: the host has (or not) the TLAS of the header.
+			ir.SetScc(any_lane(native));
+			return;
+		}
+		case Decoder::Opcode::RT_SELECT: {
+			// The wave's smallest (instance, leaf) key: uniform values.
+			const auto next     = ir.Emit(IR::ValueOpcode::RayQueryNext, {}, flags(0u));
+			const auto instance = IR::U32(ir.CompositeExtract(next, 0));
+			const auto has      = ir.INotEqual(IR::U32(ir.CompositeExtract(next, 2)), IR::U32(IR::Value(0u)));
+			const auto match    = IR::U1(ir.Emit(IR::ValueOpcode::RayQueryMatch, {}, flags(0u)));
+			WriteOperand(inst.dst, instance);
+			WriteMask(inst.dst2, match);
+			WriteMask(ExecOperand(), match);
+			ir.SetScc(has);
+			return;
+		}
+		case Decoder::Opcode::RT_REUSE: ir.SetScc(flag(Flag::Reuse)); return;
+		case Decoder::Opcode::RT_SETUP: {
+			// The setup runs for every lane with a key of the instance, so that later keys of the
+			// instance can reuse its registers.
+			ir.SetScc(flag(Flag::NeedRestore));
+			const auto lanes = flag(Flag::InstanceMatch);
+			mark(Mark::SetupBegin, lanes);
+			WriteMask(ExecOperand(), lanes);
+			return;
+		}
+		case Decoder::Opcode::RT_LEAF: {
+			// The leaf runs for the lanes with its key that the instance setup kept.
+			const auto lanes = ir.LogicalAnd(flag(Flag::Matched), ReadMask(inst.src0));
+			WriteOperand(inst.dst,
+			             IR::U32(ir.Emit(IR::ValueOpcode::RayQuerySelectedLeaf, {}, flags(0u))));
+			WriteMask(inst.src0, lanes);
+			WriteMask(ExecOperand(), lanes);
+			WriteMask(inst.dst2, lanes);
+			mark(Mark::Enter, lanes);
+			return;
+		}
+		case Decoder::Opcode::RT_RESOLVE:
+			mark(inst.dmask != 0 ? Mark::CullResolve : Mark::Resolve, ReadMask(inst.src0));
+			return;
+		case Decoder::Opcode::RT_EXIT_CHECK: ir.SetScc(flag(Flag::NeedRestore)); return;
+		case Decoder::Opcode::RT_COMMIT: {
+			// Lanes whose result is an opaque hit the hardware found: the registers the guest
+			// leaf code writes for an accepted hit.
+			using Result      = IR::RayQueryResultKind;
+			const auto result = [&](Result kind) {
+				return IR::U32(ir.Emit(IR::ValueOpcode::RayQueryResult, {}, flags(kind)));
+			};
+			const auto has = ir.INotEqual(result(Result::Has), IR::U32(IR::Value(0u)));
+			const std::array<std::pair<uint32_t, Result>, 4> outputs {{
+			    {inst.image_nsa_addr[0], Result::T},
+			    {inst.image_nsa_addr[1], Result::Word},
+			    {inst.image_nsa_addr[2], Result::InstanceLo},
+			    {inst.image_nsa_addr[3], Result::InstanceHi},
+			}};
+			for (const auto& [reg, kind]: outputs) {
+				const auto vreg = static_cast<IR::VectorReg>(reg);
+				ir.SetVectorReg(vreg, ir.Select(has, result(kind), ir.GetVectorReg(vreg)));
+			}
+			return;
+		}
+		case Decoder::Opcode::RT_EXIT:
+			WriteMask(ExecOperand(), flag(Flag::InTraversal));
+			mark(Mark::Exit, IR::U1(IR::Value(true)));
+			return;
+		default: FailMissingTranslation(inst);
+	}
+}
+
+} // namespace Libs::Graphics::ShaderRecompiler::Frontend
