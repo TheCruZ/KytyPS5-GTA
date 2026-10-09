@@ -864,6 +864,12 @@ void DefineModule(EmitterState& state) {
 	    InputVariableForKind(state, IR::StageInputKind::BaseInstance) != 0) {
 		state.builder.RequireCapability(spv::CapabilityDrawParameters);
 	}
+	if (state.program.info.ray_query) {
+		state.builder.RequireExtension("SPV_KHR_ray_query");
+		state.builder.RequireCapability(spv::CapabilityRayQueryKHR);
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
+	}
 	if (state.program.info.image_gather_extended) {
 		state.builder.RequireCapability(spv::CapabilityImageGatherExtended);
 	}

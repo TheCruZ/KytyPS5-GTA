@@ -25,6 +25,8 @@ struct CompileOptions {
 	bool                        emit_debug_info            = false;
 	const Spirv::Profile*       profile                    = &Spirv::DefaultProfile;
 	bool                        robust_buffer_access2      = false;
+	// Replace known guest BVH traversal loops with host ray queries (see RayTracingPatch.h).
+	bool                        native_ray_tracing         = false;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
