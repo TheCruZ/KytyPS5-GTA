@@ -6,7 +6,9 @@
 
 #include <array>
 #include <deque>
+#include <span>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -20,6 +22,11 @@ public:
 	KYTY_CLASS_NO_COPY(DescriptorHeap);
 
 	[[nodiscard]] vk::DescriptorSet Commit(vk::DescriptorSetLayout layout);
+
+	// Records the descriptor counts of a layout whose sets come from this heap, so that a set larger
+	// than a default pool (drivers that enforce pool sizes) gets a pool sized for it.
+	static void RegisterLayout(vk::DescriptorSetLayout                         layout,
+	                           std::span<const vk::DescriptorSetLayoutBinding> bindings);
 
 	// Sampled images of one pool; bindless image tables take tens of thousands of them per set
 	// (GTA V's ray tracing table: ~82000).
@@ -35,7 +42,8 @@ private:
 	};
 
 	[[nodiscard]] bool Allocate(vk::DescriptorSetLayout layout, Batch& batch);
-	void               CreateDescriptorPool();
+	void               CreateDescriptorPool(std::span<const vk::DescriptorPoolSize> sizes);
+	void               RetireCurrentPool();
 
 	GraphicContext&                                     m_graphics;
 	MasterSemaphore&                                    m_master_semaphore;
