@@ -230,6 +230,9 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 	create.pBindings    = bindings.data();
 	EXIT_IF(graphics.device.createDescriptorSetLayout(
 	            &create, nullptr, &pipeline.descriptor_set_layout) != vk::Result::eSuccess);
+	if (!pipeline.uses_push_descriptors) {
+		DescriptorHeap::RegisterLayout(pipeline.descriptor_set_layout, bindings);
+	}
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
