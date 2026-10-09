@@ -123,6 +123,28 @@ struct EmitterState {
 	uint32_t                                         bvh8_result_type       = 0;
 	uint32_t                                         bvh8_intersect_function = 0;
 	uint32_t                                         bvh_stack_function      = 0;
+	// Native ray tracing: per site and emulated lane half (see spirvEmitterRayQuery.cpp).
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_variables {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_states {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_nodes {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_slots {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_lists {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_counts {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_currents {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_bases {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_t {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_word {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_instance {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_u {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_v {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_node {};
+	// Wave-uniform: the selected key and the instance whose setup ran last.
+	std::array<uint32_t, 4>                          ray_query_selected_instance {};
+	std::array<uint32_t, 4>                          ray_query_selected_leaf {};
+	std::array<uint32_t, 4>                          ray_query_setup_instance {};
+	std::array<uint32_t, 4>                          ray_query_reuse {};
+	// Rounds of a site's native traversal (a wave never runs more than MaxRayQueryRounds).
+	std::array<uint32_t, 4>                          ray_query_rounds {};
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
@@ -579,6 +601,9 @@ uint32_t EmitBvhTriangle(EmitterState& state, const std::array<std::array<uint32
                          std::array<uint32_t, 3> origin, std::array<uint32_t, 3> direction,
                          uint32_t remap, uint32_t triangle_id, uint32_t bary);
 void DefineTrinityFunctions(EmitterState& state);
+void DeclareRayQueryVariables(EmitterState& state);
+// After every function variable is declared.
+void InitializeRayQueryVariables(EmitterState& state);
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
 
 // These templates accept local lambdas from several emitter translation units.
