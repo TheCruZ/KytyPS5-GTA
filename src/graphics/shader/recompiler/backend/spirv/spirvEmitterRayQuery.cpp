@@ -43,10 +43,9 @@ constexpr uint32_t SlotCapacity1        = 20;
 constexpr uint32_t CandidateIntersection = 0; // RayQueryCandidateIntersectionKHR
 constexpr uint32_t CommittedIntersection = 1; // RayQueryCommittedIntersectionKHR
 
-// gl_RayFlags: the first opaque hit ends a query; back faces (see the instance flags of the TLAS
-// walk) do not count; with the guest's alpha test off, every triangle is opaque.
+// gl_RayFlags: back faces (see the instance flags of the TLAS walk) do not count; with the
+// guest's alpha test off, every triangle is opaque.
 constexpr uint32_t RayFlagOpaque              = 0x1;
-constexpr uint32_t RayFlagTerminateOnFirstHit = 0x4;
 constexpr uint32_t RayFlagCullBackFacing      = 0x10;
 
 struct LaneVariables {
@@ -280,7 +279,7 @@ uint32_t InstanceNode(EmitterState& s, const LaneVariables& lane, uint32_t inter
 
 // Collects the alpha tested triangles a lane's ray hits (the candidates the hardware reports),
 // for a lane whose list is empty, until the list is full or the query is done. A query is done
-// at its first opaque hit (TerminateOnFirstHit), kept as the lane's result.
+// at its closest opaque hit, kept as the lane's result.
 void Refill(EmitterState& s, const LaneVariables& lane) {
 	const auto u = TypeU32(s), b = TypeBool(s), wide = TypeU64(s), f = TypeF32(s);
 	const auto state  = Load(s, u, lane.state);
@@ -483,9 +482,12 @@ uint32_t EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto direction = s.builder.AllocateId();
 		s.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(s, 3), direction, ray[3],
 		                      ray[4], ray[5]);
-		const auto flags = Select(s, u, alpha_off,
-		                          U32(s, RayFlagTerminateOnFirstHit | RayFlagCullBackFacing | RayFlagOpaque),
-		                          U32(s, RayFlagTerminateOnFirstHit | RayFlagCullBackFacing));
+		// The closest opaque hit, not the first one found: the game's traversal visits boxes front
+		// to back, and its shadow denoiser keeps no history where the hit instance is dynamic
+		// (instance record +60 bit 31). An arbitrary first hit (often static geometry farther
+		// along the ray) left moving vehicles without that flag: trails of their shadows.
+		const auto flags = Select(s, u, alpha_off, U32(s, RayFlagCullBackFacing | RayFlagOpaque),
+		                          U32(s, RayFlagCullBackFacing));
 		s.builder.AddFunction(spv::OpRayQueryInitializeKHR, lane.query, structure, flags,
 		                      And(s, ray[7], 0xffu), origin, ConstantF32Value(s, 0.0f), direction,
 		                      ray[6]);
