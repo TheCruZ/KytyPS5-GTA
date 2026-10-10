@@ -4,7 +4,7 @@
 
 namespace Libs::Graphics {
 
-void DynamicState::Commit(const GraphicContext& graphics, CommandRecorder cmdbuf) {
+void DynamicState::Commit(const GraphicContext& graphics, vk::CommandBuffer cmdbuf) {
 	if (dirty_state.viewports) {
 		dirty_state.viewports = false;
 		cmdbuf.setViewportWithCount(num_viewports, viewports.data());
@@ -125,14 +125,6 @@ void DynamicState::Commit(const GraphicContext& graphics, CommandRecorder cmdbuf
 			cmdbuf.setStencilCompareMask(vk::StencilFaceFlagBits::eBack,
 			                             stencil_back_compare_mask);
 		}
-	}
-	if (dirty_state.cull_mode) {
-		dirty_state.cull_mode = false;
-		cmdbuf.setCullMode(cull_mode);
-	}
-	if (dirty_state.front_face) {
-		dirty_state.front_face = false;
-		cmdbuf.setFrontFace(front_face);
 	}
 	if (dirty_state.blend_constants) {
 		dirty_state.blend_constants = false;
