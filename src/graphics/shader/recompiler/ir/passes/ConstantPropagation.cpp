@@ -322,7 +322,8 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			}
 			return;
 		case ValueOpcode::SelectU32:
-		case ValueOpcode::SelectF32: FoldSelect(inst); return;
+		case ValueOpcode::SelectF32:
+		case ValueOpcode::SelectF64: FoldSelect(inst); return;
 		case ValueOpcode::FPCmpClass32: {
 			const auto mask = Arg(inst, 1);
 			if (!IsImmediate(mask, Type::U32)) {
@@ -665,9 +666,8 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 		case ValueOpcode::BitwiseXor32:
 			if (!FoldU32(inst, [opcode = inst.GetOpcode()](uint32_t a, uint32_t b) {
 				    return opcode == ValueOpcode::BitwiseOr32 ? a | b : a ^ b;
-			    }) && !ReplaceBinaryIdentity(inst, Type::U32, 0u) &&
-			    IsComplementPair(inst, ValueOpcode::BitwiseNot32)) {
-				Replace(inst, Value(UINT32_MAX));
+			    })) {
+				ReplaceBinaryIdentity(inst, Type::U32, 0u);
 			}
 			return;
 		case ValueOpcode::BitwiseNot32: {
@@ -848,8 +848,6 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 					Replace(inst, lhs.U1() ? lhs : rhs);
 				} else if (IsImmediate(rhs, Type::U1)) {
 					Replace(inst, rhs.U1() ? rhs : lhs);
-				} else if (IsComplementPair(inst, ValueOpcode::LogicalNot)) {
-					Replace(inst, Value(true));
 				} else {
 					const auto* left = lhs.TryInstruction();
 					const auto* right = rhs.TryInstruction();
@@ -975,10 +973,8 @@ private:
 		if (inst.GetOpcode() != ValueOpcode::CompositeExtractU32x4 ||
 		    !Immediate(Arg(inst, 1), m_word)) return {};
 		const auto* source = Arg(inst, 0).TryInstruction();
-		if (source == nullptr) return {};
-		// Helper lanes keep the per-lane EXEC, so the live mask projects to true.
-		if (source->GetOpcode() == ValueOpcode::LiveMask) return Value(true);
-		return source->GetOpcode() == ValueOpcode::Ballot ? Arg(*source, 0) : Value {};
+		return source != nullptr && source->GetOpcode() == ValueOpcode::Ballot
+		           ? Arg(*source, 0) : Value {};
 	}
 
 	bool CanProject(Value value) {

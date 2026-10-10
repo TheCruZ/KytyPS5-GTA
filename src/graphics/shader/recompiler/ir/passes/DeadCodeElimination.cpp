@@ -146,6 +146,7 @@ bool IsLaneLocal(ValueOpcode op) {
 		case ValueOpcode::SelectU1:
 		case ValueOpcode::SelectU32:
 		case ValueOpcode::SelectF32:
+		case ValueOpcode::SelectF64:
 		case ValueOpcode::IAdd32:
 		case ValueOpcode::IAdd64:
 		case ValueOpcode::ISub32:
@@ -363,7 +364,7 @@ uint32_t EliminateMaskedSelects(const BlockList& blocks) {
 					}
 					const auto conditions = found->second.conditions;
 					const bool select = op == ValueOpcode::SelectU1 || op == ValueOpcode::SelectU32 ||
-					                    op == ValueOpcode::SelectF32;
+					                    op == ValueOpcode::SelectF32 || op == ValueOpcode::SelectF64;
 					for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
 						if (select && arg == 1) {
 							// The new value is only chosen where the condition is set.
@@ -394,7 +395,7 @@ uint32_t EliminateMaskedSelects(const BlockList& blocks) {
 		for (auto& inst: *block) {
 			const auto op = inst.GetOpcode();
 			if (op != ValueOpcode::SelectU1 && op != ValueOpcode::SelectU32 &&
-			    op != ValueOpcode::SelectF32) {
+			    op != ValueOpcode::SelectF32 && op != ValueOpcode::SelectF64) {
 				continue;
 			}
 			const auto found = demands.find(&inst);
