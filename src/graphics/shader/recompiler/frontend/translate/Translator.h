@@ -161,6 +161,7 @@ private:
 	                  bool mix);
 	void V_FREXP_MANT_F32(const Decoder::Instruction& inst);
 	void V_FRACT(const Decoder::Instruction& inst, bool half);
+	void V_FRACT_F64(const Decoder::Instruction& inst);
 	void V_DOT2C_F32_F16(const Decoder::Instruction& inst);
 	void V_CUBEID_F32(const Decoder::Instruction& inst);
 	void V_CUBESC_F32(const Decoder::Instruction& inst);

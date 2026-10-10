@@ -233,7 +233,8 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			}
 			return;
 		case ValueOpcode::SelectU32:
-		case ValueOpcode::SelectF32: FoldSelect(inst); return;
+		case ValueOpcode::SelectF32:
+		case ValueOpcode::SelectF64: FoldSelect(inst); return;
 		case ValueOpcode::FPCmpClass32: {
 			const auto mask = Arg(inst, 1);
 			if (!IsImmediate(mask, Type::U32)) {
