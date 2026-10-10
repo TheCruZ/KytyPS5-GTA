@@ -179,6 +179,21 @@ void Translator::V_FRACT(const Decoder::Instruction& inst, bool half) {
 	}
 }
 
+void Translator::V_FRACT_F64(const Decoder::Instruction& inst) {
+	// As V_FRACT: x - floor(x) rounds to 1.0 for tiny negative x, and the result is clamped to the
+	// largest double below one. The ordered compare is false for NaN, which passes through.
+	const auto constant = [&](uint64_t bits) {
+		return ir.Emit(IR::ValueOpcode::BitCastF64U64, {IR::Value(bits)});
+	};
+	const auto source    = ReadOperand(inst.src0, IR::Type::F64);
+	auto       result    = ir.Emit(IR::ValueOpcode::FPFract64, {source});
+	const auto one       = constant(0x3ff0000000000000ull);
+	const auto below_one = constant(0x3fefffffffffffffull);
+	const auto reached   = IR::U1(ir.Emit(IR::ValueOpcode::FPOrdGreaterThanEqual64, {result, one}));
+	result               = ir.Emit(IR::ValueOpcode::SelectF64, {reached, below_one, result});
+	WriteOperand(DestinationOperand(inst), result);
+}
+
 void Translator::V_DOT2C_F32_F16(const Decoder::Instruction& inst) {
 	auto a          = inst.src0;
 	a.op_sel        = false;
