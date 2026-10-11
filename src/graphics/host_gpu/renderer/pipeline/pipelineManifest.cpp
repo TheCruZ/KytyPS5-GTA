@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineManifest.h"
 
+#include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -19,8 +20,10 @@
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
+#include <filesystem>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <locale>
@@ -1093,6 +1096,27 @@ void ManifestLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
+// Runs `body` so that a fatal error or an exception in it (the translation or the driver cannot
+// handle a record) drops that record instead of ending the game. False when it was dropped.
+template <class Body>
+bool RunDroppable(std::string_view what, Body&& body) {
+#if defined(__cpp_exceptions)
+	try {
+		Common::SoftExitScope soft;
+		body();
+		return true;
+	} catch (const std::exception& error) {
+		ManifestLog("Pipeline manifest: dropping {}: {}", what, error.what());
+	} catch (...) {
+		ManifestLog("Pipeline manifest: dropping {}: unknown exception", what);
+	}
+	return false;
+#else
+	body();
+	return true;
+#endif
+}
+
 double Seconds(std::chrono::steady_clock::duration duration) {
 	return std::chrono::duration<double>(duration).count();
 }
@@ -1314,13 +1338,26 @@ bool LoadManifest(std::span<const uint8_t> bytes, PipelineManifest& manifest, ui
 // The manifest of the running title: what it lists (`warm`, immutable once loaded), what the
 // session adds to it, and the state of the threads that compile the listed modules and pipelines.
 struct PipelineCache::ManifestState {
-	PipelineManifest      warm;
 	std::filesystem::path record_path; // Empty unless recording.
+	// The shared manifest of the title (<title>_<version>.shared.kpm, which the launcher appends
+	// what other players recorded to); empty when the title has no name for one.
+	std::filesystem::path shared_path;
+	std::jthread          watcher;
+	// Only the thread that adds the listed records touches these, once the session runs: the
+	// size and time of the shared file as last read, and what is listed, by identity.
+	uintmax_t                             shared_size = 0;
+	std::filesystem::file_time_type       shared_time {};
+	std::unordered_map<uint64_t, uint32_t> warm_index;
+	std::unordered_set<uint64_t>          warm_pipeline_ids;
+	std::unordered_set<uint64_t>          warm_layout_keys;
 
 	// Under `mutex`, from here on.
 	std::mutex mutex;
-	// The listed records and those the session added, by identity; the index space of `warm`
-	// continues into `recorded`.
+	// The listed records (immutable once added, and they only grow, so references to them stay
+	// valid): those of the files loaded at the start and those that arrive while the game runs.
+	std::deque<ManifestModule>   warm_modules;
+	std::deque<ManifestPipeline> warm_pipelines;
+	// What the files listed at the start and what the session recorded, by identity.
 	PipelineManifest                       recorded;
 	std::unordered_map<uint64_t, uint32_t> module_index;
 	std::unordered_set<uint64_t>           pipeline_identities;
@@ -1341,6 +1378,7 @@ struct PipelineCache::ManifestState {
 	std::unordered_map<uint64_t, Code> code;
 	std::vector<uint8_t>               missing_code;     // By module record.
 	std::vector<const ShaderModule*>   modules;          // By module record, once compiled.
+	std::vector<uint8_t>               module_failed;    // By module record.
 	std::vector<std::vector<uint32_t>> module_pipelines; // By module record.
 	std::vector<uint8_t>               missing_modules;  // By pipeline record.
 	std::deque<uint32_t>               module_jobs;
@@ -1430,6 +1468,11 @@ void PipelineCache::OpenManifest() {
 			files.push_back(folder / name);
 		}
 	}
+	// What other players recorded, which the launcher keeps next to this computer's recording.
+	auto shared_name = name;
+	shared_name.resize(shared_name.size() - std::string_view(".kpm").size());
+	shared_name += ".shared.kpm";
+	const auto shared_path = folders.back() / shared_name;
 	// Another version's records name code by its hash: those the guest never maps stay unused.
 	if (files.empty()) {
 		for (const auto& folder: folders) {
@@ -1443,9 +1486,21 @@ void PipelineCache::OpenManifest() {
 		}
 	}
 
+	if (Common::File::IsFileExisting(shared_path) &&
+	    std::ranges::find(files, shared_path) == files.end()) {
+		files.push_back(shared_path);
+	}
+
 	m_manifest.reset(new ManifestState());
 	auto& state = *m_manifest;
 	auto& all   = state.recorded;
+	if (warm) {
+		state.shared_path = shared_path;
+		std::error_code error;
+		state.shared_size = std::filesystem::file_size(shared_path, error);
+		if (error) state.shared_size = 0;
+		state.shared_time = std::filesystem::last_write_time(shared_path, error);
+	}
 	for (const auto& path: files) {
 		PipelineManifest loaded;
 		uint32_t         skipped = 0;
@@ -1454,6 +1509,11 @@ void PipelineCache::OpenManifest() {
 			ManifestLog("Pipeline manifest: ignoring {} (another format)",
 			            Common::PathToString(path));
 			continue;
+		}
+		// The tessellation layouts go to the table the guest uses directly, and nothing in a shared
+		// file can vouch for them: only the manifests of this computer provide them.
+		if (Common::PathToString(path.filename()).ends_with(".shared.kpm")) {
+			loaded.tessellation_layouts.clear();
 		}
 		std::vector<uint32_t> indices(loaded.modules.size());
 		for (size_t i = 0; i < loaded.modules.size(); i++) {
@@ -1509,44 +1569,12 @@ void PipelineCache::OpenManifest() {
 		m_manifest.reset();
 		return;
 	}
-	if (!warm || all.modules.empty()) {
+	// A recording session starts the threads even without a manifest: records can arrive in the
+	// shared file while the game runs.
+	if (!warm) {
 		return;
 	}
 
-	// What this session creates of the manifest comes from the listed records; recording adds
-	// to a copy.
-	if (record) {
-		state.warm = all;
-	} else {
-		state.warm = std::move(all);
-	}
-	for (const auto& [key, layout]: state.warm.tessellation_layouts) {
-		m_tess_layouts.try_emplace(key, layout);
-	}
-	const auto module_count = state.warm.modules.size();
-	state.missing_code.assign(module_count, 0);
-	state.modules.assign(module_count, nullptr);
-	state.module_pipelines.assign(module_count, {});
-	state.missing_modules.assign(state.warm.pipelines.size(), 0);
-	for (uint32_t i = 0; i < module_count; i++) {
-		const auto& module = state.warm.modules[i];
-		for (const auto hash: {module.code_hash, module.back_hash}) {
-			if (hash != 0) {
-				auto& code = state.code[hash];
-				code.waiting.push_back(i);
-				code.readers++;
-				state.missing_code[i]++;
-			}
-		}
-	}
-	for (uint32_t i = 0; i < state.warm.pipelines.size(); i++) {
-		for (const auto stage: state.warm.pipelines[i].stages) {
-			if (stage != ManifestPipeline::NoStage) {
-				state.module_pipelines[stage].push_back(i);
-				state.missing_modules[i]++;
-			}
-		}
-	}
 	// Pipelines the shader store created are not created again.
 	for (const auto& key: m_graphics_pipelines | std::views::keys) {
 		m_claimed_graphics.insert(key);
@@ -1557,18 +1585,181 @@ void PipelineCache::OpenManifest() {
 	m_manifest_warm = true;
 	state.start     = std::chrono::steady_clock::now();
 	state.last_log  = state.start;
+	// What this session creates of the manifest comes from the listed records; recording adds
+	// to a copy.
+	if (record) {
+		auto listed = all;
+		AddManifestRecords(listed);
+	} else {
+		AddManifestRecords(all);
+	}
 	for (size_t i = 0; i < Common::ParallelThreads(); i++) {
 		state.threads.emplace_back([this](const std::stop_token& stop) { ManifestWorker(stop); });
 	}
+	state.watcher = std::jthread([this](const std::stop_token& stop) {
+		KYTY_PROFILER_THREAD("Thread_PipelineManifestShared");
+		Common::Thread::LowerCurrentPriority();
+		constexpr auto Period = std::chrono::seconds(15);
+		auto           next   = std::chrono::steady_clock::now() + Period;
+		while (!stop.stop_requested()) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(250));
+			if (std::chrono::steady_clock::now() >= next) {
+				ReloadSharedManifest();
+				next = std::chrono::steady_clock::now() + Period;
+			}
+		}
+	});
 	// Shaders the guest mapped before are taken at once.
 	ShaderSetMapListener(OnShaderMapped, this);
+}
+
+// Adds the records of `loaded` that the manifest does not list yet and queues them (modules
+// whose shaders the guest mapped go straight to the compile queue). Returns the modules and
+// pipelines added; `loaded` is left moved from.
+std::pair<uint32_t, uint32_t> PipelineCache::AddManifestRecords(PipelineManifest& loaded) {
+	auto&                 state = *m_manifest;
+	std::vector<uint32_t> indices(loaded.modules.size(), ManifestPipeline::NoStage);
+	std::vector<uint32_t> new_modules;
+	std::vector<uint32_t> new_pipelines;
+	// A record can name something this host does not have: a mesh shader module on a GPU without
+	// mesh shaders could not be built. (Native ray tracing is not a case: the manifest builds the
+	// programs unpatched, and a recording leaves out those the session patched.)
+	const auto supported = [&](const ManifestModule& module) {
+		return module.stage != ShaderType::Mesh || m_graphics.mesh_shader_enabled;
+	};
+	auto next_module = static_cast<uint32_t>(state.warm_modules.size());
+	for (uint32_t i = 0; i < loaded.modules.size(); i++) {
+		auto& module = loaded.modules[i];
+		if (!supported(module)) continue;
+		const auto [found, inserted] = state.warm_index.try_emplace(
+		    ManifestModuleIdentity(module, StaticKey(module)), next_module);
+		if (inserted) {
+			new_modules.push_back(i);
+			next_module++;
+		}
+		indices[i] = found->second;
+	}
+	for (uint32_t i = 0; i < loaded.pipelines.size(); i++) {
+		auto& pipeline = loaded.pipelines[i];
+		bool  dropped  = false;
+		for (auto& stage: pipeline.stages) {
+			if (stage != ManifestPipeline::NoStage) {
+				stage   = indices[stage];
+				dropped = dropped || stage == ManifestPipeline::NoStage;
+			}
+		}
+		if (!dropped && state.warm_pipeline_ids.insert(ManifestPipelineIdentity(pipeline)).second) {
+			new_pipelines.push_back(i);
+		}
+	}
+	uint32_t new_layouts = 0;
+	{
+		LockPrograms();
+		for (const auto& layout: loaded.tessellation_layouts) {
+			if (state.warm_layout_keys.insert(layout.first).second) {
+				m_tess_layouts.try_emplace(layout.first, layout.second);
+				new_layouts++;
+			}
+		}
+		UnlockPrograms();
+	}
+	if (new_modules.empty() && new_pipelines.empty()) {
+		return {0, 0};
+	}
+	{
+		std::scoped_lock lock(state.mutex);
+		for (const auto loaded_index: new_modules) {
+			const auto index = static_cast<uint32_t>(state.warm_modules.size());
+			state.warm_modules.push_back(std::move(loaded.modules[loaded_index]));
+			const auto& module = state.warm_modules.back();
+			state.missing_code.push_back(0);
+			state.modules.push_back(nullptr);
+			state.module_failed.push_back(0);
+			state.module_pipelines.emplace_back();
+			for (const auto hash: {module.code_hash, module.back_hash}) {
+				if (hash == 0) continue;
+				auto& code = state.code[hash];
+				code.readers++;
+				if (code.mapped && code.words != nullptr) continue; // Not taken yet: still there.
+				// Either the guest has not mapped it, or the records before took it all: the
+				// caller tells the listener about the shaders mapped so far again.
+				code.mapped = false;
+				code.waiting.push_back(index);
+				state.missing_code[index]++;
+			}
+			if (state.missing_code[index] == 0) {
+				state.module_jobs.push_back(index);
+			}
+		}
+		for (const auto loaded_index: new_pipelines) {
+			const auto  index    = static_cast<uint32_t>(state.warm_pipelines.size());
+			const auto& pipeline = state.warm_pipelines.emplace_back(loaded.pipelines[loaded_index]);
+			auto&       missing  = state.missing_modules.emplace_back(0);
+			for (const auto stage: pipeline.stages) {
+				if (stage == ManifestPipeline::NoStage || state.modules[stage] != nullptr) continue;
+				if (state.module_failed[stage] != 0) {
+					missing = UINT8_MAX;
+				} else {
+					state.module_pipelines[stage].push_back(index);
+					missing = missing == UINT8_MAX ? missing : static_cast<uint8_t>(missing + 1);
+				}
+			}
+			if (missing == 0) {
+				state.pipeline_jobs.push_back(index);
+			}
+		}
+		state.logged_idle = false;
+	}
+	state.available.notify_all();
+	if (state.watcher.joinable()) {
+		ManifestLog("Pipeline manifest: {} new modules, {} new pipelines and {} tessellation "
+		            "layouts from {}",
+		            new_modules.size(), new_pipelines.size(), new_layouts,
+		            Common::PathToString(state.shared_path));
+	}
+	return {static_cast<uint32_t>(new_modules.size()), static_cast<uint32_t>(new_pipelines.size())};
+}
+
+// Reads the shared manifest again when it changed and lists what is new in it.
+void PipelineCache::ReloadSharedManifest() {
+	auto&           state = *m_manifest;
+	std::error_code error;
+	const auto      size = std::filesystem::file_size(state.shared_path, error);
+	if (error) return;
+	const auto time = std::filesystem::last_write_time(state.shared_path, error);
+	if (error || (size == state.shared_size && time == state.shared_time)) return;
+	state.shared_size = size;
+	state.shared_time = time;
+	constexpr uintmax_t MaxSize = 1ull << 29;
+	if (size > MaxSize) {
+		ManifestLog("Pipeline manifest: ignoring {} ({} bytes)",
+		            Common::PathToString(state.shared_path), size);
+		return;
+	}
+	// The launcher appends to the file: a record cut short by a read in the middle of a write
+	// is left out, and the change that completes it brings it in.
+	PipelineManifest loaded;
+	uint32_t         skipped = 0;
+	if (!LoadManifest(ReadFile(state.shared_path), loaded, &skipped)) {
+		return;
+	}
+	// See OpenManifest(): no tessellation layouts from the shared file.
+	loaded.tessellation_layouts.clear();
+	for (auto& module: loaded.modules) {
+		SetHostInput(module);
+	}
+	if (AddManifestRecords(loaded) != std::pair<uint32_t, uint32_t> {0, 0}) {
+		// The shaders the guest mapped before these records arrived are taken at once.
+		ShaderSetMapListener(OnShaderMapped, this);
+	}
 }
 
 void PipelineCache::CloseManifest() {
 	if (m_manifest == nullptr) {
 		return;
 	}
-	auto& state = *m_manifest;
+	auto& state   = *m_manifest;
+	state.watcher = {};
 	if (m_manifest_warm) {
 		ShaderSetMapListener(nullptr, nullptr);
 		for (auto& thread: state.threads) {
@@ -1628,7 +1819,7 @@ void PipelineCache::ManifestWorker(const std::stop_token& stop) {
 			index      = jobs.front();
 			jobs.pop_front();
 			if (!pipeline) {
-				const auto& module = state.warm.modules[index];
+				const auto& module = state.warm_modules[index];
 				for (auto [hash, words]: {std::pair {module.code_hash, &code},
 				                          std::pair {module.back_hash, &back_code}}) {
 					if (hash == 0) {
@@ -1661,8 +1852,11 @@ void PipelineCache::ManifestWorker(const std::stop_token& stop) {
 void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t> code,
                                         std::span<const uint32_t> back_code) {
 	auto&       state  = *m_manifest;
-	const auto& record = state.warm.modules[index];
-	const auto  start  = std::chrono::steady_clock::now();
+	const auto& record = [&]() -> const ManifestModule& {
+		std::scoped_lock lock(state.mutex);
+		return state.warm_modules[index];
+	}();
+	const auto start = std::chrono::steady_clock::now();
 	auto        input  = record.input;
 	// As GetProgram() and RunCompileJob() set them; translation only reads the user data count.
 	const std::vector<uint32_t>      user_data(record.user_data_count);
@@ -1708,6 +1902,7 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 			std::scoped_lock lock(state.mutex);
 			state.modules[index] = module;
 			if (module == nullptr) {
+				state.module_failed[index] = 1;
 				state.failed++;
 			} else {
 				(built ? state.built : state.found)++;
@@ -1739,32 +1934,40 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 		finish(compiled, false);
 		return;
 	}
-	// Programs that link the functions they call from guest memory are never listed.
-	auto source = ShaderRecompiler::PrepareShaderSource(code, options);
-	if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) {
+	std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
+	std::optional<ShaderModule>                       module;
+	std::vector<uint32_t>                             spirv;
+	std::vector<uint32_t>                             plain_spirv;
+	// A record the translation or the driver cannot handle (it came from another computer) is
+	// dropped, as are those of programs that link the functions they call from guest memory.
+	RunDroppable(fmt::format("module {:016x}", record.code_hash), [&] {
+		auto source = ShaderRecompiler::PrepareShaderSource(code, options);
+		if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) {
+			return;
+		}
+		auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+		plan            = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+		module          = BuildModule(key, options, std::move(translated), record.specialization, {},
+		                              record.push_data_cursor, spirv, plain_spirv);
+	});
+	if (!module) {
 		finish(nullptr, false);
 		return;
 	}
-	auto                  translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
-	auto                  plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-	std::vector<uint32_t> spirv;
-	std::vector<uint32_t> plain_spirv;
-	auto module = BuildModule(key, options, std::move(translated), record.specialization, {},
-	                          record.push_data_cursor, spirv, plain_spirv);
-	bool added  = false;
+	bool added = false;
 	{
 		LockPrograms();
 		auto entry = m_program_cache.find(key);
 		if (entry == m_program_cache.end()) {
 			entry =
-			    m_program_cache.try_emplace(key, Program {.resource_plan = std::move(plan)}).first;
+			    m_program_cache.try_emplace(key, Program {.resource_plan = std::move(*plan)}).first;
 		}
 		auto& program = entry->second;
 		compiled      = FindCompiledModule(key, record.specialization, record.push_data_cursor);
 		if (compiled != nullptr || program.skip_dispatch || program.call_source != nullptr) {
-			DestroyModule(module);
+			DestroyModule(*module);
 		} else {
-			compiled = &program.modules.emplace_back(std::move(module));
+			compiled = &program.modules.emplace_back(std::move(*module));
 			StoreModule(key, program, *compiled, spirv, plain_spirv);
 			added = true;
 		}
@@ -1775,9 +1978,12 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 
 void PipelineCache::CreateManifestPipeline(uint32_t index) {
 	auto&                              state  = *m_manifest;
-	const auto&                        record = state.warm.pipelines[index];
 	std::array<const ShaderModule*, 4> stages {};
-	auto                               key = record.key;
+	const auto& record = [&]() -> const ManifestPipeline& {
+		std::scoped_lock lock(state.mutex);
+		return state.warm_pipelines[index];
+	}();
+	auto key = record.key;
 	{
 		std::scoped_lock lock(state.mutex);
 		for (size_t i = 0; i < stages.size(); i++) {
@@ -1809,8 +2015,10 @@ void PipelineCache::CreateManifestPipeline(uint32_t index) {
 	}
 	const auto start = std::chrono::steady_clock::now();
 	Pipeline   pipeline;
-	CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
-	const bool created = pipeline.pipeline != nullptr && pipeline.pipeline_layout != nullptr;
+	const bool ran = RunDroppable("pipeline", [&] {
+		CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
+	});
+	const bool created = ran && pipeline.pipeline != nullptr && pipeline.pipeline_layout != nullptr;
 	if (created) {
 		NoteCreatedPipeline(start);
 	}
@@ -1818,8 +2026,11 @@ void PipelineCache::CreateManifestPipeline(uint32_t index) {
 		std::scoped_lock lock(m_async_mutex);
 		if (created) {
 			m_async_ready.try_emplace(key, pipeline);
-		} else {
+		} else if (ran) {
 			m_async_failed_graphics.insert(key);
+		} else {
+			// Dropped: if a draw needs it, the draw creates it as it would without a manifest.
+			m_claimed_graphics.erase(key);
 		}
 		m_async_pending_graphics.erase(key);
 	}
@@ -1840,8 +2051,10 @@ void PipelineCache::CreateManifestComputePipeline(const ShaderModule& module) {
 	}
 	const auto start = std::chrono::steady_clock::now();
 	Pipeline   pipeline;
-	CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
-	const bool created = pipeline.pipeline != nullptr && pipeline.pipeline_layout != nullptr;
+	const bool ran = RunDroppable("compute pipeline", [&] {
+		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
+	});
+	const bool created = ran && pipeline.pipeline != nullptr && pipeline.pipeline_layout != nullptr;
 	if (created) {
 		NoteCreatedPipeline(start);
 	}
@@ -1849,6 +2062,8 @@ void PipelineCache::CreateManifestComputePipeline(const ShaderModule& module) {
 		std::scoped_lock lock(m_async_mutex);
 		if (created) {
 			m_async_ready_compute.try_emplace(module.id, pipeline);
+		} else if (!ran) {
+			m_claimed_compute.erase(module.id);
 		}
 		m_async_pending_compute.erase(module.id);
 	}
@@ -1875,8 +2090,8 @@ void PipelineCache::ManifestProgress(bool force) {
 	for (const auto missing: state.missing_code) {
 		waiting += missing != 0 ? 1u : 0u;
 	}
-	const auto modules   = state.warm.modules.size();
-	const auto pipelines = state.warm.pipelines.size();
+	const auto modules   = state.warm_modules.size();
+	const auto pipelines = state.warm_pipelines.size();
 	if (!idle && !force) {
 		ManifestLog("Pipeline manifest: {}/{} modules, {}/{} pipelines ({} modules wait for "
 		            "their shaders) at {:.1f} s",
