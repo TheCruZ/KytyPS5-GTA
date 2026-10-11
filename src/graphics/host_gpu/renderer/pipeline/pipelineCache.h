@@ -27,6 +27,7 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <unordered_map>
 #include <unordered_set>
 #include <array>
@@ -163,6 +164,7 @@ struct ProgramResolution {
 struct GraphicContext;
 struct ShaderParams;
 struct ManifestModule;
+struct PipelineManifest;
 class CommandBuffer;
 
 namespace HW {
@@ -603,6 +605,11 @@ private:
 	void RecordLayout(uint64_t key, const ShaderTessellationInputInfo& layout);
 	static void OnShaderMapped(void* userdata, uint64_t hash, std::span<const uint32_t> code);
 	void ManifestWorker(const std::stop_token& stop);
+	// Lists the records of `loaded` that the manifest does not have yet, returning how many modules
+	// and pipelines that is, and queues them for the threads.
+	std::pair<uint32_t, uint32_t> AddManifestRecords(PipelineManifest& loaded);
+	// The shared manifest (what other players recorded) is read again when it changed.
+	void ReloadSharedManifest();
 	void BuildManifestModule(uint32_t index, std::span<const uint32_t> code,
 	                         std::span<const uint32_t> back_code);
 	void CreateManifestPipeline(uint32_t index);

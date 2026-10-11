@@ -170,6 +170,10 @@ bool PipelineManifestRecord() {
 	return g_config->pipeline_manifest_record;
 }
 
+bool PipelineManifestStrict() {
+	return g_config->pipeline_manifest_strict;
+}
+
 LogDirection GetShaderLogDirection() {
 	return g_config->shader_log_direction;
 }

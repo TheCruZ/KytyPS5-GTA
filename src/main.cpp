@@ -118,6 +118,11 @@ static void PrintUsage() {
 	         "                                       title's pipeline manifest ahead of their draws.\n");
 	::printf("  --record-pipeline-manifest           Add the shaders and pipelines this session creates\n"
 	         "                                       to the title's manifest in _PipelineCache.\n");
+	::printf("  --strict-pipeline-manifest           End the game on a fatal error while creating a\n"
+	         "                                       manifest record instead of dropping the record.\n"
+	         "                                       Default: %s.\n",
+	         KYTY_STRICT_PIPELINE_MANIFEST_DEFAULT != 0 ? "on" : "off");
+	::printf("  --no-strict-pipeline-manifest        Drop such records and keep running.\n");
 	::printf("  --no-tessellation                    Skip tessellation patches instead of drawing them.\n");
 	::printf("  --no-occlusion-queries               Read occlusion queries as always visible.\n");
 	::printf(
@@ -261,6 +266,8 @@ static constexpr Flag FLAGS[] = {
     {"--pipeline-manifest", &ConfigOptions::pipeline_manifest_enabled},
     {"--no-pipeline-manifest", &ConfigOptions::pipeline_manifest_enabled, false},
     {"--record-pipeline-manifest", &ConfigOptions::pipeline_manifest_record},
+    {"--strict-pipeline-manifest", &ConfigOptions::pipeline_manifest_strict},
+    {"--no-strict-pipeline-manifest", &ConfigOptions::pipeline_manifest_strict, false},
     {"--tessellation", &ConfigOptions::tessellation_enabled},
     {"--no-tessellation", &ConfigOptions::tessellation_enabled, false},
     {"--no-occlusion-queries", &ConfigOptions::occlusion_queries_enabled, false},
