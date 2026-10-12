@@ -34,6 +34,12 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+// Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
+// TODO: this threshold is tuned for GTA V (the 1x1 targets its CPU reads back). Another game may
+// need to read a larger GPU-written tiled image from the CPU and would see stale data. The proper
+// fix is real tracking: read the image back when the CPU accesses it (a fault on a page of a
+// GPU-modified image, as is already done for buffers) instead of a size threshold.
+constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
@@ -531,7 +537,14 @@ void TextureCache::UntrackImageTail(ImageId id) {
 }
 
 void TextureCache::TrackImageDownload(ImageId id, Image& image) {
-	if (m_readback_linear_images && !image.info.IsTiled()) {
+	// Small tiled targets are written back too: games read GPU results such as reductions and
+	// simulation state from them on the CPU (PPSA04263 keeps the origin of its ocean wave grid
+	// in a 1x1 R32G32 target, and its water physics read it to sample the wave heights).
+	const auto& info   = image.info;
+	const auto  texels = static_cast<uint64_t>(info.extent.width) * info.extent.height *
+	                     info.extent.depth * info.resources.layers;
+	if (m_readback_linear_images &&
+	    (!info.IsTiled() || texels <= SmallTiledReadbackTexels)) {
 		if (!image.IsGpuModified()) {
 			EXIT("TextureCache: cannot enroll a non-GPU-owned image for download\n");
 		}
