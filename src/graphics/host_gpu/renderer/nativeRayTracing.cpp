@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "gpu_tiler_shaders/hle_blas_refit_spv.h"
 #include "gpu_tiler_shaders/hle_tlas_spv.h"
 #include "gpu_tiler_shaders/rt_blas_walk_spv.h"
 #include "gpu_tiler_shaders/rt_tlas_walk_spv.h"
@@ -153,6 +154,22 @@ struct HleTlasPush {
 
 // The instance and node bounds of hle_tlas.comp (32 bytes each).
 constexpr uint64_t HleTlasScratchSize = uint64_t {4096 + 1365} * 32;
+
+struct HleRefitPush {
+	uint64_t jobs;
+	uint64_t pool;
+	uint64_t state;
+	uint32_t mode;
+	uint32_t job_count;
+	uint32_t pool_capacity;
+	uint32_t pad;
+};
+
+constexpr uint32_t HleRefitGeometryStride = 96;
+constexpr uint32_t HleRefitBlasStride     = 16;
+constexpr uint64_t HleRefitJobsSize       = uint64_t {4} << 20u;
+constexpr uint32_t HleRefitPoolCapacity   = 1u << 22u;
+constexpr uint32_t HleRefitStateSize      = 16;
 
 struct BlasPush {
 	uint64_t jobs;
@@ -464,6 +481,8 @@ NativeRayTracing::~NativeRayTracing() {
 	device.destroyPipelineLayout(m_blas_layout);
 	device.destroyPipeline(m_hle_tlas_pipeline);
 	device.destroyPipelineLayout(m_hle_tlas_layout);
+	device.destroyPipeline(m_hle_refit_pipeline);
+	device.destroyPipelineLayout(m_hle_refit_layout);
 	device.destroyDescriptorSetLayout(m_descriptor_layout);
 }
 
@@ -503,6 +522,8 @@ void NativeRayTracing::CreatePipelines() {
 	make(RT_TLAS_WALK_SPV, sizeof(TlasPush), m_tlas_layout, m_tlas_pipeline, "RT TLAS walk");
 	make(RT_BLAS_WALK_SPV, sizeof(BlasPush), m_blas_layout, m_blas_pipeline, "RT BLAS walk");
 	make(HLE_TLAS_SPV, sizeof(HleTlasPush), m_hle_tlas_layout, m_hle_tlas_pipeline, "HLE TLAS build");
+	make(HLE_BLAS_REFIT_SPV, sizeof(HleRefitPush), m_hle_refit_layout, m_hle_refit_pipeline,
+	     "HLE BLAS refit");
 }
 
 void NativeRayTracing::CreateBuffers() {
@@ -526,6 +547,9 @@ void NativeRayTracing::CreateBuffers() {
 	m_jobs           = make(uint64_t {MaxJobs} * JobStride, DataFlags, "RT jobs");
 	m_build_scratch  = make(BuildScratchSize, AsFlags, "RT build scratch");
 	m_hle_tlas_scratch = make(HleTlasScratchSize, DataFlags, "HLE TLAS bounds");
+	m_hle_jobs       = make(HleRefitJobsSize, DataFlags, "HLE refit jobs");
+	m_hle_pool       = make(uint64_t {HleRefitPoolCapacity} * 4, DataFlags, "HLE refit pool");
+	m_hle_state      = make(HleRefitStateSize, DataFlags, "HLE refit state");
 	for (auto& readback: m_readbacks) {
 		readback.buffer = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
 		                                           AllFlags, ReadbackSize);
@@ -1376,6 +1400,78 @@ void NativeRayTracing::RecordHleTlas(const CommandRecorder& command, uint64_t in
 	                        stride};
 	command.pushConstants(m_hle_tlas_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
 	command.dispatch(1, 1, 1);
+	MemoryBarrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
+	              vk::PipelineStageFlagBits2::eAllCommands,
+	              vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+}
+
+void NativeRayTracing::RecordHleRefit(const CommandRecorder& command, std::span<const uint64_t> blases,
+                                      std::span<const HleRefitGeometry> geometries) {
+	if (!m_enabled || blases.empty()) {
+		return;
+	}
+	const uint64_t geometry_bytes = uint64_t {HleRefitGeometryStride} * geometries.size();
+	const uint64_t blas_offset    = (geometry_bytes + 255u) & ~uint64_t {255};
+	const uint64_t blas_bytes     = uint64_t {HleRefitBlasStride} * blases.size();
+	if (blas_offset + blas_bytes > HleRefitJobsSize) {
+		return;
+	}
+	static_assert(sizeof(HleRefitGeometry) == HleRefitGeometryStride);
+	// Earlier work read the jobs of the last refit and wrote what this one reads.
+	MemoryBarrier(command, vk::PipelineStageFlagBits2::eAllCommands,
+	              vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eMemoryRead,
+	              vk::PipelineStageFlagBits2::eTransfer | vk::PipelineStageFlagBits2::eComputeShader,
+	              vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderRead |
+	                  vk::AccessFlagBits2::eShaderWrite);
+	const auto upload = [&](uint64_t offset, const uint8_t* data, uint64_t size) {
+		for (uint64_t done = 0; done < size;) {
+			const auto chunk = static_cast<uint32_t>(std::min<uint64_t>(size - done, 65536));
+			UpdateBuffer(command, m_hle_jobs->Handle(), offset + done, data + done, chunk);
+			done += chunk;
+		}
+	};
+	if (geometry_bytes != 0) {
+		upload(0, reinterpret_cast<const uint8_t*>(geometries.data()), geometry_bytes);
+	}
+	std::vector<uint64_t> blas_jobs(blases.size() * 2);
+	for (size_t i = 0; i < blases.size(); i++) {
+		blas_jobs[i * 2] = blases[i];
+	}
+	upload(blas_offset, reinterpret_cast<const uint8_t*>(blas_jobs.data()), blas_bytes);
+	command.fillBuffer(m_hle_state->Handle(), 0, HleRefitStateSize, 0);
+	MemoryBarrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+	              vk::PipelineStageFlagBits2::eComputeShader,
+	              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+	auto* page_table = m_buffer_cache.GetBdaPageTableBuffer();
+	const vk::DescriptorBufferInfo page_info {page_table->Handle(), 0, page_table->Size()};
+	vk::WriteDescriptorSet write {};
+	write.dstBinding      = 0;
+	write.descriptorCount = 1;
+	write.descriptorType  = vk::DescriptorType::eStorageBuffer;
+	write.pBufferInfo     = &page_info;
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_hle_refit_pipeline);
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_hle_refit_layout, 0, 1, &write);
+	const auto jobs = m_hle_jobs->BufferDeviceAddress();
+	HleRefitPush push {jobs,
+	                   m_hle_pool->BufferDeviceAddress(),
+	                   m_hle_state->BufferDeviceAddress(),
+	                   0,
+	                   static_cast<uint32_t>(geometries.size()),
+	                   HleRefitPoolCapacity,
+	                   0};
+	if (!geometries.empty()) {
+		command.pushConstants(m_hle_refit_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+		command.dispatch(static_cast<uint32_t>(geometries.size()), 1, 1);
+		// The boxes enclose the new vertices.
+		MemoryBarrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
+		              vk::PipelineStageFlagBits2::eComputeShader,
+		              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+	}
+	push.jobs      = jobs + blas_offset;
+	push.mode      = 1;
+	push.job_count = static_cast<uint32_t>(blases.size());
+	command.pushConstants(m_hle_refit_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+	command.dispatch(static_cast<uint32_t>(blases.size()), 1, 1);
 	MemoryBarrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
 	              vk::PipelineStageFlagBits2::eAllCommands,
 	              vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
