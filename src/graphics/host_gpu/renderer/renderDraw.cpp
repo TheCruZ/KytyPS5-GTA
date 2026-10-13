@@ -1451,8 +1451,9 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 	}
 	prepared.type = source.type;
 	if (source.host_data != nullptr) {
-		auto& stream = buffer.GetContext().GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
-		prepared.offset = stream.Copy(source.host_data, source.size, 16);
+		auto& cache     = buffer.GetContext().GetBufferCache();
+		auto& stream    = cache.GetUtilityBuffer(MemoryUsage::Stream);
+		prepared.offset = cache.StreamUpload(source.host_data, source.size, 16);
 		prepared.buffer = stream.Handle();
 	} else {
 		auto [buffer_ptr, offset] =
