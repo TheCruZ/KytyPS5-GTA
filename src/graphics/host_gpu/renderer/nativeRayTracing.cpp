@@ -573,7 +573,7 @@ bool NativeRayTracing::ComputeSlotSizes(uint32_t opaque, uint32_t alpha, SlotSiz
 	sizes.storage   = (build.accelerationStructureSize + 255u) & ~uint64_t {255};
 	sizes.vertices0 = (uint64_t {sizes.capacity0} * 36 + 255u) & ~uint64_t {255};
 	sizes.vertices1 = (uint64_t {sizes.capacity1} * 36 + 255u) & ~uint64_t {255};
-	sizes.entries   = ((uint64_t {sizes.capacity0} + sizes.capacity1) * 8 + 255u) & ~uint64_t {255};
+	sizes.entries   = ((uint64_t {sizes.capacity0} + sizes.capacity1) * 16 + 255u) & ~uint64_t {255};
 	sizes.scratch   = build.buildScratchSize;
 	// A build that does not fit in the scratch buffer could never run (and would stall the queue).
 	if (sizes.scratch > BuildScratchSize || sizes.Total() > MaxSlotBytes) {
@@ -968,7 +968,9 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 	}
 	readback.build_count = 0;
 	readback.build_slots.clear();
-	readback.frame = frame;
+	const auto source_key = source.user_sgpr << 16u | source.header_offset;
+	readback.source_key   = source_key;
+	readback.frame        = frame;
 	uint32_t              tlas_count = 0;
 	std::vector<uint32_t> retry;
 	// Slots released this preparation (index and table entry), and slots that got new memory
@@ -1055,8 +1057,8 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 			}
 			return false;
 		});
-		tlas_count = std::min(m_tlas_capacity, std::max(1024u, (m_last_instance_count +
-		                                                        m_last_instance_count / 4 + 255u) &
+		const auto last = m_last_instance_counts[source_key];
+		tlas_count      = std::min(m_tlas_capacity, std::max(1024u, (last + last / 4 + 255u) &
 		                                                           ~255u));
 	}
 	m_prepare_id++;
@@ -1308,7 +1310,7 @@ void NativeRayTracing::ProcessReadback(Readback& readback) {
 			slot.last_use_frame = std::max(slot.last_use_frame, readback.frame);
 		}
 	}
-	m_last_instance_count = state.instance_count;
+	m_last_instance_counts[readback.source_key] = state.instance_count;
 	readback.tick = 0;
 }
 

@@ -30,7 +30,13 @@ enum class RayQueryResultKind : uint32_t {
 	Word       = 2, // The primitive word of its guest list entry.
 	InstanceLo = 3, // The address of its guest instance record.
 	InstanceHi = 4,
+	U          = 5, // Barycentrics as the guest triangle test reports them (closest hit sites).
+	V          = 6,
+	Node       = 7, // The guest triangle node of the hit.
 };
+
+// RayQueryInit variant bits.
+constexpr uint32_t RayQueryInitBothFacings = 1u;
 
 // RayQueryMark: state changes; the argument selects lanes.
 enum class RayQueryMarkKind : uint32_t {

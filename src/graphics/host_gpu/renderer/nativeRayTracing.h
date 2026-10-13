@@ -193,6 +193,8 @@ private:
 		uint64_t                tick  = 0;
 		uint32_t                build_count = 0;
 		std::vector<uint32_t>   build_slots;
+		// The TLAS source the preparation walked (user SGPR << 16 | header offset).
+		uint32_t                source_key  = 0;
 		// The frame of the preparation: the slots its TLAS referenced were used then.
 		uint64_t                frame       = 0;
 	};
@@ -300,7 +302,8 @@ private:
 	uint64_t                  m_defrag_after      = 0;
 	uint64_t                  m_defrag_started    = 0;
 	uint64_t                  m_last_scan_prepare = 0;
-	uint32_t                  m_last_instance_count = 0;
+	// The instance count of the last walk of each TLAS source (shaders trace different TLASes).
+	std::unordered_map<uint32_t, uint32_t> m_last_instance_counts;
 	uint32_t                  m_prepare_id          = 0;
 	uint64_t                  m_frame               = 0;
 
