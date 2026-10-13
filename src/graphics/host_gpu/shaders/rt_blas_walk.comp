@@ -50,6 +50,9 @@ layout(push_constant, std430) uniform Push {
 const uint MODE_COUNT  = 0u;
 const uint MODE_BUILD  = 1u;
 const uint MODE_VERIFY = 2u;
+// MODE_GATHER: rewrites the triangles of built slots whose guest BLAS was only refit since,
+//              through their entry tables (same triangles, same order).
+const uint MODE_GATHER = 3u;
 
 // The queue of a walk of a BLAS of known leaves: its box nodes (a 4 wide tree has about a third
 // of the leaves, a chain of boxes as many as there are leaves) and some room for growth; a walk
@@ -138,9 +141,49 @@ void EmitLeaf(uint64_t blas_va, uint64_t base, uint leaf, Job job, vec3 lo, vec3
 	}
 }
 
+// MODE_GATHER: triangle `index` of geometry `geometry` (0 opaque, 1 alpha tested) of a job.
+void GatherTriangle(Job job, uint64_t base, uint index, uint geometry) {
+	const uint     table_index  = geometry == 0u ? index : job.capacity0 + index;
+	const uvec4    entry        = EntryRef(job.entries + uint64_t(table_index) * 16).v;
+	const uint     tri          = entry.z;
+	const uint64_t node         = NodeAddress(base, tri);
+	const uvec3    ids          = TriangleVertexIds(NodeType(tri));
+	TriangleRef    out_triangle = TriangleRef((geometry == 0u ? job.vertices0 : job.vertices1) + uint64_t(index) * 36);
+	vec3 p[3];
+	bool usable = true;
+	for (uint v = 0; v < 3; v++) {
+		p[v]   = LoadVertex(node, ids[v]);
+		usable = usable && !any(isnan(p[v])) && all(lessThan(abs(p[v]), vec3(1e18)));
+	}
+	for (uint v = 0; v < 3; v++) {
+		const vec3 q = usable ? p[v] : vec3(uintBitsToFloat(0x7fc00000u));
+		out_triangle.v[v * 3]     = q.x;
+		out_triangle.v[v * 3 + 1] = q.y;
+		out_triangle.v[v * 3 + 2] = q.z;
+	}
+}
+
 void main() {
 	const uint job_index  = gl_WorkGroupID.x;
 	const uint lid        = gl_LocalInvocationID.x;
+	if (pc.mode == MODE_GATHER) {
+		if (job_index >= pc.job_count) {
+			return;
+		}
+		Job            job    = Job(pc.jobs + uint64_t(job_index) * kJobStride);
+		SlotInfo       info   = SlotInfo(pc.slots + uint64_t(job.slot) * kSlotStride);
+		const uint64_t base   = (job.blas_va >> 8) << 8;
+		const uint     count0 = min(info.count0, job.capacity0);
+		const uint     count1 = min(info.count1, job.capacity1);
+		for (uint i = lid; i < count0 + count1; i += gl_WorkGroupSize.x) {
+			if (i < count0) {
+				GatherTriangle(job, base, i, 0u);
+			} else {
+				GatherTriangle(job, base, i - count0, 1u);
+			}
+		}
+		return;
+	}
 	RtState    state      = RtState(pc.state);
 	uint64_t   blas_va    = 0;
 	uint       root       = kInvalidNode;
