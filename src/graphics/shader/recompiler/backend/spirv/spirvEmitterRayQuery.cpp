@@ -60,6 +60,9 @@ struct LaneVariables {
 	uint32_t result_t        = 0;
 	uint32_t result_word     = 0;
 	uint32_t result_instance = 0;
+	uint32_t result_u        = 0;
+	uint32_t result_v        = 0;
+	uint32_t result_node     = 0;
 };
 
 uint32_t SiteOf(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -76,7 +79,8 @@ LaneVariables Lane(EmitterState& s, uint32_t site, uint32_t half) {
 	        s.ray_query_lists[site][half],     s.ray_query_counts[site][half],
 	        s.ray_query_currents[site][half],  s.ray_query_bases[site][half],
 	        s.ray_query_result_t[site][half],  s.ray_query_result_word[site][half],
-	        s.ray_query_result_instance[site][half]};
+	        s.ray_query_result_instance[site][half], s.ray_query_result_u[site][half],
+	        s.ray_query_result_v[site][half],  s.ray_query_result_node[site][half]};
 }
 
 uint32_t Load(EmitterState& s, uint32_t type, uint32_t pointer) {
@@ -240,10 +244,18 @@ void ClearKeys(EmitterState& s, const LaneVariables& lane) {
 }
 
 // The guest list entry of a hit or candidate triangle: (leaf pointer of the entry, primitive
-// word), from the entry table of its host BLAS.
-// Also whether the entry is one of the table (a slot rebuilt meanwhile may have another table).
-std::array<uint32_t, 3> TriangleEntry(EmitterState& s, const LaneVariables& lane,
-                                      uint32_t intersection) {
+// word, guest triangle node, barycentric remap of the node), from the entry table of its host
+// BLAS (rt_blas_walk.comp). Also whether the entry is one of the table (a slot rebuilt meanwhile
+// may have another table).
+struct GuestEntry {
+	uint32_t entry = 0;
+	uint32_t word  = 0;
+	uint32_t node  = 0;
+	uint32_t remap = 0;
+	uint32_t valid = 0;
+};
+
+GuestEntry TriangleEntry(EmitterState& s, const LaneVariables& lane, uint32_t intersection) {
 	const auto u = TypeU32(s), wide = TypeU64(s);
 	const auto query = [&](spv::Op op) {
 		const auto result = s.builder.AllocateId();
@@ -262,11 +274,12 @@ std::array<uint32_t, 3> TriangleEntry(EmitterState& s, const LaneVariables& lane
 	const auto valid     = LogicalAnd(
 	    s, Binary(s, spv::OpINotEqual, TypeBool(s), table, ConstantU64(s, 0)),
 	    Less(s, primitive, Select(s, u, opaque, capacity0, capacity1)));
-	const auto entry = ScaledAddress(s, table, Select(s, u, valid, index, U32(s, 0)), 8);
-	const auto first = EmitValueOrZeroIfCondition(s, valid, [&] { return LoadAddressU32(s, entry); });
-	const auto second =
-	    EmitValueOrZeroIfCondition(s, valid, [&] { return LoadAddressU32(s, AddressPlus(s, entry, 4)); });
-	return {first, second, valid};
+	const auto entry = ScaledAddress(s, table, Select(s, u, valid, index, U32(s, 0)), 16);
+	const auto field = [&](uint32_t offset) {
+		return EmitValueOrZeroIfCondition(
+		    s, valid, [&] { return LoadAddressU32(s, AddressPlus(s, entry, offset)); });
+	};
+	return {field(0), field(4), field(8), field(12), valid};
 }
 
 // The guest TLAS leaf pointer of the instance of a hit or candidate.
@@ -309,12 +322,35 @@ void Refill(EmitterState& s, const LaneVariables& lane) {
 					const auto t = s.builder.AllocateId();
 					s.builder.AddFunction(spv::OpRayQueryGetIntersectionTKHR, f, t, lane.query,
 					                      U32(s, CommittedIntersection));
-					const auto [entry, word, valid] = TriangleEntry(s, lane, CommittedIntersection);
-					(void)valid;
-					(void)entry;
+					const auto hit_entry = TriangleEntry(s, lane, CommittedIntersection);
 					const auto node = InstanceNode(s, lane, CommittedIntersection);
 					Store(s, lane.result_t, Unary(s, spv::OpBitcast, u, t));
-					Store(s, lane.result_word, word);
+					Store(s, lane.result_word, hit_entry.word);
+					Store(s, lane.result_node, hit_entry.node);
+					// The guest triangle test reports the weights of the node vertices its remap
+					// bits select (two bits each); the host triangle has the node's vertices in order.
+					const auto bary = s.builder.AllocateId();
+					s.builder.AddFunction(spv::OpRayQueryGetIntersectionBarycentricsKHR,
+					                      TypeF32Vector(s, 2), bary, lane.query,
+					                      U32(s, CommittedIntersection));
+					std::array<uint32_t, 3> weights {};
+					for (uint32_t i = 0; i < 2; i++) {
+						weights[i + 1] = s.builder.AllocateId();
+						s.builder.AddFunction(spv::OpCompositeExtract, f, weights[i + 1], bary, i);
+					}
+					weights[0] = Binary(s, spv::OpFSub, f,
+					                    Binary(s, spv::OpFSub, f, ConstantF32Value(s, 1.0f), weights[1]),
+					                    weights[2]);
+					const auto weight = [&](uint32_t shift) {
+						const auto index = And(s, Binary(s, spv::OpShiftRightLogical, u, hit_entry.remap,
+						                                 U32(s, shift)),
+						                       3u);
+						return Unary(s, spv::OpBitcast, u,
+						             Select(s, f, Equal(s, index, U32(s, 1)), weights[1],
+						                    Select(s, f, Equal(s, index, U32(s, 2)), weights[2], weights[0])));
+					};
+					Store(s, lane.result_u, weight(0));
+					Store(s, lane.result_v, weight(2));
 					Store(s, lane.result_instance,
 					      Binary(s, spv::OpIAdd, wide, Load(s, wide, lane.base),
 					             Binary(s, spv::OpShiftLeftLogical, wide,
@@ -336,11 +372,11 @@ void Refill(EmitterState& s, const LaneVariables& lane) {
 				    s, type,
 				    U32(s, spv::RayQueryCandidateIntersectionTypeRayQueryCandidateIntersectionTriangleKHR));
 				EmitIfCondition(s, triangle, [&] {
-					const auto [entry, word, valid] = TriangleEntry(s, lane, CandidateIntersection);
-					(void)word;
+					const auto candidate = TriangleEntry(s, lane, CandidateIntersection);
 					// An entry outside its table is not tested (the candidate is a miss).
-					EmitIfCondition(s, valid, [&] {
-						InsertKey(s, lane, count, InstanceNode(s, lane, CandidateIntersection), entry);
+					EmitIfCondition(s, candidate.valid, [&] {
+						InsertKey(s, lane, count, InstanceNode(s, lane, CandidateIntersection),
+						          candidate.entry);
 						Store(s, lane.count, Add(s, count, U32(s, 1)));
 					});
 				});
@@ -401,6 +437,9 @@ void DeclareRayQueryVariables(EmitterState& s) {
 			declare(u, s.ray_query_result_t[site][half]);
 			declare(u, s.ray_query_result_word[site][half]);
 			declare(TypeU64(s), s.ray_query_result_instance[site][half]);
+			declare(u, s.ray_query_result_u[site][half]);
+			declare(u, s.ray_query_result_v[site][half]);
+			declare(u, s.ray_query_result_node[site][half]);
 		}
 		declare(u, s.ray_query_selected_instance[site]);
 		declare(u, s.ray_query_selected_leaf[site]);
@@ -486,8 +525,12 @@ uint32_t EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst) {
 		// to back, and its shadow denoiser keeps no history where the hit instance is dynamic
 		// (instance record +60 bit 31). An arbitrary first hit (often static geometry farther
 		// along the ray) left moving vehicles without that flag: trails of their shadows.
-		const auto flags = Select(s, u, alpha_off, U32(s, RayFlagCullBackFacing | RayFlagOpaque),
-		                          U32(s, RayFlagCullBackFacing));
+		// Closest hit sites (RayQueryInitBothFacings) count both facings.
+		const uint32_t facing =
+		    (IR::RayQueryVariant(inst.Flags<uint32_t>()) & IR::RayQueryInitBothFacings) != 0
+		        ? 0u
+		        : RayFlagCullBackFacing;
+		const auto flags = Select(s, u, alpha_off, U32(s, facing | RayFlagOpaque), U32(s, facing));
 		s.builder.AddFunction(spv::OpRayQueryInitializeKHR, lane.query, structure, flags,
 		                      And(s, ray[7], 0xffu), origin, ConstantF32Value(s, 0.0f), direction,
 		                      ray[6]);
@@ -593,6 +636,9 @@ uint32_t EmitRayQueryResult(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::RayQueryResultKind::InstanceLo: return Unary(s, spv::OpUConvert, u, instance);
 		case IR::RayQueryResultKind::InstanceHi:
 			return Unary(s, spv::OpUConvert, u, Binary(s, spv::OpShiftRightLogical, wide, instance, ConstantU64(s, 32)));
+		case IR::RayQueryResultKind::U: return Load(s, u, lane.result_u);
+		case IR::RayQueryResultKind::V: return Load(s, u, lane.result_v);
+		case IR::RayQueryResultKind::Node: return Load(s, u, lane.result_node);
 	}
 	ctx.Fail(inst, "unknown ray query result");
 }

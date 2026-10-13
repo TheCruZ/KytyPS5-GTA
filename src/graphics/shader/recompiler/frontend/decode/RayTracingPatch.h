@@ -34,7 +34,20 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 //              entered it accepted a hit and stop.
 //   RT_MODE    SCC = the site is traversing natively.
 //   RT_EXIT    EXEC = the lanes that started the traversal; ends the native traversal.
+//
+// A closest hit site (RayTracingKind::ClosestOpaque) is a per lane traversal whose leaf code
+// accepts the nearest triangle of either facing, with no alpha test: the hardware finds the hit
+// and RT_COMMIT writes every register the guest leaf code writes for it.
+enum class RayTracingKind : uint32_t {
+	Packet,        // Wave-wide traversal, the guest leaf code tests the alpha tested triangles.
+	ClosestOpaque, // Closest hit of opaque triangles, both facings.
+};
+
+// A register a site does not have.
+constexpr uint32_t NoRegister = 0xffffffffu;
+
 struct RayTracingSite {
+	RayTracingKind kind = RayTracingKind::Packet;
 	// The instruction that falls through to the loop header; the patch enters there.
 	uint32_t entry_pc = 0;
 	// The loop header (the fallback target).
@@ -42,6 +55,7 @@ struct RayTracingSite {
 	uint32_t origin[3] {};
 	uint32_t direction[3] {};
 	uint32_t t_max     = 0;
+	// The VGPR of the ray's instance mask (NoRegister: every instance).
 	uint32_t cull_mask = 0;
 	// SGPR pair of the TLAS header address at entry_pc.
 	uint32_t header_sgpr = 0;
@@ -51,6 +65,11 @@ struct RayTracingSite {
 	uint32_t result_t        = 0;
 	uint32_t result_word     = 0;
 	uint32_t result_instance = 0;
+	// Closest hit sites: the VGPRs of its barycentrics (as the guest leaf code divides them) and
+	// of its guest triangle node.
+	uint32_t result_u    = NoRegister;
+	uint32_t result_v    = NoRegister;
+	uint32_t result_node = NoRegister;
 	// The instance setup and the register it reads the instance node from.
 	uint32_t setup_pc      = 0;
 	uint32_t instance_sgpr = 0;

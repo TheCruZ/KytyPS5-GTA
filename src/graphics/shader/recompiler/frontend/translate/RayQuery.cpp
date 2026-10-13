@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/frontend/decode/RayTracingPatch.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ir/RayQuery.h"
 
@@ -50,7 +51,10 @@ void Translator::EmitRayTracing(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::RT_INIT: {
 			std::array<IR::U32, 8> ray;
 			for (uint32_t i = 0; i < 8; i++) {
-				ray[i] = ReadU32(VectorOperand(inst.image_nsa_addr[i]));
+				// A site without a mask register traces against every instance.
+				ray[i] = i == 7 && inst.image_nsa_addr[i] == Decoder::NoRegister
+				             ? IR::U32(IR::Value(0xffu))
+				             : ReadU32(VectorOperand(inst.image_nsa_addr[i]));
 			}
 			const auto header    = ReadU32Pair(inst.src0);
 			const auto alpha_off = ReadU32(inst.src1);
@@ -58,7 +62,7 @@ void Translator::EmitRayTracing(const Decoder::Instruction& inst) {
                 IR::ValueOpcode::RayQueryInit,
                 {ray[0], ray[1], ray[2], ray[3], ray[4], ray[5], ray[6], ray[7], header[0], header[1],
                  alpha_off, ir.GetExec()},
-                flags(0u)));
+                flags(inst.dmask)));
 			// The same in every lane: the host has (or not) the TLAS of the header.
 			ir.SetScc(any_lane(native));
 			return;
@@ -107,14 +111,31 @@ void Translator::EmitRayTracing(const Decoder::Instruction& inst) {
 			const auto result = [&](Result kind) {
 				return IR::U32(ir.Emit(IR::ValueOpcode::RayQueryResult, {}, flags(kind)));
 			};
-			const auto has = ir.INotEqual(result(Result::Has), IR::U32(IR::Value(0u)));
-			const std::array<std::pair<uint32_t, Result>, 4> outputs {{
+			auto has = ir.INotEqual(result(Result::Has), IR::U32(IR::Value(0u)));
+			if (inst.dmask != 0) {
+				// Closest hit: only when nearer than the hit the registers hold (or the t max).
+				const auto as_float = [&](IR::U32 value) {
+					return IR::F32(ir.Emit(IR::ValueOpcode::BitCastF32U32, {value}));
+				};
+				const auto current = IR::U32(ir.GetVectorReg(
+				    static_cast<IR::VectorReg>(inst.image_nsa_addr[0])));
+				has = ir.LogicalAnd(has, IR::U1(ir.Emit(IR::ValueOpcode::FPOrdLessThanEqual32,
+				                                         {as_float(result(Result::T)),
+				                                          as_float(current)})));
+			}
+			const std::array<std::pair<uint32_t, Result>, 7> outputs {{
 			    {inst.image_nsa_addr[0], Result::T},
 			    {inst.image_nsa_addr[1], Result::Word},
 			    {inst.image_nsa_addr[2], Result::InstanceLo},
 			    {inst.image_nsa_addr[3], Result::InstanceHi},
+			    {inst.image_nsa_addr[4], Result::U},
+			    {inst.image_nsa_addr[5], Result::V},
+			    {inst.image_nsa_addr[6], Result::Node},
 			}};
 			for (const auto& [reg, kind]: outputs) {
+				if (reg == Decoder::NoRegister) {
+					continue;
+				}
 				const auto vreg = static_cast<IR::VectorReg>(reg);
 				ir.SetVectorReg(vreg, ir.Select(has, result(kind), ir.GetVectorReg(vreg)));
 			}
