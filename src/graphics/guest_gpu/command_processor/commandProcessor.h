@@ -14,6 +14,7 @@
 #include <optional>
 #include <memory>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -117,6 +118,11 @@ public:
 	void RunGarbageCollector();
 	// Runs a host command in operation order.
 	void EmitHostCommand(Common::UniqueFunction<void>&& command);
+	// GTA V's TLAS builds, replaced by native ones (see graphicsRun.cpp); true when the dispatch
+	// is dropped.
+	bool HleTlasDispatch(uint64_t data_addr);
+	// The program hash of the compute shader at `data_addr`.
+	uint64_t ComputeShaderHash(uint64_t data_addr);
 	// Reads guest memory the CP decides on (WAIT_REG_MEM, COND_EXEC, predication, branches) as a
 	// serial GPU would: after the earlier operations that write it.
 	void ReadDecisionMemory(const volatile void* address, void* value, size_t size);
@@ -250,6 +256,49 @@ public:
 	void NoteAcquireMem() noexcept { m_acquire_since_operation = true; }
 
 private:
+
+	// The TLAS builds of the current TLAS stage window (see HleTlasDispatch()).
+	struct HleTlasBuild {
+		uint64_t                        input  = 0;
+		uint64_t                        header = 0;
+		uint32_t                        stride = 0;
+		uint32_t                        count  = 0;
+		NativeRayTracing::HleTlasFormat format = NativeRayTracing::HleTlasFormat::Base460;
+		// The native build can read the list.
+		[[nodiscard]] bool Native() const;
+	};
+	std::vector<HleTlasBuild>              m_hle_tlas_builds;
+	uint32_t                               m_hle_tlas_finished = 0;
+	bool                                   m_hle_tlas_window   = false;
+	// TLAS builds the game runs itself (lists the native build cannot read) whose last pass has not
+	// come yet.
+	uint32_t                               m_guest_tlas_builds = 0;
+	// The BLAS refits of the current refit window (see HleBlasDispatch()).
+	struct HleRefitGeometryRef {
+		uint64_t blas     = 0;
+		uint64_t table    = 0;
+		uint32_t geometry = 0;
+	};
+	std::vector<uint64_t>            m_hle_refit_blases;
+	std::vector<HleRefitGeometryRef> m_hle_refit_geometries;
+	uint32_t                         m_hle_refit_finished = 0;
+	bool                             m_hle_refit_window   = false;
+	// The sce::Psr BLAS builds in progress (see PsrBlasDispatch()), by the address of their scratch
+	// memory: the geometry table and the geometries whose Morton codes the build computed.
+	struct PsrBlasBuildState {
+		uint64_t             table = 0;
+		std::vector<uint8_t> seen;
+	};
+	std::unordered_map<uint64_t, PsrBlasBuildState> m_psr_blas_builds;
+	// The sizes of the memory the last builds captured, by address, and the BLAS whose
+	// decompression pass is being dispatched (address 0: none) with the size of its memory.
+	std::unordered_map<uint64_t, uint32_t> m_psr_captured;
+	uint64_t                               m_psr_decompressed      = 0;
+	uint32_t                               m_psr_decompressed_size = 0;
+	// The BLAS whose last build pass is being dispatched (blas_va 0: none).
+	NativeRayTracing::GuestBlasBuild m_psr_blas_built;
+	// The sce::Psr shader of each compute shader address seen.
+	std::unordered_map<uint64_t, Psr::Shader> m_cs_psr_shaders;
 
 	// State of the execution side, on cache lines of its own.
 	alignas(64) uint64_t m_synthetic_occlusion_counter = 0;
