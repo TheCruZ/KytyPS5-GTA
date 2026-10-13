@@ -858,6 +858,9 @@ struct Instruction {
 	bool           offen                                        = false;
 	bool           image_r128                                   = false;
 	uint32_t       branch_target                                = 0;
+	// The pc the instruction had in the guest code when a rewrite moved it (see
+	// RayTracingPatch); S_GETPC_B64 returns the address after it. UINT32_MAX: not moved.
+	uint32_t       guest_pc                                     = UINT32_MAX;
 	struct {
 		uint32_t target = 0;
 		uint32_t en     = 0;
