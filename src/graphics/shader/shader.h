@@ -358,6 +358,8 @@ void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info);
 
+uint64_t ShaderMappedHash(uint64_t addr);
+
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_H_ */

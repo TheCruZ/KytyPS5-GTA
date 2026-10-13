@@ -11,6 +11,9 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/nativeRayTracing.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -1656,8 +1659,106 @@ void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 	}
 }
 
+uint64_t CommandProcessor::ComputeShaderHash(uint64_t data_addr) {
+	auto [it, inserted] = m_cs_hashes.try_emplace(data_addr, 0);
+	if (inserted || it->second == 0) {
+		it->second = ShaderMappedHash(data_addr);
+	}
+	return it->second;
+}
+
+// GTA V (PPSA04263) builds the four TLASes of its ray tracing passes in its BVH compute queue:
+// 18 shaders after an empty one (b35f2644b8829bd8), each dispatched once per TLAS
+// (d8f2a760e26e9f63 more often), several of which wait for the GPU. With native ray tracing,
+// the stage is replaced by NativeRayTracing::RecordHleTlas(): its dispatches are dropped; the
+// instance list of each build (the V# at s[6:9] of 9df701ab41f8ed18, written by the game's CPU)
+// is kept with the TLAS address (s[0:1] of 54ec6ec2689fd4c4, the stage's last shader), and there
+// one host command builds every TLAS. True when the dispatch is dropped.
+bool CommandProcessor::HleTlasDispatch(uint64_t data_addr) {
+	if (data_addr == 0 || !m_renderer.GetNativeRayTracing().Enabled()) {
+		return false;
+	}
+	static constexpr std::array<uint64_t, 18> Stage {
+	    0x9df701ab41f8ed18ull, 0xfd3e8ce83c905301ull, 0x6a90ea743851af30ull,
+	    0x41d7bf8caa1d5b8eull, 0x245c614a852e8fb8ull, 0xe8ca52f5a7dabd9eull, 0xfd8a9f53fe5fe1d8ull,
+	    0x8609fe7579224c92ull, 0x6a66cd538ab9e139ull, 0x0e7bdeda7768b057ull, 0xbf128e4c6211fd8full,
+	    0xdb80ac5caa3f3500ull, 0xd8f2a760e26e9f63ull, 0x9dff695420f6e999ull, 0x17037cff5e02eeb8ull,
+	    0xb71ef7c579835a0dull, 0x7c7ec90f3e50e469ull, 0x54ec6ec2689fd4c4ull};
+	constexpr uint64_t ListShader  = 0x9df701ab41f8ed18ull;
+	constexpr uint64_t LastShader  = 0x54ec6ec2689fd4c4ull;
+	const auto hash = ComputeShaderHash(data_addr);
+	// Some of the stage's shaders (sorts, scans) also serve other passes: only the dispatches
+	// from the stage's first list (used only there) to the end of its last build are the TLAS
+	// builds. Other shaders run meanwhile (the stage reads nothing they write).
+	if (std::ranges::find(Stage, hash) == Stage.end()) {
+		return false;
+	}
+	if (!m_hle_tlas_window) {
+		if (hash != ListShader) {
+			return false;
+		}
+		m_hle_tlas_window = true;
+		m_hle_tlas_builds.clear();
+		m_hle_tlas_finished = 0;
+	}
+	const auto& user = GetShCtx().GetCs().cs_user_sgpr.value;
+	if (hash == ListShader) {
+		m_hle_tlas_builds.push_back({.input  = uint64_t {user[6]} | (uint64_t {user[7] & 0xffffu} << 32u),
+		                             .stride = (user[7] >> 16u) & 0x3fffu,
+		                             .count  = user[8]});
+	}
+	if (hash != LastShader) {
+		return true;
+	}
+	if (m_hle_tlas_finished < m_hle_tlas_builds.size()) {
+		// Addresses have 48 bits.
+		m_hle_tlas_builds[m_hle_tlas_finished].header =
+		    (uint64_t {user[0]} | (uint64_t {user[1]} << 32u)) & 0xffffffffffffull;
+	}
+	if (++m_hle_tlas_finished < m_hle_tlas_builds.size()) {
+		return true;
+	}
+	m_hle_tlas_window = false;
+	EmitHostCommand([this, builds = m_hle_tlas_builds] {
+		auto& context = m_renderer;
+		auto& cache   = context.GetBufferCache();
+		for (const auto& build: builds) {
+			// An empty list still makes an empty TLAS.
+			if (build.header == 0 || (build.count != 0 && (build.input == 0 || build.stride < 96))) {
+				continue;
+			}
+			// The list the CPU wrote reaches the GPU. The header depends only on the instance
+			// count: it is written here too, so CPU reads of it need no readback; the rest of the
+			// TLAS becomes GPU written.
+			if (build.count != 0) {
+				(void)cache.ObtainBuffer(build.input, uint64_t {build.stride} * build.count, false);
+			}
+			std::array<uint32_t, 32> header {};
+			const auto size = NativeRayTracing::HleTlasHeader(build.count, header);
+			Libs::LibKernel::Memory::WriteBacking(build.header, header.data(), sizeof(header));
+			(void)cache.ObtainBuffer(build.header + 256u, size - 256u, true);
+		}
+		// The builds store through device addresses; their inputs reached the GPU above (or are
+		// GPU written).
+		context.PrepareBda(true, false);
+		auto& command = context.GetCommandScheduler().Current();
+		command.EndRendering();
+		for (const auto& build: builds) {
+			if (build.header != 0 && (build.count == 0 || (build.input != 0 && build.stride >= 96))) {
+				context.GetNativeRayTracing().RecordHleTlas(command.Handle(), build.input,
+				                                            build.count, build.stride,
+				                                            build.header);
+			}
+		}
+	});
+	return true;
+}
+
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
+	if (HleTlasDispatch(GetShCtx().GetCs().cs_regs.data_addr)) {
+		return;
+	}
 	GetShCtx().SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 	auto operation     = MakeOperation(GpuOperationKind::DispatchDirect);
 	operation.dispatch = {.thread_group_x = thread_group_x,
@@ -1697,6 +1798,9 @@ void CommandProcessor::ExecuteDispatchDirect(const GpuOperation& operation, uint
 }
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
+	if (HleTlasDispatch(GetShCtx().GetCs().cs_regs.data_addr)) {
+		return;
+	}
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	GetShCtx().SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 	auto operation     = MakeOperation(GpuOperationKind::DispatchIndirect);
