@@ -64,9 +64,68 @@ constexpr std::array<RayTracingSite, 2> ShadowSites {{
     },
 }};
 
-constexpr std::array<RayTracingPatch, 1> Patches {{
+// GTA V (PPSA04263) RT shadows of the second shadow pass (6db33a2bcb077bc3): the same two
+// traversals of the TLAS at [s[4:5] + 16], over other registers. The leaf code decides per lane
+// (v9, v13) whether triangles that are not opaque count; there is no switch for the alpha test.
+constexpr std::array<RayTracingSite, 2> SecondShadowSites {{
+    {
+        .entry_pc        = 0x16e8,
+        .loop_pc         = 0x16ec,
+        .origin          = {44, 41, 40},
+        .direction       = {37, 39, 38},
+        .t_max           = 35,
+        .cull_mask       = 33,
+        .header_sgpr     = 52,
+        .alpha_off_sgpr  = NoAlphaOff,
+        .result_t        = 28,
+        .result_word     = 32,
+        .result_instance = 6,
+        .setup_pc        = 0x1810,
+        .instance_sgpr   = 16,
+        .cull_exit_pc    = 0x1c1c,
+        .blas_head_pc    = 0x1970,
+        .leaf_pc         = 0x1ac0,
+        .leaf_sgpr       = 30,
+        .mask_sgpr       = 64,
+        .saved_exec_sgpr = 28,
+        .tail_pc         = 0x1c08,
+        .after_leaf_pc   = 0,
+        .exit_pc         = 0x1c5c,
+    },
+    {
+        .entry_pc        = 0x2438,
+        .loop_pc         = 0x243c,
+        .origin          = {44, 45, 46},
+        .direction       = {47, 48, 49},
+        .t_max           = 43,
+        .cull_mask       = 16,
+        .header_sgpr     = 52,
+        .alpha_off_sgpr  = NoAlphaOff,
+        .result_t        = 14,
+        .result_word     = 15,
+        .result_instance = 6,
+        .setup_pc        = 0x2550,
+        .instance_sgpr   = 8,
+        .cull_exit_pc    = 0x295c,
+        .blas_head_pc    = 0x26b0,
+        .leaf_pc         = 0x2800,
+        .leaf_sgpr       = 22,
+        .mask_sgpr       = 36,
+        .saved_exec_sgpr = 20,
+        .tail_pc         = 0x2948,
+        .after_leaf_pc   = 0,
+        .exit_pc         = 0x299c,
+    },
+}};
+
+constexpr std::array<RayTracingPatch, 2> Patches {{
     {.shader_hash   = 0xfa8b1616fddc203bull,
      .sites         = ShadowSites,
+     .user_sgpr     = 4,
+     .header_offset = 16,
+     .root          = 37},
+    {.shader_hash   = 0x6db33a2bcb077bc3ull,
+     .sites         = SecondShadowSites,
      .user_sgpr     = 4,
      .header_offset = 16,
      .root          = 37},
@@ -276,7 +335,11 @@ bool AddNativeTraversal(Layout& layout, const Program& program, const RayTracing
 	init.image_nsa_addr[6] = site.t_max;
 	init.image_nsa_addr[7] = site.cull_mask;
 	init.src0              = Sgpr(site.header_sgpr);
-	init.src1              = Sgpr(site.alpha_off_sgpr);
+	if (site.alpha_off_sgpr != NoAlphaOff) {
+		init.src1 = Sgpr(site.alpha_off_sgpr);
+	} else {
+		init.src1.kind = OperandKind::IntegerInlineConstant;
+	}
 	layout.AddBranch(Opcode::S_CBRANCH_SCC0, Layout::Target::Guest, site.loop_pc);
 
 	const auto loop_label = layout.NewLabel(), exit_label = layout.NewLabel();
