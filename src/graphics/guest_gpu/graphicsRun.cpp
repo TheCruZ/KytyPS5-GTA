@@ -249,6 +249,15 @@ GuestGpu::GuestGpu(RenderContext& renderer)
 	if (m_pipelined) {
 		m_pending_writes = std::make_unique<GuestWrite[]>(PendingWriteCapacity);
 		m_gfx_cp->AttachPipeline(this);
+		// The execution thread's stream-buffer writes go through a copy thread of their own.
+		// KYTY_HOST_COPY_QUEUE=0 writes the stream buffer on the execution thread.
+		static const bool host_copies = [] {
+			const char* value = std::getenv("KYTY_HOST_COPY_QUEUE");
+			return value == nullptr || value[0] != '0';
+		}();
+		if (host_copies && renderer.GetCommandScheduler().Threaded()) {
+			renderer.GetCommandScheduler().EnableHostCopies();
+		}
 		m_executor = std::jthread([this] { ExecutionThread(); });
 		if (m_resolving) {
 			m_resolver = std::jthread([this] { ResolveThread(); });
@@ -460,8 +469,12 @@ void GuestGpu::RunUrgentCommands() {
 	if (m_urgent_pending.load(std::memory_order_acquire) == 0) {
 		return;
 	}
-	// Unmaps free memory that the render targets of the draw before may refer to.
+	// Unmaps free memory that the render targets of the draw before may refer to, and that copies
+	// of executed draws may still read.
 	m_renderer.GetRenderExecutor().EndDrawWindow();
+	if (auto* copies = m_renderer.GetCommandScheduler().HostCopies(); copies != nullptr) {
+		copies->Drain();
+	}
 	std::vector<Common::UniqueFunction<void>> commands;
 	{
 		std::lock_guard lock(m_urgent_mutex);
@@ -888,6 +901,15 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 		// draws read.
 		m_renderer.GetRenderExecutor().EndDrawWindow();
 	}
+	if (operation.kind != GpuOperationKind::DrawIndex &&
+	    operation.kind != GpuOperationKind::DrawAuto &&
+	    operation.kind != GpuOperationKind::DrawIndirect) {
+		// The guest may overwrite what earlier draws read once it sees the effect: their copies
+		// complete first.
+		if (auto* copies = GetScheduler().HostCopies(); copies != nullptr) {
+			copies->Drain();
+		}
+	}
 	switch (operation.kind) {
 		case GpuOperationKind::DrawIndex: ExecuteDrawIndex(operation, operation.draw_index); break;
 		case GpuOperationKind::DrawAuto: ExecuteDrawAuto(operation, operation.draw_auto); break;
@@ -907,6 +929,10 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 	}
 	if (operation.prepared) {
 		DrawPrep::ClearCurrent();
+	}
+	// Starts the copies of the operation while the next ones are prepared.
+	if (auto* copies = GetScheduler().HostCopies(); copies != nullptr) {
+		(void)copies->Flush();
 	}
 }
 

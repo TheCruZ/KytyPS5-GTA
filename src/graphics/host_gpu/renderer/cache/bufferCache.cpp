@@ -1758,16 +1758,37 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	return handle;
 }
 
-namespace {
-// Backing reads mostly hit the per-thread mapping cache; sparse ranges with holes or private
-// mappings take the full copy.
-void StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t size) {
+void BufferCache::StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t size) {
+	// The execution thread hands its copies to the host copy thread (see HostCopyQueue: writing
+	// the stream buffer itself would stall it on its next fence). The copy reads the backing
+	// store, which holds the same bytes as the guest range and is never protected, so a copy that
+	// runs after a later draw protected the range for GPU writes does not fault.
+	auto* copies = m_scheduler.HostCopies();
+	if (copies != nullptr && m_stream_buffer.IsCoherent() && GuestGpu::IsGpuThread()) {
+		if (const void* source = Libs::LibKernel::Memory::FindBackingPointer(vaddr, size)) {
+			copies->Copy(destination, source, size);
+			return;
+		}
+	}
+	// Backing reads mostly hit the per-thread mapping cache; sparse ranges with holes or private
+	// mappings take the full copy.
 	if (!LibKernel::Memory::TryReadBacking(vaddr, destination, size) &&
 	    !LibKernel::Memory::CopySparseMemory(vaddr, destination, size)) {
 		EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 	}
 }
-} // namespace
+
+uint64_t BufferCache::StreamUpload(const void* data, uint64_t size, uint64_t alignment) {
+	auto* copies = m_scheduler.HostCopies();
+	if (copies == nullptr || !m_stream_buffer.IsCoherent() || !GuestGpu::IsGpuThread()) {
+		return m_stream_buffer.Copy(data, size, alignment);
+	}
+	const auto [mapped, offset] = m_stream_buffer.Map(size, alignment);
+	EXIT_IF(mapped == nullptr);
+	copies->CopyInline(mapped, data, size);
+	m_stream_buffer.Commit();
+	return offset;
+}
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
