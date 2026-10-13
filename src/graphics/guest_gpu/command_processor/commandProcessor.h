@@ -115,6 +115,10 @@ public:
 	// GTA V's TLAS builds, replaced by native ones (see graphicsRun.cpp); true when the dispatch
 	// is dropped.
 	bool HleTlasDispatch(uint64_t data_addr);
+	// GTA V's BLAS refits, replaced by native ones (see graphicsRun.cpp); true when the dispatch
+	// is dropped.
+	bool HleBlasDispatch(uint64_t data_addr);
+	void EmitHleRefit();
 	// The program hash of the compute shader at `data_addr`.
 	uint64_t ComputeShaderHash(uint64_t data_addr);
 	// Reads guest memory the CP decides on (WAIT_REG_MEM, COND_EXEC, predication, branches) as a
@@ -260,6 +264,16 @@ private:
 	std::vector<HleTlasBuild>              m_hle_tlas_builds;
 	uint32_t                               m_hle_tlas_finished = 0;
 	bool                                   m_hle_tlas_window   = false;
+	// The BLAS refits of the current refit window (see HleBlasDispatch()).
+	struct HleRefitGeometryRef {
+		uint64_t blas     = 0;
+		uint64_t table    = 0;
+		uint32_t geometry = 0;
+	};
+	std::vector<uint64_t>            m_hle_refit_blases;
+	std::vector<HleRefitGeometryRef> m_hle_refit_geometries;
+	uint32_t                         m_hle_refit_finished = 0;
+	bool                             m_hle_refit_window   = false;
 	// The program hash of each compute shader address seen.
 	std::unordered_map<uint64_t, uint64_t> m_cs_hashes;
 
