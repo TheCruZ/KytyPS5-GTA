@@ -12,6 +12,7 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <span>
 #include <unordered_map>
 #include <vector>
 
@@ -96,6 +97,22 @@ public:
 	// nothing else); returns the TLAS size.
 	static uint32_t HleTlasHeader(uint32_t count, HleTlasFormat format,
 	                              std::array<uint32_t, 32>& header) noexcept;
+
+	// GTA V's BLAS refits (see CommandProcessor::HleBlasDispatch()): a geometry of a refit BLAS
+	// with its vertex buffer V# and object matrix (column-major), as the game's CPU wrote them.
+	struct HleRefitGeometry {
+		uint64_t                 blas     = 0;
+		uint32_t                 geometry = 0;
+		uint32_t                 pad      = 0;
+		std::array<uint32_t, 4>  vsharp {};
+		std::array<float, 16>    matrix {};
+	};
+	// Records the refits of `blases` in the game's format: the vertices of the triangle nodes of
+	// `geometries`, then the boxes of the box nodes (see hle_blas_refit.comp). `header_layout` is
+	// the BLAS header of the library: 0 for generation Base460, 1 for Base252. Outside a render
+	// pass.
+	void RecordHleRefit(const CommandRecorder& command, std::span<const uint64_t> blases,
+	                    std::span<const HleRefitGeometry> geometries, uint32_t header_layout);
 
 	// The device address of the context table the shaders look their TLAS up in (see
 	// ContextEntry in rt_tlas_walk.comp), 0 when disabled.
@@ -185,6 +202,13 @@ private:
 		// Until this preparation the slot is rebuilt every time (the guest changed it lately).
 		uint32_t                     dynamic_until = 0;
 		uint64_t                     built_frame   = UINT64_MAX;
+		// The last HLE refit pass that refit the guest BLAS, and the one before the last host
+		// build.
+		uint64_t                     refit_seq       = 0;
+		uint64_t                     built_refit_seq = 0;
+		// Built for a fast build (see FastBlasFlags), gathered builds since the last walk.
+		bool                         fast_built      = false;
+		uint32_t                     gathers         = 0;
 		// The last frame a TLAS referenced the slot (from the readbacks), or its creation.
 		uint64_t                     last_use_frame  = 0;
 		// Released: kept in m_retired's shadow until the readbacks that may name it are gone.
@@ -271,6 +295,11 @@ private:
 	vk::PipelineLayout      m_hle_tlas_layout   = nullptr;
 	vk::Pipeline            m_hle_tlas_pipeline = nullptr;
 	std::unique_ptr<Buffer> m_hle_tlas_scratch;
+	vk::PipelineLayout      m_hle_refit_layout   = nullptr;
+	vk::Pipeline            m_hle_refit_pipeline = nullptr;
+	std::unique_ptr<Buffer> m_hle_jobs;
+	std::unique_ptr<Buffer> m_hle_pool;
+	std::unique_ptr<Buffer> m_hle_state;
 
 	std::unique_ptr<Buffer> m_state;
 	std::unique_ptr<Buffer> m_queue;
@@ -300,6 +329,9 @@ private:
 	Common::Mutex             m_mutex;
 	std::vector<PendingSlot>  m_new_slots;
 	std::vector<std::unique_ptr<Slot>> m_slot_list;
+	// The slots of each guest BLAS address, and the HLE refit passes so far.
+	std::unordered_map<uint64_t, std::vector<uint32_t>> m_slots_by_blas;
+	uint64_t m_refit_seq = 0;
 	std::vector<uint32_t>     m_build_queue;
 	std::vector<uint32_t>     m_dynamic;
 	// Slots whose builds overflowed: slot, opaque and alpha tested triangles.

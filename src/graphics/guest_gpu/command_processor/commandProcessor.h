@@ -121,6 +121,10 @@ public:
 	// GTA V's TLAS builds, replaced by native ones (see graphicsRun.cpp); true when the dispatch
 	// is dropped.
 	bool HleTlasDispatch(uint64_t data_addr);
+	// GTA V's BLAS refits, replaced by native ones (see graphicsRun.cpp); true when the dispatch
+	// is dropped.
+	bool HleBlasDispatch(uint64_t data_addr);
+	void EmitHleRefit();
 	// The program hash of the compute shader at `data_addr`.
 	uint64_t ComputeShaderHash(uint64_t data_addr);
 	// Reads guest memory the CP decides on (WAIT_REG_MEM, COND_EXEC, predication, branches) as a
