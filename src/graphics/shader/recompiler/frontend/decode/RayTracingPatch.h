@@ -45,7 +45,7 @@ struct RayTracingSite {
 	uint32_t cull_mask = 0;
 	// SGPR pair of the TLAS header address at entry_pc.
 	uint32_t header_sgpr = 0;
-	// SGPR that turns the alpha test off (every triangle opaque) when not 0.
+	// SGPR that turns the alpha test off (every triangle opaque) when not 0 (NoAlphaOff: none).
 	uint32_t alpha_off_sgpr = 0;
 	// The VGPRs of an accepted hit: distance, primitive word, instance record address (pair).
 	uint32_t result_t        = 0;
@@ -70,6 +70,8 @@ struct RayTracingSite {
 	// Where the loop exits to.
 	uint32_t exit_pc = 0;
 };
+
+constexpr uint32_t NoAlphaOff = 0xffffffffu;
 
 struct RayTracingPatch {
 	uint64_t                         shader_hash = 0;
