@@ -10,6 +10,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <unordered_map>
 #include <vector>
 
@@ -73,6 +74,21 @@ public:
 	// The first 128 bytes of the header hle_tlas.comp writes for `count` instances (it depends on
 	// nothing else); returns the TLAS size.
 	static uint32_t HleTlasHeader(uint32_t count, std::array<uint32_t, 32>& header) noexcept;
+
+	// GTA V's BLAS refits (see CommandProcessor::HleBlasDispatch()): a geometry of a refit BLAS
+	// with its vertex buffer V# and object matrix (column-major), as the game's CPU wrote them.
+	struct HleRefitGeometry {
+		uint64_t                 blas     = 0;
+		uint32_t                 geometry = 0;
+		uint32_t                 pad      = 0;
+		std::array<uint32_t, 4>  vsharp {};
+		std::array<float, 16>    matrix {};
+	};
+	// Records the refits of `blases` in the game's format: the vertices of the triangle nodes of
+	// `geometries`, then the boxes of the box nodes (see hle_blas_refit.comp). Outside a render
+	// pass.
+	void RecordHleRefit(const CommandRecorder& command, std::span<const uint64_t> blases,
+	                    std::span<const HleRefitGeometry> geometries);
 
 	// The device address of the context table the shaders look their TLAS up in (see
 	// ContextEntry in rt_tlas_walk.comp), 0 when disabled.
@@ -164,6 +180,11 @@ private:
 	vk::PipelineLayout      m_hle_tlas_layout   = nullptr;
 	vk::Pipeline            m_hle_tlas_pipeline = nullptr;
 	std::unique_ptr<Buffer> m_hle_tlas_scratch;
+	vk::PipelineLayout      m_hle_refit_layout   = nullptr;
+	vk::Pipeline            m_hle_refit_pipeline = nullptr;
+	std::unique_ptr<Buffer> m_hle_jobs;
+	std::unique_ptr<Buffer> m_hle_pool;
+	std::unique_ptr<Buffer> m_hle_state;
 
 	std::unique_ptr<Buffer> m_state;
 	std::unique_ptr<Buffer> m_queue;

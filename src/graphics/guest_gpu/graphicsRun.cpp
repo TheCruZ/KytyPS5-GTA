@@ -1786,6 +1786,108 @@ uint64_t CommandProcessor::ComputeShaderHash(uint64_t data_addr) {
 	return it->second;
 }
 
+// Reads guest memory on the execution thread without waiting for the GPU when the GPU wrote
+// other bytes of its pages.
+static void ReadGuestAroundGpuWrites(uint64_t vaddr, void* data, uint64_t size) {
+	if (!Libs::LibKernel::Memory::TryReadAroundGpuWrites(vaddr, data, size)) {
+		std::memcpy(data, reinterpret_cast<const void*>(vaddr), size);
+	}
+}
+
+// GTA V refits the BLASes of its animated geometry every frame in its BVH compute queue, with
+// four shaders dispatched once per BLAS (one of them once per geometry): ddff3c6d72c4e994 (the
+// indirect arguments of the next one, from the BLAS header), 8972763dd85dcf74 (the vertices of
+// a geometry's triangle nodes, from its vertex buffer and object matrix), 8de8b6519a1fefe2 (the
+// arguments of the last one) and b2966d3472aac545 (the boxes, bottom up). With native ray
+// tracing they are replaced by NativeRayTracing::RecordHleRefit(): the dispatches are dropped;
+// each BLAS (s[0:1] of ddff3c6d72c4e994) and each geometry (the table V# at s[0:3], BLAS at s[4:5]
+// and geometry index s8 of 8972763dd85dcf74) are kept and, with the last box pass, one host
+// command refits every BLAS (with the vertices other work wrote meanwhile). True when the
+// dispatch is dropped.
+bool CommandProcessor::HleBlasDispatch(uint64_t data_addr) {
+	if (data_addr == 0 || !m_renderer.GetNativeRayTracing().Enabled()) {
+		return false;
+	}
+	constexpr uint64_t ArgsShader     = 0xddff3c6d72c4e994ull;
+	constexpr uint64_t VertexShader   = 0x8972763dd85dcf74ull;
+	constexpr uint64_t BoxArgsShader  = 0x8de8b6519a1fefe2ull;
+	constexpr uint64_t BoxShader      = 0xb2966d3472aac545ull;
+	const auto         hash           = ComputeShaderHash(data_addr);
+	const bool         refit_shader   = hash == ArgsShader || hash == VertexShader ||
+	                                    hash == BoxArgsShader || hash == BoxShader;
+	// Other shaders run meanwhile.
+	if (!refit_shader) {
+		return false;
+	}
+	if (!m_hle_refit_window) {
+		if (hash != ArgsShader) {
+			return false;
+		}
+		m_hle_refit_window = true;
+		m_hle_refit_blases.clear();
+		m_hle_refit_geometries.clear();
+		m_hle_refit_finished = 0;
+	}
+	const auto& user = GetShCtx().GetCs().cs_user_sgpr.value;
+	if (hash == ArgsShader) {
+		m_hle_refit_blases.push_back((uint64_t {user[0]} | (uint64_t {user[1]} << 32u)) &
+		                             0xffffffffffffull);
+	} else if (hash == VertexShader) {
+		m_hle_refit_geometries.push_back(
+		    {.blas     = uint64_t {user[4]} | (uint64_t {user[5] & 0xffffu} << 32u),
+		     .table    = uint64_t {user[0]} | (uint64_t {user[1] & 0xffffu} << 32u),
+		     .geometry = user[8]});
+	} else if (hash == BoxShader && ++m_hle_refit_finished == m_hle_refit_blases.size()) {
+		m_hle_refit_window = false;
+		EmitHleRefit();
+	}
+	return true;
+}
+
+void CommandProcessor::EmitHleRefit() {
+	EmitHostCommand([this, blases = m_hle_refit_blases, refs = m_hle_refit_geometries] {
+		auto&                                          context = m_renderer;
+		auto&                                          cache   = context.GetBufferCache();
+		std::vector<NativeRayTracing::HleRefitGeometry> geometries;
+		geometries.reserve(refs.size());
+		uint64_t last_vertices = 0;
+		for (const auto& ref: refs) {
+			if (ref.blas == 0 || ref.table == 0) {
+				continue;
+			}
+			// The geometry entry (120 bytes, written by the game's CPU): the vertex buffer V# at
+			// +8 and the object matrix at +56.
+			std::array<uint32_t, 30> entry {};
+			ReadGuestAroundGpuWrites(ref.table + uint64_t {ref.geometry} * 120u, entry.data(),
+			                         sizeof(entry));
+			NativeRayTracing::HleRefitGeometry geometry {.blas = ref.blas, .geometry = ref.geometry};
+			std::memcpy(geometry.vsharp.data(), &entry[2], sizeof(geometry.vsharp));
+			std::memcpy(geometry.matrix.data(), &entry[14], sizeof(geometry.matrix));
+			ShaderBufferResource vsharp;
+			std::memcpy(vsharp.fields, geometry.vsharp.data(), sizeof(vsharp.fields));
+			// The vertex buffer reaches the GPU (once per buffer in a row).
+			if (vsharp.Base48() != 0 && vsharp.Base48() != last_vertices && vsharp.GetSize() != 0) {
+				last_vertices = vsharp.Base48();
+				(void)cache.ObtainBuffer(vsharp.Base48(), vsharp.GetSize(), false);
+			}
+			geometries.push_back(geometry);
+		}
+		// The refit writes the nodes; the header (first 256 bytes) stays.
+		for (const auto blas: blases) {
+			uint32_t size = 0;
+			ReadGuestAroundGpuWrites(blas + 16, &size, sizeof(size));
+			if (blas != 0 && size > 256u) {
+				(void)cache.ObtainBuffer(blas + 256u, size - 256u, true);
+			}
+		}
+		// The inputs reached the GPU above (or are GPU written).
+		context.PrepareBda(true, false);
+		auto& command = context.GetCommandScheduler().Current();
+		command.EndRendering();
+		context.GetNativeRayTracing().RecordHleRefit(command.Handle(), blases, geometries);
+	});
+}
+
 // GTA V (PPSA04263) builds the four TLASes of its ray tracing passes in its BVH compute queue:
 // 18 shaders after an empty one (b35f2644b8829bd8), each dispatched once per TLAS
 // (d8f2a760e26e9f63 more often), several of which wait for the GPU. With native ray tracing,
@@ -1875,7 +1977,8 @@ bool CommandProcessor::HleTlasDispatch(uint64_t data_addr) {
 
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
-	if (HleTlasDispatch(GetShCtx().GetCs().cs_regs.data_addr)) {
+	if (HleTlasDispatch(GetShCtx().GetCs().cs_regs.data_addr) ||
+	    HleBlasDispatch(GetShCtx().GetCs().cs_regs.data_addr)) {
 		return;
 	}
 	GetShCtx().SetCsWaveSize(Pm4::ComputeWaveSize(mode));
@@ -1917,7 +2020,8 @@ void CommandProcessor::ExecuteDispatchDirect(const GpuOperation& operation, uint
 }
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
-	if (HleTlasDispatch(GetShCtx().GetCs().cs_regs.data_addr)) {
+	if (HleTlasDispatch(GetShCtx().GetCs().cs_regs.data_addr) ||
+	    HleBlasDispatch(GetShCtx().GetCs().cs_regs.data_addr)) {
 		return;
 	}
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
