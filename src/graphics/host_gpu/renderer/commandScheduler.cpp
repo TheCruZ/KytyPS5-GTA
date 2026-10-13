@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/cpuAffinity.h"
 #include "common/debugCounters.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/timer.h"
@@ -827,6 +828,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	    .debug_arg3   = m_command.m_debug_arg3,
 	    .debug_arg4   = m_command.m_debug_arg4,
 	};
+	// The command buffer reads the stream data the execution thread's copies write.
+	job.host_copies                   = m_host_copies != nullptr ? m_host_copies->Flush() : 0;
 	m_command.m_buffer                = nullptr;
 	m_command.m_open                  = false;
 	m_recorded_release_mem_writes     = 0;
@@ -871,7 +874,16 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	return job.tick;
 }
 
+void CommandScheduler::EnableHostCopies() {
+	EXIT_IF(m_host_copies != nullptr || !m_threaded);
+	m_host_copies = std::make_unique<HostCopyQueue>(
+	    [] { Config::ConfigureGpuStageThread(Config::GpuStageThread::HostCopy); });
+}
+
 void CommandScheduler::QueueSubmit(SubmitJob& job) {
+	if (m_host_copies != nullptr && job.host_copies != 0) {
+		m_host_copies->WaitFor(job.host_copies);
+	}
 	auto&      graphics = m_graphics;
 	vk::Result result;
 	{

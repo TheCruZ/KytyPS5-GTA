@@ -137,6 +137,9 @@ int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// Where the backing store keeps [vaddr, vaddr + size) when one mapping holds it, else null. The
+// pointer stays readable for the emulator's lifetime and reads what TryReadBacking() reads.
+[[nodiscard]] const void* FindBackingPointer(uint64_t vaddr, uint64_t size);
 // Diagnostics: the virtual mappings of the direct memory behind a range (aliases included).
 std::vector<std::pair<uint64_t, uint64_t>> FindDirectMemoryAliases(uint64_t vaddr, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);

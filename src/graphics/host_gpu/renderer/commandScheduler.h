@@ -114,6 +114,11 @@ public:
 	void EnableRecordingThread();
 	// The current command buffer's commands go through the recording thread.
 	[[nodiscard]] bool Threaded() const noexcept { return m_threaded; }
+	// A host copy thread for the stream-buffer writes of the pipeline's execution thread (see
+	// HostCopyQueue). Submissions wait for the copies queued before them. Enable it before the
+	// execution thread starts; null until then.
+	void                         EnableHostCopies();
+	[[nodiscard]] HostCopyQueue* HostCopies() noexcept { return m_host_copies.get(); }
 	// The most one Stash() or Record() can take: a larger copy is made another way (a bindless
 	// image table's descriptor array is megabytes).
 	static constexpr size_t MaxStashBytes = 128 * 1024;
@@ -215,6 +220,8 @@ private:
 		vk::CommandBuffer buffer = nullptr;
 		SubmitInfo        submit;
 		uint64_t          tick         = 0;
+		// Host copies queued before the submission: the GPU reads their destinations.
+		uint64_t          host_copies  = 0;
 		uint32_t          debug_op     = 0;
 		uint64_t          debug_submit = 0;
 		uint32_t          debug_arg0   = 0;
@@ -304,6 +311,7 @@ private:
 	// free list and counters to m_record_mutex; m_worker_buffer to the recording thread (read by
 	// the producer only after a drain).
 	bool                                m_threaded = false;
+	std::unique_ptr<HostCopyQueue>      m_host_copies;
 	std::unique_ptr<Chunk>              m_chunk;
 	std::mutex                          m_record_mutex;
 	std::condition_variable_any         m_record_available;
