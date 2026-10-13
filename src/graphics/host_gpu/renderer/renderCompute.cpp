@@ -663,7 +663,8 @@ void RenderExecutor::DispatchIndirectThreads(uint64_t submit_id, CommandBuffer& 
 
 	auto&      stream  = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
 	const std::array<uint32_t, 8> scratch_init {};
-	const auto scratch_offset = stream.Copy(scratch_init.data(), sizeof(scratch_init), 256);
+	const auto scratch_offset =
+	    m_context.GetBufferCache().StreamUpload(scratch_init.data(), sizeof(scratch_init), 256);
 
 	if (!m_indirect_thread_pass) {
 		m_indirect_thread_pass = {new IndirectThreadPass(m_context.GetGraphics()),
