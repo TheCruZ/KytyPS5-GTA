@@ -137,8 +137,8 @@ layout(buffer_reference, std430, buffer_reference_align = 8) buffer RtState {
 
 // A host BLAS: the guest BLAS it mirrors and its acceleration structure of triangles, in two
 // geometries: 0 = opaque, 1 = alpha tested. Per primitive (geometry 1 after the capacity of
-// geometry 0), the entry table holds the guest leaf pointer of its list entry and its primitive
-// word (see rt_blas_walk.comp).
+// geometry 0), the entry table holds (16 bytes) the guest leaf pointer of its list entry, its primitive
+// word, its triangle node and the barycentric remap of the node (see rt_blas_walk.comp).
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer SlotInfo {
 	uint64_t as_address;
 	uint64_t entry_table;

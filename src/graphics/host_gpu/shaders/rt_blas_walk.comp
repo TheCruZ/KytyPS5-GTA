@@ -31,8 +31,8 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer TriangleRef 
 	float v[9];
 };
 
-layout(buffer_reference, std430, buffer_reference_align = 8) buffer EntryRef {
-	uvec2 v;
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer EntryRef {
+	uvec4 v;
 };
 
 layout(push_constant, std430) uniform Push {
@@ -109,7 +109,10 @@ void EmitLeaf(uint64_t blas_va, uint64_t base, uint leaf, Job job, vec3 lo, vec3
 					out_triangle.v[v * 3 + 2] = p.z;
 				}
 				const uint table_index = opaque ? index : s_capacity0 + index;
-				EntryRef(job.entries + uint64_t(table_index) * 8).v = uvec2((first + k) << 3, word);
+				// The barycentric remap of the triangle (node word 15, 8 bits per triangle type).
+				const uint remap = (LoadGuestU32(node + 60) >> (NodeType(tri) * 8u)) & 0xffu;
+				EntryRef(job.entries + uint64_t(table_index) * 16).v =
+				    uvec4((first + k) << 3, word, tri, remap);
 			}
 		}
 		if ((word & 0x80000000u) != 0) {

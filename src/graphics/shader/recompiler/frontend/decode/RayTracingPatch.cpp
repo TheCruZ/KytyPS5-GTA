@@ -118,7 +118,33 @@ constexpr std::array<RayTracingSite, 2> SecondShadowSites {{
     },
 }};
 
-constexpr std::array<RayTracingPatch, 2> Patches {{
+// GTA V (PPSA04263) 651da332bc4a3f98 (Fidelity): short rays (at most 0.2) through the TLAS at
+// [s[4:5] + 112]; per lane BLAS traversal, nearest opaque hit of either facing, no instance mask.
+constexpr std::array<RayTracingSite, 1> ShortRaySites {{
+    {
+        .kind            = RayTracingKind::ClosestOpaque,
+        .entry_pc        = 0x384,
+        .loop_pc         = 0x38c,
+        .origin          = {25, 12, 26},
+        .direction       = {24, 11, 23},
+        .t_max           = 27,
+        .cull_mask       = NoRegister,
+        .header_sgpr     = 16,
+        .alpha_off_sgpr  = NoAlphaOff,
+        .result_t        = 27,
+        .result_word     = 22,
+        .result_instance = 9,
+        .result_u        = 16,
+        .result_v        = 15,
+        .result_node     = 8,
+        // Free at the exit: the selected key goes there.
+        .instance_sgpr   = 6,
+        .mask_sgpr       = 6,
+        .exit_pc         = 0xa94,
+    },
+}};
+
+constexpr std::array<RayTracingPatch, 3> Patches {{
     {.shader_hash   = 0xfa8b1616fddc203bull,
      .sites         = ShadowSites,
      .user_sgpr     = 4,
@@ -128,6 +154,11 @@ constexpr std::array<RayTracingPatch, 2> Patches {{
      .sites         = SecondShadowSites,
      .user_sgpr     = 4,
      .header_offset = 16,
+     .root          = 37},
+    {.shader_hash   = 0x651da332bc4a3f98ull,
+     .sites         = ShortRaySites,
+     .user_sgpr     = 4,
+     .header_offset = 112,
      .root          = 37},
 }};
 
@@ -154,6 +185,10 @@ bool CheckSite(const Program& program, const RayTracingSite& site) {
 		return inst != nullptr && (opcode == Opcode::UNKNOWN || inst->opcode == opcode);
 	};
 	const auto* entry = FindInstruction(program, site.entry_pc);
+	if (site.kind == RayTracingKind::ClosestOpaque) {
+		return entry != nullptr && EndPc(*entry) == site.loop_pc && !IsDirectBranch(entry->opcode) &&
+		       expect(site.loop_pc, Opcode::UNKNOWN) && expect(site.exit_pc, Opcode::UNKNOWN);
+	}
 	return entry != nullptr && EndPc(*entry) == site.loop_pc && !IsDirectBranch(entry->opcode) &&
 	       expect(site.loop_pc, Opcode::S_AND_B64) && expect(site.setup_pc, Opcode::UNKNOWN) &&
 	       expect(site.cull_exit_pc, Opcode::S_CMP_EQ_U32) &&
@@ -323,10 +358,17 @@ bool AddRangeCopy(Layout& layout, const Program& program, uint32_t begin, uint32
 	return true;
 }
 
-// The native traversal of a site, placed between its entry instruction and the loop header:
-// RT_INIT falls back to the loop header, else the native loop runs and exits after the loop.
-bool AddNativeTraversal(Layout& layout, const Program& program, const RayTracingSite& site,
-                        uint32_t index) {
+Operand Constant(uint32_t value) {
+	Operand operand;
+	operand.kind       = OperandKind::IntegerInlineConstant;
+	operand.value      = value;
+	operand.signed_val = static_cast<int32_t>(value);
+	return operand;
+}
+
+// The native traversal of a closest hit site: the hardware finds the hit (every triangle opaque,
+// both facings); no guest code runs for it.
+void AddClosestTraversal(Layout& layout, const RayTracingSite& site, uint32_t index) {
 	auto& init = layout.AddPseudo(Opcode::RT_INIT, index);
 	for (uint32_t i = 0; i < 3; i++) {
 		init.image_nsa_addr[i]     = site.origin[i];
@@ -335,11 +377,51 @@ bool AddNativeTraversal(Layout& layout, const Program& program, const RayTracing
 	init.image_nsa_addr[6] = site.t_max;
 	init.image_nsa_addr[7] = site.cull_mask;
 	init.src0              = Sgpr(site.header_sgpr);
-	if (site.alpha_off_sgpr != NoAlphaOff) {
-		init.src1 = Sgpr(site.alpha_off_sgpr);
-	} else {
-		init.src1.kind = OperandKind::IntegerInlineConstant;
+	init.src1              = Constant(1);
+	init.dmask             = 1; // Both facings.
+	layout.AddBranch(Opcode::S_CBRANCH_SCC0, Layout::Target::Guest, site.loop_pc);
+	const auto loop_label = layout.NewLabel(), exit_label = layout.NewLabel();
+	// Runs the queries to their end (an opaque only query has no candidates; one would be dropped).
+	layout.Bind(loop_label);
+	auto& select = layout.AddPseudo(Opcode::RT_SELECT, index);
+	select.dst   = Sgpr(site.instance_sgpr);
+	select.dst2  = Sgpr(site.mask_sgpr);
+	layout.AddBranch(Opcode::S_CBRANCH_SCC0, Layout::Target::Label, exit_label);
+	auto& skip = layout.AddPseudo(Opcode::RT_RESOLVE, index);
+	skip.src0  = Sgpr(site.mask_sgpr);
+	skip.dmask = 1;
+	layout.AddBranch(Opcode::S_BRANCH, Layout::Target::Label, loop_label);
+	layout.Bind(exit_label);
+	auto& commit = layout.AddPseudo(Opcode::RT_COMMIT, index);
+	commit.image_nsa_addr[0] = site.result_t;
+	commit.image_nsa_addr[1] = site.result_word;
+	commit.image_nsa_addr[2] = site.result_instance;
+	commit.image_nsa_addr[3] = site.result_instance + 1;
+	commit.image_nsa_addr[4] = site.result_u;
+	commit.image_nsa_addr[5] = site.result_v;
+	commit.image_nsa_addr[6] = site.result_node;
+	commit.dmask             = 1; // Only when nearer than the hit in the registers.
+	layout.AddPseudo(Opcode::RT_EXIT, index);
+	layout.AddBranch(Opcode::S_BRANCH, Layout::Target::Guest, site.exit_pc);
+}
+
+// The native traversal of a site, placed between its entry instruction and the loop header:
+// RT_INIT falls back to the loop header, else the native loop runs and exits after the loop.
+bool AddNativeTraversal(Layout& layout, const Program& program, const RayTracingSite& site,
+                        uint32_t index) {
+	if (site.kind == RayTracingKind::ClosestOpaque) {
+		AddClosestTraversal(layout, site, index);
+		return true;
 	}
+	auto& init = layout.AddPseudo(Opcode::RT_INIT, index);
+	for (uint32_t i = 0; i < 3; i++) {
+		init.image_nsa_addr[i]     = site.origin[i];
+		init.image_nsa_addr[3 + i] = site.direction[i];
+	}
+	init.image_nsa_addr[6] = site.t_max;
+	init.image_nsa_addr[7] = site.cull_mask;
+	init.src0              = Sgpr(site.header_sgpr);
+	init.src1              = site.alpha_off_sgpr != NoAlphaOff ? Sgpr(site.alpha_off_sgpr) : Constant(0);
 	layout.AddBranch(Opcode::S_CBRANCH_SCC0, Layout::Target::Guest, site.loop_pc);
 
 	const auto loop_label = layout.NewLabel(), exit_label = layout.NewLabel();
@@ -410,6 +492,9 @@ bool AddNativeTraversal(Layout& layout, const Program& program, const RayTracing
 	commit.image_nsa_addr[1] = site.result_word;
 	commit.image_nsa_addr[2] = site.result_instance;
 	commit.image_nsa_addr[3] = site.result_instance + 1;
+	commit.image_nsa_addr[4] = NoRegister;
+	commit.image_nsa_addr[5] = NoRegister;
+	commit.image_nsa_addr[6] = NoRegister;
 	layout.AddPseudo(Opcode::RT_EXIT_CHECK, index);
 	layout.AddBranch(Opcode::S_CBRANCH_SCC0, Layout::Target::Label, exit_label);
 	restore();

@@ -127,6 +127,8 @@ private:
 		uint64_t                tick  = 0;
 		uint32_t                build_count = 0;
 		std::vector<uint32_t>   build_slots;
+		// The TLAS source the preparation walked (user SGPR << 16 | header offset).
+		uint32_t                source_key  = 0;
 	};
 
 	void CreatePipelines();
@@ -184,7 +186,8 @@ private:
 	// Table entries of BLASes that could not be counted, cleared so the walk reports them again.
 	std::vector<uint32_t>     m_retry;
 	std::unordered_map<uint64_t, uint32_t> m_retries;
-	uint32_t                  m_last_instance_count = 0;
+	// The instance count of the last walk of each TLAS source (shaders trace different TLASes).
+	std::unordered_map<uint32_t, uint32_t> m_last_instance_counts;
 	uint32_t                  m_prepare_id          = 0;
 	uint64_t                  m_frame               = 0;
 

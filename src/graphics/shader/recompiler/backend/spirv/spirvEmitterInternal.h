@@ -127,6 +127,9 @@ struct EmitterState {
 	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_t {};
 	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_word {};
 	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_instance {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_u {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_v {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_node {};
 	// Wave-uniform: the selected key and the instance whose setup ran last.
 	std::array<uint32_t, 4>                          ray_query_selected_instance {};
 	std::array<uint32_t, 4>                          ray_query_selected_leaf {};

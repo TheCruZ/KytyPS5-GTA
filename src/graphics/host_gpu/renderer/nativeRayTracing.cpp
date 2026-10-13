@@ -403,7 +403,7 @@ void NativeRayTracing::AllocateSlot(Slot& slot, uint32_t opaque, uint32_t alpha)
 	slot.storage       = m_arena.Allocate(sizes.accelerationStructureSize, 256);
 	slot.vertices0     = m_arena.Allocate(uint64_t {slot.capacity0} * 36, 256);
 	slot.vertices1     = m_arena.Allocate(uint64_t {slot.capacity1} * 36, 256);
-	slot.entries       = m_arena.Allocate(uint64_t {slot.capacity0 + slot.capacity1} * 8, 256);
+	slot.entries       = m_arena.Allocate(uint64_t {slot.capacity0 + slot.capacity1} * 16, 256);
 	slot.build_scratch = sizes.buildScratchSize;
 	vk::AccelerationStructureCreateInfoKHR create {};
 	create.buffer = slot.storage.buffer->Handle();
@@ -566,6 +566,8 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 	}
 	readback.build_count = 0;
 	readback.build_slots.clear();
+	const auto source_key = source.user_sgpr << 16u | source.header_offset;
+	readback.source_key   = source_key;
 	uint32_t              tlas_count = 0;
 	std::vector<uint32_t> retry;
 	{
@@ -597,8 +599,8 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 			}
 			return false;
 		});
-		tlas_count = std::min(m_tlas_capacity, std::max(1024u, (m_last_instance_count +
-		                                                        m_last_instance_count / 4 + 255u) &
+		const auto last = m_last_instance_counts[source_key];
+		tlas_count      = std::min(m_tlas_capacity, std::max(1024u, (last + last / 4 + 255u) &
 		                                                           ~255u));
 	}
 	m_prepare_id++;
@@ -800,7 +802,7 @@ void NativeRayTracing::ProcessReadback(Readback& readback) {
 			m_build_queue.push_back(index);
 		}
 	}
-	m_last_instance_count = state.instance_count;
+	m_last_instance_counts[readback.source_key] = state.instance_count;
 	readback.tick = 0;
 }
 
