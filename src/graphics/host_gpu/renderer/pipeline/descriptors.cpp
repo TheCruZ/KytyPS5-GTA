@@ -1129,6 +1129,29 @@ void RenderExecutor::RebuildTableSpans(TableBindingState& state) {
 	std::ranges::sort(state.spans, {}, &TableBindingState::PageSpan::first);
 }
 
+void RenderExecutor::AddTableSpans(TableBindingState& state, uint32_t element) {
+	// As RebuildTableSpans() does, keeping the spans sorted.
+	constexpr uint32_t PageBits   = TextureCache::ImagePageBits;
+	auto&              entry      = state.elements[element];
+	const auto&        resolution = *entry.resolution;
+	entry.span_range              = resolution.range;
+	entry.span_metadata           = resolution.metadata_range;
+	for (const auto& range: {resolution.range, resolution.metadata_range}) {
+		if (range.size == 0) {
+			continue;
+		}
+		const uint64_t first = range.address >> PageBits;
+		const uint64_t last  = (range.size > UINT64_MAX - range.address
+		                            ? UINT64_MAX
+		                            : range.address + range.size - 1) >>
+		                      PageBits;
+		const auto at =
+		    std::ranges::upper_bound(state.spans, first, {}, &TableBindingState::PageSpan::first);
+		state.spans.insert(at, {first, last, element});
+		state.max_span = std::max(state.max_span, last - first);
+	}
+}
+
 void RenderExecutor::UnpinTableBindings(TableBindingState& state) {
 	auto& texture_cache = m_context.GetTextureCache();
 	for (auto& element: state.elements) {
@@ -1138,6 +1161,83 @@ void RenderExecutor::UnpinTableBindings(TableBindingState& state) {
 		}
 	}
 	state.valid = false;
+}
+
+void RenderExecutor::IndexTableSlots(TableBindingState& state) {
+	// A counting sort of the slots by element.
+	state.element_slot_begin.assign(state.elements.size() + 1, 0);
+	for (const auto element: state.slots) {
+		state.element_slot_begin[element + 1]++;
+	}
+	for (size_t element = 0; element < state.elements.size(); element++) {
+		state.element_slot_begin[element + 1] += state.element_slot_begin[element];
+	}
+	state.element_slots.resize(state.slots.size());
+	std::vector<uint32_t> next(state.element_slot_begin.begin(), state.element_slot_begin.end() - 1);
+	for (size_t slot = 0; slot < state.slots.size(); slot++) {
+		state.element_slots[next[state.slots[slot]]++] = static_cast<uint32_t>(slot);
+	}
+}
+
+bool RenderExecutor::PatchTableSlots(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                     const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
+                                     TableBindingState& state, uint64_t stamp) {
+	auto& texture_cache = m_context.GetTextureCache();
+	const ShaderRecompiler::IR::DescriptorValue null_value {.dword_count = 8u};
+	// The root image of each range, in the order ReuseTableBindings() compared them.
+	std::vector<uint32_t> roots;
+	ForEachImageTable(program.info.images,
+	                  [&](uint32_t root_index, auto /*kind*/) { roots.push_back(root_index); });
+	auto& index_of = state.element_index;
+	for (const auto& changed: m_table_changed_slots) {
+		auto&       range = state.ranges[changed.range];
+		const auto& table = snapshot.image_tables.at(range.table);
+		const auto& value = changed.index != 0u && changed.index < table.slots.size()
+		                        ? table.slots[changed.index]
+		                        : null_value;
+		// As the slot by slot resolution in PrepareBindings() does.
+		auto&                   resolution = *range.resolution;
+		auto&                   memo       = resolution.slots[changed.index];
+		TableElementResolution* element    = nullptr;
+		if (memo.element != nullptr && memo.dwords == value.dwords) {
+			element = &ResolveTableElement(resolution, value, stamp, memo.element);
+		} else {
+			element = &ResolveTableElement(resolution, value, stamp);
+			memo    = {value.dwords, element};
+		}
+		const auto [found, inserted] =
+		    index_of.try_emplace(element, static_cast<uint32_t>(state.elements.size()));
+		const auto index = found->second;
+		if (inserted) {
+			// As FinishTableBindings() records the elements of a slot by slot resolution; the
+			// visit below binds it and writes its descriptor.
+			state.elements.push_back({.resolution = element, .table = &resolution, .source = value,
+			                          .root = roots.at(changed.range)});
+			auto& entry = state.elements.back();
+			if (element->volatile_dcc) {
+				state.always.push_back(index);
+			} else if (!element->permanent && !element->backing_checkable) {
+				state.unchecked_backing.push_back(index);
+			}
+			entry.pinned = element->texture.image_id;
+			texture_cache.PinImage(entry.pinned);
+			// Written with the visit (the element has no view yet).
+			state.infos.emplace_back();
+			state.marks.push_back(0);
+			AddTableSpans(state, index);
+		}
+		state.values[changed.slot] = value;
+		state.slots[changed.slot]  = index;
+		MarkTableElement(state, index);
+	}
+	IndexTableSlots(state);
+	// Elements no slot names any more keep their images pinned: once there are many, the
+	// tables are resolved slot by slot again.
+	size_t unused = 0;
+	for (size_t element = 0; element < state.elements.size(); element++) {
+		unused += state.element_slot_begin[element + 1] == state.element_slot_begin[element] ? 1 : 0;
+	}
+	return unused <= std::max<size_t>(64, state.elements.size() / 16);
 }
 
 void RenderExecutor::FinishTableBindings(TableBindingState& state,
@@ -1155,18 +1255,11 @@ void RenderExecutor::FinishTableBindings(TableBindingState& state,
 	for (size_t slot = 0; slot < state.slots.size(); slot++) {
 		state.slot_infos[slot] = state.infos[state.slots[slot]];
 	}
-	// The slots of each element (a counting sort by element).
-	state.element_slot_begin.assign(state.elements.size() + 1, 0);
-	for (const auto element: state.slots) {
-		state.element_slot_begin[element + 1]++;
-	}
-	for (size_t element = 0; element < state.elements.size(); element++) {
-		state.element_slot_begin[element + 1] += state.element_slot_begin[element];
-	}
-	state.element_slots.resize(state.slots.size());
-	std::vector<uint32_t> next(state.element_slot_begin.begin(), state.element_slot_begin.end() - 1);
-	for (size_t slot = 0; slot < state.slots.size(); slot++) {
-		state.element_slots[next[state.slots[slot]]++] = static_cast<uint32_t>(slot);
+	IndexTableSlots(state);
+	state.element_index.clear();
+	state.element_index.reserve(state.elements.size());
+	for (uint32_t index = 0; index < state.elements.size(); index++) {
+		state.element_index.emplace(state.elements[index].resolution, index);
 	}
 	state.always.clear();
 	state.unchecked_backing.clear();
@@ -1199,6 +1292,10 @@ bool RenderExecutor::ReuseTableBindings(const ShaderRecompiler::IR::CompiledShad
 	size_t                                      range_index = 0;
 	size_t                                      slot_index  = 0;
 	bool                                        same        = true;
+	// A few slots may name other T#s now (GTA V adds the textures it streams in to its bindless
+	// tables: null slots name them now): those slots are bound again, the rest is reused.
+	const size_t max_changes = std::max<size_t>(256, state.values.size() / 8);
+	m_table_changed_slots.clear();
 	ForEachImageTable(program.info.images, [&](uint32_t root_index, auto /*kind*/) {
 		if (!same) {
 			return;
@@ -1219,7 +1316,15 @@ bool RenderExecutor::ReuseTableBindings(const ShaderRecompiler::IR::CompiledShad
 		for (uint32_t slot = 0; slot < root.table_capacity && same; slot++) {
 			const auto& value =
 			    slot != 0u && slot < table.slots.size() ? table.slots[slot] : null_value;
-			same = state.values[slot_index++] == value;
+			if (!(state.values[slot_index] == value)) {
+				if (m_table_changed_slots.size() == max_changes) {
+					same = false;
+				} else {
+					m_table_changed_slots.push_back(
+					    {static_cast<uint32_t>(slot_index), static_cast<uint32_t>(range_index - 1), slot});
+				}
+			}
+			slot_index++;
 		}
 	});
 	if (!same) {
@@ -1230,6 +1335,9 @@ bool RenderExecutor::ReuseTableBindings(const ShaderRecompiler::IR::CompiledShad
 	}
 	state.mark_stamp++;
 	m_table_marked.clear();
+	if (!m_table_changed_slots.empty() && !PatchTableSlots(program, snapshot, state, stamp)) {
+		return false;
+	}
 	for (const auto element: state.always) {
 		MarkTableElement(state, element);
 	}

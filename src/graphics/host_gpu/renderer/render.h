@@ -380,6 +380,8 @@ private:
 		// The slots of each element: element_slots[element_slot_begin[e] .. [e + 1]).
 		std::vector<uint32_t>                element_slot_begin;
 		std::vector<uint32_t>                element_slots;
+		// The element of each element resolution.
+		std::unordered_map<const TableElementResolution*, uint32_t> element_index;
 		// Element spans by first page; `max_span` is the longest (last - first).
 		std::vector<PageSpan>                spans;
 		uint64_t                             max_span = 0;
@@ -406,6 +408,16 @@ private:
 	void MarkTableElement(TableBindingState& state, uint32_t element);
 	void MarkTablePages(TableBindingState& state, uint64_t address, uint64_t size);
 	void RebuildTableSpans(TableBindingState& state);
+	// Adds the spans of an element that joined the state.
+	static void AddTableSpans(TableBindingState& state, uint32_t element);
+	// The slots of each element (element_slot_begin / element_slots) from `slots`.
+	static void IndexTableSlots(TableBindingState& state);
+	// ReuseTableBindings() of tables whose T#s changed in a few slots: binds those slots to the
+	// elements of their new T#s (new elements join the state). False when the state should be
+	// resolved slot by slot again.
+	[[nodiscard]] bool PatchTableSlots(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+	                     const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
+	                     TableBindingState& state, uint64_t stamp);
 	// After CommitBindings() bound the tables: records the descriptors and pins the images.
 	void FinishTableBindings(TableBindingState& state, const PreparedBindings& prepared);
 	void UnpinTableBindings(TableBindingState& state);
@@ -535,6 +547,13 @@ private:
 	std::unordered_map<const void*, TableBindingState> m_table_states;
 	std::vector<std::pair<uint64_t, uint64_t>>         m_table_changes;
 	std::vector<uint32_t>                              m_table_marked;
+	// ReuseTableBindings(): the slots whose T# changed (slot, range, slot in its range).
+	struct ChangedTableSlot {
+		uint32_t slot  = 0;
+		uint32_t range = 0;
+		uint32_t index = 0;
+	};
+	std::vector<ChangedTableSlot>                      m_table_changed_slots;
 	// RebindReusedTables(): the elements whose binding changed, one byte per element.
 	std::vector<uint8_t>                               m_table_flags;
 	// See BeginGuestOperation().
