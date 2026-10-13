@@ -317,7 +317,7 @@ add_custom_command(
 list(APPEND kyty_emulator_src "${indirect_thread_shader_header}")
 
 # Native ray tracing: walks of the guest BVHs (see nativeRayTracing.h).
-foreach(shader_name IN ITEMS rt_tlas_walk rt_blas_walk)
+foreach(shader_name IN ITEMS rt_tlas_walk rt_blas_walk hle_tlas)
 	set(shader_source "${gpu_tiler_shader_dir}/${shader_name}.comp")
 	set(shader_spv "${gpu_tiler_generated_dir}/${shader_name}.spv")
 	set(shader_header "${gpu_tiler_generated_dir}/${shader_name}_spv.h")
