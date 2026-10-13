@@ -121,6 +121,11 @@ public:
 
 	Instruction& AddGuest(const Instruction& inst) {
 		Item item {inst};
+		// The guest code stays where it is in memory: PC-relative addresses (S_GETPC_B64 reads
+		// of data after the program) keep their guest pc.
+		if (item.inst.guest_pc == UINT32_MAX) {
+			item.inst.guest_pc = inst.pc;
+		}
 		if (IsDirectBranch(inst.opcode)) {
 			item.target = Target::Guest;
 			item.value  = inst.branch_target;
