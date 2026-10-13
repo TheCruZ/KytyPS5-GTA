@@ -138,6 +138,13 @@ private:
 		// Until this preparation the slot is rebuilt every time (the guest changed it lately).
 		uint32_t                     dynamic_until = 0;
 		uint64_t                     built_frame   = UINT64_MAX;
+		// The last HLE refit pass that refit the guest BLAS, and the one before the last host
+		// build.
+		uint64_t                     refit_seq       = 0;
+		uint64_t                     built_refit_seq = 0;
+		// Built for a fast build (see FastBlasFlags), gathered builds since the last walk.
+		bool                         fast_built      = false;
+		uint32_t                     gathers         = 0;
 	};
 
 	struct PendingSlot {
@@ -214,6 +221,9 @@ private:
 	Common::Mutex             m_mutex;
 	std::vector<PendingSlot>  m_new_slots;
 	std::vector<std::unique_ptr<Slot>> m_slot_list;
+	// The slots of each guest BLAS address, and the HLE refit passes so far.
+	std::unordered_map<uint64_t, std::vector<uint32_t>> m_slots_by_blas;
+	uint64_t m_refit_seq = 0;
 	std::vector<uint32_t>     m_build_queue;
 	std::vector<uint32_t>     m_dynamic;
 	// Slots whose builds overflowed: slot, opaque and alpha tested triangles.
