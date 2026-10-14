@@ -1530,7 +1530,11 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	const bool same_program = prepared.last_program == &program &&
 	                          prepared.last_descs_generation == m_texture_descs_generation;
 	const bool same_images  = same_program && prepared.last_images == snapshot.images;
-	if (!same_images) {
+	// Otherwise the slots whose T# did not change keep their descriptions: one changed texture
+	// does not look up every other one again.
+	const bool same_slots = same_program && prepared.last_images.size() == snapshot.images.size() &&
+	                        prepared.image_descs.size() == program.info.images.size();
+	if (!same_slots) {
 		prepared.image_descs.assign(program.info.images.size(), nullptr);
 	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
@@ -1539,7 +1543,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		if (!resource.written &&
 		    resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic) {
 			auto* derived = prepared.image_descs[i];
-			if (!same_images) {
+			if (!same_images &&
+			    (derived == nullptr || !same_slots || prepared.last_images[i] != snapshot.images[i])) {
 				const auto cached =
 				    m_texture_descs.find(MakeTextureDescKey(resource, snapshot.images[i]));
 				derived = cached != m_texture_descs.end() ? &cached->second : nullptr;
