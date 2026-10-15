@@ -21,8 +21,8 @@ inline constexpr Profile DefaultProfile {};
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   uint32_t       push_data_start_dword = 0,
                                   const Profile& profile               = DefaultProfile,
-                                  bool           emit_debug_info       = false);
-
+                                  bool           emit_debug_info       = false,
+                                  bool           robust_buffer_access2 = false);
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SPIRVEMITTER_H_ */

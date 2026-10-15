@@ -16,7 +16,8 @@ uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 
 uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t target,
                               uint32_t exec) {
-	if (state.lane_count == 2) {
+	// These reads stay within 32-lane halves of the wave: a split wave's host subgroups.
+	if (state.lane_count == 2 || state.split_wave) {
 		target = Binary(state, spv::OpBitwiseAnd, TypeU32(state), target, ConstantU32(state, 31));
 	}
 	const auto shuffled = state.builder.AllocateId();
@@ -425,6 +426,12 @@ uint32_t BufferIndexInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
 	const auto index = DwordIndex(ctx, inst, mem, resource.byte_offset);
+	if (ctx.state.robust_buffer_access2 && resource.element_bits == 32u &&
+	    (resource.kind == IR::ResourceKind::Buffer ||
+	     resource.kind == IR::ResourceKind::ScalarBuffer)) {
+		// The device reads zero past the descriptor's range, which OpArrayLength measures.
+		return LoadWordInBounds(ctx, resource, index);
+	}
 	return EmitValueOrZeroIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
 	    [&]() { return LoadWordInBounds(ctx, resource, index); });
@@ -1655,9 +1662,10 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto condition = AndCondition(
 	    state, is_first,
 	    AndCondition(state,
-	                 state.lane_count == 2 ? Binary(state, spv::OpINotEqual, TypeBool(state), count,
-	                                                ConstantU32(state, 0))
-	                                       : exec,
+	                 state.lane_count == 2 || state.split_wave
+	                     ? Binary(state, spv::OpINotEqual, TypeBool(state), count,
+	                              ConstantU32(state, 0))
+	                     : exec,
 	                 bounds));
 	const auto atomic = EmitValueOrZeroIfCondition(state, condition, [&]() {
 		const auto value = state.builder.AllocateId();
@@ -1669,6 +1677,10 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                          ConstantU32(state, spv::MemorySemanticsMaskNone), count);
 		return value;
 	});
+	// A split wave's first active lane may be in the other host subgroup.
+	if (state.split_wave) {
+		return ExchangeWaveValue(state, atomic, source_lane);
+	}
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), result,
 	                          ConstantU32(state, spv::ScopeSubgroup), atomic, source_lane);
@@ -1805,7 +1817,7 @@ uint32_t EmitSwizzleU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 uint32_t EmitPermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state   = ctx.state;
 	auto       lane    = EmitSubgroupLocalInvocationId(state);
-	if (state.lane_count == 2) {
+	if (state.lane_count == 2 || state.split_wave) {
 		lane = Binary(state, spv::OpBitwiseAnd, TypeU32(state), lane, ConstantU32(state, 31));
 	}
 	const auto address = ctx.Arg(inst, 1);

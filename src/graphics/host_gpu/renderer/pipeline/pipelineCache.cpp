@@ -530,6 +530,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::CompileOptions options;
 		options.stage       = stage;
 		options.profile             = &profile;
+		options.robust_buffer_access2 = graphics.robust_buffer_access2_enabled;
 		options.shader_hash = params.hash;
 		options.user_data   = user_data;
 		options.back_code   = params.back_code;

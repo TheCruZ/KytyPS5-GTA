@@ -25,6 +25,7 @@ struct CompileOptions {
 	bool                        early_dump                 = false;
 	bool                        emit_debug_info            = false;
 	const Spirv::Profile*       profile                    = &Spirv::DefaultProfile;
+	bool                        robust_buffer_access2      = false;
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
