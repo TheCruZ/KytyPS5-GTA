@@ -216,7 +216,7 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   uint32_t push_data_start_dword, const Profile& profile,
-                                  bool emit_debug_info) {
+                                  bool emit_debug_info, bool robust_buffer_access2) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
@@ -239,6 +239,7 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 		state.debug_source = state.builder.AddString(name);
 		state.builder.EnableNames();
 	}
+	state.robust_buffer_access2 = robust_buffer_access2;
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
