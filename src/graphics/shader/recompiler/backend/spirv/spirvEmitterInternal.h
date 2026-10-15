@@ -110,6 +110,8 @@ struct EmitterState {
 
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
+	// The device returns zero for out-of-bounds storage buffer reads (robustBufferAccess2).
+	bool                                             robust_buffer_access2   = false;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
 	std::vector<uint32_t>                           memory_byte_sizes;
