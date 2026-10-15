@@ -4,6 +4,11 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <algorithm>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t PixelParameterLocation(const EmitterState& state, uint32_t attr) {
@@ -283,6 +288,284 @@ spv::ExecutionModel ExecutionModelForStage(ShaderType stage) {
 		case ShaderType::Pixel: return spv::ExecutionModelFragment;
 		default: return spv::ExecutionModelGLCompute;
 	}
+}
+
+namespace {
+
+// A branch on whether any lane's predicate is set, which the guest takes or skips for the whole
+// wave. Scalar subvector loops branch on a uniform value instead.
+bool IsWaveCondition(const IR::Inst& inst) {
+	if (inst.GetOpcode() != IR::ValueOpcode::ConditionRef) {
+		return false;
+	}
+	switch (inst.Flags<CFG::BranchCondition>()) {
+		case CFG::BranchCondition::SccZero:
+		case CFG::BranchCondition::SccNonZero:
+		case CFG::BranchCondition::VccZero:
+		case CFG::BranchCondition::VccNonZero:
+		case CFG::BranchCondition::ExecZero:
+		case CFG::BranchCondition::ExecNonZero: return true;
+		default: return false;
+	}
+}
+
+// A waterfall loop's read: the loop compares each lane's value with the one read, handles the
+// lanes that match and repeats for the rest.
+bool IsWaterfallRead(const IR::Inst& inst) {
+	if (inst.GetOpcode() != IR::ValueOpcode::ReadFirstLane) {
+		return false;
+	}
+	const auto source = inst.Arg(0).Resolve();
+	return !source.IsImmediate() && std::ranges::any_of(inst.Uses(), [&](const IR::Use& use) {
+		return use.user->GetOpcode() == IR::ValueOpcode::IEqual32 && use.operand < 2 &&
+		       use.user->Arg(1 - use.operand).Resolve() == source;
+	});
+}
+
+// A set of wave conditions, by index.
+struct ConditionSet {
+	std::vector<uint64_t> words;
+
+	explicit ConditionSet(size_t count = 0): words((count + 63) / 64) {}
+
+	void Set(size_t index) { words[index / 64] |= uint64_t {1} << (index % 64); }
+	bool Test(size_t index) const { return (words[index / 64] >> (index % 64) & 1u) != 0; }
+	bool Merge(const ConditionSet& other) {
+		bool changed = false;
+		for (size_t word = 0; word < words.size() && word < other.words.size(); word++) {
+			changed |= (other.words[word] & ~words[word]) != 0;
+			words[word] |= other.words[word];
+		}
+		return changed;
+	}
+};
+
+// The immediate post-dominator of each block, with blocks.size() standing for the exit, or an
+// empty result when some block never reaches the exit.
+std::vector<size_t> PostDominators(const IR::BlockList&                            blocks,
+                                   const std::unordered_map<const IR::Block*, size_t>& index) {
+	const auto count = blocks.size();
+	const auto exit  = count;
+	constexpr auto none = SIZE_MAX;
+	// The post-dominators are the dominators of the reversed graph, rooted at the exit.
+	const auto successors = [&](size_t block) {
+		std::vector<size_t> result;
+		if (block == exit) {
+			return result;
+		}
+		for (const auto* successor: blocks[block]->ImmSuccessors()) {
+			result.push_back(index.at(successor));
+		}
+		if (result.empty()) {
+			result.push_back(exit);
+		}
+		return result;
+	};
+	std::vector<std::vector<size_t>> reverse(count + 1);
+	for (size_t block = 0; block < count; block++) {
+		for (const auto successor: successors(block)) {
+			reverse[successor].push_back(block);
+		}
+	}
+	std::vector<size_t> order(count + 1, none);
+	std::vector<size_t> postorder;
+	std::vector<std::pair<size_t, size_t>> stack {{exit, 0}};
+	order[exit] = 0;
+	while (!stack.empty()) {
+		auto& [node, next] = stack.back();
+		if (next < reverse[node].size()) {
+			const auto child = reverse[node][next++];
+			if (order[child] == none) {
+				order[child] = 0;
+				stack.emplace_back(child, 0);
+			}
+			continue;
+		}
+		order[node] = postorder.size();
+		postorder.push_back(node);
+		stack.pop_back();
+	}
+	if (postorder.size() != count + 1) {
+		return {};
+	}
+	std::vector<size_t> idom(count + 1, none);
+	idom[exit] = exit;
+	const auto intersect = [&](size_t lhs, size_t rhs) {
+		while (lhs != rhs) {
+			while (order[lhs] < order[rhs]) lhs = idom[lhs];
+			while (order[rhs] < order[lhs]) rhs = idom[rhs];
+		}
+		return lhs;
+	};
+	for (bool changed = true; changed;) {
+		changed = false;
+		for (auto node = postorder.rbegin() + 1; node != postorder.rend(); ++node) {
+			auto dominator = none;
+			for (const auto successor: successors(*node)) {
+				if (idom[successor] != none) {
+					dominator = dominator == none ? successor : intersect(successor, dominator);
+				}
+			}
+			if (idom[*node] != dominator) {
+				idom[*node] = dominator;
+				changed     = true;
+			}
+		}
+	}
+	return idom;
+}
+
+} // namespace
+
+std::unordered_set<const IR::Inst*> SplitWaveLocalInstructions(
+    const IR::Program& program, const std::unordered_set<const IR::Block*>& sync_blocks, bool all) {
+	// Each half of a split wave may branch on its own lanes where the guest branched on all of
+	// them: a half whose lanes are all inactive then skips code the guest ran with them masked,
+	// which only changes what the guest's compiler already treats as undefined there. The halves
+	// must still meet at every barrier together, so a branch stays whole-wave when a block it
+	// controls synchronizes them, directly or through another whole-wave branch.
+	std::unordered_set<const IR::Inst*> result;
+	std::vector<const IR::Inst*>        conditions;
+	std::unordered_map<const IR::Inst*, size_t> condition_index;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (IsWaterfallRead(inst)) {
+				result.insert(&inst);
+			} else if (IsWaveCondition(inst)) {
+				condition_index.emplace(&inst, conditions.size());
+				conditions.push_back(&inst);
+			}
+		}
+	}
+	if (all || program.dispatcher_fallback) {
+		if (all) {
+			result.insert(conditions.begin(), conditions.end());
+		}
+		return result;
+	}
+
+	const auto& blocks = program.blocks;
+	const auto  count  = blocks.size();
+	std::unordered_map<const IR::Block*, size_t> index;
+	for (size_t block = 0; block < count; block++) {
+		index.emplace(blocks[block], block);
+	}
+	const auto idom = PostDominators(blocks, index);
+	if (idom.empty()) {
+		return result;
+	}
+	// A block depends on a branch when one of the branch's successors leads to it but the
+	// branch's block does not always reach it.
+	std::vector<std::vector<size_t>> controllers(count);
+	for (size_t block = 0; block < count; block++) {
+		const auto successors = blocks[block]->ImmSuccessors();
+		if (successors.size() < 2) {
+			continue;
+		}
+		for (const auto* successor: successors) {
+			for (auto runner = index.at(successor); runner != idom[block] && runner != count;
+			     runner = idom[runner]) {
+				if (std::ranges::find(controllers[runner], block) == controllers[runner].end()) {
+					controllers[runner].push_back(block);
+				}
+			}
+		}
+	}
+
+	std::vector<bool> local(conditions.size(), true);
+	for (;;) {
+		// The local conditions each branch condition and each block's execution depends on.
+		std::unordered_map<const IR::Inst*, ConditionSet> values;
+		std::vector<ConditionSet> control(count, ConditionSet(conditions.size()));
+		const auto value_of = [&](IR::Value value) {
+			value = value.Resolve();
+			const auto* inst = value.IsImmediate() ? nullptr : value.TryInstruction();
+			const auto  found = inst != nullptr ? values.find(inst) : values.end();
+			return found != values.end() ? found->second : ConditionSet(conditions.size());
+		};
+		const auto branch_of = [&](size_t block) {
+			const auto* source = blocks[block];
+			return source->terminator.kind == CFG::TerminatorKind::ConditionalBranch &&
+			               !source->condition.IsEmpty()
+			           ? value_of(source->condition)
+			           : ConditionSet(conditions.size());
+		};
+		for (bool changed = true; changed;) {
+			changed = false;
+			for (size_t block = 0; block < count; block++) {
+				for (const auto controller: controllers[block]) {
+					changed |= control[block].Merge(branch_of(controller));
+					changed |= control[block].Merge(control[controller]);
+				}
+				for (const auto& inst: *blocks[block]) {
+					ConditionSet set(conditions.size());
+					switch (inst.GetOpcode()) {
+						case IR::ValueOpcode::ConditionRef:
+							if (const auto found = condition_index.find(&inst);
+							    found != condition_index.end() && local[found->second]) {
+								set.Set(found->second);
+							}
+							break;
+						case IR::ValueOpcode::Phi:
+							if (inst.GetType() != IR::Type::U1) {
+								continue;
+							}
+							// A merged value also depends on which predecessor the wave came from.
+							for (size_t arg = 0; arg < inst.NumArgs(); arg++) {
+								set.Merge(value_of(inst.Arg(arg)));
+								const auto predecessor = index.at(inst.PhiBlock(arg));
+								set.Merge(control[predecessor]);
+								set.Merge(branch_of(predecessor));
+							}
+							break;
+						case IR::ValueOpcode::LogicalAnd:
+						case IR::ValueOpcode::LogicalOr:
+						case IR::ValueOpcode::LogicalXor:
+						case IR::ValueOpcode::LogicalNot:
+						case IR::ValueOpcode::SelectU1:
+						case IR::ValueOpcode::Identity:
+							for (size_t arg = 0; arg < inst.NumArgs(); arg++) {
+								set.Merge(value_of(inst.Arg(arg)));
+							}
+							break;
+						default: continue;
+					}
+					changed |= values.try_emplace(&inst, conditions.size()).first->second.Merge(set);
+				}
+			}
+		}
+		// Synchronizing blocks keep the branches they depend on whole-wave. A half that leaves
+		// the program early would leave the other waiting at its next barrier.
+		ConditionSet whole(conditions.size());
+		for (size_t block = 0; block < count; block++) {
+			bool syncs = sync_blocks.contains(blocks[block]) || blocks[block]->ImmSuccessors().empty();
+			for (const auto& inst: *blocks[block]) {
+				if (const auto found = condition_index.find(&inst);
+				    found != condition_index.end() && !local[found->second]) {
+					syncs = true;
+				}
+			}
+			if (syncs) {
+				whole.Merge(control[block]);
+			}
+		}
+		bool removed = false;
+		for (size_t condition = 0; condition < conditions.size(); condition++) {
+			if (local[condition] && whole.Test(condition)) {
+				local[condition] = false;
+				removed          = true;
+			}
+		}
+		if (!removed) {
+			break;
+		}
+	}
+	for (size_t condition = 0; condition < conditions.size(); condition++) {
+		if (local[condition]) {
+			result.insert(conditions[condition]);
+		}
+	}
+	return result;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

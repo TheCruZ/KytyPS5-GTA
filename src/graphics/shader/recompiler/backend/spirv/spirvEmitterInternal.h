@@ -21,6 +21,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -130,6 +131,21 @@ struct EmitterState {
 	// host invocations (WaveLdsScope in SpirvEmitter.cpp); 0 when none are emitted.
 	uint32_t                                         wave_lds_scope          = 0;
 	uint32_t                                         lane_half               = 0;
+	// A wave64 workgroup runs as two host subgroups, one guest lane per invocation, instead of
+	// two lanes per invocation of one subgroup. Wave-wide operations exchange their halves
+	// through workgroup memory, and LDS accesses synchronize the halves the guest ran in lockstep.
+	bool                                             split_wave              = false;
+	uint32_t                                         wave_exchange_variable  = 0;
+	uint32_t                                         wave_exchange_parity    = 0;
+	// ConditionRef and ReadFirstLane instructions each half of a split wave evaluates on its own
+	// (SplitWaveLocalInstructions).
+	std::unordered_set<const IR::Inst*>              wave_local_insts;
+	// When set, collects the blocks that synchronize a split wave's halves.
+	std::unordered_set<const IR::Block*>*            wave_sync_blocks        = nullptr;
+	// Whether DS instructions write the LDS, which DS reads must then wait for in split waves.
+	bool                                             ds_writes_lds           = false;
+	// The device returns zero for out-of-bounds storage buffer reads (robustBufferAccess2).
+	bool                                             robust_buffer_access2   = false;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
 	// Each buffer binding's bound range in bytes (BufferLengthDword in the shader data).
@@ -482,6 +498,25 @@ uint32_t EmitLocalInvocationIndex(EmitterState& state);
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t ballot, uint32_t lane);
 
 uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane);
+
+// Split waves (EmitterState::split_wave): the invocation's lane in its host subgroup, which
+// holds 32 of the wave's lanes; operations confined to 32-lane halves stay within it.
+uint32_t EmitHostSubgroupLane(EmitterState& state);
+// Synchronizes a split wave's halves and makes their workgroup memory writes visible.
+void     EmitWaveBarrier(EmitterState& state);
+// The value of `lane` (0-63) in a split wave, through workgroup memory.
+uint32_t ExchangeWaveValue(EmitterState& state, uint32_t value, uint32_t lane);
+// The 64-lane ballot of `predicate` in a split wave, as {low lanes, high lanes, 0, 0}.
+uint32_t ExchangeWaveBallot(EmitterState& state, uint32_t predicate);
+// The ballot of `predicate` over the invocation's own host subgroup, as one word.
+uint32_t EmitHostBallotWord(EmitterState& state, uint32_t predicate);
+// Records that the block being emitted synchronizes a split wave's halves.
+void     NoteWaveSync(EmitterState& state);
+// The ConditionRef and ReadFirstLane instructions each half of a split wave can evaluate on its
+// own, given the blocks that synchronize the halves through other instructions. With `all`,
+// every candidate, for an emission that finds those blocks.
+std::unordered_set<const IR::Inst*> SplitWaveLocalInstructions(
+    const IR::Program& program, const std::unordered_set<const IR::Block*>& sync_blocks, bool all);
 
 inline constexpr auto EmitAddU32 = EmitNative<spv::OpIAdd, IR::Type::U32, uint32_t, uint32_t>;
 

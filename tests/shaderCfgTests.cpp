@@ -13343,6 +13343,9 @@ void TestLaneMaskProjection() {
     ConstantPropagationPass({entry}, wave_size);
     Check(entry->Instructions().size() == entry_size,
           "rejected mixed mask graph left unused projected instructions");
+    const auto halves = thread_bit(e, e.Select(low_half, active_mask, ballot(e, active, 1u)));
+    const auto crossed_halves =
+        thread_bit(e, e.Select(low_half, ballot(e, active, 1u), active_mask));
     const auto combined_mask = e.BitwiseOr(active_mask, ballot(e, selected));
     const auto combined = thread_bit(e, combined_mask);
     const auto gated_mask = e.Select(selected, combined_mask, zero);
@@ -13406,6 +13409,10 @@ void TestLaneMaskProjection() {
                 gated.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32 &&
                 rejected.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32,
             "wave64 low-half mask was projected onto the wrong invocation");
+      Check(EquivalentValue(program, halves, active),
+            "wave64 ballot halves did not project to their lane predicate");
+      Check(crossed_halves.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32,
+            "wave64 mask projection read a ballot half holding other lanes");
     }
     for (const auto value : {arbitrary, mixed, mixed_or, mixed_select, different_lane, high_half}) {
       Check(value.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32,
@@ -16844,6 +16851,14 @@ void TestSpirvConditionVotes() {
     IR::CollectShaderInfo(compiled.program, options.input_info);
     const auto binary = Spirv::EmitProgram(compiled.program, options.input_info);
     CheckSpirvBinaryValidates(binary);
+    // KYTY_WAVE64_WARPS=1 runs wave64 on a 32-wide host as a split wave, whose conditions take a
+    // ballot of the whole wave instead of one subgroup's vote.
+    const char *split_setting = std::getenv("KYTY_WAVE64_WARPS");
+    if (wave != host && split_setting != nullptr && split_setting[0] == '1') {
+      Check(SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformBallot) > 0,
+            "split-wave condition votes did not take a whole-wave ballot");
+      continue;
+    }
     Check(compiled.program.info.subgroup_vote && !compiled.program.info.subgroup_ballot &&
               SpirvContainsCapability(binary, spv::CapabilityGroupNonUniformVote) &&
               SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformAll) == 3 &&

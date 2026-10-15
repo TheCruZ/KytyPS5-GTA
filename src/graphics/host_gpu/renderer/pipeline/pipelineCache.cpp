@@ -1536,6 +1536,7 @@ struct PipelineCache::ProgramCache {
 		writer.Put(options.user_data_base);
 		writer.Put(static_cast<uint32_t>(options.user_data.size()));
 		writer.Put(options.bindless_images);
+		writer.Put(options.robust_buffer_access2);
 		writer.Put(options.non_fatal);
 		writer.PutWords(code);
 		writer.PutWords(params.back_code);

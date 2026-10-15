@@ -341,6 +341,24 @@ void EmitDispatcherInstruction(ValueEmitContext& ctx, const DispatcherFunctionSt
 	}
 }
 
+// Whether the instruction accesses the workgroup's LDS through a DS instruction. Flat accesses
+// that reach LDS are left out: they go through per-lane pointers, such as the ray traversal
+// stack's, rather than share data between lanes.
+bool AccessesLds(const IR::Program& program, const IR::Inst& inst) {
+	if (IR::SharedAccessOf(inst.GetOpcode()) == IR::SharedAccess::None) {
+		return false;
+	}
+	const auto& memory = program.memory_info.at(inst.Flags<IR::MemoryFlags>().index);
+	return memory.kind == IR::ResourceKind::Lds;
+}
+
+// Whether a split wave's halves must synchronize before the instruction: a DS access that
+// another lane's DS write may conflict with.
+bool SyncsLdsAccess(const EmitterState& state, const IR::Inst& inst) {
+	return AccessesLds(state.program, inst) &&
+	       (state.ds_writes_lds || IR::SharedAccessOf(inst.GetOpcode()) != IR::SharedAccess::Read);
+}
+
 template <typename EmitInstruction>
 void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& emit_instruction) {
 	ctx.state.current_block = block;
@@ -373,6 +391,11 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 				lds_written |= writes;
 				lds_read |= access != IR::SharedAccess::Write;
 			}
+		}
+		if (ctx.state.split_wave && SyncsLdsAccess(ctx.state, inst)) {
+			// The guest's lanes ran in lockstep: a lane may read what another lane of its wave
+			// wrote, or overwrite what it read, without waiting. A split wave's halves do not.
+			EmitWaveBarrier(ctx.state);
 		}
 		for (uint32_t half = 0; half < ctx.state.lane_count; half++) {
 			auto& lane          = half == 0 ? ctx : *ctx.other_half;
@@ -840,6 +863,15 @@ uint32_t ValueEmitContext::HalfArg(const IR::Inst& inst, size_t index, uint32_t 
 }
 
 uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
+	if (state.split_wave) {
+		// Every lane of a split wave exists and reaches each IR instruction.
+		if (predicate.IsImmediate() && predicate.GetType() == IR::Type::U1 && predicate.U1()) {
+			return state.builder.Constant(spv::OpConstantComposite, TypeU32Vector(state, 4),
+			                              ConstantU32(state, ~0u), ConstantU32(state, ~0u),
+			                              ConstantU32(state, 0), ConstantU32(state, 0));
+		}
+		return ExchangeWaveBallot(state, Def(predicate));
+	}
 	const auto ballot_type = TypeU32Vector(state, 4);
 	const auto scope       = ConstantU32(state, spv::ScopeSubgroup);
 	const auto low         = state.builder.AllocateId();
@@ -885,6 +917,22 @@ uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
 
 uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t lane) {
 	const auto type  = TypeId(state, inst.Arg(index).GetType());
+	if (state.split_wave) {
+		const auto u32 = TypeU32(state);
+		const auto value = Arg(inst, index);
+		if (type == TypeBool(state)) {
+			const auto bits = ExchangeWaveValue(
+			    state, Select(state, u32, value, ConstantU32(state, 1), ConstantU32(state, 0)), lane);
+			return Binary(state, spv::OpINotEqual, type, bits, ConstantU32(state, 0));
+		}
+		if (type != u32 && type != TypeF32(state) && type != TypeI32(state)) {
+			Fail(inst, "split-wave lane read of a value wider than a dword");
+		}
+		return type == u32 ? ExchangeWaveValue(state, value, lane)
+		                   : Unary(state, spv::OpBitcast, type,
+		                           ExchangeWaveValue(state, Unary(state, spv::OpBitcast, u32, value),
+		                                             lane));
+	}
 	const auto scope = ConstantU32(state, spv::ScopeSubgroup);
 	const auto low   = state.builder.AllocateId();
 	if (other_half == nullptr) {
@@ -1086,6 +1134,12 @@ void EmitProgram(EmitterState& state) {
 		                          state.loop_guard_variable, spv::StorageClassFunction,
 		                          ConstantU32(state, 0u));
 	}
+	if (state.split_wave) {
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.wave_exchange_parity, spv::StorageClassFunction,
+		                          ConstantU32(state, 0));
+	}
 	if (state.program.info.function_lds) {
 		state.builder.AddFunction(
 		    spv::OpVariable,
@@ -1147,6 +1201,12 @@ void EmitProgram(EmitterState& state) {
 	}
 	EmitMemoryOffsets(state);
 	EmitSrtVerify(state);
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			state.ds_writes_lds |= AccessesLds(program, inst) &&
+			                       IR::SharedAccessOf(inst.GetOpcode()) != IR::SharedAccess::Read;
+		}
+	}
 	if (program.blocks.empty()) {
 		EmitReturn(ctx);
 	} else if (state.program.dispatcher_fallback) {

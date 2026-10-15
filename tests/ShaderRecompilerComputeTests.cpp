@@ -1474,6 +1474,12 @@ size_t CountText(const std::string &text, const std::string &needle) {
   return count;
 }
 
+// Whether disassembled wave64 SPIR-V runs as a split wave (KYTY_WAVE64_WARPS): one guest lane per
+// invocation of two host subgroups, instead of two lanes per invocation of one.
+bool IsSplitWave(const std::string &text) {
+  return text.find("wave_exchange") != std::string::npos;
+}
+
 void CheckPixelParameterAliases() {
   constexpr const char *name = "PixelParameterAliases";
   ShaderPixelInputInfo pixel{};
@@ -1659,13 +1665,32 @@ void CheckSpirvEmission(const TestCase &test, const std::vector<u32> &spirv) {
     Fail(test.name, "SPIR-V disassembly",
          "failed to disassemble emitted SPIR-V");
   }
-  for (const auto &required : test.required_spirv) {
+  for (auto required : test.required_spirv) {
+    // A split wave spans its workgroup's host subgroups: subgroup barriers become workgroup ones.
+    if (IsSplitWave(text) && required.starts_with("OpControlBarrier %uint_3 ")) {
+      required.replace(0, std::string_view("OpControlBarrier %uint_3").size(),
+                       "OpControlBarrier %uint_2");
+    }
+    // Its wave-wide lane reads go through workgroup memory rather than subgroup shuffles.
+    if (IsSplitWave(text) && required == "OpGroupNonUniformShuffle") {
+      required = "wave_exchange";
+    }
+    // Its wave-wide votes compare whole-wave ballots: a subgroup vote sees one half.
+    if (IsSplitWave(text) &&
+        (required == "OpGroupNonUniformAll" || required == "OpGroupNonUniformAny")) {
+      required = "OpGroupNonUniformBallot";
+    }
     if (text.find(required) == std::string::npos) {
       Fail(test.name, "SPIR-V disassembly",
            std::string("missing required text: ") + required);
     }
   }
   for (const auto &forbidden : test.forbidden_spirv) {
+    // A split wave always declares its workgroup exchange and synchronizes its halves.
+    if (IsSplitWave(text) && (forbidden.find("Workgroup") != std::string::npos ||
+                              forbidden.find("OpControlBarrier") != std::string::npos)) {
+      continue;
+    }
     if (text.find(forbidden) != std::string::npos) {
       Fail(test.name, "SPIR-V disassembly",
            std::string("found forbidden text: ") + forbidden);
@@ -33010,6 +33035,7 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
         }
       std::map<u32, std::string> functions;
       u32 function = 0, bda = 0, inline_reads = 0;
+      bool split_wave = false;
       for (size_t offset = 5; offset < compiled.spirv.size();) {
         const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
         const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
@@ -33017,6 +33043,8 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
           const std::string_view name(reinterpret_cast<const char *>(words.data() + 2));
           if (name.starts_with("load_indirect_buffer_")) functions.emplace(words[1], name);
           if (name == "get_bda_pointer") bda = words[1];
+          // Split waves (KYTY_WAVE64_WARPS) run one lane per invocation.
+          if (name.starts_with("wave_exchange")) split_wave = true;
         }
         if (opcode == spv::OpFunction) {
           function = words[2];
@@ -33035,7 +33063,7 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
               "a raw load profile was unused, missing or still emitted inline");
       for (const auto &[name, profile] : profiles)
         Require(test.name, name.c_str(), profile.uses != 0u && profile.definitions == 1u &&
-                    profile.calls == profile.uses * (wave == 64u && vulkan.SubgroupSize() == 32u ? 2u : 1u) &&
+                    profile.calls == profile.uses * (wave == 64u && vulkan.SubgroupSize() == 32u && !split_wave ? 2u : 1u) &&
                     profile.reads == profile.components,
                 "raw load helpers duplicated definitions, calls or component reads");
       auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
@@ -37081,6 +37109,8 @@ void CheckWave64WholeWaveResults() {
           tools.Disassemble(native.spirv, &native_text) &&
               tools.Disassemble(emulated.spirv, &emulated_text),
           "failed to disassemble whole-wave operations");
+  // Split waves exchange whole-wave results through workgroup memory, not per-half reuse.
+  if (IsSplitWave(emulated_text)) return;
   const auto ballots = CountText(native_text, "OpGroupNonUniformBallot ");
   Require(test.name, "whole-wave ballot reuse",
           ballots != 0 &&
@@ -39174,8 +39204,9 @@ void CheckDynamicSampleOffsets(VulkanHarness &vulkan, u32 wave_size) {
   auto compiled = CompileCase(test, vulkan.SubgroupSize());
   spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
   std::string text;
-  const auto halves = wave_size > vulkan.SubgroupSize() ? 2u : 1u;
-  Require(test.name, "direct dynamic offset", tools.Disassemble(compiled.spirv, &text) &&
+  const bool disassembled = tools.Disassemble(compiled.spirv, &text);
+  const auto halves = wave_size > vulkan.SubgroupSize() && !IsSplitWave(text) ? 2u : 1u;
+  Require(test.name, "direct dynamic offset", disassembled &&
               CountText(text, "OpImageSampleExplicitLod") == halves &&
               CountText(text, "OpBitFieldSExtract %int") == 2u * halves,
           "dynamic offsets expanded samples or lost signed six-bit components");
@@ -39645,6 +39676,7 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
         u32 bda_calls = 0, conversion_calls = 0, conversion_definitions = 0;
         u32 geometry_calls = 0, geometry_definitions = 0, geometry_switches = 0;
         bool geometry_pure = true, geometry_cases = true;
+        bool split_wave = false;
         for (size_t offset = 5; offset < compiled.spirv.size();) {
           const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
           const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
@@ -39682,11 +39714,15 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
             if (words[3] == geometry_function) ++geometry_calls;
           }
           if (opcode == spv::OpFunctionEnd) function = 0;
+          // Split waves (KYTY_WAVE64_WARPS) run one lane per invocation.
+          if (opcode == spv::OpName && words.size() > 2 &&
+              std::string_view(reinterpret_cast<const char*>(&words[2])).starts_with("wave_exchange"))
+            split_wave = true;
           offset += words.size();
         }
         Require(test.name, "one shared formatted conversion",
                 conversion_definitions == 1u &&
-                    conversion_calls == (wave > vulkan.SubgroupSize() ? 2u : 1u),
+                    conversion_calls == (wave > vulkan.SubgroupSize() && !split_wave ? 2u : 1u),
                 "formatted loads must call one conversion function across virtual halves");
         Require(test.name, "one shared pure format geometry",
                 geometry_definitions == 1u && geometry_calls == conversion_calls &&
@@ -39694,7 +39730,7 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
                 "format geometry duplicated, lost a format/default or acquired memory accesses");
         Require(test.name, "one shared indirect store per virtual half",
                 std::ranges::count_if(stores, [&](u32 pointer) { return nonuniform.contains(pointer); }) ==
-                    (wave > vulkan.SubgroupSize() ? 2 : 1),
+                    (wave > vulkan.SubgroupSize() && !split_wave ? 2 : 1),
                 "formatted identity lowering duplicated the store per descriptor");
         Require(test.name, "shared formatted payload read", bda_calls <= 12u,
                 "formatted source load duplicated BDA reads per format or component");
@@ -40249,16 +40285,21 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
     if (!wide) {
       std::set<u32> nonuniform;
       u32 shared_stores = 0;
+      bool split_wave = false;
       for (size_t offset = 5; offset < compiled.spirv.size();) {
         const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
         const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
         if (opcode == spv::OpDecorate && words[2] == spv::DecorationNonUniform)
           nonuniform.insert(words[1]);
         if (opcode == spv::OpStore && nonuniform.contains(words[1])) ++shared_stores;
+        // Split waves (KYTY_WAVE64_WARPS) run one lane per invocation.
+        if (opcode == spv::OpName && words.size() > 2 &&
+            std::string_view(reinterpret_cast<const char*>(&words[2])).starts_with("wave_exchange"))
+          split_wave = true;
         offset += words.size();
       }
       Require(test.name, "one shared store after the null candidate",
-              shared_stores == (wave > vulkan.SubgroupSize() ? 2u : 1u),
+              shared_stores == (wave > vulkan.SubgroupSize() && !split_wave ? 2u : 1u),
               "homogeneous children duplicated the native store per descriptor");
     }
     u32 bda_loads = 0, native_stores = 0;
@@ -41257,11 +41298,13 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
     if (large_samplers) {
       spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
       std::string text;
-      const auto halves = wave > vulkan.SubgroupSize() ? 2u : 1u;
+      const bool disassembled = tools.Disassemble(compiled.spirv, &text);
+      // A split wave samples one lane per invocation instead of both halves.
+      const auto halves = wave > vulkan.SubgroupSize() && !IsSplitWave(text) ? 2u : 1u;
       Require(test.name, "expanded sampler bindings and emitted size",
               compiled.resources.samplers.size() == rows + 1u &&
                   compiled.program.info.samplers.size() == rows + 1u &&
-                  tools.Disassemble(compiled.spirv, &text) &&
+                  disassembled &&
                   CountText(text, "OpImageSampleExplicitLod") == halves &&
                   compiled.spirv.size() <= 8192u * halves,
               "59 sampler records hit the SGPR root limit or duplicated image sampling bodies");
@@ -41927,10 +41970,11 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
       compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
       compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
       ValidateSpirv(test.name, compiled.spirv);
-      const auto halves = wave_size > compute.host_subgroup_size ? 2u : 1u;
+      const bool disassembled = tools.Disassemble(compiled.spirv, &text);
+      const auto halves = wave_size > compute.host_subgroup_size && !IsSplitWave(text) ? 2u : 1u;
       const auto image_opcode = fetch ? "OpImageFetch" : gather ? "OpImageGather"
                                                           : "OpImageSampleExplicitLod";
-      Require(test.name, "native array image runs", tools.Disassemble(compiled.spirv, &text) &&
+      Require(test.name, "native array image runs", disassembled &&
                   CountText(text, image_opcode) == (homogeneous ? 1u : mixed_mips ? 4u : 2u) * halves,
               "mixed runs expanded into per-image accesses");
       if (homogeneous) {
@@ -42060,8 +42104,9 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
     compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
     compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
     ValidateSpirv(test.name, compiled.spirv);
-    const auto halves = wave_size > compute.host_subgroup_size ? 2u : 1u;
-    Require(test.name, "typed query body count", tools.Disassemble(compiled.spirv, &text) &&
+    const bool disassembled = tools.Disassemble(compiled.spirv, &text);
+    const auto halves = wave_size > compute.host_subgroup_size && !IsSplitWave(text) ? 2u : 1u;
+    Require(test.name, "typed query body count", disassembled &&
                 CountText(text, "OpImageQuerySizeLod") == 3u * halves &&
                 CountText(text, "OpImageQueryLevels") == 3u * halves &&
                 compiled.spirv.size() <= 8192u * halves,
@@ -42145,9 +42190,12 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
       compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
       compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
       ValidateSpirv(test.name, compiled.spirv);
-      const auto halves = wave_size > compute.host_subgroup_size ? 2u : 1u;
+      const bool disassembled = tools.Disassemble(compiled.spirv, &text);
+      // A split wave writes one lane per invocation instead of both halves.
+      const auto halves =
+          wave_size > compute.host_subgroup_size && !IsSplitWave(text) ? 2u : 1u;
       Require(test.name, "native array writes per dimension and swizzle run",
-              tools.Disassemble(compiled.spirv, &text) &&
+              disassembled &&
                   CountText(text, "OpImageWrite") == (mixed ? 4u : 1u) * halves &&
                   (mixed || text.find("OpSwitch") == std::string::npos) &&
                   text.find("StorageImageArrayNonUniformIndexing") != std::string::npos,
