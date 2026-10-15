@@ -105,38 +105,6 @@ uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t value) {
 	return EmitOrU32(state, sign, magnitude);
 }
 
-uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
-	const auto trunc         = EmitTruncF32Value(state, src);
-	const auto converted_raw = state.builder.AllocateId();
-	if (signed_value) {
-		const auto converted_i = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpConvertFToS, TypeI32(state), converted_i, trunc);
-		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), converted_raw, converted_i);
-	} else {
-		state.builder.AddFunction(spv::OpConvertFToU, TypeU32(state), converted_raw, trunc);
-	}
-	const auto nan = EmitClassifyF32(state, src).nan;
-	if (signed_value) {
-		const auto below = Binary(state, spv::OpFOrdLessThanEqual, TypeBool(state), src,
-		                          ConstantF32(state, 0xcf000000u));
-		const auto above = Binary(state, spv::OpFOrdGreaterThanEqual, TypeBool(state), src,
-		                          ConstantF32(state, 0x4f000000u));
-		const auto high =
-		    Select(state, TypeU32(state), above, ConstantU32(state, 0x7fffffffu), converted_raw);
-		const auto low =
-		    Select(state, TypeU32(state), below, ConstantU32(state, 0x80000000u), high);
-		return Select(state, TypeU32(state), nan, ConstantU32(state, 0), low);
-	}
-	const auto below =
-	    Binary(state, spv::OpFOrdLessThanEqual, TypeBool(state), src, ConstantF32(state, 0));
-	const auto above = Binary(state, spv::OpFOrdGreaterThanEqual, TypeBool(state), src,
-	                          ConstantF32(state, 0x4f800000u));
-	const auto zero  = Binary(state, spv::OpLogicalOr, TypeBool(state), nan, below);
-	const auto high =
-	    Select(state, TypeU32(state), above, ConstantU32(state, 0xffffffffu), converted_raw);
-	return Select(state, TypeU32(state), zero, ConstantU32(state, 0), high);
-}
-
 } // namespace
 
 uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
@@ -187,12 +155,15 @@ uint32_t EmitConvertF16F32(EmitterState& state, uint32_t arg0) {
 	return EmitPackHalf2x16(state, pair);
 }
 
+// The frontend saturates the guest conversions first (ConvertF32ToI32Saturated and
+// ConvertF32ToU32Saturated), so the value is integral, in range and not NaN here.
 uint32_t EmitConvertS32F32(EmitterState& state, uint32_t arg0) {
-	return EmitF32ToU32(state, arg0, true);
+	return Unary(state, spv::OpBitcast, TypeU32(state),
+	             Unary(state, spv::OpConvertFToS, TypeI32(state), arg0));
 }
 
 uint32_t EmitConvertU32F32(EmitterState& state, uint32_t arg0) {
-	return EmitF32ToU32(state, arg0, false);
+	return Unary(state, spv::OpConvertFToU, TypeU32(state), arg0);
 }
 
 uint32_t EmitConvertF32F64(EmitterState& state, uint32_t arg0) {

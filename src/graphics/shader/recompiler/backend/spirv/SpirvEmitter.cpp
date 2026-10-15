@@ -7,10 +7,20 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
 namespace {
+
+// KYTY_WAVE64_WARPS=1 runs eligible wave64 workgroups as two host subgroups (split waves).
+bool SplitWavesEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_WAVE64_WARPS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
 
 [[noreturn]] void Fail(const IR::Program& program, const char* reason) {
 	EXIT("SPIR-V validation failed: hash=0x%016" PRIx64 " stage=%u reason=%s\n",
@@ -215,7 +225,7 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   uint32_t push_data_start_dword, bool maintenance8_enabled,
-                                  bool emit_debug_info) {
+                                  bool emit_debug_info, bool robust_buffer_access2) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
@@ -237,11 +247,37 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 		              program.shader_hash);
 		state.debug_source = state.builder.AddString(name);
 	}
+	state.robust_buffer_access2 = robust_buffer_access2;
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
-	state.lane_count =
-	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
-	        ? 2u
-	        : 1u;
+	const bool narrow_host =
+	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u;
+	// Split waves need the workgroup to be one whole wave: their barriers synchronize the
+	// workgroup, and every lane exists. Explicitly laid out LDS cannot hold a separate exchange.
+	state.split_wave =
+	    narrow_host && SplitWavesEnabled() && program.stage == ShaderType::Compute &&
+	    std::max(workgroup->threads_num[0], 1u) * std::max(workgroup->threads_num[1], 1u) *
+	            std::max(workgroup->threads_num[2], 1u) == 64u &&
+	    !program.info.compute_derivatives && !program.info.shared_int64_atomics &&
+	    state.lds_storage_class == spv::StorageClassWorkgroup;
+	state.lane_count = narrow_host && !state.split_wave ? 2u : 1u;
+	if (state.split_wave) {
+		// A first emission, with every candidate branch local to a half, finds the blocks that
+		// synchronize the halves regardless of which branches stay whole-wave.
+		const auto bindings = program.bindings;
+		std::unordered_set<const IR::Block*> sync_blocks;
+		{
+			EmitterState probe(program, input_info, maintenance8_enabled);
+			probe.split_wave       = true;
+			probe.robust_buffer_access2 = robust_buffer_access2;
+			probe.lane_count       = 1;
+			probe.wave_local_insts = SplitWaveLocalInstructions(program, {}, true);
+			probe.wave_sync_blocks = &sync_blocks;
+			DefineModule(probe);
+			EmitProgram(probe);
+		}
+		program.bindings       = bindings;
+		state.wave_local_insts = SplitWaveLocalInstructions(program, sync_blocks, false);
+	}
 	DefineModule(state);
 	ValidateNativeProgram(program, program.stage == ShaderType::Compute &&
 	                                   input_info.compute != nullptr && input_info.compute->lds_storage);
