@@ -36,6 +36,8 @@ struct GraphicContext {
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
 	bool                               conditional_rendering_enabled         = false;
+	// Out-of-bounds storage buffer reads return zero (VK_EXT_robustness2).
+	bool                               robust_buffer_access2_enabled         = false;
 	bool                               occlusion_queries_enabled             = false;
 	bool                               occlusion_query_precise_enabled       = false;
 	// Draws whose arguments the GPU writes read them on the GPU (vkCmdDraw*Indirect*).

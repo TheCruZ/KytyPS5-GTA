@@ -691,8 +691,11 @@ uint32_t EmitIdentity(ValueEmitContext&, uint32_t value) {
 void EmitVoid(ValueEmitContext&) {}
 
 void EmitStoreCompletion(EmitterState& state) {
+	// A split wave spans two host subgroups of its workgroup.
+	NoteWaveSync(state);
 	state.builder.AddFunction(
-	    spv::OpControlBarrier, ConstantU32(state, spv::ScopeSubgroup),
+	    spv::OpControlBarrier,
+	    ConstantU32(state, state.split_wave ? spv::ScopeWorkgroup : spv::ScopeSubgroup),
 	    ConstantU32(state, spv::ScopeDevice),
 	    ConstantU32(state, spv::MemorySemanticsReleaseMask | spv::MemorySemanticsUniformMemoryMask |
 	                          spv::MemorySemanticsImageMemoryMask));
@@ -725,6 +728,7 @@ void EmitBarrier(EmitterState& state) {
 	}
 	const auto semantics = tessellation ? spv::MemorySemanticsMaskNone
 	                                    : spv::MemorySemanticsAcquireReleaseMask | memory;
+	NoteWaveSync(state);
 	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
 	                          ConstantU32(state, memory_scope), ConstantU32(state, semantics));
 }
@@ -772,16 +776,38 @@ uint32_t EmitUndefU1(EmitterState& state, const IR::Inst& inst) {
 	return result;
 }
 
+// Reads `value` from `lane` of a split wave's 32-lane half: within the invocation's own host
+// subgroup, for operations that stay within rows or halves of the wave.
+uint32_t ReadHostSubgroupLane(EmitterState& state, uint32_t type, uint32_t value, uint32_t lane) {
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, result,
+	                          ConstantU32(state, spv::ScopeSubgroup), value,
+	                          EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31)));
+	return result;
+}
+
 uint32_t EmitDppMoveU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state    = ctx.state;
 	const auto flags    = inst.Flags<IR::DppMoveFlags>();
 	const auto target   = EmitDppTargetLane(state, flags);
-	const auto shuffled = ctx.Shuffle(inst, 0, target.lane);
+	// DPP reads within rows of 16 lanes, which never leave a split wave's half.
+	const auto shuffled = state.split_wave
+	                          ? ReadHostSubgroupLane(state, TypeU32(state), ctx.Arg(inst, 0),
+	                                                 target.lane)
+	                          : ctx.Shuffle(inst, 0, target.lane);
 	if (flags.fetch_inactive) {
 		return shuffled;
 	}
-	const auto ballot        = ctx.Ballot(inst.Arg(1));
-	const auto source_active = EmitBallotLaneActiveBool(state, ballot, target.lane);
+	uint32_t ballot = 0, source_lane = target.lane;
+	if (state.split_wave) {
+		ballot = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+		                          ConstantU32(state, spv::ScopeSubgroup), ctx.Arg(inst, 1));
+		source_lane = EmitBinaryU32(state, spv::OpBitwiseAnd, target.lane, ConstantU32(state, 31));
+	} else {
+		ballot = ctx.Ballot(inst.Arg(1));
+	}
+	const auto source_active = EmitBallotLaneActiveBool(state, ballot, source_lane);
 	const auto can_fetch     = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), can_fetch, target.valid,
 	                          source_active);
@@ -803,6 +829,22 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (kind == CFG::BranchCondition::ScalarInstruction) return ctx.Arg(inst, 0);
 	const bool zero = kind == CFG::BranchCondition::ExecZero ||
 	                  kind == CFG::BranchCondition::VccZero || kind == CFG::BranchCondition::SccZero;
+	if (ctx.state.wave_local_insts.contains(&inst)) {
+		// No block this branch controls synchronizes the halves, so a half may branch on its own
+		// lanes: one whose lanes are all inactive skips code the guest ran with them masked.
+		const auto word = EmitHostBallotWord(ctx.state, ctx.Arg(inst, 0));
+		return Binary(ctx.state, zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(ctx.state),
+		              word, ConstantU32(ctx.state, zero ? ~0u : 0u));
+	}
+	if (ctx.state.split_wave) {
+		// A subgroup vote sees one half; the ballot covers the whole wave.
+		const auto ballot = ctx.Ballot(inst.Arg(0));
+		const auto reference = zero ? ctx.Ballot(IR::Value(true))
+		                            : ConstantU32CompositeZero(ctx.state, 4);
+		const auto compare = Binary(ctx.state, zero ? spv::OpIEqual : spv::OpINotEqual,
+		                            TypeBoolVector(ctx.state, 4), ballot, reference);
+		return Unary(ctx.state, zero ? spv::OpAll : spv::OpAny, TypeBool(ctx.state), compare);
+	}
 	// Zero-kind predicates are already inverted by translation.
 	auto predicate = ctx.Arg(inst, 0);
 	if (ctx.other_half != nullptr) {
@@ -828,6 +870,15 @@ uint32_t EmitLiveMask(EmitterState& state) {
 }
 
 uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (ctx.state.wave_local_insts.contains(&inst)) {
+		// A waterfall loop handles the lanes whose value matches the one read and repeats for
+		// the rest, so each half of a split wave can read its own first active lane.
+		auto&      state = ctx.state;
+		const auto first = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpExtInst, TypeU32(state), first, GlslStd450(state),
+		                          GLSLstd450FindILsb, EmitHostBallotWord(state, ctx.Arg(inst, 1)));
+		return ReadHostSubgroupLane(state, TypeU32(state), ctx.Arg(inst, 0), first);
+	}
 	const auto ballot = ctx.Ballot(inst.Arg(1));
 	const auto lane   = ctx.FirstLane(ballot);
 	return ctx.Shuffle(inst, 0, lane);
@@ -848,6 +899,15 @@ static uint32_t EmitSubgroupReduceU32(ValueEmitContext& ctx, const IR::Inst& ins
 	state.builder.AddFunction(Reduce, TypeU32(state), result,
 	                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce,
 	                          value);
+	if (state.split_wave) {
+		// Each host subgroup reduces its half; the other half's result arrives through the
+		// exchange, from the matching lane of that half.
+		const auto other = ExchangeWaveValue(
+		    state, result,
+		    EmitBinaryU32(state, spv::OpBitwiseXor, EmitLocalInvocationIndex(state),
+		                  ConstantU32(state, 32)));
+		return Combine(state, result, other);
+	}
 	return result;
 }
 
@@ -900,7 +960,11 @@ uint32_t EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), index, shifted,
 	                          ConstantU32(state, 15));
 	state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), target, row_value, index);
-	const auto shuffled = ctx.Shuffle(inst, 0, target);
+	// Permlane16 reads within the caller's 32-lane half, a split wave's host subgroup.
+	const auto shuffled =
+	    state.split_wave ? ReadHostSubgroupLane(state, TypeId(state, inst.Arg(0).GetType()),
+	                                            ctx.Arg(inst, 0), target)
+	                     : ctx.Shuffle(inst, 0, target);
 	if (flags.fetch_inactive) {
 		return shuffled;
 	}

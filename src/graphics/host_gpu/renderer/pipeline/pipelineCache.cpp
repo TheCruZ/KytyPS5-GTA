@@ -464,6 +464,7 @@ ShaderModule PipelineCache::BuildModule(const ProgramKey&                       
 	const auto profile         = SpirvProfile(m_graphics);
 	auto       compile_options = options;
 	compile_options.profile    = &profile;
+	compile_options.robust_buffer_access2 = m_graphics.robust_buffer_access2_enabled;
 	auto result = ShaderRecompiler::CompileProgram(std::move(translated), compile_options,
 	                                               specialization, push_data_cursor);
 	auto info = std::move(result.program).TakeCompiledInfo();
