@@ -23,6 +23,7 @@ struct CompileOptions {
 	bool                        early_dump                 = false;
 	bool                        emit_debug_info            = false;
 	bool                        maintenance8_enabled       = false;
+	bool                        robust_buffer_access2      = false;
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;

@@ -658,6 +658,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
 	robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
 	robustness2.nullDescriptor      = VK_TRUE;
+	graphics.robust_buffer_access2_enabled = robustness2.robustBufferAccess2 == VK_TRUE;
 
 	auto features13 = WindowContext::RequiredVulkan13Features();
 	features13.pNext = &robustness2;
@@ -665,9 +666,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	features13.subgroupSizeControl =
 	    graphics.compute_subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
 
-	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
+	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s robustBufferAccess2=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
-	     robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false");
+	     robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false",
+	     graphics.robust_buffer_access2_enabled ? "true" : "false");
 
 	vk::DeviceCreateInfo create_info {};
 	vk::PhysicalDeviceMeshShaderFeaturesEXT mesh_features {};
