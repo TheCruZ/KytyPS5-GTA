@@ -425,6 +425,12 @@ uint32_t BufferIndexInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
 	const auto index = DwordIndex(ctx, inst, mem, resource.byte_offset);
+	if (ctx.state.robust_buffer_access2 && resource.element_bits == 32u &&
+	    (resource.kind == IR::ResourceKind::Buffer ||
+	     resource.kind == IR::ResourceKind::ScalarBuffer)) {
+		// The device reads zero past the descriptor's range, which OpArrayLength measures.
+		return LoadWordInBounds(ctx, resource, index);
+	}
 	return EmitValueOrZeroIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
 	    [&]() { return LoadWordInBounds(ctx, resource, index); });
