@@ -1735,7 +1735,10 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto condition = AndCondition(
 	    state, is_first,
 	    AndCondition(state,
-	                 Binary(state, spv::OpINotEqual, TypeBool(state), count, ConstantU32(state, 0)),
+	                 state.lane_count == 2 || state.split_wave
+	                     ? Binary(state, spv::OpINotEqual, TypeBool(state), count,
+	                              ConstantU32(state, 0))
+	                     : exec,
 	                 bounds));
 	const auto atomic = EmitValueOrZeroIfCondition(state, condition, [&]() {
 		const auto value = state.builder.AllocateId();

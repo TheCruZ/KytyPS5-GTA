@@ -14,6 +14,7 @@
 #include <cstring>
 #include <optional>
 #include <vector>
+#include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
@@ -189,7 +190,6 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 		if (!kind.has_value()) {
 			Fail(program, "native shader plan has an invalid image class");
 		}
-		if (image.heap) continue;
 		if (image.mip_count == 0u ||
 		    (image.mip_mode != IR::ImageMipMode::Dynamic && image.mip_count != 1u)) {
 			Fail(program, "native shader plan has an invalid image mip descriptor count");
@@ -491,16 +491,40 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 		std::snprintf(name, sizeof(name), "rdna2-%016" PRIx64 "-block-byte-pc-plus-one",
 		              program.shader_hash);
 		state.debug_source = state.builder.AddString(name);
-		state.builder.EnableNames();
 	}
 	state.robust_buffer_access2 = robust_buffer_access2;
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
-	state.lane_count =
-	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
-	        ? 2u
-	        : 1u;
+	const bool narrow_host =
+	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u;
+	// Split waves need the workgroup to be one whole wave: their barriers synchronize the
+	// workgroup, and every lane exists. Explicitly laid out LDS cannot hold a separate exchange.
+	state.split_wave =
+	    narrow_host && SplitWavesEnabled() && program.stage == ShaderType::Compute &&
+	    std::max(workgroup->threads_num[0], 1u) * std::max(workgroup->threads_num[1], 1u) *
+	            std::max(workgroup->threads_num[2], 1u) == 64u &&
+	    !program.info.compute_derivatives && !program.info.shared_int64_atomics &&
+	    state.lds_storage_class == spv::StorageClassWorkgroup;
+	state.lane_count = narrow_host && !state.split_wave ? 2u : 1u;
 	if (program.stage == ShaderType::Mesh) {
 		state.mesh_passes = std::max(input_info.vertex->mesh.passes, 1u);
+	}
+	if (state.split_wave) {
+		// A first emission, with every candidate branch local to a half, finds the blocks that
+		// synchronize the halves regardless of which branches stay whole-wave.
+		const auto bindings = program.bindings;
+		std::unordered_set<const IR::Block*> sync_blocks;
+		{
+			EmitterState probe(program, input_info, profile);
+			probe.split_wave       = true;
+			probe.robust_buffer_access2 = robust_buffer_access2;
+			probe.lane_count       = 1;
+			probe.wave_local_insts = SplitWaveLocalInstructions(program, {}, true);
+			probe.wave_sync_blocks = &sync_blocks;
+			DefineModule(probe);
+			EmitProgram(probe);
+		}
+		program.bindings       = bindings;
+		state.wave_local_insts = SplitWaveLocalInstructions(program, sync_blocks, false);
 	}
 	state.wave_lds_scope = WaveLdsScope(program, workgroup, state.lane_count);
 	AnalyzeExtraRequirements(state);

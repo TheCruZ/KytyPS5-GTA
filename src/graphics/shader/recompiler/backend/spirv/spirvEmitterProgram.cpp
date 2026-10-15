@@ -415,6 +415,11 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 				lds_read |= access != IR::SharedAccess::Write;
 			}
 		}
+		if (ctx.state.split_wave && SyncsLdsAccess(ctx.state, inst)) {
+			// The guest's lanes ran in lockstep: a lane may read what another lane of its wave
+			// wrote, or overwrite what it read, without waiting. A split wave's halves do not.
+			EmitWaveBarrier(ctx.state);
+		}
 		for (uint32_t half = 0; half < ctx.state.lane_count; half++) {
 			auto& lane          = half == 0 ? ctx : *ctx.other_half;
 			ctx.state.lane_half = half;
@@ -1153,6 +1158,12 @@ void EmitProgram(EmitterState& state) {
 		                          state.loop_guard_variable, spv::StorageClassFunction,
 		                          ConstantU32(state, 0u));
 	}
+	if (state.split_wave) {
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.wave_exchange_parity, spv::StorageClassFunction,
+		                          ConstantU32(state, 0));
+	}
 	if (state.program.info.function_lds) {
 		state.builder.AddFunction(
 		    spv::OpVariable,
@@ -1214,6 +1225,12 @@ void EmitProgram(EmitterState& state) {
 	}
 	EmitMemoryOffsets(state);
 	EmitSrtVerify(state);
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			state.ds_writes_lds |= AccessesLds(program, inst) &&
+			                       IR::SharedAccessOf(inst.GetOpcode()) != IR::SharedAccess::Read;
+		}
+	}
 	if (program.blocks.empty()) {
 		EmitReturn(ctx);
 	} else if (state.program.dispatcher_fallback) {
