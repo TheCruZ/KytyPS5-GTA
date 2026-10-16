@@ -354,7 +354,7 @@ bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t 
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 		    ClearWriteBits(address, bytes);
-		ForgetColorMetadataChecks(address, bytes);
+		    ForgetColorMetadataChecks(address, bytes);
 	    });
 	if (copies.empty()) {
 		return false;
@@ -445,7 +445,7 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-			                                      mapped + (copy.dstOffset - offset), copy.size);
+			                                                  mapped + (copy.dstOffset - offset), copy.size);
 		}
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		for (const auto& copy: copies) {
@@ -583,6 +583,8 @@ bool BufferCache::KnownFill(uint64_t vaddr, uint64_t size, uint32_t& value) cons
 }
 
 void BufferCache::ForgetKnownFills(uint64_t vaddr, uint64_t size) {
+	// The same writes (GPU work, CPU stores) invalidate the metadata checks the GPU made.
+	ForgetColorMetadataChecks(vaddr, size);
 	if (m_known_fills.empty()) {
 		return;
 	}
@@ -599,6 +601,7 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
+	ForgetKnownFills(vaddr, size);
 	m_memory_tracker.InvalidateRegion(vaddr, size, [this, vaddr, size] {
 		KYTY_PROFILER_BLOCK("ReadMemory: CPU write over GPU-written bytes");
 		// KYTY_FPS_LOG: on the GPU thread, which pages its own writes flush most (every 10 s).
@@ -1850,9 +1853,6 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	if (is_written) {
 		MarkGpuWritten(vaddr, size);
-		ForgetColorMetadataChecks(vaddr, size);
-		NoteWrite(vaddr, size);
-		ForgetKnownFills(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -2799,6 +2799,7 @@ static void WatchGpuWriteDiag(uint64_t vaddr, uint64_t size, bool shared) {
 
 void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 	KYTY_PROFILER_BLOCK("Obtain::MarkWritten");
+	ForgetKnownFills(vaddr, size);
 	if (IsShared(vaddr, size) && m_shared_ranges.Contains(vaddr, size)) {
 		// GPU writes to a shared buffer land in guest memory: no download, no page protection.
 		// Until they have executed, the bytes count as GPU-written for the GPU thread's own reads
@@ -3430,7 +3431,9 @@ bool BufferCache::IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t
 
 void BufferCache::ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size) {
 	for (auto& checked: m_checked_color_metadata) {
-		checked.Subtract(vaddr, size);
+		if (!checked.Empty()) {
+			checked.Subtract(vaddr, size);
+		}
 	}
 }
 
@@ -3989,6 +3992,7 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 			continue;
 		}
 		TouchBuffer(buffer);
+		ForgetKnownFills(start, finish - start);
 		m_memory_tracker.MarkRegionAsGpuModifiedUnlessCpuDirty(
 		    start, finish - start, [&](uint64_t page, uint64_t bytes) {
 			    const auto first = std::max(page, start);
@@ -4481,13 +4485,13 @@ void BufferCache::CompleteCopyReadback(uint64_t marker) {
 					return;
 				}
 				Libs::LibKernel::Memory::WriteBacking(from, mapped + copy.dstOffset + (from - begin),
-				                                      to - from);
+				                                                  to - from);
 			});
 		}
 	} else {
 		for (const auto& copy: slot.copies) {
 			Libs::LibKernel::Memory::WriteBacking(slot.buffer_address + copy.srcOffset,
-			                                      mapped + copy.dstOffset, copy.size);
+			                                                  mapped + copy.dstOffset, copy.size);
 		}
 	}
 	if (slot.snapshot) {

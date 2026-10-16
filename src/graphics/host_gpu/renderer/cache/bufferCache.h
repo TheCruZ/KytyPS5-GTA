@@ -180,6 +180,14 @@ public:
 	// Same, but visits only the tracker regions that may hold CPU-dirty pages.
 	void                            SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size);
 	void                            RunGarbageCollector();
+	// Guest ranges whose GPU contents are a uniform 32-bit value written by a recorded compute
+	// fill. Lets CPU-side consumers read the value without draining the GPU.
+	void               NoteKnownFill(uint64_t vaddr, uint64_t size, uint32_t value);
+	[[nodiscard]] bool KnownFill(uint64_t vaddr, uint64_t size, uint32_t& value) const;
+	void               ForgetKnownFills(uint64_t vaddr, uint64_t size);
+	// Writes `value` over [vaddr, vaddr + size) as the emulator's own update of guest bytes (the
+	// expanded metadata of a fast clear), without reading GPU-owned bytes back first.
+	void               FillInternalMemory(uint64_t vaddr, uint64_t size, uint32_t value);
 	// Diagnostics, GPU thread: makes guest memory current for [vaddr, vaddr + size) by
 	// downloading what the GPU wrote there (drains the GPU).
 	void                            DownloadRangeForDiagnostics(uint64_t vaddr, uint64_t size);
@@ -355,6 +363,7 @@ private:
 	template <bool async>
 	void DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
 	                          uint64_t total_size);
+	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
 
 	// Copy-queue readbacks (KYTY_COPY_QUEUE_READBACK, default on). GPU thread: when every GPU
 	// write to the window has executed, copies its GPU-written bytes on the second queue and
@@ -405,26 +414,6 @@ private:
 	uint64_t                                          m_copy_taken   = 0;
 	uint64_t                                          m_copy_busy    = 0;
 	uint64_t                                          m_copy_running = 0;
-	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
-	// Reads GPU-written bytes whose last writes were already submitted: a copy on the readback
-	// queue waits for those submissions only, not for the work queued after them.
-	[[nodiscard]] bool DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::BufferCopy> copies,
-	                                           uint64_t total_size);
-	void NoteWrite(uint64_t vaddr, uint64_t size) {
-		// Draws bind the same written ranges again and again.
-		if (m_pending_writes.empty() || m_pending_writes.back() != std::pair {vaddr, size}) {
-			m_pending_writes.emplace_back(vaddr, size);
-			for (const auto& hot: m_readback_hot) {
-				if (vaddr < hot.end && hot.begin < vaddr + size) {
-					m_flush_requested = true;
-					break;
-				}
-			}
-		}
-	}
-	// A readback of [begin, end) waited for writes still being recorded (`drained`) or for
-	// submitted ones; `device_address` when they were device-address writes.
-	void NoteReadbackWait(uint64_t begin, uint64_t end, bool device_address, bool drained);
 
 	GraphicContext&                                    m_graphics;
 	CommandScheduler&                                  m_scheduler;
@@ -436,6 +425,8 @@ private:
 	BufferMap                                          m_buffers;
 	PageTable                                          m_page_table;
 	RangeSet                                           m_gpu_modified_ranges;
+	// Recorded uniform fills: start -> (end, value). See NoteKnownFill.
+	std::map<uint64_t, std::pair<uint64_t, uint32_t>>  m_known_fills;
 	// Ranges whose buffers the garbage collector released (ConsumeReleasedRanges).
 	RangeSet                                           m_released_ranges;
 	bool                                               m_record_released = false;

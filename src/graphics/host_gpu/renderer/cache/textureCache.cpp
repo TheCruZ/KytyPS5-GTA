@@ -1421,8 +1421,8 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}
 	const auto       slice_size = range.size / layers;
 	const GuestRange viewed {range.address + slice_size * first, slice_size * count};
-	// A metadata range last written by a recorded uniform compute fill is known without asking
-	// the GPU or draining it.
+	// A metadata range last written by a recorded uniform compute fill is known without a GPU
+	// drain or a conditional clear.
 	uint32_t   known_value = 0;
 	const bool known_fill  = m_buffer_cache.KnownFill(range.address, range.size, known_value);
 	if (!known_fill && m_buffer_cache.IsRegionGpuModified(viewed.address, viewed.size)) {

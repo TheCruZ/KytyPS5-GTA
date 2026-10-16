@@ -1230,6 +1230,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			if (DispatchRunsEnabled()) DispatchRun().pending_post = false;
 		}
 	} while (recovery.Retry());
+	if (known_fill) {
+		// Recorded after binding, which forgets older fills over the written ranges.
+		m_context.GetBufferCache().NoteKnownFill(known_fill_descriptor.Base48(), known_fill_size,
+		                                         known_fill_value);
+	}
 	ResetBindings();
 }
 
