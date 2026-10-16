@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 
+#include "common/assert.h"
+#include "common/logging/log.h"
 #include "gpu_tiler_shaders/fault_buffer_process_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -8,7 +10,9 @@
 
 #include <algorithm>
 #include <bit>
+#include <cinttypes>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -81,8 +85,12 @@ void FaultManager::ProcessFaultBuffer() {
 		RangeSet fault_ranges;
 		for (const auto address: pages) {
 			fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);
+			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
 		}
-		m_buffer_cache.MarkDmaAccess(fault_ranges);
+		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
+			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
+			(void)m_buffer_cache.FindBuffer(start, end - start);
+		});
 	});
 }
 
