@@ -29,10 +29,6 @@ public:
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
-	// Queue after changing ownership; a concurrent drain must not consume an event
-	// before the dirty pages it describes become visible.
-	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] RangeSet TakeBdaSync();
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -55,7 +51,6 @@ public:
 				on_flush();
 			}
 		});
-		QueueBdaSync(vaddr, size);
 	}
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	void ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
@@ -79,6 +74,59 @@ public:
 				manager->template ChangeState<DirtySource::Gpu, false>(address, bytes);
 			}
 		});
+	}
+
+	// The CPU-dirty epoch of the tracking region `index` (address / TRACKER_REGION_SIZE), which
+	// advances whenever its pages become CPU dirty; 0 while the region is untracked.
+	[[nodiscard]] uint64_t RegionCpuDirtyEpoch(uint64_t index) const {
+		if (index >= REGION_COUNT) {
+			EXIT("invalid memory tracker region\n");
+		}
+		const auto* manager = m_regions[index].load(std::memory_order_acquire);
+		return manager != nullptr ? manager->RegionCpuDirtyEpoch() : 0;
+	}
+
+	// Calls func(address, size) for maximal runs of pages that may hold CPU writes not yet
+	// uploaded, after releasing the region locks. Untracked regions count as dirty, as a new
+	// region starts dirty.
+	template <typename Func>
+	void ForEachCpuDirtySpan(uint64_t vaddr, uint64_t size, Func&& func) {
+		ValidateRange(vaddr, size);
+		CheckNotInUploadCallback();
+		const auto                                  end = vaddr + size;
+		std::vector<std::pair<uint64_t, uint64_t>> spans; // [begin, end)
+		const auto add = [&](uint64_t begin, uint64_t finish) {
+			begin  = std::max(begin, vaddr);
+			finish = std::min(finish, end);
+			if (begin >= finish) {
+				return;
+			}
+			if (!spans.empty() && spans.back().second == begin) {
+				spans.back().second = finish;
+			} else {
+				spans.emplace_back(begin, finish);
+			}
+		};
+		for (uint64_t index = vaddr / TRACKER_REGION_SIZE; index * TRACKER_REGION_SIZE < end;
+		     index++) {
+			auto*      manager = m_regions[index].load(std::memory_order_acquire);
+			const auto start   = std::max(index * TRACKER_REGION_SIZE, vaddr);
+			const auto finish  = std::min((index + 1) * TRACKER_REGION_SIZE, end);
+			if (manager == nullptr) {
+				add(start, finish);
+				continue;
+			}
+			if (!manager->HasCpuDirty()) {
+				continue;
+			}
+			std::scoped_lock lock(manager->lock);
+			manager->ForEachModifiedRange<DirtySource::Cpu, false>(
+			    start, finish - start,
+			    [&](uint64_t address, uint64_t bytes) { add(address, address + bytes); });
+		}
+		for (const auto& [begin, finish]: spans) {
+			func(begin, finish - begin);
+		}
 	}
 
 	// Calls func(address, size) for the runs of pages of [vaddr, vaddr + size) that the CPU may
@@ -201,8 +249,6 @@ private:
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
-	std::mutex                                     m_bda_sync_mutex;
-	RangeSet                                       m_bda_sync;
 	PageManager&                                   m_page_manager;
 };
 
