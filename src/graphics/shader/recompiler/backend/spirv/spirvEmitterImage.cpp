@@ -586,20 +586,10 @@ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint
 			                              components[component], texel, component);
 			// UNorm/SNorm backing preserves the guest's filtering; scaling precedes swizzle
 			// constants.
-			const auto scale = info.type == Format::ComponentType::Sscaled
-			                       ? ScaledTexelFactor(info)
-			                       : static_cast<float>((1u << info.component_bits[component]) - 1u);
 			components[component] = Binary(ctx.state, spv::OpFMul, scalar_type, components[component],
-			                               ConstantF32Value(ctx.state, scale));
-			if (integer) {
-				// Depth bits: round back to the stored UNorm code.
-				components[component] =
-				    Unary(ctx.state, spv::OpConvertFToU, TypeU32(ctx.state),
-				          Binary(ctx.state, spv::OpFAdd, scalar_type, components[component],
-				                 ConstantF32Value(ctx.state, 0.5f)));
-			} else if (exact && (info.type == Format::ComponentType::Sscaled ||
-			                     (info.type == Format::ComponentType::Uscaled &&
-			                      info.component_bits[0] > 8u))) {
+			                               ConstantF32Value(ctx.state, ScaledTexelFactor(info)));
+			if (exact && (info.type == Format::ComponentType::Sscaled ||
+			              (info.type == Format::ComponentType::Uscaled && info.component_bits[0] > 8u))) {
 				const auto rounded = ctx.state.builder.AllocateId();
 				ctx.state.builder.AddFunction(spv::OpExtInst, scalar_type, rounded,
 				                              GlslStd450(ctx.state), GLSLstd450RoundEven,

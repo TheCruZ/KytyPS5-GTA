@@ -40529,39 +40529,6 @@ template <bool rg, bool snorm = false> TestCase ImageSamplePacked8() {
   return test;
 }
 
-// A kDepth k16UInt image load returns the stored D16 codes and integer swizzle constants.
-TestCase ImageLoadDepthBits() {
-  using O = ShaderOpcode;
-  TestCase test;
-  test.name = "ImageLoadDepthBits";
-  constexpr std::array<u32, 4> depth{0x2000u, 0xc000u, 0xffffu, 0x0001u};
-  for (u32 texel = 0; texel < depth.size(); ++texel) {
-    AppendVMovU32(&test.code, 20, texel % 2u);
-    AppendVMovU32(&test.code, 21, texel / 2u);
-    test.code.push_back(EncodeMimg0(0x00, 0xf));
-    test.code.push_back(EncodeMimg1(0, 20));
-    for (u32 component = 0; component < 4; ++component) {
-      AppendStoreVgpr(&test.code, component, texel * 4u + component);
-    }
-    test.expected.insert(test.expected.end(), {depth[texel], 0u, 0u, 1u});
-  }
-  AppendEnd(&test.code);
-  test.image_width = test.image_height = 2;
-  test.sampled_image_rgba = {depth[0] | depth[1] << 16u, depth[2] | depth[3] << 16u};
-  test.sampled_image_format = vk::Format::eR16Unorm;
-  test.sampled_image_dwords_per_pixel = 1;
-  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k16UInt);
-  test.user_data[1] |= 1u << 30u;
-  test.user_data[2] = 1u << 14u;
-  test.user_data[3] |= static_cast<u32>(Prospero::TileMode::kDepth) << 20u;
-  test.user_data[50] = test.expected.size() * sizeof(u32);
-  test.user_data[51] = 3u << 28u;
-  test.has_user_data = true;
-  test.image_descriptor_swizzle = DstSel(4, 0, 0, 1);
-  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  return test;
-}
-
 // R16G16B16A16 USCALED/SSCALED texels are integers read as floats. They are backed by an
 // UNorm/SNorm image (hosts rarely sample *SCALED), so loads must round-trip the integer
 // exactly and filtered samples must interpolate the integers.
@@ -40625,7 +40592,7 @@ template <bool is_signed, bool load> TestCase ImageScaled16() {
     test.sampler_filter = vk::Filter::eLinear;
     // Hardware filtering of 16-bit normalized texels is not bit exact.
     test.expected_float_tolerance = 1.0f;
-    test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::IMAGE_GATHER4,
+    test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::IMAGE_GATHER4_LZ,
                     O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   }
   for (u32 index = 0; index < test.expected.size(); ++index) {
@@ -47683,7 +47650,6 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageSamplePacked8<false>);
   AddCase(ImageSamplePacked8<true>);
   AddCase(ImageSamplePacked8<false, true>);
-  AddCase(ImageLoadDepthBits);
   AddCase(ImageScaled16<false, true>);
   AddCase(ImageScaled16<true, true>);
   AddCase(ImageScaled16<false, false>);
@@ -54303,17 +54269,6 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageScaled16<true, true>());
     RunCase(&vulkan, ImageScaled16<false, false>());
     RunCase(&vulkan, ImageScaled16<true, false>());
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--msaa-storage-only") == 0) {
-    VulkanHarness vulkan;
-    vulkan.CheckMsaaStorageClear();
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--depth-bits-only") == 0) {
-    VulkanHarness vulkan;
-    vulkan.CheckDepthBitsCopy();
-    RunCase(&vulkan, ImageLoadDepthBits());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--packed-texture-only") == 0) {
