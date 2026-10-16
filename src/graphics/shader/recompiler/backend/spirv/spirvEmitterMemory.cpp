@@ -1713,6 +1713,12 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto element = Binary(
 	    state, spv::OpIAdd, TypeU32(state), index,
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.byte_offset, ConstantU32(state, 2)));
+	if (state.robust_buffer_access2) {
+		// The device reads zero past the descriptor's range, which OpArrayLength measures.
+		ctx.Define(inst, EmitNative<spv::OpLoad, IR::Type::U32>(
+		                     state, EmitMemoryElementPointer(state, access, element)));
+		return;
+	}
 	const auto condition = EmitMemoryElementInBounds(state, access, element);
 	ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
 		           return EmitNative<spv::OpLoad, IR::Type::U32>(
