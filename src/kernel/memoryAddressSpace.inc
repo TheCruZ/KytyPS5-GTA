@@ -1322,7 +1322,7 @@ public:
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
-		DiagLockGuard lock(m_mutex, __func__);
+		DiagSharedLockGuard lock(m_mutex);
 		return std::any_of(m_owned.begin(), m_owned.end(), [vaddr, size](const auto& range) {
 			return vaddr >= range.first && vaddr + size <= range.first + range.second;
 		});
@@ -1332,7 +1332,7 @@ public:
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
-		DiagLockGuard lock(m_mutex, __func__);
+		DiagSharedLockGuard lock(m_mutex);
 		return std::any_of(m_owned.begin(), m_owned.end(), [vaddr, size](const auto& range) {
 			return VirtualRangesOverlap(vaddr, size, range.first, range.second);
 		});
@@ -1369,7 +1369,7 @@ public:
 		}
 		if constexpr (!copy_private) {
 			{
-				DiagLockGuard lock(m_mutex, __func__);
+				DiagSharedLockGuard lock(m_mutex);
 				if (OverlapsPrivateUnlocked(vaddr, size)) {
 					return false;
 				}
@@ -1404,13 +1404,17 @@ public:
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
-	// Tracker protections only read m_mapped; the page tracker orders them per page.
+	// Only the PageManager calls this, with the SpinGuard of the page's region held for the whole
+	// call, so every change of one page's protection through here is serialized per region, and a
+	// change never crosses regions. The mapping table is only read, so this takes m_mutex shared
+	// and the many watcher updates of the GPU threads and of the game's write faults run in
+	// parallel. Protect() (the game's mprotect) still takes m_mutex exclusive and so excludes it.
 	bool ProtectTransient(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
 
-		DiagLockGuard lock(m_mutex, __func__);
+		DiagSharedLockGuard lock(m_mutex);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
