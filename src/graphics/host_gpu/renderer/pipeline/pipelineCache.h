@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/file.h"
+#include "common/threads.h"
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -14,6 +15,7 @@
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -241,8 +243,11 @@ private:
 	ProgramKey                             m_lookup_key;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
-	std::chrono::steady_clock::time_point m_next_driver_cache_save;
-	bool                          m_driver_cache_dirty = false;
+	// Pipelines created since the driver cache was last written; a background thread writes
+	// the cache periodically so a crash does not lose the pipelines compiled until then.
+	std::atomic_uint64_t          m_unsaved_pipelines {0};
+	Common::Mutex                 m_write_mutex;
+	std::jthread                  m_save_thread;
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
 	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
 	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
@@ -257,7 +262,8 @@ private:
 	                            ShaderRecompiler::TranslateResult translated,
 	                            uint32_t                          push_data_cursor);
 	void InitializeDriverCache();
-	void CheckpointDriverCache();
+	// Writes the driver cache data to m_driver_cache_path; the cache must stay alive meanwhile.
+	void WriteDriverCache();
 
 	// pipelineSerialization.cpp
 	void WarmUp(const std::filesystem::path& path);

@@ -43,8 +43,6 @@ namespace Libs::Graphics {
 
 namespace {
 
-constexpr auto DriverCacheSaveInterval = std::chrono::minutes {5};
-
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
 		case Prospero::BlendFactor::kSrcAlpha:
@@ -461,8 +459,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
                              ShaderRecompiler::IR::ImageHeapSource* image_heap,
                              const std::filesystem::path&           shader_store)
-    : m_graphics(graphics), m_image_heap(image_heap),
-      m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
+    : m_graphics(graphics), m_image_heap(image_heap) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 	WarmUp(shader_store);
@@ -562,23 +559,36 @@ void PipelineCache::InitializeDriverCache() {
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
-}
-
-void PipelineCache::CheckpointDriverCache() {
-	if (m_driver_cache == nullptr) {
-		return;
-	}
-	m_driver_cache_dirty = true;
-	if (std::chrono::steady_clock::now() >= m_next_driver_cache_save) {
-		Save();
-	}
+	m_save_thread = std::jthread([this](const std::stop_token& stop) {
+		constexpr auto Period = std::chrono::seconds(60);
+		auto           next   = std::chrono::steady_clock::now() + Period;
+		while (!stop.stop_requested()) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(250));
+			if (std::chrono::steady_clock::now() < next) {
+				continue;
+			}
+			next = std::chrono::steady_clock::now() + Period;
+			if (m_unsaved_pipelines.exchange(0) != 0) {
+				WriteDriverCache();
+			}
+		}
+	});
 }
 
 void PipelineCache::Save() {
-	if (m_driver_cache == nullptr || !m_driver_cache_dirty) {
+	if (m_save_thread.joinable()) {
+		m_save_thread.request_stop();
+		m_save_thread.join();
+	}
+	if (m_driver_cache == nullptr) {
 		return;
 	}
-	m_next_driver_cache_save = std::chrono::steady_clock::now() + DriverCacheSaveInterval;
+	WriteDriverCache();
+}
+
+void PipelineCache::WriteDriverCache() {
+	// Pipeline creation may continue meanwhile: the driver synchronizes the cache object.
+	Common::LockGuard lock(m_write_mutex);
 
 	size_t               size = 0;
 	vk::Result           result;
@@ -634,7 +644,6 @@ void PipelineCache::Save() {
 	PipelineCacheLog("Vulkan pipeline cache: saved {:.2f} MB to {}",
 	                 static_cast<double>(payload.size()) / 1'000'000.0,
 	                 Common::PathToString(m_driver_cache_path));
-	m_driver_cache_dirty = false;
 }
 
 void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state) {
@@ -1062,7 +1071,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
 	}
 	StorePipeline(key);
-	CheckpointDriverCache();
+	m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
 
 	return pipeline;
 }
@@ -1089,7 +1098,7 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
 	}
-	CheckpointDriverCache();
+	m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
 
 	return pipeline;
 }
