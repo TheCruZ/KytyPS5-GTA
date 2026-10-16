@@ -118,6 +118,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		const auto [it, inserted] = m_buffers.emplace(buffer.CpuAddress(), id);
 		(void)it;
 		EXIT_IF(!inserted);
+		m_register_epoch++;
 		m_total_used_memory += buffer.Size();
 		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
 		std::vector<vk::DeviceAddress> addresses;
@@ -127,7 +128,6 @@ void BufferCache::ChangeRegister(BufferId id) {
 		}
 		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
 		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
-		QueueBdaSync(buffer.CpuAddress(), buffer.Size());
 	} else {
 		const auto found = m_buffers.find(buffer.CpuAddress());
 		EXIT_IF(found == m_buffers.end() || found->second != id);
@@ -299,7 +299,6 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	}
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
-	QueueBdaSync(vaddr, size);
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
@@ -319,7 +318,6 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-			QueueBdaSync(vaddr, size);
 		}
 	});
 }
@@ -569,7 +567,10 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
 	if (!IsRegionGpuModified(vaddr, size)) {
-		// Access the guest mapping so write faults invalidate cached buffers and images.
+		// Invalidate cached buffers and images for the whole range up front, as the write
+		// faults would page by page, so the fill below does not fault on every tracked page.
+		InvalidateMemory(vaddr, size);
+		m_texture_cache.InvalidateMemory(vaddr, size);
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
 		return;
@@ -727,18 +728,6 @@ void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
 }
 
-void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size) {
-	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
-	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
-	std::lock_guard lock(m_bda_sync_mutex);
-	m_bda_sync.Add(begin, end - begin);
-}
-
-RangeSet BufferCache::TakeBdaSync() {
-	std::lock_guard lock(m_bda_sync_mutex);
-	return std::exchange(m_bda_sync, {});
-}
-
 void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid GPU write range\n");
@@ -765,20 +754,65 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 	}
 }
 
-void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
-	const auto end = vaddr + size;
-	auto       it  = m_buffers.upper_bound(vaddr);
-	if (it != m_buffers.begin()) {
-		--it;
-	}
-	for (; it != m_buffers.end() && it->first < end; ++it) {
-		auto&      buffer = m_slot_buffers[it->second];
-		const auto start  = std::max(buffer.CpuAddress(), vaddr);
-		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
-		if (start < finish) {
-			(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
+void BufferCache::SynchronizeBuffersInRanges(const RangeSet& ranges, bool all) {
+	// Read each region's epoch before scanning it: pages dirtied during or after the scan advance
+	// it again, and the next call visits the region again.
+	m_sync_regions.clear();
+	ranges.ForEach([&](uint64_t start, uint64_t end) {
+		for (auto index = start / TRACKER_REGION_SIZE; index * TRACKER_REGION_SIZE < end; index++) {
+			if (!m_sync_regions.empty() && m_sync_regions.back().first == index) {
+				continue;
+			}
+			const auto epoch = m_memory_tracker.RegionCpuDirtyEpoch(index);
+			if (!all) {
+				// Synchronizing a buffer tracks its pages, so an untracked region holds no buffer
+				// since the last full pass.
+				if (epoch == 0) {
+					continue;
+				}
+				const auto synced = m_synced_region_epochs.find(index);
+				if (synced != m_synced_region_epochs.end() && synced->second == epoch) {
+					continue;
+				}
+			}
+			m_sync_regions.emplace_back(index, epoch);
+		}
+	});
+	if (all) {
+		m_synced_region_epochs.clear();
+		ranges.ForEach([this](uint64_t start, uint64_t end) {
+			SynchronizeBuffersInRange(start, end - start);
+		});
+	} else {
+		for (const auto& [index, epoch]: m_sync_regions) {
+			ranges.ForEachInRange(index * TRACKER_REGION_SIZE, TRACKER_REGION_SIZE,
+			                      [this](uint64_t start, uint64_t end) {
+				                      SynchronizeBuffersInRange(start, end - start);
+			                      });
 		}
 	}
+	for (const auto& [index, epoch]: m_sync_regions) {
+		m_synced_region_epochs[index] = epoch;
+	}
+}
+
+void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
+	// Only tracking regions with pending CPU writes can have anything to upload.
+	m_memory_tracker.ForEachCpuDirtySpan(vaddr, size, [&](uint64_t span, uint64_t span_size) {
+		const auto end = span + span_size;
+		auto       it  = m_buffers.upper_bound(span);
+		if (it != m_buffers.begin()) {
+			--it;
+		}
+		for (; it != m_buffers.end() && it->first < end; ++it) {
+			auto&      buffer = m_slot_buffers[it->second];
+			const auto start  = std::max(buffer.CpuAddress(), span);
+			const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+			if (start < finish) {
+				(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
+			}
+		}
+	});
 }
 
 } // namespace Libs::Graphics
