@@ -4,11 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
-#include "common/file.h"
 #include "common/threads.h"
-#include "common/uniqueFunction.h"
-#include "graphics/host_gpu/renderer/colorRenderTarget.h"
-#include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -16,6 +12,7 @@
 #include "graphics/shader/shader.h"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -420,8 +417,11 @@ private:
 	ProgramKey                             m_lookup_key;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
-	std::chrono::steady_clock::time_point m_next_driver_cache_save;
-	bool                          m_driver_cache_dirty = false;
+	// Pipelines created since the driver cache was last written; a background thread writes
+	// the cache periodically so a crash does not lose the pipelines compiled until then.
+	std::atomic_uint64_t          m_unsaved_pipelines {0};
+	Common::Mutex                 m_write_mutex;
+	std::jthread                  m_save_thread;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
@@ -517,7 +517,8 @@ private:
 	void InitializeDriverCache();
 	// Takes a finished background compile into the pipeline; false while it still runs.
 	bool FinishPending(Pipeline& pipeline);
-	void CheckpointDriverCache();
+	// Writes the driver cache data to m_driver_cache_path; the cache must stay alive meanwhile.
+	void WriteDriverCache();
 };
 
 // KYTY_DYNAMIC_RASTER_STATE (default on): cull mode and front face are dynamic state of every
