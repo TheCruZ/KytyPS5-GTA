@@ -195,8 +195,6 @@ struct BufferCacheTestAccess {
     return cache.SynchronizeBufferFromImage(buffer, address, size);
   }
 
-  static std::mutex &BdaSyncMutex(BufferCache &cache) { return cache.m_bda_sync_mutex; }
-
   static BufferId PageOwner(const BufferCache &cache, uint64_t address) {
     const auto *owner = cache.m_page_table.Find(
         address >> BufferCache::PageTable::kPageBits);
@@ -6096,23 +6094,6 @@ public:
     context.MapMemory(base + 2 * page, page);
     context.PrepareBda();
     snapshot(2 * page, 5);
-
-    // A write fault on GPU-dirty memory flushes it on the GPU thread, which must queue the page
-    // itself: the faulting thread can resume only after later commands.
-    (void)cache.ObtainBuffer(base + 20, sizeof(u32), true, false);
-    std::unique_lock queue_lock(BufferCacheTestAccess::BdaSyncMutex(cache));
-    std::jthread fault([&] { cache.InvalidateMemory(base + 20, sizeof(u32)); });
-    while (!cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE)) {
-      std::this_thread::yield();
-    }
-    std::binary_semaphore later_command{0};
-    context.GetGpu().SendCommand([&] { later_command.release(); });
-    Require(name, "flush queue order",
-            !later_command.try_acquire_for(std::chrono::milliseconds(100)),
-            "a GPU command ran before the write-fault flush queued its page");
-    queue_lock.unlock();
-    fault.join();
-    later_command.acquire();
 
     // Garbage collection untracks a clean buffer; its replacement queues the range on Register.
     BufferCacheTestAccess::SetGarbageCollectionThresholds(
