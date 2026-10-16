@@ -281,6 +281,7 @@ static constexpr Flag FLAGS[] = {
     {"--no-float-image-atomics", &ConfigOptions::float_image_atomics_enabled, false},
     {"--vulkan-validation-fatal", &ConfigOptions::vulkan_validation_fatal},
     {"--no-vulkan-validation-fatal", &ConfigOptions::vulkan_validation_fatal, false},
+    {"--pad-haptic-rumble", &ConfigOptions::pad_haptic_rumble},
     {"--trophy-notifications", &ConfigOptions::trophy_enabled},
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
     {"--redzone", &ConfigOptions::red_zone_protection_enabled},
