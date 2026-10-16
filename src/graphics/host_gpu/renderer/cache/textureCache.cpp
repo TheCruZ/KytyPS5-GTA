@@ -1333,7 +1333,11 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}
 	const auto       slice_size = range.size / layers;
 	const GuestRange viewed {range.address + slice_size * first, slice_size * count};
-	if (m_buffer_cache.IsRegionGpuModified(viewed.address, viewed.size)) {
+	// A metadata range last written by a recorded uniform compute fill is known without a GPU
+	// drain or a conditional clear.
+	uint32_t   known_value = 0;
+	const bool known_fill  = m_buffer_cache.KnownFill(range.address, range.size, known_value);
+	if (!known_fill && m_buffer_cache.IsRegionGpuModified(viewed.address, viewed.size)) {
 		std::array<vk::ClearAttachment, TileManager::ColorClearSlots> clears {};
 		uint32_t keys = 0;
 		for (uint32_t key = 0; key < clears.size(); key++) {
@@ -1406,19 +1410,28 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t code = 0;
-		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
+		if (known_fill) {
+			code = static_cast<uint8_t>(known_value);
+		} else if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
 			EXIT("TextureCache: failed to read color metadata backing\n");
 		}
 		vk::ClearValue clear {};
 		if (!DecodeColorClear(desc, code, clear.color)) {
 			continue;
 		}
-		std::vector<uint8_t> bytes(slice_size);
-		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
-			EXIT("TextureCache: failed to read color metadata slice\n");
-		}
-		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
-			continue;
+		if (known_fill) {
+			if (known_value != 0x01010101u * code) {
+				continue;
+			}
+		} else {
+			std::vector<uint8_t> bytes(slice_size);
+			if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
+				EXIT("TextureCache: failed to read color metadata slice\n");
+			}
+			if (!std::all_of(bytes.begin(), bytes.end(),
+			                 [code](uint8_t byte) { return byte == code; })) {
+				continue;
+			}
 		}
 		{
 			std::scoped_lock lock {m_lock};
@@ -1434,11 +1447,9 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			            image_first + slice, 1}, clear);
 		}
 		// Publish the conversion's expanded keys without treating them as guest writes
-		// to overlapping image data. Invalidate the buffer before updating its backing.
+		// to overlapping image data, and without reading GPU-owned metadata back first.
 		if (desc.type != BindingType::VideoOut) {
-			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
-			m_buffer_cache.InvalidateMemory(address, slice_size);
-			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
+			m_buffer_cache.FillInternalMemory(address, slice_size, UINT32_MAX);
 		}
 	}
 }

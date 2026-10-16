@@ -1045,6 +1045,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			return;
 		}
 	}
+	ShaderBufferResource known_fill_descriptor;
+	uint32_t             known_fill_value = 0;
+	uint64_t             known_fill_size  = 0;
+	const bool           known_fill =
+	    ResolveComputeBufferFill(input_info, thread_group_x, thread_group_y, thread_group_z, mode,
+	                             known_fill_descriptor, known_fill_value, known_fill_size);
 
 	if (use_thread_dimensions) {
 		const uint32_t old_x = thread_group_x;
@@ -1226,6 +1232,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			if (DispatchRunsEnabled()) DispatchRun().pending_post = false;
 		}
 	} while (recovery.Retry());
+	if (known_fill) {
+		// Recorded after binding, which forgets older fills over the written ranges.
+		m_context.GetBufferCache().NoteKnownFill(known_fill_descriptor.Base48(), known_fill_size,
+		                                         known_fill_value);
+	}
 	ResetBindings();
 }
 

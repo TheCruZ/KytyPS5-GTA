@@ -759,6 +759,7 @@ bool RenderExecutor::ConsumeMetadataColorOperation(CommandBuffer& buffer,
 struct DrawEmitInfo {
 	int32_t          vertex_offset  = 0; // the first vertex of non-indexed draws
 	uint32_t         first_instance = 0;
+	// Nonzero address: a draw whose records, counts and offsets the GPU reads.
 	DrawIndirectArgs indirect;
 	// Nonzero: a draw whose counts the GPU reads from this guest vk::DrawIndirectCommand.
 	uint64_t gpu_args_address = 0;
