@@ -15,6 +15,7 @@
 #include <map>
 #include <mutex>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -78,6 +79,10 @@ public:
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	// Fills memory the emulator itself rewrites, such as consumed color metadata, without
+	// invalidating images over it. Memory the GPU owns is filled on the GPU, so the fill never
+	// drains it; other memory gets a backing write.
+	void FillInternalMemory(uint64_t vaddr, uint64_t size, uint32_t value);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
@@ -91,10 +96,6 @@ public:
 	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
 	void               PrepareFaultBuffer() { m_fault_manager.PrepareFaultBuffer(); }
 	void               ProcessFaultBuffer();
-	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
-	// Queue after the range's state change becomes visible, or a drain could consume it first.
-	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] RangeSet TakeBdaSync();
 	void ProcessWriteBuffer(FaultManager::PagesHandler&& handler) {
 		m_fault_manager.ProcessWriteBuffer(std::move(handler));
 	}
@@ -117,6 +118,20 @@ public:
 		m_released_ranges.Clear();
 		m_record_released = true;
 	}
+	// Guest ranges whose GPU contents are a uniform 32-bit value written by a recorded compute
+	// fill. Lets CPU-side consumers read the value without draining the GPU.
+	void               NoteKnownFill(uint64_t vaddr, uint64_t size, uint32_t value);
+	[[nodiscard]] bool KnownFill(uint64_t vaddr, uint64_t size, uint32_t& value) const;
+	void               ForgetKnownFills(uint64_t vaddr, uint64_t size);
+	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Uploads the pending CPU writes of the buffers within `ranges`. Unless `all`, visits only the
+	// tracking regions whose pages became CPU dirty since the previous call: that call left no
+	// pending write under a buffer anywhere else in `ranges`, provided no buffer was registered
+	// and `ranges` did not change since. Callers pass `all` otherwise.
+	void SynchronizeBuffersInRanges(const RangeSet& ranges, bool all);
+	// Advances whenever a buffer is registered: a new buffer may cover CPU-dirty pages that no
+	// earlier synchronization uploaded.
+	[[nodiscard]] uint64_t RegisterEpoch() const { return m_register_epoch; }
 	void               RunGarbageCollector();
 
 private:
@@ -170,17 +185,20 @@ private:
 	RangeSet                                          m_released_ranges;
 	bool                                              m_record_released = false;
 	MemoryTracker                                     m_memory_tracker;
-	std::mutex                                        m_bda_sync_mutex;
-	RangeSet                                          m_bda_sync;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
 	uint64_t                                          m_total_used_memory  = 0;
+	uint64_t                                          m_register_epoch     = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	std::map<uint64_t, std::pair<uint64_t, uint32_t>> m_known_fills;
+	// CPU-dirty epoch of each tracking region as SynchronizeBuffersInRanges last visited it.
+	std::unordered_map<uint64_t, uint64_t>     m_synced_region_epochs;
+	std::vector<std::pair<uint64_t, uint64_t>> m_sync_regions;
 };
 
 } // namespace Libs::Graphics
