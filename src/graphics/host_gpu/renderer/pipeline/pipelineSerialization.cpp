@@ -182,9 +182,8 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 			                       m_driver_cache);
 		}
 	}
-	if (!m_graphics_pipelines.empty() || !m_compute_pipelines.empty()) {
-		CheckpointDriverCache();
-	}
+	m_unsaved_pipelines.fetch_add(m_graphics_pipelines.size() + m_compute_pipelines.size(),
+	                              std::memory_order_relaxed);
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "Shader cache: loaded {} programs, {} modules, {} pipelines in {} ms\n",
 	    m_program_cache.size(), modules.size() - 1,
