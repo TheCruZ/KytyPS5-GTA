@@ -873,6 +873,11 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	ir.value_storage.clear();
 	IR::RemoveIdentities(ir);
 	IR::EliminateDeadCode(ir.blocks);
+	if (const auto selects = IR::EliminateMaskedSelects(ir.blocks); selects != 0) {
+		LOGF("%s masked select elimination: selects=%" PRIu32 "\n", GetDumpLabel(options), selects);
+	}
+	IR::RemoveIdentities(ir);
+	IR::EliminateDeadCode(ir.blocks);
 
 	IR::CollectShaderInfo(ir, options.input_info);
 	std::string ir_dump;

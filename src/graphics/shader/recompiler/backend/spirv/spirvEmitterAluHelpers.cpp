@@ -101,24 +101,12 @@ uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask) {
 }
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
-	const auto lhs_class = EmitClassifyF32(state, lhs);
-	const auto rhs_class = EmitClassifyF32(state, rhs);
-
-	const auto numeric_cond = state.builder.AllocateId();
-	state.builder.AddFunction(max_value ? spv::OpFOrdGreaterThanEqual : spv::OpFOrdLessThan,
-	                          TypeBool(state), numeric_cond, lhs, rhs);
-	const auto ordered_bits =
-	    EmitSelectValueU32(state, numeric_cond, lhs_class.bits, rhs_class.bits);
-
-	const auto both_zero    = EmitLogicalAndBool(state, lhs_class.zero, rhs_class.zero);
-	const auto zero_bits    = max_value ? EmitAndU32(state, lhs_class.bits, rhs_class.bits)
-	                                    : EmitOrU32(state, lhs_class.bits, rhs_class.bits);
-	const auto numeric_bits = EmitSelectValueU32(state, both_zero, zero_bits, ordered_bits);
-
-	const auto rhs_nan_bits =
-	    EmitSelectValueU32(state, rhs_class.nan, lhs_class.bits, numeric_bits);
-	const auto result_bits = EmitSelectValueU32(state, lhs_class.nan, rhs_class.bits, rhs_nan_bits);
-	return EmitBitcastU32ToF32(state, result_bits);
+	// Non-IEEE mode returns the other operand for one NaN, as NMin and NMax do; the native
+	// instruction leaves only which zero max(-0, +0) and min(-0, +0) return unspecified.
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), result, GlslStd450(state),
+	                          max_value ? GLSLstd450NMax : GLSLstd450NMin, lhs, rhs);
+	return result;
 }
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
