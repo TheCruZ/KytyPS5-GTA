@@ -397,6 +397,17 @@ private:
 	DiagMutex& m_mutex;
 };
 
+class DiagSharedLockGuard {
+public:
+	explicit DiagSharedLockGuard(DiagMutex& mutex): m_mutex(mutex) { m_mutex.lock_shared(); }
+	~DiagSharedLockGuard() { m_mutex.unlock_shared(); }
+	DiagSharedLockGuard(const DiagSharedLockGuard&)            = delete;
+	DiagSharedLockGuard& operator=(const DiagSharedLockGuard&) = delete;
+
+private:
+	DiagMutex& m_mutex;
+};
+
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static uint32_t        g_test_backing_store_unmaps_before_failure = UINT32_MAX;
 static callback_func_t g_test_before_backing_map                   = nullptr;
