@@ -2,6 +2,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
