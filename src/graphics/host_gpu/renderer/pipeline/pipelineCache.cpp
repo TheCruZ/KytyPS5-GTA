@@ -68,8 +68,6 @@ bool ShaderFailureNonFatal() {
 
 namespace {
 
-constexpr auto DriverCacheSaveInterval = std::chrono::minutes {5};
-
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
 		case Prospero::BlendFactor::kSrcAlpha:
@@ -2733,8 +2731,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
               .device_id           = graphics.GetPhysicalDeviceProperties().deviceID,
               .bindless_images     = graphics.bindless_enabled && Config::BindlessImagesEnabled(),
               .float_image_atomics = Config::FloatImageAtomicsEnabled()},
-          ShaderDiskCacheDirectory())),
-      m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
+          ShaderDiskCacheDirectory())) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 	if (g_async_pipelines) {
@@ -2845,23 +2842,36 @@ void PipelineCache::InitializeDriverCache() {
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
-}
-
-void PipelineCache::CheckpointDriverCache() {
-	if (m_driver_cache == nullptr) {
-		return;
-	}
-	m_driver_cache_dirty = true;
-	if (std::chrono::steady_clock::now() >= m_next_driver_cache_save) {
-		Save();
-	}
+	m_save_thread = std::jthread([this](const std::stop_token& stop) {
+		constexpr auto Period = std::chrono::seconds(60);
+		auto           next   = std::chrono::steady_clock::now() + Period;
+		while (!stop.stop_requested()) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(250));
+			if (std::chrono::steady_clock::now() < next) {
+				continue;
+			}
+			next = std::chrono::steady_clock::now() + Period;
+			if (m_unsaved_pipelines.exchange(0) != 0) {
+				WriteDriverCache();
+			}
+		}
+	});
 }
 
 void PipelineCache::Save() {
-	if (m_driver_cache == nullptr || !m_driver_cache_dirty) {
+	if (m_save_thread.joinable()) {
+		m_save_thread.request_stop();
+		m_save_thread.join();
+	}
+	if (m_driver_cache == nullptr) {
 		return;
 	}
-	m_next_driver_cache_save = std::chrono::steady_clock::now() + DriverCacheSaveInterval;
+	WriteDriverCache();
+}
+
+void PipelineCache::WriteDriverCache() {
+	// Pipeline creation may continue meanwhile: the driver synchronizes the cache object.
+	Common::LockGuard lock(m_write_mutex);
 
 	size_t               size = 0;
 	vk::Result           result;
@@ -2917,7 +2927,6 @@ void PipelineCache::Save() {
 	PipelineCacheLog("Vulkan pipeline cache: saved {:.2f} MB to {}",
 	                 static_cast<double>(payload.size()) / 1'000'000.0,
 	                 Common::PathToString(m_driver_cache_path));
-	m_driver_cache_dirty = false;
 }
 
 // Glyphs, icons and other cached layers are drawn once into small offscreen targets, and a draw
@@ -3318,7 +3327,7 @@ bool PipelineCache::FinishPending(Pipeline& pipeline) {
 	EXIT_NOT_IMPLEMENTED(job.result != vk::Result::eSuccess || job.pipeline == nullptr);
 	pipeline.pipeline = job.pipeline;
 	pipeline.pending.reset();
-	CheckpointDriverCache();
+	m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
 	return true;
 }
 
@@ -3617,12 +3626,12 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	                            ps_active ? ps_input_info->stage.program->shader_hash : 0,
 	                            build_begin);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
+	m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
-	CheckpointDriverCache();
 
 	return iter->second.get();
 }
@@ -3656,13 +3665,13 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
 		ReportPipelineBuilt(Profiler::Counter::ComputePipelinesBuilt, "Compute", hash, 0, begin);
 	}
+	m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
-	CheckpointDriverCache();
 
 	return *iter->second;
 }
