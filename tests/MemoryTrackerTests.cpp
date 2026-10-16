@@ -417,74 +417,6 @@ void TestCpuDirtyUpload() {
   Release(memory);
 }
 
-void TestBdaSyncDirtiness() {
-  constexpr auto page = Libs::Graphics::TRACKER_PAGE_SIZE;
-  TrackerHarness harness;
-  auto &tracker = harness.tracker;
-  auto *memory = Allocate(harness.page_manager, 3);
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  Check(tracker.TakeBdaSync().Empty(), "new tracker queued unowned memory");
-  tracker.QueueBdaSync(address, 3 * page);
-  Check(tracker.IsRegionCpuModified(address, page), "new region was clean");
-  auto pending = tracker.TakeBdaSync();
-  Check(pending.Contains(address, 3 * page) && !pending.Intersects(address + 3 * page, page),
-        "mapped or registered range did not bound initial BDA synchronization");
-  tracker.ForEachUploadRange(address, 3 * page, false,
-                             [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
-  Check(tracker.TakeBdaSync().Empty(), "clean upload queued redundant BDA work");
-
-  tracker.MarkRegionAsCpuModified(address + 17, 1);
-  pending = tracker.TakeBdaSync();
-  Check(pending.Contains(address, page) && !pending.Intersects(address + page, page) &&
-            tracker.TakeBdaSync().Empty(),
-        "byte dirtiness did not drain exactly its whole tracker page");
-  // A write after Take belongs to the next drain, even when its page was just taken.
-  tracker.MarkRegionAsCpuModified(address + 31, 1);
-  Check(tracker.TakeBdaSync().Contains(address, page), "re-dirty event was lost");
-  tracker.ForEachUploadRange(address, page, true,
-                             [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
-  Check(tracker.TakeBdaSync().Empty(), "GPU ownership queued an unnecessary upload");
-  tracker.InvalidateRegion(address + 7, 1, [&] {
-    tracker.UnmarkRegionAsGpuModified(address, page);
-    tracker.MarkRegionAsCpuModified(address, page);
-  });
-  Check(tracker.TakeBdaSync().Contains(address, page),
-        "GPU-to-CPU invalidation did not queue BDA synchronization");
-  tracker.InvalidateRegion(address + page + 7, 1, [] {});
-  Check(tracker.TakeBdaSync().Contains(address + page, page),
-        "CPU invalidation did not queue BDA synchronization");
-  tracker.UntrackMemory(address, 3 * page);
-  Check(tracker.TakeBdaSync().Contains(address, 3 * page),
-        "untracked memory did not queue its newly dirty pages");
-  Release(memory);
-}
-
-void TestBdaSyncConcurrentDrain() {
-  constexpr auto page = Libs::Graphics::TRACKER_PAGE_SIZE;
-  TrackerHarness harness;
-  auto &tracker = harness.tracker;
-  auto *memory = Allocate(harness.page_manager, 1);
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  tracker.ForEachUploadRange(address, page, false,
-                             [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
-  (void)tracker.TakeBdaSync();
-  ProtectionGate gate;
-  g_protection_gate = &gate;
-  std::jthread writer([&] { tracker.MarkRegionAsCpuModified(address + 17, 1); });
-  gate.entered.acquire();
-  // Ownership is still changing. Publishing its event before this point would let
-  // a drain consume it before the writer has finished releasing page protection.
-  Check(tracker.TakeBdaSync().Empty(), "BDA event preceded its state transition");
-  gate.resume.release();
-  writer.join();
-  g_protection_gate = nullptr;
-  Check(tracker.TakeBdaSync().Contains(address, page) &&
-            tracker.IsRegionCpuModified(address, page),
-        "concurrent drain lost a completed CPU dirty transition");
-  tracker.UntrackMemory(address, page);
-  Release(memory);
-}
-
 void TestCleanUploadPreservesOwnership() {
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
@@ -576,6 +508,41 @@ void BenchmarkCleanUploads() {
                 static_cast<double>(elapsed.count()) / completions);
   }
   tracker.UntrackMemory(address, size);
+  Release(memory);
+}
+
+void TestRegionCpuDirtyEpoch() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 1);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto index = address / Libs::Graphics::TRACKER_REGION_SIZE;
+  Check(tracker.RegionCpuDirtyEpoch(index) == 0,
+        "untracked region reported a CPU-dirty epoch");
+
+  tracker.ForEachUploadRange(
+      address, page_size, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  const auto uploaded = tracker.RegionCpuDirtyEpoch(index);
+  Check(uploaded != 0, "tracked region reported no CPU-dirty epoch");
+  (void)tracker.IsRegionCpuModified(address, page_size);
+  Check(tracker.RegionCpuDirtyEpoch(index) == uploaded,
+        "CPU-dirty epoch advanced without new CPU writes");
+
+  tracker.MarkRegionAsCpuModified(address, page_size);
+  const auto marked = tracker.RegionCpuDirtyEpoch(index);
+  Check(marked != uploaded, "CPU-dirty epoch did not advance on a CPU write");
+  tracker.ForEachUploadRange(
+      address, page_size, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  Check(tracker.RegionCpuDirtyEpoch(index) == marked,
+        "CPU-dirty epoch advanced when an upload cleaned the region");
+  tracker.UntrackMemory(address, page_size);
+  Release(memory);
+}
+
 std::vector<std::pair<uint64_t, uint64_t>>
 ConsumeCpuWrites(MemoryTracker &tracker, uint64_t address, uint64_t size) {
   std::vector<std::pair<uint64_t, uint64_t>> runs;
@@ -1378,9 +1345,8 @@ int main(int argc, char **argv) {
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
-  TestBdaSyncDirtiness();
-  TestBdaSyncConcurrentDrain();
   TestCleanUploadPreservesOwnership();
+  TestRegionCpuDirtyEpoch();
   TestConsumeCpuWrites();
   TestGpuMarkingSkipsCpuDirtyPages();
   TestRangeInvalidation();
