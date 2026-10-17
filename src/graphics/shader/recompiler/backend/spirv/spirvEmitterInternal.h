@@ -188,6 +188,8 @@ uint32_t TypeU32Pair(EmitterState& state);
 uint32_t TypeI32(EmitterState& state);
 uint32_t TypeI32Pair(EmitterState& state);
 uint32_t TypeF32(EmitterState& state);
+uint32_t TypeF16(EmitterState& state);
+uint32_t TypeF16x2(EmitterState& state);
 uint32_t TypeF64(EmitterState& state);
 uint32_t TypeU32Vector(EmitterState& state, uint32_t components);
 
