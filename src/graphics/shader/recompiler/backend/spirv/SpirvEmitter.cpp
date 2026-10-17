@@ -13,11 +13,12 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
 namespace {
 
-// KYTY_WAVE64_WARPS=1 runs eligible wave64 workgroups as two host subgroups (split waves).
+// Eligible wave64 workgroups run as two host subgroups (split waves); KYTY_WAVE64_WARPS=0
+// emulates both halves in each invocation instead.
 bool SplitWavesEnabled() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_WAVE64_WARPS");
-		return value != nullptr && value[0] == '1';
+		return value == nullptr || value[0] != '0';
 	}();
 	return enabled;
 }
