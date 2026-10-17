@@ -361,6 +361,10 @@ namespace {
 
 // Packed F16 values stay U32 in the module; each operation bitcasts its operands to an F16
 // vector, which host compilers fold into one native two-lane instruction (HFMA2 and kin).
+uint32_t TypeF16x2(EmitterState& state) {
+	return state.builder.Type(spv::OpTypeVector, state.builder.Type(spv::OpTypeFloat, 16), 2);
+}
+
 uint32_t PackedF16Operation(EmitterState& state, spv::Op opcode, uint32_t glsl,
                             std::initializer_list<uint32_t> args) {
 	std::array<uint32_t, 3> halves {};

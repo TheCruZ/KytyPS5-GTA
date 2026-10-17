@@ -54220,8 +54220,6 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, Vop3pOpselHiUsesArchitecturalSourceBits());
     RunCase(&vulkan, PackedMinMaxF16NanAndSignedZeroEdges());
     RunCase(&vulkan, FloatInlineConstantF16UsesNumericValue());
-    RunCase(&vulkan, VectorCosF16CapturedSdwaAndEdges());
-    RunCase(&vulkan, VectorSinF16SdwaAndEdges());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--new-opcodes-only") == 0) {

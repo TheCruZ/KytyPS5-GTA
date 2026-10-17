@@ -1084,6 +1084,13 @@ void DefineModule(EmitterState& state) {
 		state.builder.AddExecutionMode(state.main_func,
 		                               spv::ExecutionModeSignedZeroInfNanPreserve, 32u);
 	}
+	if (state.program.info.float16) {
+		state.builder.RequireCapability(spv::CapabilityFloat16);
+		if (float_controls) {
+			state.builder.AddExecutionMode(state.main_func,
+			                               spv::ExecutionModeSignedZeroInfNanPreserve, 16u);
+		}
+	}
 	if (HostFlushesF32Denorms(state)) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDenormFlushToZero, 32u);
 	}
