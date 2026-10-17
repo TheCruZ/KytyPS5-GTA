@@ -3152,6 +3152,13 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		    prepared.buffer_sources[index].size == 0
 		        ? 0u
 		        : static_cast<uint32_t>(prepared.buffers[index].range);
+		if (resource.uniform_index != UINT32_MAX) {
+			auto view  = prepared.buffers[index];
+			view.range = std::min<vk::DeviceSize>(
+			    {view.range, ShaderRecompiler::IR::UniformBufferBytes,
+			     m_context.GetGraphics().GetPhysicalDeviceProperties().limits.maxUniformBufferRange});
+			prepared.uniform_buffers[resource.uniform_index] = view;
+		}
 	}
 	// KYTY_SRT_VERIFY: the values the host used in place of GPU-written bytes, each followed by
 	// a slot the GPU fills with its own copy (FillFlatSlotsOnGpu); the shader compares them.

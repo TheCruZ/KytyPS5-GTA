@@ -432,8 +432,8 @@ enum class DescriptorBindingKind : uint32_t {
 inline constexpr uint32_t UniformBufferBytes = 65536u;
 inline constexpr uint32_t UniformBufferBaseSlack = 256u;
 
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 51u);
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 59u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 49u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 57u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;

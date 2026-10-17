@@ -9507,15 +9507,15 @@ void TestImageBindingAbi() {
 
   Check(ImageBindingCount == 50u &&
             static_cast<uint32_t>(DescriptorBindingKind::Buffers) == 0u &&
-            static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 51u &&
-            static_cast<uint32_t>(DescriptorBindingKind::Gds) == 52u &&
-            static_cast<uint32_t>(DescriptorBindingKind::BdaPagetable) == 53u &&
-            static_cast<uint32_t>(DescriptorBindingKind::FaultBuffer) == 54u &&
-            static_cast<uint32_t>(DescriptorBindingKind::FlattenedSrt) == 55u &&
-            static_cast<uint32_t>(DescriptorBindingKind::ShaderData) == 56u &&
-            static_cast<uint32_t>(DescriptorBindingKind::SharedMemory) == 57u &&
-            static_cast<uint32_t>(DescriptorBindingKind::UniformBuffers) == 58u &&
-            static_cast<uint32_t>(DescriptorBindingKind::Count) == 59u,
+            static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 49u &&
+            static_cast<uint32_t>(DescriptorBindingKind::Gds) == 50u &&
+            static_cast<uint32_t>(DescriptorBindingKind::BdaPagetable) == 51u &&
+            static_cast<uint32_t>(DescriptorBindingKind::FaultBuffer) == 52u &&
+            static_cast<uint32_t>(DescriptorBindingKind::FlattenedSrt) == 53u &&
+            static_cast<uint32_t>(DescriptorBindingKind::ShaderData) == 54u &&
+            static_cast<uint32_t>(DescriptorBindingKind::SharedMemory) == 55u &&
+            static_cast<uint32_t>(DescriptorBindingKind::UniformBuffers) == 56u &&
+            static_cast<uint32_t>(DescriptorBindingKind::Count) == 57u,
         "native descriptor binding anchors changed");
 
   const std::array sampled_dimensions{

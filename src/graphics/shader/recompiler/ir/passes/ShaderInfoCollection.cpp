@@ -623,7 +623,8 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 		                       !buffer.written && !buffer.atomic && !buffer.formatted &&
 		                       buffer.image_alias == BufferResource::NoImageAlias &&
 		                       buffer.indirect_root == BufferResource::NoIndirectBuffer &&
-		                       buffer.indirect_resources.empty() && !buffer.indirect_write_table;
+		                       buffer.indirect_resources.empty() &&
+		                       buffer.gpu_records_flat == BufferResource::NoGpuRecords;
 	}
 	const auto uses_mapping = [](const auto& resource) {
 		return resource.indirect_root != UINT32_MAX;
