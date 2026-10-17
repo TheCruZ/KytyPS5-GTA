@@ -270,6 +270,61 @@ uint32_t EmitFPMax32(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 	return EmitMinMaxF32Value(state, arg0, arg1, true);
 }
 
+namespace {
+
+// Packed F16 values stay U32 in the module; each operation bitcasts its operands to an F16
+// vector, which host compilers fold into one native two-lane instruction (HFMA2 and kin).
+uint32_t TypeF16x2(EmitterState& state) {
+	return state.builder.Type(spv::OpTypeVector, state.builder.Type(spv::OpTypeFloat, 16), 2);
+}
+
+uint32_t PackedF16Operation(EmitterState& state, spv::Op opcode, uint32_t glsl,
+                            std::initializer_list<uint32_t> args) {
+	std::array<uint32_t, 3> halves {};
+	size_t                  count = 0;
+	for (const auto arg: args) {
+		halves[count++] = Unary(state, spv::OpBitcast, TypeF16x2(state), arg);
+	}
+	const auto result = state.builder.AllocateId();
+	if (opcode == spv::OpExtInst) {
+		if (count == 2) {
+			state.builder.AddFunction(spv::OpExtInst, TypeF16x2(state), result, GlslStd450(state),
+			                          glsl, halves[0], halves[1]);
+		} else {
+			state.builder.AddFunction(spv::OpExtInst, TypeF16x2(state), result, GlslStd450(state),
+			                          glsl, halves[0], halves[1], halves[2]);
+		}
+	} else {
+		state.builder.AddFunction(opcode, TypeF16x2(state), result, halves[0], halves[1]);
+	}
+	// Each guest operation rounds once; keep the host compiler from fusing a mul and an add.
+	state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+	return Unary(state, spv::OpBitcast, TypeU32(state), result);
+}
+
+} // namespace
+
+uint32_t EmitPackedFPAdd16x2(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	return PackedF16Operation(state, spv::OpFAdd, 0, {arg0, arg1});
+}
+
+uint32_t EmitPackedFPMul16x2(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	return PackedF16Operation(state, spv::OpFMul, 0, {arg0, arg1});
+}
+
+uint32_t EmitPackedFPFma16x2(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2) {
+	return PackedF16Operation(state, spv::OpExtInst, GLSLstd450Fma, {arg0, arg1, arg2});
+}
+
+uint32_t EmitPackedFPMin16x2(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	// One NaN operand yields the other, as for the F32 forms (see EmitMinMaxF32Value).
+	return PackedF16Operation(state, spv::OpExtInst, GLSLstd450NMin, {arg0, arg1});
+}
+
+uint32_t EmitPackedFPMax16x2(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	return PackedF16Operation(state, spv::OpExtInst, GLSLstd450NMax, {arg0, arg1});
+}
+
 uint32_t EmitFPMin64(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 	return EmitMinMaxF64(state, arg0, arg1, false);
 }

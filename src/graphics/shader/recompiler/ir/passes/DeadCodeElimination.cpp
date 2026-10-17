@@ -241,6 +241,11 @@ bool IsLaneLocal(ValueOpcode op) {
 		case ValueOpcode::FPMax32:
 		case ValueOpcode::FPMin64:
 		case ValueOpcode::FPMax64:
+		case ValueOpcode::PackedFPAdd16x2:
+		case ValueOpcode::PackedFPMul16x2:
+		case ValueOpcode::PackedFPFma16x2:
+		case ValueOpcode::PackedFPMin16x2:
+		case ValueOpcode::PackedFPMax16x2:
 		case ValueOpcode::FPMinTri32:
 		case ValueOpcode::FPMaxTri32:
 		case ValueOpcode::FPMedTri32:
