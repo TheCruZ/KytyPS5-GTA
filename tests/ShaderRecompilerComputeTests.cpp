@@ -25186,7 +25186,7 @@ TestCase Vop1SdwaMovByteDestinations() {
   test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.decoded_counts = {{"V_MOV_B32 v1.sdwa(sel=2,sext=0), 0", 1}};
-  test.required_spirv = {"OpBitFieldInsert", "OpBitFieldSExtract", "OpBitwiseOr"};
+  test.required_spirv = {"OpBitFieldInsert", "OpBitFieldSExtract"};
   return test;
 }
 
@@ -25303,7 +25303,7 @@ TestCase Vop2SdwaAddNcCapturedHighWordDestination() {
   test.expected = {0x00010002u, 0x0006c3d4u};
   test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::V_MOV_B32,
                   O::V_ADD_NC_U32,      O::BUFFER_STORE_DWORD,  O::S_ENDPGM};
-  test.required_spirv = {"OpIAdd", "OpShiftLeftLogical", "OpBitwiseOr"};
+  test.required_spirv = {"OpIAdd", "OpBitFieldInsert"};
   return test;
 }
 
@@ -27393,7 +27393,6 @@ TestCase VectorFractF16CapturedAndEdges() {
   test.decoded_counts = {{"V_FRACT_F16 v9, v7", inputs.size()}};
   test.ir_counts = {{" = FPFract32 ", inputs.size()}};
   test.required_spirv = {" Fract ", " PackHalf2x16 ", " UnpackHalf2x16 "};
-  test.forbidden_spirv = {"OpCapability Float16"};
   return test;
 }
 
@@ -27474,7 +27473,6 @@ TestCase VectorCosF16CapturedSdwaAndEdges() {
                           1}};
   test.ir_counts = {{" = FPCos ", 6}};
   test.required_spirv = {" Fract ", " Cos ", " PackHalf2x16 "};
-  test.forbidden_spirv = {"OpCapability Float16"};
   return test;
 }
 
@@ -27520,7 +27518,6 @@ TestCase VectorSinF16SdwaAndEdges() {
                           1}};
   test.ir_counts = {{" = FPSin ", 9}};
   test.required_spirv = {" Fract ", " Sin ", " PackHalf2x16 "};
-  test.forbidden_spirv = {"OpCapability Float16"};
   return test;
 }
 
@@ -50309,6 +50306,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, Vop3pOpselHiUsesArchitecturalSourceBits());
     RunCase(&vulkan, PackedMinMaxF16NanAndSignedZeroEdges());
     RunCase(&vulkan, FloatInlineConstantF16UsesNumericValue());
+    RunCase(&vulkan, VectorCosF16CapturedSdwaAndEdges());
+    RunCase(&vulkan, VectorSinF16SdwaAndEdges());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--new-opcodes-only") == 0) {

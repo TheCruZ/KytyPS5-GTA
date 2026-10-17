@@ -118,6 +118,14 @@ uint32_t TypeF32(EmitterState& state) {
 	return state.f32_type;
 }
 
+uint32_t TypeF16(EmitterState& state) {
+	return state.builder.Type(spv::OpTypeFloat, 16);
+}
+
+uint32_t TypeF16x2(EmitterState& state) {
+	return state.builder.Type(spv::OpTypeVector, TypeF16(state), 2);
+}
+
 uint32_t TypeF64(EmitterState& state) {
 	if (state.f64_type == 0) {
 		state.f64_type = state.builder.Type(spv::OpTypeFloat, 64);
