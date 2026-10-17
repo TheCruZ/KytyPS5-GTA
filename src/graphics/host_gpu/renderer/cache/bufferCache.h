@@ -141,11 +141,15 @@ public:
 	[[nodiscard]] bool KnownFill(uint64_t vaddr, uint64_t size, uint32_t& value) const;
 	void               ForgetKnownFills(uint64_t vaddr, uint64_t size);
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
-	// Uploads the pending CPU writes of the buffers within `ranges`. Unless `all`, visits only the
-	// tracking regions whose pages became CPU dirty since the previous call: that call left no
-	// pending write under a buffer anywhere else in `ranges`, provided no buffer was registered
-	// and `ranges` did not change since. Callers pass `all` otherwise.
+	// Uploads the pending CPU writes of the buffers within `ranges`. Visits only the tracking
+	// regions that hold a registered buffer and whose pages became CPU dirty since the previous
+	// call, or that were forced since (a buffer registered there, ForceSynchronization()): that
+	// call left no pending write under a buffer anywhere else in `ranges`. `all` visits every
+	// region that holds a buffer.
 	void SynchronizeBuffersInRanges(const RangeSet& ranges, bool all);
+	// The next SynchronizeBuffersInRanges() visits the regions of the range whatever their epoch
+	// (the range was mapped: parts of buffers there were outside the ranges synchronized so far).
+	void ForceSynchronization(uint64_t vaddr, uint64_t size);
 	// Uploads the pending CPU writes of the buffers within each [first, second) span, recorded
 	// together as SynchronizeBuffersInRanges() records them.
 	void SynchronizeBuffersInSpans(std::span<const std::pair<uint64_t, uint64_t>> spans);
@@ -380,8 +384,18 @@ private:
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
 	std::map<uint64_t, std::pair<uint64_t, uint32_t>> m_known_fills;
-	// CPU-dirty epoch of each tracking region as SynchronizeBuffersInRanges last visited it.
-	std::unordered_map<uint64_t, uint64_t>     m_synced_region_epochs;
+	// Per tracking region (address / TRACKER_REGION_SIZE), grown to the highest region that held a
+	// buffer: the number of registered buffers it holds, bitmaps of the regions holding any and of
+	// the regions to visit at the next synchronization whatever their epoch, and the CPU-dirty
+	// epoch as SynchronizeBuffersInRanges last visited it. A synchronization walks the bitmap of
+	// regions with buffers instead of every region of the mapped ranges (thousands in Demon's
+	// Souls, at each dispatch).
+	void                                       NoteBufferRegions(const Buffer& buffer, bool insert);
+	void                                       GrowRegionTables(uint64_t region);
+	std::vector<uint32_t>                      m_region_buffer_count;
+	std::vector<uint64_t>                      m_buffer_region_bits;
+	std::vector<uint64_t>                      m_forced_region_bits;
+	std::vector<uint64_t>                      m_synced_region_epochs;
 	std::vector<std::pair<uint64_t, uint64_t>> m_sync_regions;
 };
 
