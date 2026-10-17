@@ -74,6 +74,7 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 		case BindingKind::FlattenedSrt:
 		case BindingKind::ShaderData:
 		case BindingKind::SharedMemory: return vk::DescriptorType::eStorageBuffer;
+		case BindingKind::UniformBuffers: return vk::DescriptorType::eUniformBuffer;
 		case BindingKind::Count: EXIT("invalid native descriptor binding kind");
 	}
 	EXIT("invalid native descriptor binding kind");
@@ -147,7 +148,13 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
 	}
 	const auto& graphics  = context.GetGraphics();
-	const auto  alignment = graphics.StorageMinAlignment();
+	// A buffer with a uniform view aligns both views alike: they share the base adjustment.
+	const auto  alignment =
+	    resource.uniform_index == UINT32_MAX
+	        ? graphics.StorageMinAlignment()
+	        : std::max<vk::DeviceSize>(
+	              graphics.StorageMinAlignment(),
+	              graphics.GetPhysicalDeviceProperties().limits.minUniformBufferOffsetAlignment);
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
@@ -1774,6 +1781,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	EXIT_IF(prepared.buffer_sources.size() != layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
 
 	prepared.buffers.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
+	prepared.uniform_buffers.resize(
+	    layout.descriptor_counts[static_cast<size_t>(BindingKind::UniformBuffers)]);
 	EXIT_IF(prepared.shader_data.size() != layout.ShaderDataDwords());
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
 	          prepared.shader_data.end(), 0);
@@ -1792,6 +1801,13 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		// Null bindings allow 0 bytes, not the shared null buffer's 16, so no store reaches it.
 		prepared.shader_data[layout.MemorySizeDword() + index] =
 		    static_cast<uint32_t>(prepared.buffer_sources[index].size + buffer_offset);
+		if (resource.uniform_index != UINT32_MAX) {
+			auto view  = prepared.buffers[index];
+			view.range = std::min<vk::DeviceSize>(
+			    {view.range, ShaderRecompiler::IR::UniformBufferBytes,
+			     m_context.GetGraphics().GetPhysicalDeviceProperties().limits.maxUniformBufferRange});
+			prepared.uniform_buffers[resource.uniform_index] = view;
+		}
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
@@ -2099,6 +2115,13 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 							EXIT_IF(view.buffer == nullptr);
 						}
 						write.pBufferInfo = descriptors.buffers.data();
+						break;
+					case BindingKind::UniformBuffers:
+						EXIT_IF(descriptors.uniform_buffers.size() != write.descriptorCount);
+						for (const auto& view: descriptors.uniform_buffers) {
+							EXIT_IF(view.buffer == nullptr);
+						}
+						write.pBufferInfo = descriptors.uniform_buffers.data();
 						break;
 					case BindingKind::BdaPagetable:
 					case BindingKind::FaultBuffer: {
