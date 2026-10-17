@@ -42,6 +42,8 @@ struct PreparedBindings {
 	// become stale and need resolving again when bindings are rebound.
 	std::vector<BufferSource>             buffer_sources;
 	std::vector<vk::DescriptorBufferInfo> buffers;
+	// The uniform views of the buffers that have a uniform_index, by that index.
+	std::vector<vk::DescriptorBufferInfo> uniform_buffers;
 	std::vector<TextureBinding>           images;
 	std::vector<vk::Sampler>              samplers;
 	vk::DescriptorBufferInfo              gds {nullptr, 0, VK_WHOLE_SIZE};

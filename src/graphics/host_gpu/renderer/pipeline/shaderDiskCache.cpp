@@ -25,7 +25,7 @@ namespace {
 
 // Bump when the encoding below changes in a way the source version cannot see (it hashes this
 // file too, so this is belt and braces).
-constexpr uint32_t FormatVersion = 5;
+constexpr uint32_t FormatVersion = 6;
 constexpr uint32_t FileMagic     = 0x4344534bu; // "KSDC"
 constexpr uint64_t MaxFileSize   = uint64_t {256} << 20u;
 
@@ -91,6 +91,7 @@ requires Is<T, IR::BufferResource>
 void Visit(Io& io, T& v) {
 	io(v.source);
 	io(v.descriptor_index);
+	io(v.uniform_index);
 	io(v.first_use_pc);
 	io(v.max_byte_extent);
 	io(v.packed_stride);

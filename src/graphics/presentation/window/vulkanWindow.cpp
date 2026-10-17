@@ -76,6 +76,7 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.shaderStorageImageArrayNonUniformIndexing = VK_TRUE;
 	features.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
 	features.shaderFloat16 = VK_TRUE;
+	features.uniformBufferStandardLayout = VK_TRUE;
 	return features;
 }
 
@@ -321,6 +322,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		              "shaderStorageBufferArrayNonUniformIndexing",
 		              required_features12.shaderStorageBufferArrayNonUniformIndexing);
 		check_feature(features12.shaderFloat16, "shaderFloat16", required_features12.shaderFloat16);
+		check_feature(features12.uniformBufferStandardLayout, "uniformBufferStandardLayout",
+		              required_features12.uniformBufferStandardLayout);
 		check_feature(features13.robustImageAccess, "robustImageAccess");
 		check_feature(robustness2.nullDescriptor, "nullDescriptor");
 		check_feature(features13.dynamicRendering, "dynamicRendering",
