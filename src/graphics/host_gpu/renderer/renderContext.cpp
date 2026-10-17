@@ -146,6 +146,7 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
 	m_mapped_ranges_version++;
+	m_bda_mapped_since_sync.emplace_back(vaddr, size);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -323,9 +324,14 @@ void RenderContext::PrepareBda(bool may_write, bool full_sync) {
 	if (full_sync && epochs != m_bda_sync_epochs &&
 	    (!same_layout || m_bda_synced_generation != m_bda_generation)) {
 		m_bda_synced_generation = m_bda_generation;
-		// A new buffer or mapped range may cover CPU-dirty pages that earlier passes skipped.
-		const bool all = epochs[1] != m_bda_sync_epochs[1] || epochs[2] != m_bda_sync_epochs[2];
-		m_buffer_cache.SynchronizeBuffersInRanges(m_mapped_ranges, all);
+		// A new buffer or mapped range may cover CPU-dirty pages that earlier passes skipped: the
+		// buffer cache forces the regions of new buffers, and of the ranges mapped since. Only this
+		// thread takes the ranges out; MapMemory() adds them under the exclusive lock.
+		for (const auto& [vaddr, size]: m_bda_mapped_since_sync) {
+			m_buffer_cache.ForceSynchronization(vaddr, size);
+		}
+		m_bda_mapped_since_sync.clear();
+		m_buffer_cache.SynchronizeBuffersInRanges(m_mapped_ranges, false);
 		m_bda_sync_epochs = epochs;
 	}
 	m_fault_process_pending = true;
