@@ -17,6 +17,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <bit>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
@@ -123,6 +124,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		EXIT_IF(!inserted);
 		m_register_epoch++;
 		m_buffer_set_epoch++;
+		NoteBufferRegions(buffer, true);
 		m_total_used_memory += buffer.Size();
 		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
 		std::vector<vk::DeviceAddress> addresses;
@@ -137,6 +139,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		EXIT_IF(found == m_buffers.end() || found->second != id);
 		m_buffers.erase(found);
 		m_buffer_set_epoch++;
+		NoteBufferRegions(buffer, false);
 		EXIT_IF(buffer.Size() > m_total_used_memory);
 		m_total_used_memory -= buffer.Size();
 		m_lru_cache.Free(buffer.lru_id);
@@ -1485,45 +1488,74 @@ void BufferCache::SynchronizeBuffersInSpans(std::span<const std::pair<uint64_t, 
 	}
 }
 
+void BufferCache::GrowRegionTables(uint64_t region) {
+	if (region < m_region_buffer_count.size()) {
+		return;
+	}
+	const auto words = region / 64 + 1;
+	m_region_buffer_count.resize(words * 64, 0);
+	m_synced_region_epochs.resize(words * 64, 0);
+	m_buffer_region_bits.resize(words, 0);
+	m_forced_region_bits.resize(words, 0);
+}
+
+void BufferCache::NoteBufferRegions(const Buffer& buffer, bool insert) {
+	const auto first = buffer.CpuAddress() / TRACKER_REGION_SIZE;
+	const auto last  = (buffer.CpuAddress() + buffer.Size() - 1) / TRACKER_REGION_SIZE;
+	GrowRegionTables(last);
+	for (auto index = first; index <= last; index++) {
+		const auto bit = uint64_t {1} << (index % 64);
+		if (insert) {
+			// A new buffer may cover CPU-dirty pages that no earlier synchronization uploaded.
+			m_region_buffer_count[index]++;
+			m_buffer_region_bits[index / 64] |= bit;
+			m_forced_region_bits[index / 64] |= bit;
+		} else {
+			EXIT_IF(m_region_buffer_count[index] == 0);
+			if (--m_region_buffer_count[index] == 0) {
+				m_buffer_region_bits[index / 64] &= ~bit;
+			}
+		}
+	}
+}
+
+void BufferCache::ForceSynchronization(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || m_buffer_region_bits.empty()) {
+		return;
+	}
+	const auto first = vaddr / TRACKER_REGION_SIZE;
+	const auto last  = std::min((vaddr + size - 1) / TRACKER_REGION_SIZE, m_region_buffer_count.size() - 1);
+	for (auto index = first; index <= last; index++) {
+		m_forced_region_bits[index / 64] |= uint64_t {1} << (index % 64);
+	}
+}
+
 void BufferCache::SynchronizeBuffersInRanges(const RangeSet& ranges, bool all) {
 	const UploadBatch batch {*this};
 	// Read each region's epoch before scanning it: pages dirtied during or after the scan advance
-	// it again, and the next call visits the region again.
+	// it again, and the next call visits the region again. Regions without buffers have nothing
+	// to upload; a buffer registered later forces its regions.
 	m_sync_regions.clear();
-	ranges.ForEach([&](uint64_t start, uint64_t end) {
-		for (auto index = start / TRACKER_REGION_SIZE; index * TRACKER_REGION_SIZE < end; index++) {
-			if (!m_sync_regions.empty() && m_sync_regions.back().first == index) {
-				continue;
-			}
+	for (size_t word = 0; word < m_buffer_region_bits.size(); word++) {
+		const auto forced = m_forced_region_bits[word];
+		m_forced_region_bits[word] = 0;
+		for (auto bits = m_buffer_region_bits[word]; bits != 0; bits &= bits - 1) {
+			const auto index = word * 64 + static_cast<uint64_t>(std::countr_zero(bits));
 			const auto epoch = m_memory_tracker.RegionCpuDirtyEpoch(index);
-			if (!all) {
-				// Synchronizing a buffer tracks its pages, so an untracked region holds no buffer
-				// since the last full pass.
-				if (epoch == 0) {
-					continue;
-				}
-				const auto synced = m_synced_region_epochs.find(index);
-				if (synced != m_synced_region_epochs.end() && synced->second == epoch) {
-					continue;
-				}
+			// Synchronizing a buffer tracks its pages, so an untracked region (epoch 0) has no
+			// pending write under a buffer unless the region was forced.
+			if (!all && (forced & (uint64_t {1} << (index % 64))) == 0 &&
+			    (epoch == 0 || m_synced_region_epochs[index] == epoch)) {
+				continue;
 			}
 			m_sync_regions.emplace_back(index, epoch);
 		}
-	});
-	if (all) {
-		m_synced_region_epochs.clear();
-		ranges.ForEach([this](uint64_t start, uint64_t end) {
-			SynchronizeBuffersInRange(start, end - start);
-		});
-	} else {
-		for (const auto& [index, epoch]: m_sync_regions) {
-			ranges.ForEachInRange(index * TRACKER_REGION_SIZE, TRACKER_REGION_SIZE,
-			                      [this](uint64_t start, uint64_t end) {
-				                      SynchronizeBuffersInRange(start, end - start);
-			                      });
-		}
 	}
 	for (const auto& [index, epoch]: m_sync_regions) {
+		ranges.ForEachInRange(index * TRACKER_REGION_SIZE, TRACKER_REGION_SIZE,
+		                      [this](uint64_t start, uint64_t end) {
+			                      SynchronizeBuffersInRange(start, end - start);
+		                      });
 		m_synced_region_epochs[index] = epoch;
 	}
 }
