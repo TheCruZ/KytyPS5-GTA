@@ -296,15 +296,11 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 				value               = ir.ShiftLeftLogical(extended, IR::U32(IR::Value(offset)));
 				break;
 			}
-			case 2: {
-				const uint32_t field_mask = width == 32u ? 0xffffffffu : (1u << width) - 1u;
-				const auto     inserted =
-				    ir.ShiftLeftLogical(ir.BitwiseAnd(value, IR::U32(IR::Value(field_mask))),
-				                        IR::U32(IR::Value(offset)));
-				const auto cleared = ir.BitwiseAnd(ReadRawU32(PlainOperand(operand)),
-				                                   IR::U32(IR::Value(~(field_mask << offset))));
-				value              = ir.BitwiseOr(cleared, inserted);
-			} break;
+			case 2:
+				value = IR::U32(ir.Emit(IR::ValueOpcode::BitFieldInsert,
+				                        {ReadRawU32(PlainOperand(operand)), value, IR::Value(offset),
+				                         IR::Value(width)}));
+				break;
 			default: EXIT("reserved SDWA DST_U mode");
 		}
 	}
@@ -459,6 +455,9 @@ void Translator::Write16Bits(const Decoder::Operand& operand, IR::U32 value) {
 void Translator::WriteF16(const Decoder::Operand& operand, IR::F32 value) {
 	value           = ApplyF32ResultModifiers(operand, value);
 	const auto half = IR::F16(ir.Emit(IR::ValueOpcode::ConvertF16F32, {value}));
+	if (NativeF16Enabled() && WriteF16Lane(operand, half)) {
+		return;
+	}
 	const auto bits = IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32U16,
 	                                  {IR::U16(ir.Emit(IR::ValueOpcode::BitCastU16F16, {half}))}));
 	Write16Bits(operand, bits);
@@ -505,6 +504,26 @@ IR::U64 Translator::ReadU64(const Decoder::Operand& operand) {
 }
 
 IR::F32 Translator::ReadF16LaneAsF32(const Decoder::Operand& operand, bool high_lane) {
+	if (operand.kind != Decoder::OperandKind::FloatInlineConstant && operand.sdwa_sel >= 4u) {
+		// Convert the selected half in place; the sign modifiers apply exactly in F32.
+		auto raw_operand      = operand;
+		raw_operand.sdwa_sel  = 6;
+		raw_operand.sdwa_sext = false;
+		const auto bits = ApplyBitSourceModifiers(raw_operand, ReadRawU32(operand));
+		bool       high = high_lane ? operand.op_sel_hi : operand.op_sel;
+		if (operand.sdwa_sel != 6u) {
+			high = operand.sdwa_sel == 5u;
+		}
+		auto value = IR::F32(
+		    ir.Emit(IR::ValueOpcode::ConvertF32F16Lane, {bits, IR::Value(high ? 1u : 0u)}));
+		if (operand.absolute) {
+			value = IR::F32(ir.Emit(IR::ValueOpcode::FPAbs32, {value}));
+		}
+		if (high_lane ? operand.negate_hi : operand.negate) {
+			value = IR::F32(ir.Emit(IR::ValueOpcode::FPNeg32, {value}));
+		}
+		return value;
+	}
 	const auto bits     = Read16LaneBits(operand, high_lane);
 	const auto half_u16 = IR::U16(ir.Emit(IR::ValueOpcode::ConvertU16U32, {bits}));
 	const auto half     = IR::F16(ir.Emit(IR::ValueOpcode::BitCastF16U16, {half_u16}));
