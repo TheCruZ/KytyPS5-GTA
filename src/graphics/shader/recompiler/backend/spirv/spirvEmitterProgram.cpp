@@ -411,8 +411,8 @@ uint32_t TypeId(EmitterState& state, IR::Type type) {
 		case IR::Type::U1: return TypeBool(state);
 		case IR::Type::U8:
 		case IR::Type::U16:
-		case IR::Type::U32:
-		case IR::Type::F16: return TypeU32(state);
+		case IR::Type::U32: return TypeU32(state);
+		case IR::Type::F16: return TypeF16(state);
 		case IR::Type::U64: return TypeU64(state);
 		case IR::Type::U32x2: return TypeU32Pair(state);
 		case IR::Type::F32: return TypeF32(state);
@@ -433,7 +433,8 @@ uint32_t ValueEmitContext::Def(IR::Value value) {
 			case IR::Type::U16: return ConstantU32(state, value.U16());
 			case IR::Type::U32: return ConstantU32(state, value.U32());
 			case IR::Type::U64: return ConstantU64(state, value.U64());
-			case IR::Type::F16: return ConstantU32(state, value.F16Bits());
+			case IR::Type::F16:
+				return state.builder.Constant(spv::OpConstant, TypeF16(state), value.F16Bits());
 			case IR::Type::F32:
 				return ConstantF32(state, std::bit_cast<uint32_t>(value.F32Value()));
 			default: break;
