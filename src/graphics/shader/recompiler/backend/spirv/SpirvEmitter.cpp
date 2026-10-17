@@ -160,6 +160,14 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 			Fail(program, "native buffer descriptor index does not match shader topology");
 		}
 	}
+	auto& uniform_count = expected[static_cast<size_t>(Kind::UniformBuffers)];
+	for (const auto& buffer: program.info.buffers) {
+		if (buffer.uniform_index == UINT32_MAX) continue;
+		if (buffer.uniform_index != uniform_count++ || !buffer.constant_only ||
+		    buffer.descriptor_index == UINT32_MAX) {
+			Fail(program, "native uniform buffer index does not match shader topology");
+		}
+	}
 	for (const auto& image: program.info.images) {
 		const auto kind = IR::DescriptorBindingForImage(image);
 		if (!kind.has_value()) {
