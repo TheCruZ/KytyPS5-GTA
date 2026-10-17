@@ -130,20 +130,6 @@ std::array<IR::U32, 2> Translator::BallotMask(IR::U1 value) {
 	        program.wave_size == 64u ? ir.CompositeExtract(mask, 1) : IR::U32(IR::Value(0u))};
 }
 
-std::array<IR::U32, 2> Translator::ExecMask() {
-	return {ir.GetExecLo(), program.wave_size == 64u ? ir.GetExecHi() : IR::U32(IR::Value(0u))};
-}
-
-// Pixel EXEC words exclude the helper invocations that the per-lane EXEC keeps enabled.
-std::array<IR::U32, 2> Translator::VectorMask(IR::U1 value) {
-	auto mask = BallotMask(value);
-	if (program.stage == ShaderType::Pixel) {
-		const auto exec = ExecMask();
-		mask = {ir.BitwiseAnd(mask[0], exec[0]), ir.BitwiseAnd(mask[1], exec[1])};
-	}
-	return mask;
-}
-
 IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
 	switch (operand.kind) {
 		case Decoder::OperandKind::LiteralConstant:
@@ -313,15 +299,11 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 				value               = ir.ShiftLeftLogical(extended, IR::U32(IR::Value(offset)));
 				break;
 			}
-			case 2: {
-				const uint32_t field_mask = width == 32u ? 0xffffffffu : (1u << width) - 1u;
-				const auto     inserted =
-				    ir.ShiftLeftLogical(ir.BitwiseAnd(value, IR::U32(IR::Value(field_mask))),
-				                        IR::U32(IR::Value(offset)));
-				const auto cleared = ir.BitwiseAnd(ReadRawU32(PlainOperand(operand)),
-				                                   IR::U32(IR::Value(~(field_mask << offset))));
-				value              = ir.BitwiseOr(cleared, inserted);
-			} break;
+			case 2:
+				value = IR::U32(ir.Emit(IR::ValueOpcode::BitFieldInsert,
+				                        {ReadRawU32(PlainOperand(operand)), value, IR::Value(offset),
+				                         IR::Value(width)}));
+				break;
 			default: EXIT("reserved SDWA DST_U mode");
 		}
 	}
@@ -340,10 +322,7 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 		case Decoder::OperandKind::Vgpr: {
 			const auto reg = static_cast<IR::VectorReg>(operand.reg);
 			const auto old = ir.GetVectorReg(reg);
-			// DPP skips EXEC lanes only through row/bank masks, or for invalid sources without
-			// BOUND_CTRL (dpp8 reads zero); otherwise it is a plain masked write.
-			if (operand.dpp && (operand.dpp_row_mask != 0xfu || operand.dpp_bank_mask != 0xfu ||
-			                    (!operand.dpp_bound_ctrl && !operand.dpp8))) {
+			if (operand.dpp) {
 				value = IR::U32(ir.Emit(IR::ValueOpcode::DppUpdateU32, {value, old, ir.GetExec()},
 				                        DppFlags(operand)));
 			} else {
@@ -418,9 +397,21 @@ void Translator::WriteOperand(const Decoder::Operand& operand, IR::Value value) 
 		switch (operand.kind) {
 			case Decoder::OperandKind::Scc: ir.SetScc(IR::U1(value)); return;
 			case Decoder::OperandKind::ExecLo:
-			case Decoder::OperandKind::ExecHi:
+			case Decoder::OperandKind::ExecHi: {
+				const auto mask = BallotMask(IR::U1(value));
+				ir.SetExec(IR::U1(value));
+				ir.SetExecLo(mask[0]);
+				ir.SetExecHi(mask[1]);
+				return;
+			}
 			case Decoder::OperandKind::VccLo:
-			case Decoder::OperandKind::VccHi: EXIT("lane masks are written through WriteMask");
+			case Decoder::OperandKind::VccHi: {
+				const auto mask = BallotMask(IR::U1(value));
+				ir.SetVcc(IR::U1(value));
+				ir.SetVccLo(mask[0]);
+				ir.SetVccHi(mask[1]);
+				return;
+			}
 			default:
 				WriteRawU32(operand, ir.Select(IR::U1(value), IR::U32(IR::Value(1u)),
 				                               IR::U32(IR::Value(0u))));
@@ -689,7 +680,7 @@ IR::U1 Translator::ReadMask(const Decoder::Operand& operand) {
 		}
 		case Decoder::OperandKind::ExecLo:
 		case Decoder::OperandKind::ExecHi: return ir.GetExec();
-		case Decoder::OperandKind::VccLo: return ir.GetVcc();
+		case Decoder::OperandKind::VccLo:
 		case Decoder::OperandKind::VccHi:
 			return program.wave_size == 32u
 			           ? ThreadBit({ReadRawU32(operand), IR::U32(IR::Value(0u))})
@@ -727,8 +718,9 @@ IR::U1 Translator::ReadMaskValid(const Decoder::Operand& operand) {
 	}
 }
 
-void Translator::WriteMask(const Decoder::Operand& operand, IR::U1 value,
-                           const std::array<IR::U32, 2>& mask, bool write_64) {
+std::array<IR::U32, 2> Translator::WriteMask(const Decoder::Operand& operand, IR::U1 value,
+                                             bool write_64) {
+	const auto mask = BallotMask(value);
 	switch (operand.kind) {
 		case Decoder::OperandKind::Sgpr: {
 			const auto reg  = static_cast<IR::ScalarReg>(operand.reg);
@@ -749,43 +741,43 @@ void Translator::WriteMask(const Decoder::Operand& operand, IR::U1 value,
 				ir.SetThreadBitScalarReg(high, IR::U1(IR::Value(false)));
 				ir.SetScalarMaskTag(high, IR::U1(IR::Value(false)));
 			}
-			return;
+			return mask;
 		}
 		case Decoder::OperandKind::ExecLo:
 		case Decoder::OperandKind::ExecHi: {
 			ir.SetExec(value);
 			ir.SetExecLo(mask[0]);
 			ir.SetExecHi(mask[1]);
-			return;
+			return mask;
 		}
 		case Decoder::OperandKind::VccLo:
 		case Decoder::OperandKind::VccHi: {
-			if (operand.kind == Decoder::OperandKind::VccHi && !write_64 &&
-			    program.wave_size == 32u) {
+			if (!write_64 && program.wave_size == 32u) {
 				WriteRawU32(operand, mask[0]);
-				return;
+				return mask;
 			}
 			ir.SetVcc(value);
 			ir.SetVccLo(mask[0]);
-			if (write_64 || program.wave_size == 64u) {
-				ir.SetVccHi(mask[1]);
-			}
-			return;
+			ir.SetVccHi(mask[1]);
+			return mask;
 		}
-		case Decoder::OperandKind::Scc: ir.SetScc(value); return;
+		case Decoder::OperandKind::Scc: ir.SetScc(value); return mask;
 		default:
 			WriteRawU32(operand, mask[0]);
 			WriteRawU32(OffsetOperand(operand, 1), mask[1]);
-			return;
+			return mask;
 	}
 }
 
-void Translator::WriteVectorMask(const Decoder::Operand& operand, IR::U1 value) {
+void Translator::WriteCompareResult(const Decoder::Operand& operand, IR::U1 value) {
+	if (operand.kind == Decoder::OperandKind::Scc) {
+		WriteOperand(operand, value);
+		return;
+	}
 	// VALU instructions only write lanes enabled by the incoming EXEC mask. This is
 	// especially important for V_CMPX: replacing EXEC with the ungated comparison would
 	// reactivate lanes disabled by an enclosing divergent region.
-	const auto active = ir.LogicalAnd(ir.GetExec(), value);
-	WriteMask(operand, active, VectorMask(active));
+	WriteMask(operand, ir.LogicalAnd(ir.GetExec(), value));
 }
 
 void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
@@ -1202,10 +1194,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 		}
 		entry_ir.SetExec(initial_exec);
-		// Pixel EXEC words start with the live (non-helper) lanes; helpers keep the per-lane EXEC.
-		const auto initial_mask = options.stage == ShaderType::Pixel
-		                              ? entry_ir.Emit(IR::ValueOpcode::LiveMask)
-		                              : entry_ir.Emit(IR::ValueOpcode::Ballot, {initial_exec});
+		const auto initial_mask = entry_ir.Emit(IR::ValueOpcode::Ballot, {initial_exec});
 		const auto initial_lo = entry_ir.CompositeExtract(initial_mask, 0);
 		const auto initial_hi = options.wave_size == 64u ? entry_ir.CompositeExtract(initial_mask, 1)
 		                                               : IR::U32(IR::Value(0u));
@@ -1291,7 +1280,6 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			    entry_ir.BitwiseOr(wave_info, entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(
 			                                                         primitive_count, u32(8)),
 			                                                     vertex_count)));
-			// Instance IDs exclude the start instance, which shaders add from user data.
 			if (mesh.fast_launch) {
 				// Fast launch broadcasts the subgroup's base vertex and instance to every lane.
 				// The instance VGPR excludes the start instance, as on hardware: the shader adds
@@ -1372,14 +1360,14 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                                         entry_ir.ShiftLeftLogical(second, u32(18))));
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(1),
 				                      entry_ir.ShiftLeftLogical(third, u32(2)));
-				const auto index_bytes  = draw(2);
+				const auto index_bytes  = draw(3);
 				const auto indexed      = entry_ir.INotEqual(index_bytes, u32(0));
-				const auto index_low    = draw(3);
+				const auto index_low    = draw(4);
 				const auto byte_offset  = entry_ir.IAdd(entry_ir.BitwiseAnd(index_low, u32(3)),
 				                                           entry_ir.IMul(input_vertex, index_bytes));
 				const auto index_resource = entry_ir.Emit(
 				    IR::ValueOpcode::GetAddressResource,
-				    {entry_ir.BitwiseAnd(index_low, u32(~3u)), draw(4)});
+				    {entry_ir.BitwiseAnd(index_low, u32(~3u)), draw(5)});
 				const auto memory_index = static_cast<uint32_t>(result.memory_info.size());
 				result.memory_info.push_back({.kind = IR::ResourceKind::Global});
 				const auto packed_index = entry_ir.Emit(
@@ -1393,8 +1381,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				     entry_ir.IMul(index_bytes, u32(8))}));
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 				                      entry_ir.IAdd(draw(1), entry_ir.Select(indexed, index, input_vertex)));
-				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
-				                      builtin(IR::StageInputKind::WorkgroupId, 1));
+				entry_ir.SetVectorReg(
+				    static_cast<IR::VectorReg>(8),
+				    entry_ir.IAdd(draw(2), builtin(IR::StageInputKind::WorkgroupId, 1)));
 			}
 		} else if (options.stage == ShaderType::Local) {
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3), IR::U32(IR::Value(64u)));
@@ -1484,27 +1473,10 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                      IR::U32(IR::Value(options.wave_size << 12u)));
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
 			                      entry_ir.BitwiseOr(vertex_count, IR::U32(IR::Value(1u << 28u))));
-			// Vulkan adds an indirect record's bases to the indices; the hardware passes them
-			// only in the user SGPRs the packet patches.
-			const auto& offsets = options.input_info.vertex->indirect_offsets;
-			const auto  index   = [&](uint8_t slot, IR::StageInputKind kind,
-			                          IR::StageInputKind base_kind) {
-				if (offsets == ShaderIndirectOffsets {}) {
-					return builtin(kind);
-				}
-				const auto base = builtin(base_kind);
-				if (slot < options.user_data_count) {
-					entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(options.user_data_base + slot),
-					                      base);
-				}
-				return entry_ir.ISub(builtin(kind), base);
-			};
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
-			                      index(offsets.vertex, IR::StageInputKind::VertexIndex,
-			                            IR::StageInputKind::BaseVertex));
+			                      builtin(IR::StageInputKind::VertexIndex));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
-			                      index(offsets.instance, IR::StageInputKind::InstanceIndex,
-			                            IR::StageInputKind::BaseInstance));
+			                      builtin(IR::StageInputKind::InstanceIndex));
 		}
 	}
 	const bool flush_f32_inputs = options.stage == ShaderType::Compute &&

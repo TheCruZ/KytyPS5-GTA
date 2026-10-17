@@ -291,7 +291,10 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 	info.float64 |= inst.GetType() == Type::F64;
 	info.float16 |= op == ValueOpcode::PackedFPAdd16x2 || op == ValueOpcode::PackedFPMul16x2 ||
 	                op == ValueOpcode::PackedFPFma16x2 || op == ValueOpcode::PackedFPMin16x2 ||
-	                op == ValueOpcode::PackedFPMax16x2;
+	                op == ValueOpcode::PackedFPMax16x2 || inst.GetType() == Type::F16;
+	for (size_t arg = 0; arg < inst.NumArgs(); ++arg) {
+		info.float16 |= inst.Arg(arg).GetType() == Type::F16;
+	}
 	info.buffer_int64_atomics |= buffer_access == BufferAccess::Atomic &&
 	                             inst.GetType() == Type::U64;
 	if (buffer_access != BufferAccess::None || address_access != AddressAccess::None ||

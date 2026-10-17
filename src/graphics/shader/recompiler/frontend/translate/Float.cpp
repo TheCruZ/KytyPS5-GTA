@@ -7,15 +7,27 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
-namespace {
-
-// KYTY_NATIVE_F16=0 evaluates packed F16 arithmetic per lane in F32 instead of natively.
+// KYTY_NATIVE_F16=0 evaluates F16 arithmetic per lane in F32 instead of natively.
 bool NativeF16Enabled() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_NATIVE_F16");
 		return value == nullptr || value[0] != '0';
 	}();
 	return enabled;
+}
+
+namespace {
+
+IR::ValueOpcode NativeScalarF16Opcode(IR::ValueOpcode opcode) {
+	switch (opcode) {
+		case IR::ValueOpcode::FPAdd32: return IR::ValueOpcode::FPAdd16;
+		case IR::ValueOpcode::FPSub32: return IR::ValueOpcode::FPSub16;
+		case IR::ValueOpcode::FPMul32: return IR::ValueOpcode::FPMul16;
+		case IR::ValueOpcode::FPFma32: return IR::ValueOpcode::FPFma16;
+		case IR::ValueOpcode::FPMin32: return IR::ValueOpcode::FPMin16;
+		case IR::ValueOpcode::FPMax32: return IR::ValueOpcode::FPMax16;
+		default: return IR::ValueOpcode::Identity;
+	}
 }
 
 IR::ValueOpcode NativePackedF16Opcode(IR::ValueOpcode opcode) {
@@ -32,10 +44,25 @@ IR::ValueOpcode NativePackedF16Opcode(IR::ValueOpcode opcode) {
 } // namespace
 
 IR::U32 Translator::ReadPackedF16(const Decoder::Operand& operand) {
-	if (operand.sdwa_sel == 6u && !operand.op_sel && operand.op_sel_hi && !operand.absolute &&
-	    operand.kind != Decoder::OperandKind::FloatInlineConstant) {
-		// Both lanes in place: the register is the packed value.
-		auto       bits = ApplyBitSourceModifiers(operand, ReadRawU32(operand));
+	if (operand.sdwa_sel == 6u && operand.kind != Decoder::OperandKind::FloatInlineConstant) {
+		// A register: OP_SEL picks each lane's half, a bit insert at most.
+		const auto raw    = ApplyBitSourceModifiers(operand, ReadRawU32(operand));
+		const auto insert = [&](IR::U32 base, IR::U32 half, uint32_t offset) {
+			return IR::U32(ir.Emit(IR::ValueOpcode::BitFieldInsert,
+			                       {base, half, IR::Value(offset), IR::Value(16u)}));
+		};
+		const auto high = [&] { return ir.ShiftRightLogical(raw, IR::U32(IR::Value(16u))); };
+		auto       bits = raw;
+		if (operand.op_sel && !operand.op_sel_hi) {
+			bits = ir.BitwiseOr(high(), ir.ShiftLeftLogical(raw, IR::U32(IR::Value(16u))));
+		} else if (!operand.op_sel && !operand.op_sel_hi) {
+			bits = insert(raw, raw, 16u);
+		} else if (operand.op_sel && operand.op_sel_hi) {
+			bits = insert(raw, high(), 0u);
+		}
+		if (operand.absolute) {
+			bits = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x7fff7fffu)));
+		}
 		const auto sign = (operand.negate ? 0x8000u : 0u) | (operand.negate_hi ? 0x80000000u : 0u);
 		if (sign != 0u) {
 			bits = ir.BitwiseXor(bits, IR::U32(IR::Value(sign)));
@@ -266,33 +293,6 @@ void Translator::Float16Ternary(const Decoder::Instruction& inst, IR::ValueOpcod
 void Translator::FloatUnary(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
 	const auto type = IR::ArgTypeOf(opcode, 0);
 	WriteOperand(DestinationOperand(inst), ir.Emit(opcode, {ReadOperand(inst.src0, type)}));
-}
-
-void Translator::V_FRACT(const Decoder::Instruction& inst, IR::Type type) {
-	// x - floor(x) rounds to 1.0 for a tiny negative x; v_fract returns the largest value below
-	// one instead. The ordered compare lets NaN through.
-	const auto destination = DestinationOperand(inst);
-	if (type == IR::Type::F64) {
-		const auto result    = ir.Emit(IR::ValueOpcode::FPFract64, {ReadOperand(inst.src0, type)});
-		const auto below_one = ir.Emit(IR::ValueOpcode::BitCastF64U64,
-		                               {IR::Value(uint64_t {0x3fefffffffffffff})});
-		const auto above     = ir.Emit(IR::ValueOpcode::FPOrdGreaterThan64, {result, below_one});
-		WriteOperand(destination, ir.Emit(IR::ValueOpcode::SelectF64, {above, below_one, result}));
-		return;
-	}
-	const bool half   = type == IR::Type::F16;
-	const auto source = half ? ReadF16AsF32(inst.src0) : IR::F32(ReadOperand(inst.src0, type));
-	const auto result = IR::F32(ir.Emit(IR::ValueOpcode::FPFract32, {source}));
-	// Clamp in the destination precision: 0x3f7fe000 is the half 0x3bff.
-	const auto below_one =
-	    IR::F32(IR::Value::F32(std::bit_cast<float>(half ? 0x3f7fe000u : 0x3f7fffffu)));
-	const auto above   = IR::U1(ir.Emit(IR::ValueOpcode::FPOrdGreaterThan32, {result, below_one}));
-	const auto clamped = SelectF32(above, below_one, result);
-	if (half) {
-		WriteF16(destination, clamped);
-	} else {
-		WriteOperand(destination, clamped);
-	}
 }
 
 void Translator::FloatBinary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,

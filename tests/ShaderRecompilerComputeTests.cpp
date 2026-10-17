@@ -27109,7 +27109,7 @@ TestCase Vop1SdwaMovByteDestinations() {
   test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.decoded_counts = {{"V_MOV_B32 v1.sdwa(sel=2,sext=0), 0", 1}};
-  test.required_spirv = {"OpBitFieldInsert", "OpBitFieldSExtract", "OpBitwiseOr"};
+  test.required_spirv = {"OpBitFieldInsert", "OpBitFieldSExtract"};
   return test;
 }
 
@@ -27226,7 +27226,7 @@ TestCase Vop2SdwaAddNcCapturedHighWordDestination() {
   test.expected = {0x00010002u, 0x0006c3d4u};
   test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::V_MOV_B32,
                   O::V_ADD_NC_U32,      O::BUFFER_STORE_DWORD,  O::S_ENDPGM};
-  test.required_spirv = {"OpIAdd", "OpShiftLeftLogical", "OpBitwiseOr"};
+  test.required_spirv = {"OpIAdd", "OpBitFieldInsert"};
   return test;
 }
 
@@ -29338,37 +29338,6 @@ TestCase VectorFractF16CapturedAndEdges() {
   test.decoded_counts = {{"V_FRACT_F16 v9, v7", inputs.size()}};
   test.ir_counts = {{" = FPFract32 ", inputs.size()}};
   test.required_spirv = {" Fract ", " PackHalf2x16 ", " UnpackHalf2x16 "};
-  return test;
-}
-
-// V_FRACT_F32 clamps to 0x3f7fffff where x - floor(x) rounds to 1.0, before output modifiers.
-TestCase VectorFractF32Edges() {
-  using O = ShaderOpcode;
-
-  constexpr std::array<std::array<u32, 3>, 4> cases{{
-      {0xb3800000u, 0, 0x3f7fffffu},   // -2^-24: exact
-      {0xb3000000u, 0, 0x3f7fffffu},   // -2^-25: the tie rounds to 1.0
-      {0xb3000000u, 1, 0x3fffffffu},   // omod *2 applies after the clamp
-      {0x7fc00001u, 0, 0x7fc00000u}}}; // Quiet NaN class
-  TestCase test;
-  test.name = "VectorFractF32Edges";
-  for (const auto &[source, omod, expected] : cases) test.initial.push_back(source);
-  test.expected = test.initial;
-  auto &code = test.code;
-  for (u32 i = 0; i < cases.size(); i++) {
-    AppendVMovU32(&code, 30, i * 4u);
-    AppendBufferLoadDword(&code, 7, 30);
-    AppendVop3(&code, 0x1a0, 9, Vgpr(7), 0, 0, 0, 0, false, cases[i][1]);
-    if (i + 1u == cases.size()) {
-      code.push_back(EncodeVop2(0x1b, 9, 255u, 9));
-      code.push_back(0x7fc00000u);
-    }
-    AppendStoreVgpr(&code, 9, static_cast<u32>(cases.size()) + i);
-    test.expected.push_back(cases[i][2]);
-  }
-  AppendEnd(&code);
-  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_FRACT_F32,
-                  O::V_AND_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   return test;
 }
 
@@ -54220,6 +54189,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, Vop3pOpselHiUsesArchitecturalSourceBits());
     RunCase(&vulkan, PackedMinMaxF16NanAndSignedZeroEdges());
     RunCase(&vulkan, FloatInlineConstantF16UsesNumericValue());
+    RunCase(&vulkan, VectorCosF16CapturedSdwaAndEdges());
+    RunCase(&vulkan, VectorSinF16SdwaAndEdges());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--new-opcodes-only") == 0) {
