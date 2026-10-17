@@ -112,6 +112,9 @@ private:
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	uint64_t                  m_mapped_ranges_version = 0;
+	// Ranges mapped since the last BDA synchronization (under m_mapped_ranges_mutex): that
+	// synchronization forces their regions (BufferCache::ForceSynchronization()).
+	std::vector<std::pair<uint64_t, uint64_t>> m_bda_mapped_since_sync;
 	// SynchronizeDmaFootprint(): the spans of an operation.
 	std::vector<std::pair<uint64_t, uint64_t>> m_dma_spans;
 	// Epochs (CPU dirty, buffer registrations, mapped ranges) read before the last full BDA
