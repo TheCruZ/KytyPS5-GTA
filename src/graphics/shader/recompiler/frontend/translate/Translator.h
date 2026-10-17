@@ -29,6 +29,8 @@ inline Decoder::Operand ConditionOperand(Decoder::OperandKind kind) {
 using LaneSpills = std::array<std::pair<uint32_t, uint32_t>, IR::NumVectorRegs>;
 inline constexpr LaneSpills NoLaneSpills {};
 
+[[nodiscard]] bool NativeF16Enabled();
+
 class Translator {
 public:
 	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit,
@@ -66,6 +68,8 @@ private:
 	IR::U64                ReadU64(const Decoder::Operand& operand);
 	IR::F32 ReadF16LaneAsF32(const Decoder::Operand& operand, bool high_lane);
 	IR::U32 ReadPackedF16(const Decoder::Operand& operand);
+	IR::F16 ReadF16Lane(const Decoder::Operand& operand, bool high_lane);
+	bool    WriteF16Lane(const Decoder::Operand& operand, IR::F16 value);
 	IR::F32 ReadF16AsF32(const Decoder::Operand& operand);
 	IR::F32 ReadMixF32(const Decoder::Operand& operand);
 	IR::U32 ReadU16LaneAsU32(const Decoder::Operand& operand, bool high_lane, bool sign_extend);
