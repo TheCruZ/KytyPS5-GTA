@@ -181,6 +181,11 @@ uint32_t EmitFPFma32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t
 uint32_t EmitFPMad32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
 uint32_t EmitFPMin32(EmitterState& state, uint32_t arg0, uint32_t arg1);
 uint32_t EmitFPMax32(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitPackedFPAdd16x2(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitPackedFPMul16x2(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitPackedFPFma16x2(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
+uint32_t EmitPackedFPMin16x2(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitPackedFPMax16x2(EmitterState& state, uint32_t arg0, uint32_t arg1);
 uint32_t EmitFPMin64(EmitterState& state, uint32_t arg0, uint32_t arg1);
 uint32_t EmitFPMax64(EmitterState& state, uint32_t arg0, uint32_t arg1);
 uint32_t EmitFPMinTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
