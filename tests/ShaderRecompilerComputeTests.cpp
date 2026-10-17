@@ -49613,6 +49613,16 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorVop3CmpxNeI64CapturedExecMask());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--packed-f16-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorLaneAndPackedOps());
+    RunCase(&vulkan, Vop2PkFmacF16AccumulatesPackedHalvesIndependently());
+    RunCase(&vulkan, Vop2PkFmacF16DppNegatesBothPackedHalves());
+    RunCase(&vulkan, Vop3pOpselHiUsesArchitecturalSourceBits());
+    RunCase(&vulkan, PackedMinMaxF16NanAndSignedZeroEdges());
+    RunCase(&vulkan, FloatInlineConstantF16UsesNumericValue());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--new-opcodes-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorCompareInteger64Edges());
