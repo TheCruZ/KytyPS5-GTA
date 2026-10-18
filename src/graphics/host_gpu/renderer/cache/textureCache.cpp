@@ -32,6 +32,12 @@ namespace Libs::Graphics {
 
 namespace {
 
+// KYTY_IMAGE_GRANULES=0: region lookups walk their pages even where no image was ever registered.
+bool ImageGranulesEnabled() {
+	const char* value = std::getenv("KYTY_IMAGE_GRANULES");
+	return value == nullptr || value[0] != '0';
+}
+
 constexpr uint64_t NumFramesBeforeRemoval = 32;
 // Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
 constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
@@ -126,6 +132,9 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
       m_buffer_cache(buffer_cache),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
+	if (ImageGranulesEnabled()) {
+		m_image_granules.assign((ImageGranuleSpace >> ImageGranuleBits) / 64u, 0);
+	}
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
 		const auto        budget =
@@ -265,6 +274,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 	});
+	MarkImageGranules(image.info.data.address, image.info.data.size);
 	image.registered = true;
 	++image.registrations;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
@@ -286,6 +296,16 @@ void TextureCache::UnregisterImage(ImageId id) {
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
 		EXIT("TextureCache: registered image is outside the guest address space\n");
+	}
+	if (!m_image_granules.empty() && ++m_image_granule_releases >= 4096u) {
+		// Rebuilt from the images still registered, this one left out.
+		m_image_granule_releases = 0;
+		std::fill(m_image_granules.begin(), m_image_granules.end(), 0);
+		m_slot_images.ForEach([&](ImageId other, const Image& registered) {
+			if (registered.registered && other != id) {
+				MarkImageGranules(registered.info.data.address, registered.info.data.size);
+			}
+		});
 	}
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		auto* owners = m_image_page_table.Find(page);
@@ -600,10 +620,43 @@ void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 	}
 }
 
+void TextureCache::MarkImageGranules(uint64_t address, uint64_t size) {
+	if (m_image_granules.empty() || size == 0 || address >= ImageGranuleSpace) {
+		return;
+	}
+	const auto first = address >> ImageGranuleBits;
+	const auto last  = (std::min(address + size, ImageGranuleSpace) - 1u) >> ImageGranuleBits;
+	for (auto granule = first; granule <= last; ++granule) {
+		m_image_granules[granule / 64u] |= uint64_t {1} << (granule % 64u);
+	}
+}
+
+bool TextureCache::MayHaveImages(uint64_t address, uint64_t size) const {
+	if (m_image_granules.empty() || size == 0 || address >= ImageGranuleSpace ||
+	    size > ImageGranuleSpace - address) {
+		return true;
+	}
+	const auto first = address >> ImageGranuleBits;
+	const auto last  = (address + size - 1u) >> ImageGranuleBits;
+	for (auto granule = first; granule <= last; ++granule) {
+		if ((m_image_granules[granule / 64u] & (uint64_t {1} << (granule % 64u))) != 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
 TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64_t size,
                                                         bool page_overlap) const {
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
+		return {};
+	}
+	// (Page overlaps count images anywhere on the pages of the region.)
+	if (const auto page = uint64_t {1} << ImagePageBits,
+	    begin = page_overlap ? Common::AlignDown(address, page) : address,
+	    end   = page_overlap ? Common::AlignUp(address + size, page) : address + size;
+	    !MayHaveImages(begin, end - begin)) {
 		return {};
 	}
 

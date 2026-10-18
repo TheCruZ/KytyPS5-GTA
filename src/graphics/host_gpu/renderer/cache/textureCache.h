@@ -241,6 +241,15 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
+	// One bit per 64 KiB granule of the guest address space that some registered image reaches (chenxiao07's
+	// KYTY_IMAGE_GRANULES): a region lookup whose granules are all clear finds no image without walking its
+	// pages. Bits are set on registration and cleared only by a rebuild, after enough unregistrations.
+	static constexpr uint32_t ImageGranuleBits  = 16;
+	static constexpr uint64_t ImageGranuleSpace = uint64_t {1} << 40u;
+	std::vector<uint64_t>     m_image_granules;
+	uint32_t                  m_image_granule_releases = 0;
+	void                      MarkImageGranules(uint64_t address, uint64_t size);
+	[[nodiscard]] bool        MayHaveImages(uint64_t address, uint64_t size) const;
 	MultiLevelPageTable<uint64_t, ImagePageTable::kPageBits, ImagePageTable::kAddressSpaceBits,
 	                    ImagePageTable::kFirstLevelBits>
 	    m_image_page_epochs;
