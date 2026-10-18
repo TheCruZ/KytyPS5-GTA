@@ -14,6 +14,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
+#include "loader/gameArgs.h"
 
 #include <algorithm>
 #include <atomic>
@@ -537,7 +538,15 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 			LOGF_COLOR(result ? Log::Color::Green : Log::Color::Red, "\tCreate: %s, %s\n",
 			           Common::PathToString(file->real_name).c_str(), result ? "[ok]" : "[fail]");
 		} else {
-			result = file->f.Open(file->real_name, rw_mode);
+			// The game's command-line file gets the console variables of KYTY_GAME_CONVARS
+			// (loader/gameArgs.h).
+			auto open_name = file->real_name;
+			if (rw_mode == Common::File::Mode::Read) {
+				if (auto args = Loader::GameArgs::RedirectRead(file->real_name); !args.empty()) {
+					open_name = std::move(args);
+				}
+			}
+			result = file->f.Open(open_name, rw_mode);
 
 			LOGF_COLOR(result ? Log::Color::Green : Log::Color::Red, "\tOpen: %s, %s\n",
 			           Common::PathToString(file->real_name).c_str(), result ? "[ok]" : "[fail]");
@@ -1137,7 +1146,9 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 		stat.st_blksize = 512;
 		stat.st_blocks  = stat.st_size / 512;
 	} else {
-		stat.st_size    = static_cast<int64_t>(info->size);
+		// The game's command-line file: a read gets a copy of another size (KernelOpen).
+		const auto redirected = Loader::GameArgs::RedirectedSize(real_file_name);
+		stat.st_size    = static_cast<int64_t>(redirected ? *redirected : info->size);
 		stat.st_blksize = 512;
 		stat.st_blocks  = (stat.st_size + 511) / 512;
 
