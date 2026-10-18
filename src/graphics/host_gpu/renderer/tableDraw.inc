@@ -33,6 +33,14 @@ uint32_t TableXprMode() {
 	return mode;
 }
 
+// chenxiao07's KYTY_TABLE_STORE_BUDGET (default 0: no limit): table stores asked for per frame. Each store request
+// draws the normal way (and compiles programs or a pipeline); hundreds of pairs warming up at once made every one of
+// them a normal draw in the same frame.
+uint32_t TableStoreBudget() {
+	static const uint32_t budget = NativeXprNumberSwitch("KYTY_TABLE_STORE_BUDGET", 0u);
+	return budget;
+}
+
 // The stages' static input key a pair's programs were compiled for: both stages' code and static input, and whether
 // the pixel stage runs.
 uint64_t TableDrawKey(std::vector<uint32_t>& key, const ShaderParams& vertex_params,
@@ -199,6 +207,9 @@ struct RenderExecutor::TableXpr {
 	// The next prepared draw of the pair under this state stores (TableStore).
 	TablePair* store       = nullptr;
 	uint64_t   store_state = 0;
+	// The frame's store requests so far (KYTY_TABLE_STORE_BUDGET).
+	uint64_t store_frame    = UINT64_MAX;
+	uint32_t store_requests = 0;
 	// The draw's T#/S# words (the set's key) and its runs' addresses.
 	std::vector<uint32_t> words;
 	std::vector<uint32_t> static_key; // (scratch)
@@ -1073,9 +1084,18 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, uint
 	const auto state_key = cache.state_key;
 	// A store at most once a frame per pair and draw state: while its programs or its pipeline are on their way, the
 	// pair's draws take the normal path (Deferred).
+	// Within the frame's budget (KYTY_TABLE_STORE_BUDGET): past it the others take native records or the normal path
+	// meanwhile, and ask again in a later frame.
 	const auto request_store = [&] {
 		if (pair.pending != nullptr || (pair.store_frame == frame && pair.store_state == state_key))
 			return TableResult::Deferred;
+		if (table.store_frame != frame) {
+			table.store_frame    = frame;
+			table.store_requests = 0;
+		}
+		if (const auto budget = TableStoreBudget(); budget != 0 && table.store_requests >= budget)
+			return TableResult::Native;
+		++table.store_requests;
 		pair.store_frame  = frame;
 		pair.store_state  = state_key;
 		table.store       = &pair;
