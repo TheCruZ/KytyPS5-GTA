@@ -249,10 +249,10 @@ public:
 	// live registers); operations with the same id see the same context registers.
 	void UseContextId(uint64_t context_id) noexcept { m_context_id = context_id; }
 	// Execution thread: an operation of guest queue `queue` is about to execute. The barrier
-	// after a direct dispatch is deferred to the next operation, unless that is a direct dispatch
-	// of the same queue the guest did not order after it (see DispatchDirect()).
-	void BeginGuestOperation(uint32_t queue, bool dispatch_direct, bool guest_sync);
-	// Records the barrier a direct dispatch deferred, if any.
+	// after a dispatch is deferred to the next operation, unless that is a dispatch of the same
+	// queue the guest did not order after it (see DispatchDirect() and DispatchIndirect()).
+	void BeginGuestOperation(uint32_t queue, bool dispatch, bool guest_sync);
+	// Records the barrier a dispatch deferred, if any.
 	void FlushDeferredDispatchBarrier();
 	// Execution thread: an operation other than a draw is about to execute (see
 	// RenderTargetMemo).

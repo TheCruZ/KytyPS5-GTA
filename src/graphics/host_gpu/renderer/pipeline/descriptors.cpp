@@ -1470,9 +1470,9 @@ void RenderExecutor::FlushDeferredDispatchBarrier() {
 	                    vk::PipelineStageFlagBits::eComputeShader);
 }
 
-void RenderExecutor::BeginGuestOperation(uint32_t queue, bool dispatch_direct, bool guest_sync) {
+void RenderExecutor::BeginGuestOperation(uint32_t queue, bool dispatch, bool guest_sync) {
 	m_guest_queue = queue;
-	if (m_deferred_barrier && dispatch_direct && !guest_sync && queue == m_deferred_barrier_queue) {
+	if (m_deferred_barrier && dispatch && !guest_sync && queue == m_deferred_barrier_queue) {
 		m_dispatch_chained = true;
 		return;
 	}

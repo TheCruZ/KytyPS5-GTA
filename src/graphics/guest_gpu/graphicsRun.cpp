@@ -602,8 +602,14 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 	m_renderer.NoteOperation(operation.submit_id, operation.after_wait);
 	auto& executor = m_renderer.GetRenderExecutor();
 	executor.UseContextId(operation.state.context_id);
+	// KYTY_INDIRECT_CHAIN=0: indirect dispatches end a chain.
+	static const bool indirect_chains = [] {
+		const char* value = std::getenv("KYTY_INDIRECT_CHAIN");
+		return value == nullptr || value[0] != '0';
+	}();
 	executor.BeginGuestOperation(static_cast<uint32_t>(m_interrupt_event_id),
-	                             operation.kind == GpuOperationKind::DispatchDirect,
+	                             operation.kind == GpuOperationKind::DispatchDirect ||
+	                                 (indirect_chains && operation.kind == GpuOperationKind::DispatchIndirect),
 	                             operation.guest_sync);
 	if (operation.after_wait) {
 		executor.InvalidateRenderTargetMemo();
