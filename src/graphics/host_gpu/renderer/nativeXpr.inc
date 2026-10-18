@@ -180,6 +180,12 @@ struct RenderExecutor::NativeXprDrawState {
 	// ImageSetEpoch under which the targets were what a lookup finds.
 	uint64_t            targets_epoch = 0;
 	uint64_t            used_frame    = 0;
+	// TextureCache::ImagesEpoch after a table draw last emitted the targets (NativeXprEmitTargets): they stay in place
+	// while it does not move (UINT64_MAX: not yet).
+	uint64_t            emitted_epoch = UINT64_MAX;
+	// Times the state was captured at this address (NativeXprCaptureState): what was proven under an earlier capture
+	// (an image set's transit) holds no more.
+	uint64_t            captures = 0;
 };
 
 // One object: its resources under the compiled programs it was translated with.
@@ -297,7 +303,19 @@ struct RenderExecutor::NativeXprCache {
 	uint64_t store_frame    = UINT64_MAX;
 	uint32_t store_requests = 0;
 	uint64_t last_hash = 0; // the key hash of the last native draw's record (KYTY_NATIVE_XPR_PREDICT)
+	// Draw states stay at their address (the table draws' emission tracking compares pointers): a state captured
+	// again is written over the old one (NativeXprCaptureState).
 	std::unordered_map<uint64_t, std::unique_ptr<NativeXprDrawState>, NativeXprKeyHash> states;
+	// What the last table draw (tableDraw.inc) bound in the command buffer, while the scheduler's DynamicState
+	// generation is the same (no other draw, helper pipeline or command buffer since): its draw state (dynamic state
+	// and rendering), pipeline and index buffer, which the next table draw does not bind again.
+	struct Emit {
+		uint64_t                       generation = UINT64_MAX;
+		const NativeXprDrawState*      state      = nullptr;
+		const PipelineCache::Pipeline* pipeline   = nullptr;
+		uint64_t                       index_base = 0, index_bytes = 0;
+		vk::IndexType                  index_type = vk::IndexType::eUint16;
+	} emit;
 	struct RetiredSet {
 		vk::DescriptorPool pool;
 		vk::DescriptorSet  set;
@@ -1101,40 +1119,7 @@ void RenderExecutor::NativeXprStoreRecord(std::unique_ptr<NativeXprRecord> recor
 	if (reads != nullptr) record->reads = *reads;
 
 	// The draw state: the targets as this draw left them and the dynamic state.
-	{
-		auto& textures  = m_context.GetTextureCache();
-		auto  draw_state = std::make_unique<NativeXprDrawState>();
-		draw_state->rendering = rendering;
-		for (auto& attachment: draw_state->rendering.color_attachments) attachment.is_clear = false;
-		draw_state->rendering.depth_stencil_attachment.depth_clear   = false;
-		draw_state->rendering.depth_stencil_attachment.stencil_clear = false;
-		const auto metadata_of = [](const TextureCache::ImageDesc& desc) {
-			return desc.info.metadata.kind == ImageMetadataKind::None ? uint64_t {0} : desc.info.metadata.range.address;
-		};
-		for (uint32_t i = 0; i < state.color_count; ++i) {
-			const auto& target = state.colors[i];
-			const auto& view   = target.desc.view_info;
-			const auto& image  = textures.GetImage(target.image_id);
-			draw_state->targets.push_back({target.image_id, image.serial,
-			                               rendering.color_attachments[target.target_slot].image_layout,
-			                               image.binding.attachment_access,
-			                               {view.base_level, view.level_count, view.base_layer, view.layer_count},
-			                               metadata_of(target.desc), view.base_layer, target.desc.info});
-		}
-		if (state.depth->image_id) {
-			const auto& view  = state.depth->desc.view_info;
-			const auto& image = textures.GetImage(state.depth->image_id);
-			draw_state->targets.push_back({state.depth->image_id, image.serial,
-			                               rendering.depth_stencil_attachment.image_layout,
-			                               image.binding.attachment_access,
-			                               {view.base_level, view.level_count, view.base_layer, view.layer_count},
-			                               metadata_of(state.depth->desc), view.base_layer, state.depth->desc.info});
-		}
-		draw_state->dynamic       = dynamic_state;
-		draw_state->targets_epoch = textures.ImageSetEpoch();
-		draw_state->used_frame    = frame;
-		cache.states[state_key]   = std::move(draw_state);
-	}
+	NativeXprCaptureState(state, rendering, state_key, dynamic_state);
 
 	if (relocated) {
 		std::array<NativeXprStageView, 2> views {};
@@ -1206,6 +1191,51 @@ void RenderExecutor::NativeXprStoreRecord(std::unique_ptr<NativeXprRecord> recor
 	variants.insert(variants.begin(), std::move(record));
 	++cache.record_count;
 	++cache.counters.stored;
+}
+
+// The draw state of a stored draw (a native record's or a table draw's): the targets as the draw left them, their
+// rendering without clears and the dynamic state. A state already known is written over in place.
+void RenderExecutor::NativeXprCaptureState(const DrawRenderState& state, const RenderState& rendering,
+                                           uint64_t state_key, const DynamicState& dynamic_state) {
+	auto&               cache    = NativeXprState();
+	auto&               textures = m_context.GetTextureCache();
+	NativeXprDrawState  draw_state;
+	draw_state.rendering = rendering;
+	for (auto& attachment: draw_state.rendering.color_attachments) attachment.is_clear = false;
+	draw_state.rendering.depth_stencil_attachment.depth_clear   = false;
+	draw_state.rendering.depth_stencil_attachment.stencil_clear = false;
+	const auto metadata_of = [](const TextureCache::ImageDesc& desc) {
+		return desc.info.metadata.kind == ImageMetadataKind::None ? uint64_t {0} : desc.info.metadata.range.address;
+	};
+	for (uint32_t i = 0; i < state.color_count; ++i) {
+		const auto& target = state.colors[i];
+		const auto& view   = target.desc.view_info;
+		const auto& image  = textures.GetImage(target.image_id);
+		draw_state.targets.push_back({target.image_id, image.serial,
+		                              rendering.color_attachments[target.target_slot].image_layout,
+		                              image.binding.attachment_access,
+		                              {view.base_level, view.level_count, view.base_layer, view.layer_count},
+		                              metadata_of(target.desc), view.base_layer, target.desc.info});
+	}
+	if (state.depth->image_id) {
+		const auto& view  = state.depth->desc.view_info;
+		const auto& image = textures.GetImage(state.depth->image_id);
+		draw_state.targets.push_back({state.depth->image_id, image.serial,
+		                              rendering.depth_stencil_attachment.image_layout,
+		                              image.binding.attachment_access,
+		                              {view.base_level, view.level_count, view.base_layer, view.layer_count},
+		                              metadata_of(state.depth->desc), view.base_layer, state.depth->desc.info});
+	}
+	draw_state.dynamic       = dynamic_state;
+	draw_state.targets_epoch = textures.ImageSetEpoch();
+	draw_state.used_frame    = m_context.FrameNumber();
+	auto& slot               = cache.states[state_key];
+	if (!slot) slot = std::make_unique<NativeXprDrawState>();
+	const auto captures = slot->captures;
+	*slot               = std::move(draw_state);
+	// (Its emission and the image sets' transits under it were for the state before.)
+	slot->captures = captures + 1;
+	if (cache.emit.state == slot.get()) cache.emit.state = nullptr;
 }
 
 // The normal path drew a draw a try asked to store as no record can hold it (mesh, draw data,
@@ -1537,6 +1567,7 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	auto& dynamic   = scheduler.GetDynamicState();
 	dynamic.Assign(draw_state.dynamic);
 	dynamic.Commit(m_context.GetGraphics(), vk_buffer);
+	dynamic.MoveGeneration(); // (its pipeline, set and index buffer replace a table draw's)
 	scheduler.BeginRendering(draw_state.rendering);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	vk_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline.pipeline_layout, 0, 1, &record.set,
@@ -1756,15 +1787,15 @@ bool RenderExecutor::NativeXprTryDirect(CommandBuffer& buffer, const DrawIndexAr
 
 // An indexed indirect draw of one object, its arguments read by the host GPU.
 bool RenderExecutor::NativeXprLikely(const HW::Shader& shaders) const noexcept {
-	return NativeXprEnabled() && NativeXprResolveSkipEnabled() &&
+	return (NativeXprEnabled() || TableXprMode() != 0) && NativeXprResolveSkipEnabled() &&
 	       m_native_xpr_drawn[NativeXprPairOfShaders(shaders) & (m_native_xpr_drawn.size() - 1)].load(
 	           std::memory_order_relaxed) != 0;
 }
 
 bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, uint64_t args_addr, uint64_t index_base,
                                   uint64_t index_bytes, vk::IndexType index_type) {
-	if (!NativeXprEnabled() || buffer.IsInvalid() || (!TableXprComplements() && TableDrawServes(buffer.GetShaders())))
-		return false;
+	// (A table draw's store or pending variant: the normal path draws, storing no record.)
+	if (!NativeXprEnabled() || buffer.IsInvalid() || m_table_claimed) return false;
 	// The resolve thread skips the resolution ahead of draws of pairs whose last try drew.
 	const auto pair  = NativeXprPairOf(buffer);
 	bool       drawn = false;

@@ -500,6 +500,7 @@ void TextureCache::DeleteImage(ImageId id) {
 		    metadata->second.type == MetaDataInfo::Type::HTile) {
 			// A later binding may have reused this address for another metadata type.
 			m_surface_metas.erase(metadata);
+			m_meta_epoch.fetch_add(1, std::memory_order_relaxed);
 		}
 	}
 	UnregisterImage(id);
@@ -1853,6 +1854,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		image.info.metadata = desc.info.metadata;
 		// Native color metadata must not retain a reused HTile/CMask/FMask clear flag.
 		m_surface_metas.erase(range.address);
+		m_meta_epoch.fetch_add(1, std::memory_order_relaxed);
 		if (range.size == 0 || desc.info.resources.levels != 1) {
 			return;
 		}
@@ -2291,6 +2293,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc, I
 	if (desc.info.HasMetadata()) {
 		const auto [metadata, inserted] = m_surface_metas.try_emplace(desc.info.metadata.range.address);
 		if (inserted) {
+			m_meta_epoch.fetch_add(1, std::memory_order_relaxed);
 			metadata->second.type = MetaDataInfo::Type::HTile;
 			if (image.info.htile_initial_clear) {
 				metadata->second.clear_mask.set();
@@ -2768,6 +2771,7 @@ bool TextureCache::ClearMeta(uint64_t address) {
 		return false;
 	}
 	found->second.clear_mask.set();
+	m_meta_epoch.fetch_add(1, std::memory_order_relaxed);
 	return true;
 }
 
@@ -2777,7 +2781,10 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	if (found == m_surface_metas.end() || slice >= found->second.clear_mask.size()) {
 		return false;
 	}
-	found->second.clear_mask.set(slice, is_clear);
+	if (found->second.clear_mask.test(slice) != is_clear) {
+		found->second.clear_mask.set(slice, is_clear);
+		m_meta_epoch.fetch_add(1, std::memory_order_relaxed);
+	}
 	return true;
 }
 
@@ -2795,6 +2802,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		const auto base = metadata->first;
 		if (base >= address && base < address + size) {
 			metadata = m_surface_metas.erase(metadata);
+			m_meta_epoch.fetch_add(1, std::memory_order_relaxed);
 		} else {
 			++metadata;
 		}

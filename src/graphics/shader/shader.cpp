@@ -51,6 +51,7 @@ struct ShaderMapEntry {
 
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMapEntry>> g_shader_map;
 static std::mutex                                                      g_shader_map_mutex;
+static std::atomic<uint64_t>                                           g_shader_map_generation {0};
 
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
@@ -68,6 +69,18 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	const auto hash = XXH3_64bits(reinterpret_cast<const void*>(addr), data.code_size_bytes);
 	std::scoped_lock lock(g_shader_map_mutex);
 	(*g_shader_map)[addr] = {data, hash};
+	g_shader_map_generation.fetch_add(1, std::memory_order_release);
+}
+
+uint64_t ShaderMapGeneration() {
+	return g_shader_map_generation.load(std::memory_order_acquire);
+}
+
+uint64_t ShaderHashAt(uint64_t addr) {
+	EXIT_IF(g_shader_map == nullptr);
+	std::scoped_lock lock(g_shader_map_mutex);
+	const auto       found = g_shader_map->find(addr);
+	return found != g_shader_map->end() ? found->second.hash : 0;
 }
 
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {

@@ -63,7 +63,8 @@
 namespace Libs::Graphics {
 
 namespace {
-bool NativeXprVertexBuffersEnabled(); // nativeXpr.inc
+bool     NativeXprVertexBuffersEnabled(); // nativeXpr.inc
+uint32_t TableXprMode();                  // tableDraw.inc
 } // namespace
 
 std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
@@ -465,7 +466,6 @@ struct DrawRenderState {
 	std::array<ShaderVertexInputInfo, 3> vertex_info;
 	ShaderPixelInputInfo  ps_input_info;
 	PipelineCache::GraphicsPrograms programs;
-	bool                  table = false; // the programs are a table pair's (tableDraw.inc)
 	// The targets of the draw: color_info and depth_info, or those of the render target memo
 	// when the draw reuses the targets of the draw before.
 	RenderColorInfo* colors = color_info;
@@ -756,7 +756,6 @@ static void ResetDrawRenderState(DrawRenderState& state, bool tessellation_stage
 	}
 	ValueInitialize(state.ps_input_info);
 	ValueInitialize(state.programs);
-	state.table  = false;
 	state.colors = state.color_info;
 	state.depth  = &state.depth_info;
 }
@@ -1335,11 +1334,6 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(const HW::Context
 	draw.programs.Reset();
 	const auto color_output_mask = DrawColorOutputMask(context);
 	state.ps_active              = PixelShaderActive(context, shaders, color_output_mask);
-	if (TableDrawAhead(context, user_config, shaders, color_output_mask, state, draw.programs)) {
-		draw.busy.store(true, std::memory_order_relaxed);
-		return &draw;
-	}
-	draw.programs.Reset();
 	RefreshShaderPrograms(m_context.GetPipelineCache(), context, shaders, user_config,
 	                      color_output_mask, state, &draw.programs);
 	if (draw.programs.reads.Failed()) {
@@ -1477,9 +1471,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_
 		state.ps_active =
 		    PixelShaderActive(buffer.GetRegisters(), buffer.GetShaders(), color_output_mask);
 	}
-	if (shaders_resolved && state.table) {
-		m_table_draw_active = true; // resolved ahead (TableDrawAhead)
-	} else if (!TableDrawPrograms(buffer, color_output_mask, state) && !shaders_resolved) {
+	if (!shaders_resolved) {
 		RefreshShaders(buffer, draw, color_output_mask, state);
 	}
 	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
@@ -1847,11 +1839,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	PrepareGraphicsBindings(stages, std::span {state.colors, state.color_count});
-	if (m_table_draw_active && !TableDrawBlocks(stages)) {
-		m_table_draw_active = false;
-		ResetBindings();
-		return;
-	}
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
@@ -1914,6 +1901,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                           rendering);
 	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
 	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
+	dynamic_state.MoveGeneration(); // (its pipeline, descriptors and index buffer replace a table draw's)
 
 	LogDrawPhase(draw.Name(), "BeginRendering");
 	if (!draw.IsIndexed()) {
@@ -1975,15 +1963,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);
 	}
 	// After the draw is recorded: storing may clean buffer owners (copies) and so may end
-	// rendering or restart the scheduler. A table draw stores nothing; a normal one teaches its table pair.
-	if (std::exchange(m_table_draw_active, false)) {
-		m_native_xpr_store = false;
-	} else if (!mesh_active && draw.IsIndexed()) {
-		TableDrawLearn(buffer, state);
+	// rendering or restart the scheduler.
+	const bool storable = !mesh_active && draw.IsIndexed() &&
+	                      (emit.indirect != nullptr || index_source.host_data == nullptr) && draw_dwords == 0;
+	if (std::exchange(m_table_store, false)) {
+		TableStore(buffer, state, topology, primitive_restart_enable, rendering, dynamic_state,
+		           storable && vertex_bindings.count == 0);
 	}
 	if (std::exchange(m_native_xpr_store, false)) {
-		if (!mesh_active && draw.IsIndexed() && (emit.indirect != nullptr || index_source.host_data == nullptr) &&
-		    (vertex_bindings.count == 0 || NativeXprVertexBuffersEnabled()) && draw_dwords == 0) {
+		if (storable && (vertex_bindings.count == 0 || NativeXprVertexBuffersEnabled())) {
 			NativeXprStore(buffer, state, topology, primitive_restart_enable, rendering, stages, dynamic_state);
 		} else {
 			NativeXprRefuseStore(buffer);
@@ -2308,7 +2296,6 @@ bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_
 }
 
 #include "graphics/host_gpu/renderer/nativeXpr.inc"
-#include "graphics/host_gpu/renderer/tableUse.inc"
 #include "graphics/host_gpu/renderer/tableDraw.inc"
 
 } // namespace Libs::Graphics

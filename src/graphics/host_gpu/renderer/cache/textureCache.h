@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <array>
+#include <atomic>
 #include <bitset>
 #include <map>
 #include <memory>
@@ -95,6 +96,12 @@ public:
 	void ProcessDownloadImages();
 	// Advances whenever an image is registered or unregistered.
 	[[nodiscard]] uint64_t ImageSetEpoch() const { return m_image_set_epoch; }
+	// Moves with any image's barrier state, GPU-written or buffer-modified state, registration, surface metadata or
+	// CPU-written bytes: images found in place (a table draw's targets and image set) stay so while it does not.
+	[[nodiscard]] uint64_t ImagesEpoch() const {
+		return Image::StateEpoch() + m_image_set_epoch + m_meta_epoch.load(std::memory_order_relaxed) +
+		       Image::CpuDirtyEpoch();
+	}
 	// Native XPR records (RenderExecutor::NativeXpr*) keep sampled images across image
 	// registrations elsewhere: the image is still registered, not being rebound, and has the
 	// backing and resources of `desc` (a plain color texture: no depth, stencil or metadata).
@@ -298,6 +305,8 @@ private:
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
 	uint64_t         m_image_set_epoch        = 0;
+	// Moves when surface metadata is added, removed or cleared (ImagesEpoch).
+	std::atomic<uint64_t> m_meta_epoch {0};
 	// The image range of the last registrations and unregistrations, by ImageSetEpoch.
 	static constexpr uint64_t ImageSetChangeHistory = 1024;
 	std::array<std::pair<uint64_t, uint64_t>, ImageSetChangeHistory> m_image_set_changes {};

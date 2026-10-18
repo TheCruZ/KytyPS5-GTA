@@ -1581,7 +1581,9 @@ void CommandProcessor::ExecuteDrawIndex(const GpuOperation& operation, DrawIndex
 	auto& executor = m_renderer.GetRenderExecutor();
 	// A direct draw of an object may come from its native XPR record (nativeXpr.inc); indirect
 	// ones were offered in TryExecuteDrawIndirectOnGpu().
-	if (args.gpu_indirect == nullptr && executor.NativeXprTryDirect(CurrentBuffer(), args)) {
+	if (args.gpu_indirect == nullptr &&
+	    (executor.TableXprTry(CurrentBuffer(), 0, 0, 0, vk::IndexType::eUint16, &args, false) ||
+	     executor.NativeXprTryDirect(CurrentBuffer(), args))) {
 		return;
 	}
 	executor.DrawIndex(operation.submit_id, CurrentBuffer(), args);
@@ -1775,10 +1777,13 @@ bool CommandProcessor::TryExecuteDrawIndirectOnGpu(const GpuOperation& operation
 	// The counts and offsets are placeholders for the ones the GPU reads.
 	if (indirect.indexed) {
 		auto& executor = m_renderer.GetRenderExecutor();
-		// A single draw of an object may come from its native XPR record (nativeXpr.inc).
+		// A single draw of an object may come from its table pair (tableDraw.inc) or its native XPR record
+		// (nativeXpr.inc).
+		const auto index_type = indirect.index_type == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
 		if (indirect.count_addr == nullptr && indirect.max_count == 1 &&
-		    executor.NativeXprTry(CurrentBuffer(), args_addr, indirect.index_base, index_bytes,
-		                          indirect.index_type == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32)) {
+		    (executor.TableXprTry(CurrentBuffer(), args_addr, indirect.index_base, index_bytes, index_type, nullptr,
+		                          false) ||
+		     executor.NativeXprTry(CurrentBuffer(), args_addr, indirect.index_base, index_bytes, index_type))) {
 			NoteRecordedWork();
 			return true;
 		}

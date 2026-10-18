@@ -208,11 +208,22 @@ public:
 		m_cpu_dirty       = false;
 		m_maybe_cpu_dirty = false;
 		DropPartialDirty();
+		MoveStateEpoch();
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
-	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
-	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
+	void               MarkGpuModified() noexcept {
+		if (!m_gpu_modified) {
+			MoveStateEpoch();
+		}
+		m_gpu_modified = true;
+	}
+	void ClearGpuModified() noexcept {
+		if (m_gpu_modified) {
+			MoveStateEpoch();
+		}
+		m_gpu_modified = false;
+	}
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
 	void               MarkBufferModified() noexcept {
@@ -221,7 +232,19 @@ public:
 		}
 		m_buffer_modified = true;
 	}
-	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
+	void ClearBufferModified() noexcept {
+		if (m_buffer_modified) {
+			MoveStateEpoch();
+		}
+		m_buffer_modified = false;
+	}
+	// Advances whenever an image's barrier state (layout, access), its GPU-written or buffer-modified state or a
+	// refresh changes: images found in place (a table draw's targets and image set) stay so while it does not move
+	// (TextureCache::ImagesEpoch).
+	[[nodiscard]] static uint64_t StateEpoch() noexcept {
+		return s_state_epoch.load(std::memory_order_relaxed);
+	}
+	static void MoveStateEpoch() noexcept { s_state_epoch.fetch_add(1, std::memory_order_relaxed); }
 
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
 	                            bool pages = false) const noexcept {
@@ -291,6 +314,7 @@ private:
 
 	inline static std::atomic<uint64_t> s_next_serial {0};
 	inline static std::atomic<uint64_t> s_cpu_dirty_epoch {1};
+	inline static std::atomic<uint64_t> s_state_epoch {1};
 };
 
 namespace ImageOps {

@@ -92,6 +92,7 @@ struct DynamicState {
 	uint32_t                                           num_color_write_enables {};
 	float                                              line_width {};
 	vk::ImageAspectFlags                               feedback_loop_aspects {};
+	uint64_t                                           generation {}; // see Generation()
 
 	/// Commits the dynamic state to the provided command buffer.
 	void Commit(const GraphicContext& graphics, CommandRecorder cmdbuf);
@@ -120,7 +121,16 @@ struct DynamicState {
 	}
 
 	/// Invalidates all dynamic state to be flushed into the next command buffer.
-	void Invalidate() { std::memset(&dirty_state, 0xFF, sizeof(dirty_state)); }
+	void Invalidate() {
+		std::memset(&dirty_state, 0xFF, sizeof(dirty_state));
+		++generation;
+	}
+
+	/// Advances at every Invalidate() (a new command buffer, a helper pipeline) and whenever a draw binds its
+	/// pipeline, descriptors and index buffer (MoveGeneration): a path that binds graphics state itself (table
+	/// draws, RenderExecutor::TableDraw) can tell whether anything else bound state since.
+	[[nodiscard]] uint64_t Generation() const noexcept { return generation; }
+	void                   MoveGeneration() noexcept { ++generation; }
 
 	void SetViewports(std::span<const vk::Viewport> viewports_) {
 		EXIT_IF(viewports_.size() > viewports.size());

@@ -241,6 +241,9 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 
 	state         = {destination_stage, destination_access, destination_layout, guest};
 	transit_group = g_transit_group;
+	if (!barriers.empty()) {
+		MoveStateEpoch();
+	}
 	return barriers;
 }
 

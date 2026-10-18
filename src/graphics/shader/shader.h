@@ -343,6 +343,10 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+// Moves with every registration (ShaderMapUserData): what was compiled for an address may be stale.
+[[nodiscard]] uint64_t ShaderMapGeneration();
+// The code hash of the shader registered at `addr`, 0 when none is.
+[[nodiscard]] uint64_t ShaderHashAt(uint64_t addr);
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
