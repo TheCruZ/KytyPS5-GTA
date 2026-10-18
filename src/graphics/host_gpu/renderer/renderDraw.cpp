@@ -37,6 +37,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <immintrin.h>
 #include <array>
 #include <atomic>
 #include <bit>

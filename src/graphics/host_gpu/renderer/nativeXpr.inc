@@ -78,6 +78,12 @@ bool NativeXprImageProofEnabled() {
 	return enabled;
 }
 
+// KYTY_NATIVE_XPR_PREDICT=0: no prefetch of the record the next draw used last time.
+bool NativeXprPredictEnabled() {
+	static const bool enabled = NativeXprSwitch("KYTY_NATIVE_XPR_PREDICT");
+	return enabled;
+}
+
 bool NativeXprStatsEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_NATIVE_XPR_STATS");
@@ -216,7 +222,29 @@ struct RenderExecutor::NativeXprRecord {
 	bool     relocated  = false;
 	uint64_t full_hash  = 0;
 	uint64_t shape_hash = 0;
+	// The key hash of the record the next native draw used after this one, last time (KYTY_NATIVE_XPR_PREDICT).
+	uint64_t next_hash = 0;
 };
+
+// Records are used about once a frame, so each is cold when its draw comes: the record the next draw used last
+// time is pulled into the cache while this one is validated and emitted.
+template <typename Record>
+static void NativeXprPrefetch(const Record& record) {
+	const auto prefetch = [](const void* address) {
+		if (address != nullptr) _mm_prefetch(static_cast<const char*>(address), _MM_HINT_T0);
+	};
+	prefetch(&record);
+	prefetch(reinterpret_cast<const char*>(&record) + 64);
+	prefetch(&record.cpu_epoch);
+	prefetch(&record.used_frame);
+	prefetch(record.key.data());
+	prefetch(record.pipelines.data());
+	prefetch(record.buffers.data());
+	prefetch(record.images.data());
+	prefetch(record.word_targets.data());
+	prefetch(record.word_known.data());
+	prefetch(record.set_buffers.data());
+}
 
 struct RenderExecutor::NativeXprCache {
 	vk::Device device;
@@ -225,6 +253,7 @@ struct RenderExecutor::NativeXprCache {
 	static constexpr size_t MaxVariants = 4;
 	std::unordered_map<uint64_t, std::vector<std::unique_ptr<NativeXprRecord>>, NativeXprKeyHash> records;
 	size_t record_count = 0;
+	uint64_t last_hash = 0; // the key hash of the last native draw's record (KYTY_NATIVE_XPR_PREDICT)
 	std::unordered_map<uint64_t, std::unique_ptr<NativeXprDrawState>, NativeXprKeyHash> states;
 	struct RetiredSet {
 		vk::DescriptorPool pool;
@@ -1754,6 +1783,21 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, uint64_t args_addr, uin
 	auto& record      = *chosen;
 	record.used_frame = frame;
 	++record.uses;
+	// Learn the order objects are drawn in, and prefetch the record the next draw is likely to use (chenxiao07's
+	// KYTY_NATIVE_XPR_PREDICT). A wrong guess only wastes the prefetch.
+	if (NativeXprPredictEnabled()) {
+		if (cache.last_hash != 0 && cache.last_hash != hash) {
+			if (const auto previous = cache.records.find(cache.last_hash);
+			    previous != cache.records.end() && !previous->second.empty())
+				previous->second.front()->next_hash = hash;
+		}
+		cache.last_hash = hash;
+		if (record.next_hash != 0) {
+			if (const auto next = cache.records.find(record.next_hash);
+			    next != cache.records.end() && !next->second.empty())
+				NativeXprPrefetch(*next->second.front());
+		}
+	}
 	const auto state_it = cache.states.find(cache.state_key);
 	const auto pipeline_it =
 	    std::ranges::find(record.pipelines, cache.state_key, &std::pair<uint64_t, const PipelineCache::Pipeline*>::first);
