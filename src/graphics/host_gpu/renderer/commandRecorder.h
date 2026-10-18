@@ -202,6 +202,21 @@ private:
 	Common::SpscQueue<ChunkPtr> m_recycled;
 };
 
+// A draw's last commands as one record (see CommandRecorder::drawPacket()).
+struct DrawPacket {
+	vk::Pipeline           pipeline       = nullptr;
+	uint32_t               vertex_buffers = 0;
+	const vk::Buffer*      buffers        = nullptr;
+	const vk::DeviceSize*  offsets        = nullptr;
+	const vk::DeviceSize*  sizes          = nullptr;
+	vk::Buffer             index_buffer   = nullptr; // null: no index buffer bound
+	vk::DeviceSize         index_offset   = 0;
+	vk::IndexType          index_type     = vk::IndexType::eUint16;
+	bool                   indexed        = false;
+	uint32_t               count = 0, instance_count = 0, first_vertex = 0, first_instance = 0;
+	int32_t                vertex_offset = 0;
+};
+
 // The vkCmd* subset used by the renderer. A recorder either calls the Vulkan command buffer
 // directly or appends the command to a CommandStream; the method names and signatures follow
 // vk::CommandBuffer so recording code does not depend on the mode.
@@ -368,6 +383,9 @@ public:
 	void bindVertexBuffers2(uint32_t first, uint32_t count, const vk::Buffer* buffers,
 	                        const vk::DeviceSize* offsets, const vk::DeviceSize* sizes,
 	                        const vk::DeviceSize* strides) const;
+	// Binds the vertex and index buffers and the graphics pipeline, then draws: the commands a draw records last, in
+	// one record of the stream (chenxiao07's draw packets) instead of four.
+	void drawPacket(const DrawPacket& packet) const;
 	void bindIndexBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::IndexType type) const {
 		if (m_stream == nullptr) {
 			m_direct.bindIndexBuffer(buffer, offset, type);

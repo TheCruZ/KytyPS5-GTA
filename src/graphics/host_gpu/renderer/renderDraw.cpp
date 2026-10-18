@@ -1550,6 +1550,16 @@ static void CommitVertexBuffers(CommandRecorder              vk_buffer,
 	}
 }
 
+// chenxiao07's KYTY_DRAW_PACKETS: a direct draw's buffer and pipeline binds and the draw go to the recording thread as
+// one record (DrawPacket); 0 records them one by one.
+static bool DrawPacketsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAW_PACKETS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 static void CommitIndexBuffer(CommandRecorder vk_buffer, const PreparedIndexBuffer& prepared) {
 	if (prepared.buffer == nullptr) {
 		return;
@@ -1853,14 +1863,19 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// memory.
 	auto vk_buffer = buffer.Handle();
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
-	if (!mesh_active) {
+	// (Binds hold across BeginRendering(): a packet binds them with the draw.)
+	const auto prim_type = ucfg.GetPrimType();
+	const bool packet    = DrawPacketsEnabled() && !mesh_active && emit.indirect == nullptr &&
+	                    prim_type != Prospero::PrimitiveType::kQuadListLegacy &&
+	                    prim_type != Prospero::PrimitiveType::kNone;
+	if (!mesh_active && !packet) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}
 	if (state.ps_active && !draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
-	if (!mesh_active) {
+	if (!mesh_active && !packet) {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
 	const auto draw_dwords = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
@@ -1895,11 +1910,33 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	if (!packet) {
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	}
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
-	if (mesh_active) {
+	if (packet) {
+		for (uint32_t i = 0; i < vertex_bindings.count; i++) {
+			EXIT_IF(vertex_bindings.buffers[i] == nullptr);
+		}
+		DrawPacket packed;
+		packed.pipeline       = pipeline.pipeline;
+		packed.vertex_buffers = vertex_bindings.count;
+		packed.buffers        = vertex_bindings.buffers.data();
+		packed.offsets        = vertex_bindings.offsets.data();
+		packed.sizes          = vertex_bindings.sizes.data();
+		packed.index_buffer   = index_binding.buffer;
+		packed.index_offset   = index_binding.offset;
+		packed.index_type     = index_binding.type;
+		packed.indexed        = draw.IsIndexed();
+		packed.count          = draw.index_count;
+		packed.instance_count = draw.instance_count;
+		packed.first_vertex   = emit.first_vertex;
+		packed.first_instance = emit.first_instance;
+		packed.vertex_offset  = emit.vertex_offset;
+		vk_buffer.drawPacket(packed);
+	} else if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else if (emit.indirect != nullptr) {
 		EmitIndirectDraws(vk_buffer, draw, *emit.indirect, indirect_args);

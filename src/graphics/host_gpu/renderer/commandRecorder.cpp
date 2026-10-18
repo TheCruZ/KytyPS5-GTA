@@ -232,6 +232,36 @@ void CommandRecorder::bindVertexBuffers2(uint32_t first, uint32_t count,
 	});
 }
 
+void CommandRecorder::drawPacket(const DrawPacket& packet) const {
+	const auto replay = [](vk::CommandBuffer c, const DrawPacket& p) {
+		if (p.vertex_buffers != 0) {
+			c.bindVertexBuffers2(0, p.vertex_buffers, p.buffers, p.offsets, p.sizes, nullptr);
+		}
+		if (p.index_buffer) {
+			c.bindIndexBuffer(p.index_buffer, p.index_offset, p.index_type);
+		}
+		c.bindPipeline(vk::PipelineBindPoint::eGraphics, p.pipeline);
+		if (p.indexed) {
+			c.drawIndexed(p.count, p.instance_count, 0, p.vertex_offset, p.first_instance);
+		} else {
+			c.draw(p.count, p.instance_count, p.first_vertex, p.first_instance);
+		}
+	};
+	if (m_stream == nullptr) {
+		replay(m_direct, packet);
+		return;
+	}
+	const auto count = packet.vertex_buffers;
+	m_stream->Reserve(CommandStream::RoundUp(sizeof(vk::Buffer) * count) +
+	                  2 * CommandStream::RoundUp(sizeof(vk::DeviceSize) * count) +
+	                  CommandStream::RoundUp(sizeof(DrawPacket)) + 128);
+	auto copy    = packet;
+	copy.buffers = count != 0 ? m_stream->Copy(packet.buffers, count) : nullptr;
+	copy.offsets = count != 0 ? m_stream->Copy(packet.offsets, count) : nullptr;
+	copy.sizes   = count != 0 ? m_stream->Copy(packet.sizes, count) : nullptr;
+	m_stream->Record([=](vk::CommandBuffer c) { replay(c, copy); });
+}
+
 void CommandRecorder::copyBuffer(vk::Buffer source, vk::Buffer destination, uint32_t count,
                                  const vk::BufferCopy* regions) const {
 	if (m_stream == nullptr) {
