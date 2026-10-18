@@ -405,6 +405,9 @@ private:
 	// Small CPU-dirty ranges draws read, in host memory instead of the device-visible stream buffer
 	// (KYTY_STREAM_UPLOAD=1); null when off.
 	std::unique_ptr<StreamBuffer>                     m_host_upload;
+	// KYTY_ASYNC_UPLOAD: queues a copy of guest memory into `destination` (mapped staging memory) on the host copy
+	// thread; false when it must be read here.
+	[[nodiscard]] bool QueueGuestRead(uint8_t* destination, uint64_t vaddr, uint64_t size, uint32_t mode);
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;

@@ -1231,6 +1231,34 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	return false;
 }
 
+// chenxiao07's KYTY_ASYNC_UPLOAD (a678f274b): 1 (default) the buffer uploads' reads of guest memory, 2 the image
+// stagings' too, go to the host copy thread instead of the execution thread; 0 off.
+static uint32_t AsyncUploadMode() {
+	static const uint32_t mode = [] {
+		const char* value = std::getenv("KYTY_ASYNC_UPLOAD");
+		return value != nullptr && value[0] != '\0' ? static_cast<uint32_t>(value[0] - '0') : 2u;
+	}();
+	return mode;
+}
+
+// As StreamGuestData(): the copy reads the backing store (the guest range's bytes, never protected) before the
+// submission that uses the staging memory (HostCopyQueue::WaitFor), and unmaps drain the queue first.
+bool BufferCache::QueueGuestRead(uint8_t* destination, uint64_t vaddr, uint64_t size, uint32_t mode) {
+	if (AsyncUploadMode() < mode || !m_staging_buffer.IsCoherent() || !GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	auto* copies = m_scheduler.HostCopies();
+	if (copies == nullptr) {
+		return false;
+	}
+	const void* source = Libs::LibKernel::Memory::FindBackingPointer(vaddr, size);
+	if (source == nullptr) {
+		return false;
+	}
+	copies->Copy(destination, source, size);
+	return true;
+}
+
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
                                      uint64_t total_size) {
 	if (copies.empty()) {
@@ -1244,6 +1272,10 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	    vk::BufferUsageFlagBits::eTransferSrc, [&](uint8_t* mapped, uint64_t base_offset) {
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
+			if (QueueGuestRead(mapped + copy.srcOffset, address, copy.size, 1)) {
+				copy.srcOffset += base_offset;
+				continue;
+			}
 			if (!LibKernel::Memory::CopySparseMemory(address, mapped + copy.srcOffset, copy.size)) {
 				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 			}
@@ -1400,6 +1432,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	return UploadMemory(m_graphics, m_scheduler, m_staging_buffer, size, 16,
 	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eStorageBuffer,
 	    [&](uint8_t* mapped, uint64_t) {
+		if (QueueGuestRead(mapped, vaddr, size, 2)) {
+			return;
+		}
 		if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, mapped, size)) {
 			EXIT("BufferCache: failed to read mapped guest image backing\n");
 		}
