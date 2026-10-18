@@ -90,13 +90,20 @@ public:
 		m_cpu_written.Fill();
 		m_writable.Fill();
 		m_readable.Fill();
-		s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
+		m_last_dirty.store(s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel) + 1, std::memory_order_release);
 	}
 
 	// Advances whenever pages of any region become CPU dirty: while it is unchanged, no page
 	// was dirtied since a synchronization that started after reading it.
 	[[nodiscard]] static uint64_t CpuDirtyEpoch() {
 		return s_cpu_dirty_epoch.load(std::memory_order_acquire);
+	}
+
+	// The value CpuDirtyEpoch() had after the last time pages of this region became CPU dirty (a new region: its creation).
+	// The CPU dirty pages of a region whose value is not above a CpuDirtyEpoch() read earlier were dirty all the time since
+	// (nothing made them clean: see CommandScheduler::UploadPrologue). Read under the lock.
+	[[nodiscard]] uint64_t LastCpuDirtyEpoch() const {
+		return m_last_dirty.load(std::memory_order_acquire);
 	}
 
 	// Advances, after the pages change under the lock, whenever pages of this region become CPU
@@ -138,7 +145,8 @@ public:
 			if constexpr (enable) {
 				m_cpu_written.SetRange(start, end);
 				m_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
-				s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
+				m_last_dirty.store(s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel) + 1,
+				                   std::memory_order_release);
 			}
 			m_has_cpu_dirty.store(m_cpu_dirty.Any(), std::memory_order_release);
 			UpdateProtection<!enable, false>();
@@ -271,6 +279,7 @@ private:
 	std::atomic_bool      m_has_cpu_dirty {true};
 	std::atomic_bool      m_has_gpu_dirty {false};
 	std::atomic<uint64_t> m_cpu_dirty_epoch {1};
+	std::atomic<uint64_t> m_last_dirty {0};
 
 	inline static std::atomic<uint64_t> s_cpu_dirty_epoch {0};
 };

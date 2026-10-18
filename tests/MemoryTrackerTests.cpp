@@ -453,6 +453,40 @@ void TestCpuDirtyUpload() {
   Release(memory);
 }
 
+void TestUploadLastDirtyEpoch() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  // The first upload creates the region; its pages are dirtied again before `began` is read.
+  uint64_t last_dirty = 0;
+  tracker.ForEachUploadRange(
+      address, page_size * 2, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  tracker.MarkRegionAsCpuModified(address, page_size * 2);
+  const auto began = Libs::Graphics::RegionManager::CpuDirtyEpoch();
+
+  // Pages dirty before `began`: not above it.
+  tracker.ForEachUploadRange(
+      address, page_size * 2, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {}, &last_dirty);
+  Check(last_dirty != 0 && last_dirty <= began,
+        "pages dirty since before the epoch were reported as dirtied after it");
+
+  // Pages dirtied after `began` are above it.
+  tracker.MarkRegionAsCpuModified(address, page_size);
+  last_dirty = 0;
+  tracker.ForEachUploadRange(
+      address, page_size * 2, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {}, &last_dirty);
+  Check(last_dirty > began,
+        "pages dirtied after the epoch were reported as dirty before it");
+  tracker.UntrackMemory(address, page_size * 2);
+  Release(memory);
+}
+
 void TestCleanUploadPreservesOwnership() {
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
@@ -1385,6 +1419,7 @@ int main(int argc, char **argv) {
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
+  TestUploadLastDirtyEpoch();
   TestCleanUploadPreservesOwnership();
   TestRegionCpuDirtyEpoch();
   TestConsumeCpuWrites();

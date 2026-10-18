@@ -2027,6 +2027,7 @@ void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t des
 	if (!CanDownload(image)) {
 		EXIT("TextureCache: invalid image download\n");
 	}
+	destination.written_serial = m_scheduler.CommandSerial();
 	if (UploadBinding(image) == BindingType::DepthTarget) {
 		EXIT_IF(destination_size != image.info.data.size || levels != image.info.resources.levels);
 		DownloadDepth(image, destination, destination_offset);

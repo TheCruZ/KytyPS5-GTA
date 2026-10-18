@@ -60,6 +60,7 @@ std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandSched
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
                                   uint64_t size) {
 	auto* bytes = static_cast<const uint8_t*>(source);
+	buffer.written_serial = m_scheduler.CommandSerial();
 	while (size != 0) {
 		const auto chunk  = std::min(size, m_staging_buffer.Size());
 		// Copy waits for ring reuse and flushes the fresh host data before submission.
@@ -1221,6 +1222,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
+	uint64_t                    last_dirty = 0;
 	vk::Buffer                  source;
 	// A read upload's new write protections wait until its copies are known: queued with them when they are all
 	// queued (a guest write before the protection lands in the copy, one after it faults), applied here otherwise.
@@ -1241,12 +1243,20 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			    PageManager::SetDeferredProtectionSink(nullptr);
 		    }
 		    source = UploadCopies(buffer, copies, total_size);
-	    });
+	    },
+	    &last_dirty);
 	if (defer) {
 		PageManager::SetDeferredProtectionSink(nullptr);
 		ApplyDeferredProtection(false); // (none were queued: nothing to upload)
 	}
-	if (source && m_upload_batching && source == m_staging_buffer.Handle()) {
+	// Pages dirty since before the open command buffer began: copied ahead of all its commands.
+	vk::CommandBuffer prologue;
+	if (source) {
+		prologue = m_scheduler.UploadPrologue(last_dirty, buffer.written_serial);
+	}
+	if (prologue) {
+		prologue.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()), copies.data());
+	} else if (source && m_upload_batching && source == m_staging_buffer.Handle()) {
 		m_upload_batch_buffers.emplace_back(buffer.Handle(), static_cast<uint32_t>(copies.size()));
 		m_upload_batch_copies.insert(m_upload_batch_copies.end(), copies.begin(), copies.end());
 	} else if (source) {
@@ -1463,6 +1473,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		         .id           = id};
 	}
 	if (is_written) {
+		buffer.written_serial = m_scheduler.CommandSerial();
 		m_gpu_write_generation++;
 		m_gpu_modified_ranges.Add(vaddr, size);
 		NoteWrite(vaddr, size);
@@ -2032,6 +2043,7 @@ bool BufferCache::WriteAroundGpuWrites(uint64_t vaddr, const void* data, uint64_
 	// at this point of the command stream.
 	auto&      stream  = GetUtilityBuffer(MemoryUsage::Stream);
 	const auto offset  = StreamUpload(data, size, 4);
+	buffer->written_serial = m_scheduler.CommandSerial();
 	auto&      command = m_scheduler.Current();
 	command.EndRendering();
 	const auto native = command.Handle();

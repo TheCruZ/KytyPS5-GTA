@@ -5,8 +5,10 @@
 #include "common/emulatorConfig.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/regionManager.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -46,6 +48,15 @@ uint32_t FlushDeferBacklog() {
 	return backlog;
 }
 
+// chenxiao07's KYTY_UPLOAD_PROLOGUE (default on; 0 records every buffer upload in order).
+bool UploadPrologueEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_UPLOAD_PROLOGUE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 } // namespace
 
 CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master)
@@ -78,15 +89,18 @@ size_t CommandScheduler::CommandPool::Grow() {
 }
 
 vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
+	std::lock_guard lock(m_mutex);
 	return m_buffers[Acquire(m_master.CurrentTick())];
 }
 
 std::pair<vk::CommandBuffer, size_t> CommandScheduler::CommandPool::CommitDeferred() {
+	std::lock_guard lock(m_mutex);
 	const auto index = Acquire(std::numeric_limits<uint64_t>::max());
 	return {m_buffers[index], index};
 }
 
 void CommandScheduler::CommandPool::Retire(size_t index, uint64_t tick) {
+	std::lock_guard lock(m_mutex);
 	EXIT_IF(index >= m_ticks.size() || m_ticks[index] != std::numeric_limits<uint64_t>::max());
 	m_ticks[index] = tick;
 }
@@ -129,7 +143,8 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics,
                                    bool deferred_recording)
     : m_master(graphics), m_context(context), m_graphics(graphics),
-      m_command_pool(graphics, m_master), m_deferred(deferred_recording),
+      m_command_pool(graphics, m_master), m_prologue_pool(graphics, m_master),
+      m_deferred(deferred_recording),
       m_stream(&m_chunk_queue), m_command(*this, deferred_recording ? &m_stream : nullptr),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
 	if (m_deferred) {
@@ -524,6 +539,8 @@ CommandBuffer& CommandScheduler::Current() {
 
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
+	++m_command_serial;
+	m_command_clock = RegionManager::CpuDirtyEpoch();
 	if (m_deferred) {
 		m_command.m_open = true;
 	} else {
@@ -532,6 +549,44 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	m_command.Begin();
 	m_dynamic_state.Invalidate();
 	return m_command;
+}
+
+vk::CommandBuffer CommandScheduler::UploadPrologue(uint64_t last_dirty, uint64_t written_serial) {
+	if (!UploadPrologueEnabled() || m_command.IsInvalid() || last_dirty > m_command_clock ||
+	    written_serial == m_command_serial) {
+		return nullptr;
+	}
+	if (m_prologue == nullptr) {
+		// (Taken for the open buffer's submission: the pool reuses it once that completes.)
+		if (m_deferred) {
+			std::tie(m_prologue, m_prologue_index) = m_prologue_pool.CommitDeferred();
+		} else {
+			m_prologue = m_prologue_pool.Commit();
+		}
+		vk::CommandBufferBeginInfo begin_info {};
+		begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+		EXIT_NOT_IMPLEMENTED(m_prologue.begin(&begin_info) != vk::Result::eSuccess);
+		// The copies after everything submitted before (which may read or write their destinations).
+		vk::MemoryBarrier before {};
+		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		before.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+		m_prologue.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                           vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+		                           nullptr);
+	}
+	return m_prologue;
+}
+
+vk::CommandBuffer CommandScheduler::ClosePrologue() {
+	// Everything after the copies (the open buffer's commands) sees them.
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	m_prologue.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                           vk::PipelineStageFlagBits::eAllCommands, {}, 1, &after, 0, nullptr, 0,
+	                           nullptr);
+	EXIT_NOT_IMPLEMENTED(m_prologue.end() != vk::Result::eSuccess);
+	return std::exchange(m_prologue, nullptr);
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
@@ -544,6 +599,11 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	}
 
 	m_command.End();
+	vk::CommandBuffer prologue = nullptr;
+	if (m_prologue != nullptr) {
+		prologue = ClosePrologue();
+	}
+	const auto prologue_index = m_prologue_index;
 	// Only this scheduler's owner allocates its ticks, in submission order.
 	const auto     tick = m_master.NextTick();
 	RecordedSubmit debug {};
@@ -554,6 +614,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	debug.debug_arg2      = m_command.m_debug_arg2;
 	debug.debug_arg3      = m_command.m_debug_arg3;
 	debug.debug_arg4      = m_command.m_debug_arg4;
+	debug.prologue        = prologue;
+	debug.prologue_index  = prologue_index;
 	if (m_deferred) {
 		// Waiting for the tick waits for the recording thread too: the timeline semaphore only
 		// reaches it after the thread submitted the commands recorded until now.
@@ -567,13 +629,13 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		return tick;
 	}
 
-	QueueSubmit(m_command.m_buffer, submit, tick, debug);
+	QueueSubmit(prologue, m_command.m_buffer, submit, tick, debug);
 	m_command.m_buffer = nullptr;
 	return tick;
 }
 
-void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit, uint64_t tick,
-                                   const RecordedSubmit& debug) {
+void CommandScheduler::QueueSubmit(vk::CommandBuffer prologue, vk::CommandBuffer buffer, SubmitInfo& submit,
+                                   uint64_t tick, const RecordedSubmit& debug) {
 	auto& graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
 	submit.AddSignal(m_master.Handle(), tick);
@@ -589,8 +651,16 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 	submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
 	submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
 	submit_info.pWaitDstStageMask    = submit.wait_stages.data();
-	submit_info.commandBufferCount   = buffer != nullptr ? 1 : 0;
-	submit_info.pCommandBuffers      = buffer != nullptr ? &buffer : nullptr;
+	std::array<vk::CommandBuffer, 2> buffers {};
+	uint32_t                         buffer_count = 0;
+	if (prologue != nullptr) {
+		buffers[buffer_count++] = prologue;
+	}
+	if (buffer != nullptr) {
+		buffers[buffer_count++] = buffer;
+	}
+	submit_info.commandBufferCount   = buffer_count;
+	submit_info.pCommandBuffers      = buffer_count != 0 ? buffers.data() : nullptr;
 	submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 	submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
@@ -651,7 +721,10 @@ void CommandScheduler::SubmitRecorded(vk::CommandBuffer& buffer, size_t buffer_i
 		m_host_copies->WaitFor(recorded.host_copies);
 	}
 	auto submit = recorded.info;
-	QueueSubmit(buffer, submit, recorded.tick, recorded);
+	QueueSubmit(recorded.prologue, buffer, submit, recorded.tick, recorded);
+	if (recorded.prologue != nullptr) {
+		m_prologue_pool.Retire(recorded.prologue_index, recorded.tick);
+	}
 	if (buffer != nullptr) {
 		m_command_pool.Retire(buffer_index, recorded.tick);
 		buffer = nullptr;

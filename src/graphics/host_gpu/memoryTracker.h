@@ -192,9 +192,11 @@ public:
 		}
 	}
 
+	// `last_dirty`: the latest RegionManager::LastCpuDirtyEpoch() of the regions that hold CPU dirty pages of the range, read
+	// with the pages it uploads (raised, not set).
 	template <typename RangeFunc, typename UploadFunc>
 	void ForEachUploadRange(uint64_t vaddr, uint64_t size, bool is_written, RangeFunc&& range_func,
-	                        UploadFunc&& upload_func) {
+	                        UploadFunc&& upload_func, uint64_t* last_dirty = nullptr) {
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		CheckNotInUploadCallback();
@@ -206,6 +208,9 @@ public:
 				return;
 			}
 			manager->lock.lock();
+			if (last_dirty != nullptr) {
+				*last_dirty = std::max(*last_dirty, manager->LastCpuDirtyEpoch());
+			}
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
 			                                                      bytes, range_func);
 			if (!is_written) {

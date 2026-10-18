@@ -75,6 +75,10 @@ public:
 	// Shaders reached the buffer's memory through device addresses the host did not know
 	// beforehand (a device-address fault): the age collection keeps it.
 	bool device_address_pinned = false;
+	// The command buffer (CommandScheduler::CommandSerial) that last recorded a write into it: a copy or fill into it, a
+	// shader's (ObtainBuffer as written) or an image's bytes (TextureCache::DownloadImage). Uploads into it then stay in
+	// order in that buffer (CommandScheduler::UploadPrologue).
+	uint64_t written_serial = 0;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }

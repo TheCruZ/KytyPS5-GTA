@@ -66,6 +66,17 @@ public:
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
+	// A buffer upload (BufferCache::SynchronizeBuffer) of pages whose regions were last made CPU dirty at `last_dirty`
+	// (RegionManager::CpuDirtyEpoch), no later than the open buffer began: those pages were dirty all the time since, so no
+	// command recorded into the open buffer read or wrote them (every use of a CPU dirty range synchronizes it first), and
+	// their copies may run before all of its commands. They go into this buffer, submitted ahead of the open one: one
+	// dependency each way per submission, where an upload in order ended the render pass and drained the queue on both
+	// sides. Not into a buffer the open buffer recorded a write into (`written_serial`, Buffer::written_serial: a buffer
+	// created now gets its old buffers' bytes by a copy, an image download writes more than the range synced). Null: the
+	// upload is recorded in order (pages dirtied since, KYTY_UPLOAD_PROLOGUE=0).
+	[[nodiscard]] vk::CommandBuffer UploadPrologue(uint64_t last_dirty, uint64_t written_serial);
+	// Advances with every command buffer this scheduler begins.
+	[[nodiscard]] uint64_t CommandSerial() const noexcept { return m_command_serial; }
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
@@ -115,6 +126,8 @@ private:
 		// A command buffer the GPU finished with, marked busy until `busy_until`.
 		size_t Acquire(uint64_t busy_until);
 
+		// The execution thread takes buffers for upload prologues while the recording thread retires them.
+		std::mutex                     m_mutex;
 		GraphicContext&                m_graphics;
 		MasterSemaphore&               m_master;
 		vk::CommandPool                m_pool = nullptr;
@@ -134,6 +147,9 @@ private:
 	struct RecordedSubmit {
 		SubmitInfo info;
 		uint64_t   tick            = 0;
+		// An upload prologue (CommandScheduler::UploadPrologue) ahead of the buffer, and its place in the pool.
+		vk::CommandBuffer prologue        = nullptr;
+		size_t            prologue_index  = 0;
 		// Host copies queued before the submission.
 		uint64_t   host_copies     = 0;
 		uint64_t   debug_submit_id = 0;
@@ -151,8 +167,10 @@ private:
 	void RecordingThread();
 	void SubmitRecorded(vk::CommandBuffer& buffer, size_t buffer_index,
 	                    const RecordedSubmit& recorded);
-	void QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit, uint64_t tick,
+	void QueueSubmit(vk::CommandBuffer prologue, vk::CommandBuffer buffer, SubmitInfo& submit, uint64_t tick,
 	                 const RecordedSubmit& debug);
+	// Ends the open upload prologue (the commands after its copies see them).
+	[[nodiscard]] vk::CommandBuffer ClosePrologue();
 	void PriorityOperationsThread(std::stop_token stop);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 
@@ -160,10 +178,20 @@ private:
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;
+	// The buffers of upload prologues, recorded by the execution thread: a command pool is externally synchronized, and the
+	// recording thread records into the other's buffers.
+	CommandPool                  m_prologue_pool;
 	const bool                   m_deferred;
 	CommandChunkQueue            m_chunk_queue;
 	CommandStream                m_stream;
 	CommandBuffer                m_command;
+	// The upload prologue of the open buffer (UploadPrologue), submitted ahead of it; with deferred recording it is
+	// recorded here, not into the stream, and its place in the pool goes to the recording thread with the submission.
+	vk::CommandBuffer            m_prologue         = nullptr;
+	size_t                       m_prologue_index   = 0;
+	// RegionManager::CpuDirtyEpoch() when m_command began.
+	uint64_t                     m_command_clock    = 0;
+	uint64_t                     m_command_serial   = 1;
 	DynamicState                 m_dynamic_state;
 	std::queue<PendingOperation> m_pending_operations;
 	// The tick of the oldest pending operation (UINT64_MAX without any), written under
