@@ -39,6 +39,7 @@
 #include <span>
 #include <string_view>
 #include <unordered_map>
+#include <xxhash.h>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -429,9 +430,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
+	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+	if (!use_thread_dimensions && TableDispatch(buffer, cs_regs, thread_group_x, thread_group_y, thread_group_z,
+	                                            async_compute)) {
+		return;
+	}
 	ShaderComputeInputInfo input_info {};
 	input_info.async_compute = async_compute;
-	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
 	input_info.workgroup_counts[0] = thread_group_x;
 	input_info.workgroup_counts[1] = thread_group_y;
@@ -451,6 +456,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	if (!compute_program) {
 		return;
+	}
+	if (!use_thread_dimensions) {
+		TableDispatchLearn(cs_regs, sh_regs, input_info, compute_program, async_compute);
 	}
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
@@ -926,5 +934,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	m_deferred_barrier_queue = m_guest_queue;
 	ResetBindings();
 }
+
+#include "graphics/host_gpu/renderer/tableDispatch.inc"
 
 } // namespace Libs::Graphics

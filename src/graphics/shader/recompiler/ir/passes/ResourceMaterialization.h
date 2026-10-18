@@ -66,6 +66,12 @@ void SetComputeIndirectFloors(size_t keys, size_t images);
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
+// The specialization of resources whose descriptors the caller evaluated (table mode, chenxiao07's KytyPS5 fork):
+// snapshot.buffers, images and samplers hold one descriptor per resource of the plan, as resource materialization
+// derives it from them. False for a plan with indirect descriptors, or descriptors no specialization takes.
+bool SpecializeDirectResources(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                               ResourceSpecialization& specialization);
+
 // The same refresh through SrtWalker alone, without the compiled plan; tests compare the two.
 bool MaterializeResourcesReference(const ResourcePlan& program, const SrtRuntime& runtime,
                                    ResourceSnapshot& snapshot,

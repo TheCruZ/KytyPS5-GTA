@@ -658,6 +658,51 @@ struct PipelineCache::ProgramCache {
 		return {};
 	}
 
+	std::pair<const ShaderRecompiler::IR::ResourcePlan*, const ShaderRecompiler::IR::ResourceSpecialization*>
+	PlanOf(uint64_t id) {
+		const auto found = by_id.find(id);
+		if (found == by_id.end()) return {nullptr, nullptr};
+		const auto entry = programs.find(*found->second.first);
+		if (entry == programs.end()) return {nullptr, nullptr};
+		return {&entry->second.resource_plan, &found->second.second->specialization};
+	}
+
+	// Table mode: the compute program translated in table mode for a specialization (PipelineCache::CompileTableCompute).
+	const PipelineCache::TableProgram* CompileTableCompute(
+	    const ShaderParams& params, ShaderComputeInputInfo& input_info,
+	    const ShaderRecompiler::IR::ResourceSpecialization& specialization, std::string& refusal) {
+		auto [options, stage_name] = MakeCompileOptions(ShaderType::Compute, params, input_info);
+		options.table_mode         = true;
+		options.dump_ir            = false;
+		options.early_dump         = false;
+		const auto source          = ShaderRecompiler::PrepareShaderSource(params.code, options);
+		if (source.call) {
+			refusal = "a program that calls functions";
+			return nullptr;
+		}
+		auto result = ShaderRecompiler::CompileProgram(ShaderRecompiler::TranslateProgram(source.decoded, options),
+		                                               options, specialization, 0u);
+		if (result.spirv.empty()) {
+			refusal = result.table_refusal;
+			return nullptr;
+		}
+		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv, options.maintenance8_enabled)) {
+			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+			refusal = "SPIR-V validation failed";
+			return nullptr;
+		}
+		const auto module = CompileSPV(result.spirv, graphics.device);
+		if (module == nullptr) {
+			refusal = "no shader module";
+			return nullptr;
+		}
+		auto& table          = table_programs.emplace_back();
+		table.program        = std::move(result.program).TakeCompiledInfo();
+		table.specialization = specialization;
+		table.handle         = {.id = next_shader_id.fetch_add(1) + 1, .module = module};
+		return &table;
+	}
+
 	// Resolves a stage ahead of execution: only programs and permutations that exist, into the
 	// storage of the resolution, reading guest memory through its log.
 	template <typename InputInfo>
@@ -854,12 +899,17 @@ struct PipelineCache::ProgramCache {
 				graphics.device.destroyShaderModule(permutation.handle.module, nullptr);
 			}
 		}
+		for (const auto& table: table_programs) {
+			graphics.device.destroyShaderModule(table.handle.module, nullptr);
+		}
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
 	GraphicContext&                                             graphics;
 	std::atomic_uint64_t                                        next_shader_id {0};
+	// Table mode programs (CompileTableCompute); a deque: callers keep pointers to them.
+	std::deque<PipelineCache::TableProgram>                     table_programs;
 
 	// Graphics programs compiled on worker threads: the resolve thread queues the programs and
 	// permutations its draws miss, so the shaders of a new area compile in parallel instead of
@@ -2008,6 +2058,35 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 		return m_program_cache->GetAhead(params, input_info, push_data_cursor, *ahead);
 	}
 	return m_program_cache->Get(params, input_info, push_data_cursor);
+}
+
+std::pair<const ShaderRecompiler::IR::ResourcePlan*, const ShaderRecompiler::IR::ResourceSpecialization*>
+PipelineCache::ProgramPlanOf(const ShaderProgram& program) {
+	const ProgramLockGuard lock(m_program_lock);
+	return m_program_cache->PlanOf(program.id);
+}
+
+bool PipelineCache::SpecializeDirectResources(const ShaderRecompiler::IR::ResourcePlan&     plan,
+                                              ShaderRecompiler::IR::ResourceSnapshot&       snapshot,
+                                              ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+	const ProgramLockGuard lock(m_program_lock);
+	return ShaderRecompiler::IR::SpecializeDirectResources(plan, snapshot, specialization);
+}
+
+const PipelineCache::TableProgram* PipelineCache::CompileTableCompute(
+    const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh, ShaderComputeInputInfo& input_info,
+    const ShaderRecompiler::IR::ResourceSpecialization& specialization, std::string& refusal) {
+	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
+	const auto params             = PrepareProgram(regs, sh, input_info);
+	input_info.lds_storage        = input_info.lds_size_dwords * 4u >
+	                         m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+	const ProgramLockGuard lock(m_program_lock);
+	auto* table = const_cast<TableProgram*>(m_program_cache->CompileTableCompute(params, input_info, specialization, refusal));
+	if (table != nullptr) {
+		table->input_info       = input_info;
+		table->input_info.stage = {};
+	}
+	return table;
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {

@@ -93,6 +93,9 @@ public:
 	// Copies host data into the stream buffer (on the host copy thread from the execution thread)
 	// and returns its offset there.
 	[[nodiscard]] uint64_t StreamUpload(const void* data, uint64_t size, uint64_t alignment);
+	// Table mode (RenderExecutor::TableDispatch): a block the GPU reads through its device address, valid until the
+	// command buffer recorded now completed. Created on first use.
+	[[nodiscard]] vk::DeviceAddress TableUpload(const void* data, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	// Fills memory the emulator itself rewrites, such as consumed color metadata, without
 	// invalidating images over it. Memory the GPU owns is filled on the GPU, so the fill never
@@ -398,6 +401,7 @@ private:
 	std::vector<std::pair<vk::Buffer, uint32_t>>      m_upload_batch_buffers;
 	std::vector<vk::BufferCopy>                       m_upload_batch_copies;
 	StreamBuffer                                      m_stream_buffer;
+	std::unique_ptr<StreamBuffer>                     m_table_upload;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;

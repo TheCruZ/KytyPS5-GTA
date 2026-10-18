@@ -287,7 +287,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                              BDA_PAGETABLE_SIZE),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
-      m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
+      // (Device addresses: table dispatches read the small ranges ObtainBuffer() streams through it.)
+      m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB,
+                      AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
@@ -1248,6 +1250,14 @@ uint64_t BufferCache::StreamUpload(const void* data, uint64_t size, uint64_t ali
 	copies->CopyInline(mapped, data, size);
 	m_stream_buffer.Commit();
 	return offset;
+}
+
+vk::DeviceAddress BufferCache::TableUpload(const void* data, uint64_t size) {
+	if (!m_table_upload) {
+		m_table_upload = std::make_unique<StreamBuffer>(m_graphics, m_scheduler, MemoryUsage::Stream, 32 * MiB,
+		                                                AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress);
+	}
+	return m_table_upload->BufferDeviceAddress() + m_table_upload->Copy(data, size, 16);
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,

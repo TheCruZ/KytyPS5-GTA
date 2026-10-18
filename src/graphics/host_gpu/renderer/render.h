@@ -646,6 +646,19 @@ private:
 	std::unique_ptr<IndirectThreadPass, void (*)(IndirectThreadPass*)> m_indirect_thread_pass {
 	    nullptr, nullptr};
 	std::unique_ptr<NativeXprCache, void (*)(NativeXprCache*)> m_native_xpr {nullptr, nullptr};
+	// Table dispatches (tableDispatch.inc, KYTY_TABLE_DISPATCH): compute programs translated in table mode read
+	// their SRT slots and buffers from a block written for each dispatch, instead of the normal path's resolution.
+	struct TableDispatchCache;
+	std::unique_ptr<TableDispatchCache, void (*)(TableDispatchCache*)> m_table_dispatch {nullptr, nullptr};
+	TableDispatchCache& TableDispatchState();
+	// True when the dispatch was recorded from a table program.
+	bool TableDispatch(CommandBuffer& buffer, const HW::ComputeShaderInfo& cs, uint32_t x, uint32_t y, uint32_t z,
+	                   bool async_compute);
+	// After the normal path's lookup of a dispatch's program: a table program for its specialization, when table
+	// mode can serve the program (compiled within a budget per frame).
+	void TableDispatchLearn(const HW::ComputeShaderInfo& cs, const HW::ShaderRegisters& sh,
+	                        const ShaderComputeInputInfo& input_info, const ShaderProgram& compute_program,
+	                        bool async_compute);
 	const DrawIndexArgs* m_native_xpr_direct = nullptr; // the direct draw a try is for
 	// The try of the executing draw asked the normal path to store a record.
 	bool m_native_xpr_store = false;

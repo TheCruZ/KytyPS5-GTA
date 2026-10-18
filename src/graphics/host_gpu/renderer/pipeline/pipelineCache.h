@@ -231,6 +231,28 @@ public:
 	                                ShaderComputeInputInfo&      input_info,
 	                                ProgramResolution*           ahead = nullptr);
 
+	// Table mode (chenxiao07's KytyPS5 fork, RenderExecutor::TableDispatch): the compute program translated so that it
+	// reads its SRT slots and buffers from a block the renderer fills for each dispatch, for one specialization. Null,
+	// with the reason, when table mode cannot serve the program. The cache keeps it.
+	struct TableProgram {
+		ShaderRecompiler::IR::CompiledShaderInfo     program;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		ShaderProgram                                handle;
+		ShaderComputeInputInfo                       input_info; // as compiled (its pipeline's)
+	};
+	// The resource plan and the specialization of a compiled program (by its handle), or null. Both live as long as
+	// the cache.
+	std::pair<const ShaderRecompiler::IR::ResourcePlan*, const ShaderRecompiler::IR::ResourceSpecialization*>
+	ProgramPlanOf(const ShaderProgram& program);
+	// IR::SpecializeDirectResources() under the program lock (other threads evaluate the same plans).
+	bool SpecializeDirectResources(const ShaderRecompiler::IR::ResourcePlan& plan,
+	                               ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
+	                               ShaderRecompiler::IR::ResourceSpecialization& specialization);
+	const TableProgram* CompileTableCompute(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
+	                                        ShaderComputeInputInfo&                             input_info,
+	                                        const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                                        std::string&                                        refusal);
+
 	// With `allow_async`, a pipeline that does not exist yet is created on a background thread
 	// and the lookup returns null until it is there (the draw can be skipped meanwhile);
 	// otherwise the lookup creates the pipeline, or waits for a background thread creating it.
