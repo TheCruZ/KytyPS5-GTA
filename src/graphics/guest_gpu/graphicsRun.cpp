@@ -21,6 +21,8 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -1204,19 +1206,37 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::FlipPreparation:
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
-		case SubmissionType::SuspendPoint:
+		case SubmissionType::SuspendPoint: {
 			// Age caches at the frame boundary, not once per command list.
 			cp.RunGarbageCollector();
 			cp.EmitGlobalBarrier();
-			// Registered at the operation's place in the stream: a pipelined command processor
-			// runs ahead of the recorded commands. Releasing the slot only touches host state.
-			cp.EmitHostCommand([this, ready = m_suspend_point_ready] {
-				m_renderer.GetCommandScheduler().DeferHostOperation([ready] { ready->release(); },
-				                                                    true);
-			});
+			// The guest prepares the next frame once the host GPU finished this one (the default),
+			// KYTY_FRAME_PIPELINE=exec once the execution thread reached the point, =cp once the
+			// command processor consumed it. (Demon's Souls corrupts its job data with cp: its
+			// threads overwrite memory the resolve and execution threads still read.)
+			static const int release = [] {
+				const char* value = std::getenv("KYTY_FRAME_PIPELINE");
+				if (value == nullptr) return 2;
+				return std::strcmp(value, "cp") == 0 ? 0 : std::strcmp(value, "exec") == 0 ? 1 : 2;
+			}();
+			if (release == 0) {
+				m_suspend_point_ready->release();
+			} else {
+				// Registered at the operation's place in the stream: a pipelined command processor
+				// runs ahead of the recorded commands. Releasing the slot only touches host state.
+				cp.EmitHostCommand([this, ready = m_suspend_point_ready] {
+					if (release == 1) {
+						ready->release();
+						return;
+					}
+					m_renderer.GetCommandScheduler().DeferHostOperation([ready] { ready->release(); },
+					                                                    true);
+				});
+			}
 			cp.BufferFlush();
 			cp.Reset();
 			break;
+		}
 	}
 
 	return complete;
