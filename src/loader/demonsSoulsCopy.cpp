@@ -33,20 +33,23 @@ bool CompareEnabled() {
 }
 
 // A large move page by page: a page whose bytes here may be stale (the GPU wrote it: reading it
-// would fault and read it back) or differ is written; a page that already holds the source's
-// bytes is left alone.
+// would fault and read it back) or differ is written, its GPU-written bytes dropped first (the
+// move replaces them); a page that already holds the source's bytes is left alone.
 void* CompareMove(uint64_t to, uint64_t from, size_t size) {
 	constexpr uint64_t Page = 4096;
+	// (The images over all of it as before: a GPU-written image's bytes here are stale, equal or not.)
+	(void)Libs::LibKernel::Memory::InvalidateImages(to, size);
 	uint64_t           run = 0, run_end = 0;
 	const auto         write = [&] {
-        if (run_end != run)
-	        std::memmove(reinterpret_cast<void*>(to + run), reinterpret_cast<const void*>(from + run), run_end - run);
+        if (run_end == run) return;
+        (void)Libs::LibKernel::Memory::InvalidateMemoryForWrite(to + run, run_end - run);
+        std::memmove(reinterpret_cast<void*>(to + run), reinterpret_cast<const void*>(from + run), run_end - run);
 	};
 	for (uint64_t at = 0; at < size;) {
 		const auto next  = std::min<uint64_t>(size, ((to + at) / Page + 1) * Page - to);
 		const auto bytes = next - at;
 		const bool differs =
-		    Libs::LibKernel::Memory::MayBeGpuWritten(to + at, bytes) ||
+		    Libs::LibKernel::Memory::MayFaultOnGpuRead(to + at, bytes) ||
 		    std::memcmp(reinterpret_cast<const void*>(to + at), reinterpret_cast<const void*>(from + at), bytes) != 0;
 		if (differs) {
 			if (run_end != at) {
@@ -66,6 +69,16 @@ void* KYTY_SYSV_ABI CoherentMove(void* destination, const void* source, size_t s
 	if (size == 0 || to == from) return destination;
 	const bool overlap = to < from + size && from < to + size;
 	if (!overlap && size >= 256 * 1024 && CompareEnabled()) return CompareMove(to, from, size);
+	// A large move prepares its destination at once instead of a fault a page: a move within one
+	// range reads bytes it then writes (their GPU data is read back first), else the destination's
+	// GPU data is replaced whole and dropped.
+	if (size >= 256 * 1024) {
+		if (overlap) {
+			Libs::LibKernel::Memory::InvalidateMemory(to, size);
+		} else {
+			(void)Libs::LibKernel::Memory::InvalidateMemoryForWrite(to, size);
+		}
+	}
 	return std::memmove(destination, source, size);
 }
 
@@ -84,6 +97,8 @@ constexpr std::array<Body, 2> Bodies {{
 
 void Install(Program* program) {
 #if defined(__x86_64__) || defined(_M_X64)
+	// KYTY_GUEST_MOVE=0: the guest's own memmove.
+	if (const char* value = std::getenv("KYTY_GUEST_MOVE"); value != nullptr && value[0] == '0') return;
 	if (site != 0 || program == nullptr || program->file_name.filename() != "libc.prx" || !IsDemonsSouls()) return;
 	const auto body = std::find_if(Bodies.begin(), Bodies.end(), [&](const Body& b) {
 		const auto address = program->base_vaddr + b.offset;

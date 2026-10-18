@@ -380,6 +380,51 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
+// Demon's Souls streams files (AMPR reads) and moves megabytes (its memmove, DemonsSoulsCopy) over
+// memory the GPU wrote: each page faulted and was read back first, for bytes the write then
+// replaced. Ported from chenxiao07's KytyPS5 fork.
+void BufferCache::InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: invalid memory-invalidation range\n");
+	}
+	ForgetKnownFills(vaddr, size);
+	bool requested = false; // (once for all of the range's regions)
+	m_memory_tracker.InvalidateRegion(vaddr, size, [&] {
+		if (std::exchange(requested, true)) {
+			return;
+		}
+		if (GuestGpu::IsGpuThread()) {
+			DiscardGpuWrites(vaddr, size);
+			return;
+		}
+		m_scheduler.Context().GetGpu().SendUrgentCommandSync([this, vaddr, size] { DiscardGpuWrites(vaddr, size); });
+	});
+}
+
+// Execution thread: as a write fault's readback, but only the GPU-written bytes of the first and
+// last page outside the range are read back; the others are dropped, the write replaces them.
+void BufferCache::DiscardGpuWrites(uint64_t vaddr, uint64_t size) {
+	const auto end   = vaddr + size;
+	const auto first = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto last  = Common::AlignUp(end, TRACKER_PAGE_SIZE);
+	DrainAsyncReadbacks(first, last - first);
+	if (!IsRegionRegistered(vaddr, size)) {
+		return;
+	}
+	for (const auto& [begin, stop]: {std::pair {first, vaddr}, std::pair {end, last}}) {
+		if (begin >= stop || !m_gpu_modified_ranges.Intersects(begin, stop - begin) ||
+		    !IsRegionRegistered(begin, stop - begin)) {
+			continue;
+		}
+		// (The buffer of that page alone: one over the whole range would join every buffer in it.)
+		auto& buffer = m_slot_buffers[FindBuffer(begin, stop - begin)];
+		(void)DownloadBufferMemory<false>(buffer, begin, stop - begin);
+	}
+	m_gpu_modified_ranges.Subtract(first, last - first);
+	m_memory_tracker.UnmarkRegionAsGpuModified(first, last - first);
+	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+}
+
 void BufferCache::InvalidateFaultedPage(uint64_t vaddr) {
 	// The guest fills its streaming memory (vertex and constant rings) upwards, and every page it
 	// writes under a cached buffer takes a fault: thousands per frame, each a system call to drop

@@ -1442,6 +1442,9 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 		return OK;
 	}
 
+	// The read replaces all of the readable bytes: GPU-written ones there are dropped, not read back
+	// page by page as the copies below fault on them.
+	(void)LibKernel::Memory::InvalidateMemoryForWrite(destination, readable);
 	static thread_local std::vector<uint8_t> buffer;
 	const auto buffer_size = static_cast<size_t>(std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable));
 	if (buffer.size() < buffer_size) {

@@ -674,8 +674,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	const auto pos        = file->f.Tell();
 	const auto file_size  = file->f.Size();
 	const auto remaining  = pos < file_size ? file_size - pos : 0;
-	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
-	                         std::min<uint64_t>(nbytes, remaining));
+	Memory::InvalidateMemoryForWrite(reinterpret_cast<uint64_t>(buf), std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
 	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
 
@@ -799,8 +798,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	const auto file_size  = file->f.Size();
 	const auto remaining =
 	    static_cast<uint64_t>(offset) < file_size ? file_size - static_cast<uint64_t>(offset) : 0;
-	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
-	                         std::min<uint64_t>(nbytes, remaining));
+	Memory::InvalidateMemoryForWrite(reinterpret_cast<uint64_t>(buf), std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
 	file->f.Seek(offset);
 	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);

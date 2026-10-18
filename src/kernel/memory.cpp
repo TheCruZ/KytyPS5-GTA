@@ -1133,6 +1133,20 @@ void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	(void)GetGpuResources().InvalidateMemory(vaddr, size);
 }
 
+bool InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || g_gpu_resources == nullptr) {
+		return false;
+	}
+	return g_gpu_resources->InvalidateMemoryForWrite(vaddr, size);
+}
+
+bool InvalidateImages(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || g_gpu_resources == nullptr) {
+		return false;
+	}
+	return g_gpu_resources->InvalidateImages(vaddr, size);
+}
+
 void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	EXIT_IF(resources != nullptr && g_gpu_resources != nullptr);
 	g_gpu_resources = resources;

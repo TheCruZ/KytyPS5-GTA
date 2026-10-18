@@ -60,6 +60,9 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// Before a host write of all of the range (a file read, a large guest memmove): as
+	// InvalidateMemory(), but GPU-written bytes the write replaces are dropped, not read back.
+	void                   InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
 	// A guest write faulted on a page the cache protects.
 	void                   InvalidateFaultedPage(uint64_t vaddr);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
@@ -330,6 +333,7 @@ private:
 		std::unique_ptr<Buffer> staging;
 	};
 	ReadbackQueue m_readback;
+	void DiscardGpuWrites(uint64_t vaddr, uint64_t size);
 	// The range a guest access of GPU-written memory reads back (see ReadMemory()).
 	[[nodiscard]] std::pair<uint64_t, uint64_t> ReadbackWindow(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Guest reads of GPU-written memory copied on the readback queue while the execution thread

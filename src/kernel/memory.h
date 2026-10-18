@@ -149,6 +149,12 @@ bool                   IsBackingReadable(uint64_t vaddr, uint64_t size);
 // Not noexcept: under a Common::SoftExitScope its failure throws to the scope's owner.
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+// Before a host write of all of [vaddr, vaddr + size) (a file read, a large guest memmove): as
+// InvalidateMemory, but GPU-written bytes the write replaces whole are dropped instead of read back.
+// False when the range is not GPU memory (writes fault as before).
+bool                   InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
+// The images over the range only, as InvalidateMemory makes them (CPU-written).
+bool                   InvalidateImages(uint64_t vaddr, uint64_t size);
 // For a fault in a guest range briefly unmapped while the emulator replaced its mapping (MAP_FIXED
 // over a mapping, or a Windows file view split by a partial unmap): waits until it is mapped again
 // and returns the range's id. 0 for any other fault.
