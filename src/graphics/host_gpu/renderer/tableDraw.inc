@@ -7,8 +7,8 @@
 // buffers go as the normal path takes them.
 //
 // A pair (the stages' code and static input) is learnt after a normal draw of it (TableDrawLearn): both programs are
-// compiled in table mode for that draw's specializations. A draw whose descriptors select others compiles a variant
-// (a few per frame) or takes the normal path. Native XPR records draw an object for less (a draw of a pair whose record
+// compiled in table mode for that draw's specializations, and a draw whose descriptors select others gets a variant
+// compiled for them; compilations run on a background thread, the draws taking the normal path until they are done. Native XPR records draw an object for less (a draw of a pair whose record
 // is valid takes 2 us of the execution thread, a table draw 5-9): table draws only learn the pairs native XPR records
 // do not serve (shapes they do not hold, pairs they cannot store or that rest after their tries stored nothing), and
 // records come first (KYTY_TABLE_XPR_COMPLEMENT=0: table draws take every pair they learn, and records leave them).
@@ -44,15 +44,22 @@ struct RenderExecutor::TableDrawCache {
 		                      ShaderRecompiler::IR::ResourceSpecialization>>
 		     refused_specializations;
 		bool refused = false;
+		// A compilation in flight (execution thread only), the specializations it is for, and for the first one the
+		// plans and the shaders' address pair.
+		std::shared_ptr<PipelineCache::TableTicket> pending;
+		std::pair<ShaderRecompiler::IR::ResourceSpecialization, ShaderRecompiler::IR::ResourceSpecialization>
+		         pending_specializations;
+		bool     pending_pixel = false;
+		uint64_t shader_pair   = 0;
 	};
 	// The execution thread changes pairs and served under the lock; the resolve thread reads them under it.
 	std::unordered_map<uint64_t, Pair> pairs;
 	// Shader address pairs (NativeXprPairOfShaders) some table pair serves: native XPR records leave them.
 	std::unordered_set<uint64_t> served;
 	std::atomic_flag             lock;
-	static constexpr uint32_t    CompileBudget = 4;
-	uint64_t                     budget_frame  = UINT64_MAX;
-	uint32_t                     compiles      = 0;
+	// Compilations in flight, at most MaxPending.
+	static constexpr uint32_t MaxPending = 32;
+	uint32_t                  pending    = 0;
 	// The draw's resources per stage (its bindings refer to them until the next operation) and scratch.
 	std::array<ShaderRecompiler::IR::ResourceSnapshot, 2>       snapshots;
 	std::array<ShaderRecompiler::IR::ResourceSpecialization, 2> specializations;
@@ -60,12 +67,42 @@ struct RenderExecutor::TableDrawCache {
 	std::vector<uint32_t>                                       ahead_key; // the resolve thread's
 	std::vector<uint32_t>                                       block;
 
-	bool TakeBudget(uint64_t frame) {
-		if (frame != budget_frame) {
-			budget_frame = frame;
-			compiles     = 0;
+	// Execution thread: takes the pair's finished compilation in (the first one makes the pair serve its draws).
+	void Poll(Pair& pair) {
+		if (pair.pending == nullptr || !pair.pending->done.load(std::memory_order_acquire)) return;
+		const Variant variant {pair.pending->programs[0], pair.pending->programs[1]};
+		const auto    serves = [&](const PipelineCache::TableProgram* table, const PipelineCache::TableProgram* reference) {
+			return table != nullptr && table->program.bindings.UsesPushData() &&
+			       (reference == nullptr || table->program.table_plan == reference->program.table_plan);
+		};
+		const bool first = pair.variants.empty();
+		const bool ok    = serves(variant.vertex, first ? nullptr : pair.variants.front().vertex) &&
+		                (!pair.pending_pixel || serves(variant.pixel, first ? nullptr : pair.variants.front().pixel));
+		const TableLockGuard guard(lock);
+		if (ok) {
+			pair.variants.push_back(variant);
+			if (first) served.insert(pair.shader_pair);
+		} else if (first) {
+			pair.refused = true;
+		} else {
+			pair.refused_specializations.push_back(pair.pending_specializations);
 		}
-		return compiles++ < CompileBudget;
+		pair.pending.reset();
+		--pending;
+	}
+	// Execution thread: queues the compilation of the pair's programs for these specializations.
+	void Queue(Pair& pair, PipelineCache& pipelines, const ShaderParams& vertex_params,
+	           const ShaderVertexInputInfo& vertex_info, const ShaderParams* pixel_params,
+	           const ShaderPixelInputInfo& pixel_info, const ShaderRecompiler::IR::ResourceSpecialization& vertex_spec,
+	           const ShaderRecompiler::IR::ResourceSpecialization* pixel_spec) {
+		if (pair.pending != nullptr || pending >= MaxPending) return;
+		pair.pending = pipelines.CompileTableGraphicsAsync(vertex_params, vertex_info, pixel_params,
+		                                                   pixel_params != nullptr ? &pixel_info : nullptr, vertex_spec,
+		                                                   pixel_spec);
+		pair.pending_specializations = {vertex_spec, pixel_spec != nullptr ? *pixel_spec
+		                                                                   : ShaderRecompiler::IR::ResourceSpecialization {}};
+		pair.pending_pixel           = pixel_params != nullptr;
+		++pending;
 	}
 };
 
@@ -142,12 +179,13 @@ void RenderExecutor::TableDrawLearn(CommandBuffer& buffer, const DrawRenderState
 		const TableLockGuard lock(cache.lock);
 		found = cache.pairs.emplace(key, TableDrawCache::Pair {}).first;
 	}
-	auto&      pair   = found->second;
+	auto& pair = found->second;
+	cache.Poll(pair);
+	if (pair.refused || !pair.variants.empty() || pair.pending != nullptr) return;
 	const auto refuse = [&] {
 		const TableLockGuard lock(cache.lock);
 		pair.refused = true;
 	};
-	if (!cache.TakeBudget(m_context.FrameNumber())) return;
 	const auto [vertex_plan, vertex_specialization] = pipelines.ProgramPlanOf(state.programs.vertex[0]);
 	const auto [pixel_plan, pixel_specialization] =
 	    state.ps_active ? pipelines.ProgramPlanOf(state.programs.pixel)
@@ -157,29 +195,14 @@ void RenderExecutor::TableDrawLearn(CommandBuffer& buffer, const DrawRenderState
 		refuse();
 		return;
 	}
-	TableDrawCache::Variant variant;
-	std::string             refusal;
-	uint32_t                cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(false, false);
-	if (state.ps_active) {
-		variant.pixel = pipelines.CompileTableGraphics(pixel_params, nullptr, &pixel_info, *pixel_specialization, cursor,
-		                                               refusal);
-		if (variant.pixel == nullptr || !variant.pixel->program.bindings.UsesPushData()) {
-			refuse();
-			return;
-		}
-		variant.pixel->program.bindings.AdvancePushData(cursor);
+	{
+		const TableLockGuard lock(cache.lock);
+		pair.vertex_plan = vertex_plan;
+		pair.pixel_plan  = pixel_plan;
+		pair.shader_pair = NativeXprPairOfShaders(sh);
 	}
-	variant.vertex = pipelines.CompileTableGraphics(vertex_params, &vertex_info, nullptr, *vertex_specialization, cursor,
-	                                                refusal);
-	if (variant.vertex == nullptr || !variant.vertex->program.bindings.UsesPushData()) {
-		refuse();
-		return;
-	}
-	const TableLockGuard lock(cache.lock);
-	pair.vertex_plan = vertex_plan;
-	pair.pixel_plan  = pixel_plan;
-	pair.variants.push_back(variant);
-	cache.served.insert(NativeXprPairOfShaders(sh));
+	cache.Queue(pair, pipelines, vertex_params, vertex_info, state.ps_active ? &pixel_params : nullptr, pixel_info,
+	            *vertex_specialization, state.ps_active ? pixel_specialization : nullptr);
 }
 
 // The draw's programs from its table pair, and their resources into `snapshots`; false when the normal path takes it.
@@ -234,29 +257,15 @@ bool RenderExecutor::TableDrawSelect(const HW::Context& ctx, const HW::UserConfi
 	if (const auto it = std::ranges::find_if(pair.variants, matches); it != pair.variants.end()) variant = *it;
 	lock.reset();
 	if (variant.vertex == nullptr) {
+		// A variant compiles in the background (execution thread only); the normal path takes the draw meanwhile.
+		if (ahead != nullptr) return false;
+		cache.Poll(pair);
 		const auto refused =
 		    std::pair {specs[0], state.ps_active ? specs[1] : ShaderRecompiler::IR::ResourceSpecialization {}};
-		if (ahead != nullptr ||
-		    std::ranges::find(pair.refused_specializations, refused) != pair.refused_specializations.end() ||
-		    !cache.TakeBudget(m_context.FrameNumber()))
-			return false;
-		std::string refusal;
-		uint32_t    cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(false, false);
-		if (state.ps_active) {
-			variant.pixel = pipelines.CompileTableGraphics(pixel_params, nullptr, &pixel_info, specs[1], cursor, refusal);
-			if (variant.pixel != nullptr) variant.pixel->program.bindings.AdvancePushData(cursor);
-		}
-		variant.vertex = pipelines.CompileTableGraphics(vertex_params, &vertex_info, nullptr, specs[0], cursor, refusal);
-		const TableLockGuard guard(cache.lock);
-		if (variant.vertex == nullptr || (state.ps_active && variant.pixel == nullptr) ||
-		    !variant.vertex->program.bindings.UsesPushData() ||
-		    !(variant.vertex->program.table_plan == reference.vertex->program.table_plan) ||
-		    (state.ps_active && (!variant.pixel->program.bindings.UsesPushData() ||
-		                         !(variant.pixel->program.table_plan == reference.pixel->program.table_plan)))) {
-			pair.refused_specializations.push_back(refused);
-			return false;
-		}
-		pair.variants.push_back(variant);
+		if (std::ranges::find(pair.refused_specializations, refused) == pair.refused_specializations.end())
+			cache.Queue(pair, pipelines, vertex_params, vertex_info, state.ps_active ? &pixel_params : nullptr,
+			            pixel_info, specs[0], state.ps_active ? &specs[1] : nullptr);
+		return false;
 	}
 	state.programs             = {};
 	state.programs.vertex[0]   = variant.vertex->handle;

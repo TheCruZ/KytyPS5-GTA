@@ -667,15 +667,15 @@ struct PipelineCache::ProgramCache {
 		return {&entry->second.resource_plan, &found->second.second->specialization};
 	}
 
-	// Table mode: the compute program translated in table mode for a specialization (PipelineCache::CompileTableCompute).
-	const PipelineCache::TableProgram* CompileTableCompute(
+	// Table mode: the compute program translated in table mode for a specialization (PipelineCache::CompileTableComputeAsync).
+	std::unique_ptr<PipelineCache::TableProgram> CompileTableCompute(
 	    const ShaderParams& params, ShaderComputeInputInfo& input_info,
 	    const ShaderRecompiler::IR::ResourceSpecialization& specialization, std::string& refusal) {
 		return CompileTable(ShaderType::Compute, params, input_info, specialization, 0u, refusal);
 	}
 
 	template <typename InputInfo>
-	const PipelineCache::TableProgram* CompileTableGraphics(
+	std::unique_ptr<PipelineCache::TableProgram> CompileTableGraphics(
 	    const ShaderParams& params, InputInfo& input_info,
 	    const ShaderRecompiler::IR::ResourceSpecialization& specialization, uint32_t push_data_start_dword,
 	    std::string& refusal) {
@@ -684,8 +684,9 @@ struct PipelineCache::ProgramCache {
 		return CompileTable(stage, params, input_info, specialization, push_data_start_dword, refusal);
 	}
 
+	// Without the program lock (the compilation); StoreTable() keeps the result.
 	template <typename InputInfo>
-	const PipelineCache::TableProgram* CompileTable(
+	std::unique_ptr<PipelineCache::TableProgram> CompileTable(
 	    ShaderType stage, const ShaderParams& params, InputInfo& input_info,
 	    const ShaderRecompiler::IR::ResourceSpecialization& specialization, uint32_t push_data_start_dword,
 	    std::string& refusal) {
@@ -714,11 +715,17 @@ struct PipelineCache::ProgramCache {
 			refusal = "no shader module";
 			return nullptr;
 		}
-		auto& table          = table_programs.emplace_back();
-		table.program        = std::move(result.program).TakeCompiledInfo();
-		table.specialization = specialization;
-		table.handle         = {.id = next_shader_id.fetch_add(1) + 1, .module = module};
-		return &table;
+		auto table            = std::make_unique<PipelineCache::TableProgram>();
+		table->program        = std::move(result.program).TakeCompiledInfo();
+		table->specialization = specialization;
+		table->handle         = {.id = next_shader_id.fetch_add(1) + 1, .module = module};
+		return table;
+	}
+
+	// Under the program lock.
+	const PipelineCache::TableProgram* StoreTable(std::unique_ptr<PipelineCache::TableProgram> table) {
+		if (table == nullptr) return nullptr;
+		return &table_programs.emplace_back(std::move(*table));
 	}
 
 	// Resolves a stage ahead of execution: only programs and permutations that exist, into the
@@ -1723,6 +1730,10 @@ void PipelineCache::RecordComputePipeline(const ShaderComputeInputInfo& input_in
 }
 
 PipelineCache::~PipelineCache() {
+	if (m_table_worker.joinable()) {
+		m_table_worker.request_stop();
+		m_table_worker.join();
+	}
 	m_program_cache->StopWorkers();
 	StopAsyncPipelines();
 	m_precreate_threads.clear();
@@ -2104,16 +2115,72 @@ bool PipelineCache::PrepareGraphicsStages(const HW::VertexShaderInfo& vertex_reg
 	return true;
 }
 
-const PipelineCache::TableProgram* PipelineCache::CompileTableGraphics(
-    const ShaderParams& params, ShaderVertexInputInfo* vertex_info, ShaderPixelInputInfo* pixel_info,
-    const ShaderRecompiler::IR::ResourceSpecialization& specialization, uint32_t push_data_start_dword,
-    std::string& refusal) {
-	const ProgramLockGuard lock(m_program_lock);
-	return vertex_info != nullptr
-	           ? m_program_cache->CompileTableGraphics(params, *vertex_info, specialization, push_data_start_dword,
-	                                                   refusal)
-	           : m_program_cache->CompileTableGraphics(params, *pixel_info, specialization, push_data_start_dword,
-	                                                   refusal);
+void PipelineCache::QueueTableJob(std::function<void()> job) {
+	{
+		std::lock_guard lock(m_table_mutex);
+		m_table_jobs.push_back(std::move(job));
+		if (!m_table_worker.joinable()) {
+			m_table_worker = std::jthread([this](const std::stop_token& stop) {
+				KYTY_PROFILER_THREAD("Thread_TableCompile");
+				for (;;) {
+					std::function<void()> next;
+					{
+						std::unique_lock lock(m_table_mutex);
+						if (!m_table_available.wait(lock, stop, [&] { return !m_table_jobs.empty(); })) return;
+						next = std::move(m_table_jobs.front());
+						m_table_jobs.pop_front();
+					}
+					next();
+				}
+			});
+		}
+	}
+	m_table_available.notify_one();
+}
+
+std::shared_ptr<PipelineCache::TableTicket> PipelineCache::CompileTableGraphicsAsync(
+    const ShaderParams& vertex_params, const ShaderVertexInputInfo& vertex_info, const ShaderParams* pixel_params,
+    const ShaderPixelInputInfo* pixel_info, const ShaderRecompiler::IR::ResourceSpecialization& vertex_specialization,
+    const ShaderRecompiler::IR::ResourceSpecialization* pixel_specialization) {
+	auto ticket = std::make_shared<TableTicket>();
+	struct Job {
+		ShaderParams                                                vertex_params;
+		ShaderVertexInputInfo                                       vertex_info;
+		std::optional<ShaderParams>                                 pixel_params;
+		std::optional<ShaderPixelInputInfo>                         pixel_info;
+		ShaderRecompiler::IR::ResourceSpecialization                vertex_specialization;
+		std::optional<ShaderRecompiler::IR::ResourceSpecialization> pixel_specialization;
+	};
+	auto job = std::make_shared<Job>(Job {vertex_params, vertex_info, {}, {}, vertex_specialization, {}});
+	if (pixel_params != nullptr) {
+		job->pixel_params         = *pixel_params;
+		job->pixel_info           = *pixel_info;
+		job->pixel_specialization = *pixel_specialization;
+	}
+	QueueTableJob([this, ticket, job] {
+		std::string                   refusal;
+		std::unique_ptr<TableProgram> pixel;
+		uint32_t                      cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(false, false);
+		if (job->pixel_params) {
+			pixel = m_program_cache->CompileTableGraphics(*job->pixel_params, *job->pixel_info,
+			                                              *job->pixel_specialization, cursor, refusal);
+			if (pixel != nullptr) pixel->program.bindings.AdvancePushData(cursor);
+		}
+		auto vertex = (!job->pixel_params || pixel != nullptr)
+		                  ? m_program_cache->CompileTableGraphics(job->vertex_params, job->vertex_info,
+		                                                          job->vertex_specialization, cursor, refusal)
+		                  : nullptr;
+		{
+			const ProgramLockGuard lock(m_program_lock);
+			if (vertex != nullptr && (!job->pixel_params || pixel != nullptr)) {
+				ticket->programs[0] = m_program_cache->StoreTable(std::move(vertex));
+				ticket->programs[1] = m_program_cache->StoreTable(std::move(pixel));
+			}
+		}
+		ticket->refusal = std::move(refusal);
+		ticket->done.store(true, std::memory_order_release);
+	});
+	return ticket;
 }
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
@@ -2148,20 +2215,31 @@ bool PipelineCache::SpecializeDirectResources(const ShaderRecompiler::IR::Resour
 	return ShaderRecompiler::IR::SpecializeDirectResources(plan, snapshot, specialization);
 }
 
-const PipelineCache::TableProgram* PipelineCache::CompileTableCompute(
-    const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh, ShaderComputeInputInfo& input_info,
-    const ShaderRecompiler::IR::ResourceSpecialization& specialization, std::string& refusal) {
+std::shared_ptr<PipelineCache::TableTicket> PipelineCache::CompileTableComputeAsync(
+    const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh, bool async_compute,
+    const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+	auto                   ticket = std::make_shared<TableTicket>();
+	ShaderComputeInputInfo input_info {};
+	input_info.async_compute      = async_compute;
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto params             = PrepareProgram(regs, sh, input_info);
 	input_info.lds_storage        = input_info.lds_size_dwords * 4u >
 	                         m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
-	const ProgramLockGuard lock(m_program_lock);
-	auto* table = const_cast<TableProgram*>(m_program_cache->CompileTableCompute(params, input_info, specialization, refusal));
-	if (table != nullptr) {
-		table->input_info       = input_info;
-		table->input_info.stage = {};
-	}
-	return table;
+	QueueTableJob([this, ticket, params, input_info, specialization]() mutable {
+		std::string refusal;
+		auto        table = m_program_cache->CompileTableCompute(params, input_info, specialization, refusal);
+		if (table != nullptr) {
+			table->input_info       = input_info;
+			table->input_info.stage = {};
+		}
+		{
+			const ProgramLockGuard lock(m_program_lock);
+			ticket->programs[0] = m_program_cache->StoreTable(std::move(table));
+		}
+		ticket->refusal = std::move(refusal);
+		ticket->done.store(true, std::memory_order_release);
+	});
+	return ticket;
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {

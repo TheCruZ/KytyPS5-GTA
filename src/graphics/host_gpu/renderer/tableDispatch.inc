@@ -9,8 +9,8 @@
 //
 // A program is learnt from the normal path's lookup of one of its dispatches (TableDispatchLearn): its table program
 // is compiled for that dispatch's specialization; later dispatches whose descriptors select another specialization
-// compile one for it (a few per frame), or take the normal path. Programs table mode cannot serve (indirect
-// descriptors and images, GDS, ...) take the normal path for good.
+// get one compiled for it. Compilations run on a background thread, the dispatches taking the normal path until they
+// are done. Programs table mode cannot serve (indirect descriptors and images, GDS, ...) take it for good.
 //
 // The resolve thread evaluates the block and selects the program ahead of the dispatch (TableDispatchAhead) instead
 // of the normal resolution, reading guest memory through the resolution's log; the execution thread then only gives
@@ -46,26 +46,45 @@ struct RenderExecutor::TableDispatchCache {
 		std::vector<const PipelineCache::TableProgram*>           variants;
 		std::vector<ShaderRecompiler::IR::ResourceSpecialization> refused_specializations;
 		bool                                                      refused = false;
+		// A compilation in flight (execution thread only) and the specialization it is for.
+		std::shared_ptr<PipelineCache::TableTicket>  pending;
+		ShaderRecompiler::IR::ResourceSpecialization pending_specialization;
 	};
 	// The execution thread changes entries under the lock; the resolve thread reads them under it.
 	std::unordered_map<uint64_t, Entry> entries;
 	std::atomic_flag                    lock;
-	// Table programs compiled on the execution thread, per frame.
-	static constexpr uint32_t CompileBudget = 4;
-	uint64_t                  budget_frame  = UINT64_MAX;
-	uint32_t                  compiles      = 0;
+	// Compilations in flight, at most MaxPending.
+	static constexpr uint32_t MaxPending = 32;
+	uint32_t                  pending    = 0;
 	// The dispatch's resources (its bindings refer to them until the next operation) and scratch.
 	ShaderRecompiler::IR::ResourceSnapshot       snapshot;
 	ShaderRecompiler::IR::ResourceSpecialization specialization;
 	std::vector<uint32_t>                        block;
 	ShaderComputeInputInfo                       input;
 
-	bool TakeBudget(uint64_t frame) {
-		if (frame != budget_frame) {
-			budget_frame = frame;
-			compiles     = 0;
+	// Execution thread: takes the entry's finished compilation in.
+	void Poll(Entry& entry) {
+		if (entry.pending == nullptr || !entry.pending->done.load(std::memory_order_acquire)) return;
+		const auto* table = entry.pending->programs[0];
+		const TableLockGuard guard(lock);
+		if (table != nullptr && TableServes(table->program) &&
+		    (entry.variants.empty() || table->program.table_plan == entry.variants.front()->program.table_plan)) {
+			entry.variants.push_back(table);
+		} else if (entry.variants.empty()) {
+			entry.refused = true;
+		} else {
+			entry.refused_specializations.push_back(entry.pending_specialization);
 		}
-		return compiles++ < CompileBudget;
+		entry.pending.reset();
+		--pending;
+	}
+	// Execution thread: queues the compilation of the entry's table program for a specialization.
+	void Queue(Entry& entry, PipelineCache& pipelines, const HW::ComputeShaderInfo& cs, const HW::ShaderRegisters& sh,
+	           bool async_compute, const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+		if (entry.pending != nullptr || pending >= MaxPending) return;
+		entry.pending                = pipelines.CompileTableComputeAsync(cs, sh, async_compute, specialization);
+		entry.pending_specialization = specialization;
+		++pending;
 	}
 };
 
@@ -89,7 +108,9 @@ void RenderExecutor::TableDispatchLearn(const HW::ComputeShaderInfo& cs, const H
 		const TableLockGuard lock(cache.lock);
 		found = cache.entries.emplace(key, TableDispatchCache::Entry {}).first;
 	}
-	auto&      entry  = found->second;
+	auto& entry = found->second;
+	cache.Poll(entry);
+	if (entry.refused || !entry.variants.empty() || entry.pending != nullptr) return;
 	const auto refuse = [&] {
 		const TableLockGuard lock(cache.lock);
 		entry.refused = true;
@@ -99,24 +120,17 @@ void RenderExecutor::TableDispatchLearn(const HW::ComputeShaderInfo& cs, const H
 		refuse();
 		return;
 	}
-	if (!cache.TakeBudget(m_context.FrameNumber())) return;
 	auto&      pipelines                 = m_context.GetPipelineCache();
 	const auto [plan, specialization] = pipelines.ProgramPlanOf(compute_program);
 	if (plan == nullptr || specialization == nullptr) {
 		refuse();
 		return;
 	}
-	ShaderComputeInputInfo table_input {};
-	table_input.async_compute = async_compute;
-	std::string refusal;
-	const auto* table = pipelines.CompileTableCompute(cs, sh, table_input, *specialization, refusal);
-	if (table == nullptr || !TableServes(table->program)) {
-		refuse();
-		return;
+	{
+		const TableLockGuard lock(cache.lock);
+		entry.plan = plan;
 	}
-	const TableLockGuard lock(cache.lock);
-	entry.plan = plan;
-	entry.variants.push_back(table);
+	cache.Queue(entry, pipelines, cs, sh, async_compute, *specialization);
 }
 
 // The table program of a dispatch and its resources, into `snapshot`; null when the normal path takes it. Ahead of
@@ -150,24 +164,13 @@ const PipelineCache::TableProgram* RenderExecutor::TableDispatchSelect(
 		return nullptr;
 	}
 	auto& entry = cache.entries.find(key)->second;
+	cache.Poll(entry);
 	for (const auto* variant: entry.variants) {
 		if (variant->specialization == specialization) return variant;
 	}
-	if (std::ranges::find(entry.refused_specializations, specialization) != entry.refused_specializations.end() ||
-	    !cache.TakeBudget(m_context.FrameNumber()))
-		return nullptr;
-	ShaderComputeInputInfo table_input {};
-	table_input.async_compute = async_compute;
-	std::string refusal;
-	const auto* table = pipelines.CompileTableCompute(cs, *sh, table_input, specialization, refusal);
-	const TableLockGuard lock(cache.lock);
-	if (table == nullptr || !TableServes(table->program) ||
-	    !(table->program.table_plan == reference->program.table_plan)) {
-		entry.refused_specializations.push_back(specialization);
-		return nullptr;
-	}
-	entry.variants.push_back(table);
-	return table;
+	if (std::ranges::find(entry.refused_specializations, specialization) == entry.refused_specializations.end())
+		cache.Queue(entry, pipelines, cs, *sh, async_compute, specialization);
+	return nullptr;
 }
 
 const PipelineCache::TableProgram* RenderExecutor::TableDispatchAhead(const HW::ComputeShaderInfo& cs,

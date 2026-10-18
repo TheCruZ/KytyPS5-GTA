@@ -258,17 +258,22 @@ public:
 	                           bool pixel_active, ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info,
 	                           ShaderParams& vertex_params, ShaderParams& pixel_params,
 	                           ProgramResolution* ahead = nullptr);
-	// Table draws: a vertex or pixel program in table mode (as CompileTableCompute()), its push data from
-	// `push_data_start_dword`.
-	const TableProgram* CompileTableGraphics(const ShaderParams& params, ShaderVertexInputInfo* vertex_info,
-	                                         ShaderPixelInputInfo* pixel_info,
-	                                         const ShaderRecompiler::IR::ResourceSpecialization& specialization,
-	                                         uint32_t push_data_start_dword, std::string& refusal);
-
-	const TableProgram* CompileTableCompute(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
-	                                        ShaderComputeInputInfo&                             input_info,
-	                                        const ShaderRecompiler::IR::ResourceSpecialization& specialization,
-	                                        std::string&                                        refusal);
+	// Table programs compile on a background thread: the caller polls the ticket (done, then the programs, null with
+	// the reason when table mode cannot serve them) and takes the normal path meanwhile.
+	struct TableTicket {
+		std::atomic_bool                   done {false};
+		std::array<const TableProgram*, 2> programs {}; // compute: [0]; draws: [0] vertex, [1] pixel
+		std::string                        refusal;
+	};
+	// A compute program in table mode for a specialization.
+	std::shared_ptr<TableTicket> CompileTableComputeAsync(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
+	                                                      bool async_compute,
+	                                                      const ShaderRecompiler::IR::ResourceSpecialization& specialization);
+	// A draw's vertex and (with pixel_params) pixel programs in table mode, the pixel stage's push data first.
+	std::shared_ptr<TableTicket> CompileTableGraphicsAsync(
+	    const ShaderParams& vertex_params, const ShaderVertexInputInfo& vertex_info, const ShaderParams* pixel_params,
+	    const ShaderPixelInputInfo* pixel_info, const ShaderRecompiler::IR::ResourceSpecialization& vertex_specialization,
+	    const ShaderRecompiler::IR::ResourceSpecialization* pixel_specialization);
 
 	// With `allow_async`, a pipeline that does not exist yet is created on a background thread
 	// and the lookup returns null until it is there (the draw can be skipped meanwhile);
@@ -352,6 +357,12 @@ private:
 	                                                        m_precreated_graphics;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_precreated_compute;
 	std::vector<std::jthread>                               m_precreate_threads;
+	// Table program compilations (CompileTable*Async), on their thread.
+	std::mutex                                              m_table_mutex;
+	std::condition_variable_any                             m_table_available;
+	std::deque<std::function<void()>>                       m_table_jobs;
+	std::jthread                                            m_table_worker;
+	void QueueTableJob(std::function<void()> job);
 
 	// Pipelines new to every store, created on background threads instead of stalling the
 	// execution thread: graphics pipelines of draws that may be skipped until they are there,
