@@ -59,6 +59,10 @@
 
 namespace Libs::Graphics {
 
+namespace {
+bool NativeXprVertexBuffersEnabled(); // nativeXpr.inc
+} // namespace
+
 std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
 	                                           const ShaderVertexInputInfo& vs_input_info) {
 	auto     vertex_offset   = static_cast<int32_t>(index_offset);
@@ -1877,8 +1881,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// rendering or restart the scheduler.
 	if (std::exchange(m_native_xpr_store, false)) {
 		if (!mesh_active && draw.IsIndexed() && (emit.indirect != nullptr || index_source.host_data == nullptr) &&
-		    vertex_bindings.count == 0 && draw_dwords == 0) {
+		    (vertex_bindings.count == 0 || NativeXprVertexBuffersEnabled()) && draw_dwords == 0) {
 			NativeXprStore(buffer, state, topology, primitive_restart_enable, rendering, stages, dynamic_state);
+		} else {
+			NativeXprRefuseStore(buffer);
 		}
 	}
 }

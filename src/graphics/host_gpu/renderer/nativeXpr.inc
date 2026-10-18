@@ -44,6 +44,33 @@ bool NativeXprEnabled() {
 	return enabled;
 }
 
+// KYTY_NATIVE_XPR_RELOCATE=1: relocated records (see the top of this file). Off by default: in
+// GTA V nearly every use rebinds moved buffers (a new set) and its normal path is cheaper.
+bool NativeXprRelocateEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_NATIVE_XPR_RELOCATE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+// KYTY_NATIVE_XPR_DIRECT=0: direct indexed draws take the normal path; KYTY_NATIVE_XPR_VB=0: draws
+// with vertex buffers are not stored.
+bool NativeXprSwitch(const char* name) {
+	const char* value = std::getenv(name);
+	return value == nullptr || value[0] != '0';
+}
+
+bool NativeXprDirectEnabled() {
+	static const bool enabled = NativeXprSwitch("KYTY_NATIVE_XPR_DIRECT");
+	return enabled;
+}
+
+bool NativeXprVertexBuffersEnabled() {
+	static const bool enabled = NativeXprSwitch("KYTY_NATIVE_XPR_VB");
+	return enabled;
+}
+
 bool NativeXprStatsEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_NATIVE_XPR_STATS");
@@ -176,6 +203,7 @@ struct RenderExecutor::NativeXprRecord {
 	uint64_t used_frame        = 0;
 	uint64_t uses              = 0;
 	bool     fetch_embedded = false; // the vertex program fetches (ResolveDrawOffsets())
+	bool     vertex_buffers = false; // the draw binds vertex buffers: taken from its resolution
 	// Relocated records (no read log): their hashes (NativeXprRelocationHashes).
 	bool     relocated  = false;
 	uint64_t full_hash  = 0;
@@ -233,12 +261,20 @@ struct RenderExecutor::NativeXprCache {
 	std::unordered_map<uint64_t, uint64_t, NativeXprKeyHash> refused;
 	// Per shader-address pair: a pair whose programs cannot be recorded stops asking.
 	std::unordered_map<uint64_t, bool, NativeXprKeyHash> unstorable;
+	// Per pair: tries since its last record was stored; a pair whose objects never come again
+	// (their user data move every frame) rests for a while.
+	struct PairUse {
+		uint64_t tries = 0, stored = 0, resting_until = 0;
+	};
+	static constexpr uint64_t PairTriesWithoutRecord = 2048, PairRestFrames = 1800;
+	std::unordered_map<uint64_t, PairUse, NativeXprKeyHash> pairs;
 	// Relocated records by the full hash of their programs and descriptors, and the latest record
 	// of each shape (the same but the buffer bases).
 	std::unordered_map<uint64_t, std::unique_ptr<NativeXprRecord>, NativeXprKeyHash> relocated;
 	std::unordered_map<uint64_t, NativeXprRecord*, NativeXprKeyHash>                 relocated_shapes;
 	std::vector<SeenKey> relocated_seen = std::vector<SeenKey>(8192);
 	bool                 store_relocated = false; // the store asked for is a relocated one
+	bool                 resolution_valid = false; // this try proved the draw's resolution current
 	uint64_t             relocated_full = 0, relocated_shape = 0;
 	// Scratch.
 	std::vector<uint32_t>                      key;
@@ -274,6 +310,17 @@ namespace {
 // The shader addresses and the user-data counts.
 uint64_t NativeXprPairKey(const std::vector<uint32_t>& key) {
 	return key.size() < 4 ? 0 : XXH3_64bits(key.data(), 4 * sizeof(uint32_t));
+}
+
+// The pair of shader addresses, as NativeXprPairKey() hashes them.
+uint64_t NativeXprPairOf(const CommandBuffer& buffer) {
+	const auto& sh = buffer.GetShaders();
+	const auto  es = sh.GetVs().es_regs.data_addr;
+	const auto  vs = es != 0 ? es : sh.GetVs().gs_regs.data_addr;
+	const auto  ps = sh.GetPs().ps_regs.data_addr;
+	const std::array<uint32_t, 4> words {static_cast<uint32_t>(vs), static_cast<uint32_t>(vs >> 32u),
+	                                     static_cast<uint32_t>(ps), static_cast<uint32_t>(ps >> 32u)};
+	return XXH3_64bits(words.data(), sizeof(words));
 }
 
 // Object identity: both shader addresses and every user-data SGPR (the SRT chains start there).
@@ -944,6 +991,7 @@ void RenderExecutor::NativeXprStoreRecord(std::unique_ptr<NativeXprRecord> recor
 	if (pipeline == nullptr || !pipeline->native_bindings || pipeline->uses_push_descriptors) return refuse("pipeline");
 	record->vertex_program = state.programs.vertex[0].id;
 	record->fetch_embedded = state.vertex_info[0].fetch_embedded;
+	record->vertex_buffers = state.vertex_info[0].buffers_num > 0;
 	record->pixel_program  = state.ps_active ? state.programs.pixel.id : 0;
 	record->pipelines.emplace_back(state_key, pipeline);
 	if (const char* reason = NativeXprBindResources(*record, stages, *pipeline)) {
@@ -1012,6 +1060,7 @@ void RenderExecutor::NativeXprStoreRecord(std::unique_ptr<NativeXprRecord> recor
 			NativeXprDropRelocated(*other->second);
 		}
 		cache.relocated_shapes[shape] = record.get();
+		++cache.pairs[NativeXprPairKey(record->key)].stored;
 		cache.relocated.emplace(full, std::move(record));
 		++cache.record_count;
 		++cache.counters.relocated_stored;
@@ -1053,9 +1102,21 @@ void RenderExecutor::NativeXprStoreRecord(std::unique_ptr<NativeXprRecord> recor
 		NativeXprRetire(std::move(variants.back()));
 		variants.pop_back();
 	}
+	++cache.pairs[NativeXprPairKey(record->key)].stored;
 	variants.insert(variants.begin(), std::move(record));
 	++cache.record_count;
 	++cache.counters.stored;
+}
+
+// The normal path drew a draw a try asked to store as no record can hold it (mesh, draw data,
+// 8-bit indices): its shader pair stops asking.
+void RenderExecutor::NativeXprRefuseStore(CommandBuffer& buffer) {
+	auto& cache = NativeXprState();
+	++cache.counters.refused;
+	++cache.refuse_reasons["draw_shape"];
+	std::vector<uint32_t> key;
+	NativeXprKeyOf(buffer, key);
+	cache.unstorable[NativeXprPairKey(key)] = true;
 }
 
 // Buffers and images: once per frame, or when the buffer or image set moved.
@@ -1345,6 +1406,17 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	    direct != nullptr ? std::pair<Buffer*, uint64_t> {nullptr, 0}
 	                      : buffer_cache.ObtainBuffer(args_addr, sizeof(vk::DrawIndexedIndirectCommand), false);
 	if (indices == nullptr || (direct == nullptr && arguments == nullptr) || buffer.IsInvalid()) return false;
+	// Vertex buffers as the normal path acquires them, from the draw's resolution.
+	PreparedVertexBuffers vertex_bindings;
+	if (record.vertex_buffers) {
+		auto* resolved = m_resolved_draw;
+		if (resolved == nullptr || (!m_native_xpr->resolution_valid && !resolved->programs.reads.StillValid()))
+			return false;
+		const auto& vertex = resolved->storage.state.vertex_info[0];
+		if (vertex.buffers_num <= 0 || resolved->storage.state.programs.vertex[0].id != record.vertex_program) return false;
+		vertex_bindings = AcquireVertexBuffers(buffer, vertex);
+		if (buffer.IsInvalid()) return false;
+	}
 	auto vk_buffer = buffer.Handle();
 
 	auto& textures = m_context.GetTextureCache();
@@ -1365,6 +1437,7 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	if (record.has_push)
 		vk_buffer.pushConstants(pipeline.pipeline_layout, record.push_stages, 0, sizeof(push_data),
 		                        push_data.dwords.data());
+	CommitVertexBuffers(vk_buffer, vertex_bindings);
 	vk_buffer.bindIndexBuffer(indices->Handle(), index_offset, index_type);
 	if (direct != nullptr) {
 		// The offsets as DrawIndex() resolves them (ResolveDrawOffsets()).
@@ -1417,6 +1490,7 @@ RenderExecutor::NativeXprRecord* RenderExecutor::NativeXprRelocated(uint64_t fra
 		++cache.counters.relocated_unresolved;
 		return nullptr;
 	}
+	cache.resolution_valid = true;
 	const auto& state = resolved->storage.state;
 	if (state.programs.VertexStageCount() != 1) return nullptr;
 	const std::array<const ShaderStageRuntime*, 2> runtimes {&state.vertex_info[0].stage, &state.ps_input_info.stage};
@@ -1476,7 +1550,8 @@ RenderExecutor::NativeXprRecord* RenderExecutor::NativeXprRelocated(uint64_t fra
 	};
 	if (record == nullptr) {
 		++cache.counters.relocated_miss;
-		if (NativeXprCache::SeenAgainIn(cache.relocated_seen, full, frame)) ask_store();
+		// (By shape: buffer bases that move every frame are rebound.)
+		if (NativeXprCache::SeenAgainIn(cache.relocated_seen, shape, frame)) ask_store();
 		return nullptr;
 	}
 	// The resolution's constants: the flattened SRT and the user data part of the shader data (the
@@ -1538,7 +1613,7 @@ RenderExecutor::NativeXprRecord* RenderExecutor::NativeXprRelocated(uint64_t fra
 
 // A direct indexed draw of one object: as an indirect one (NativeXprTry()), drawn with its counts.
 bool RenderExecutor::NativeXprTryDirect(CommandBuffer& buffer, const DrawIndexArgs& args) {
-	if (!NativeXprEnabled() || args.gpu_indirect != nullptr || args.offset_source != DrawOffsetSource::DrawState ||
+	if (!NativeXprEnabled() || !NativeXprDirectEnabled() || args.gpu_indirect != nullptr || args.offset_source != DrawOffsetSource::DrawState ||
 	    args.index_addr == nullptr || args.index_count == 0 || args.instance_count == 0 ||
 	    args.render_target_slice_offset != 0 || args.first_instance != 0 || args.index_type_and_size > 1)
 		return false;
@@ -1566,19 +1641,27 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, uint64_t args_addr, uin
 	if (ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList || ctx.HasObjectPrimitiveIdOutput() ||
 	    ctx.GetColorControl().mode > 1u || (ucfg.GetPrimitiveResetControl() & 0x1u) != 0)
 		return false;
-	++cache.counters.tries;
 	const auto frame = m_context.FrameNumber();
-	cache.state_key  = NativeXprStateKeyOf(buffer);
+	const auto pair  = NativeXprPairOf(buffer);
+	auto&      use   = cache.pairs[pair];
+	if (use.resting_until > frame || cache.unstorable.contains(pair)) return false;
+	if (++use.tries > NativeXprCache::PairTriesWithoutRecord && use.stored == 0) {
+		use.tries         = 0;
+		use.resting_until = frame + NativeXprCache::PairRestFrames;
+		return false;
+	}
+	++cache.counters.tries;
+	cache.state_key = NativeXprStateKeyOf(buffer);
 	NativeXprKeyOf(buffer, cache.key);
 	const auto hash  = NativeXprHash(cache.key);
 	cache.tried_hash = hash;
 	const auto request_store = [&] { m_native_xpr_store = true; };
 	cache.store_relocated    = false;
+	cache.resolution_valid   = false;
 	const auto found = cache.records.find(hash);
 	NativeXprRecord* chosen = nullptr;
 	if (found == cache.records.end() || found->second.empty() || found->second.front()->key != cache.key) {
 		++cache.counters.miss_key;
-		if (cache.unstorable.contains(NativeXprPairKey(cache.key))) return false;
 		if (const auto refused = cache.refused.find(hash);
 		    refused != cache.refused.end() && refused->second + NativeXprCache::RefuseFrames > frame)
 			return false;
@@ -1589,7 +1672,7 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, uint64_t args_addr, uin
 			return false;
 		}
 		bool store_relocated = false;
-		chosen               = NativeXprRelocated(frame, store_relocated);
+		chosen               = NativeXprRelocateEnabled() ? NativeXprRelocated(frame, store_relocated) : nullptr;
 		if (chosen == nullptr) {
 			if (store_relocated) {
 				cache.store_relocated = true;

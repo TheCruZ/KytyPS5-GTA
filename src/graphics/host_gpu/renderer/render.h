@@ -300,6 +300,7 @@ private:
 	bool NativeXprValidate(NativeXprRecord& record, uint64_t frame, bool& broken);
 	bool NativeXprRebindBuffers(NativeXprRecord& record, std::span<const std::pair<uint32_t, uint32_t>> slots);
 	NativeXprRecord* NativeXprRelocated(uint64_t frame, bool& store);
+	void             NativeXprRefuseStore(CommandBuffer& buffer);
 	void             NativeXprDropRelocated(NativeXprRecord& record);
 	void NativeXprStoreRecord(std::unique_ptr<NativeXprRecord> record, CommandBuffer& buffer,
 	                          const DrawRenderState& state, vk::PrimitiveTopology topology,
