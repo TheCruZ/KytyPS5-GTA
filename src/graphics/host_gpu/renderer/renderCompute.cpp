@@ -26,6 +26,7 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
+#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <array>
@@ -34,11 +35,97 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <span>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
+// Demon's Souls (PPSA01340, PPSA01341, PPSA01342) copies memory with a compute shader, the engine's
+// cs_memset32 (coredata/enginesupport/shaders/_ps5/cs_memset32): dst[i] = src[i % period] for
+// i < count, 700+ small copies a frame in Boletaria. Ported from chenxiao07's KytyPS5 fork
+// (renderer/demonsSouls.cpp): the linear subset (count <= period) is a buffer copy, without the
+// program's bindings. The shader as the builds seen have it: 01.007.000's, and 01.005.000's with
+// the period in s12 instead of s8 (the same translated program).
+namespace DemonsSoulsCopy {
+static bool IsDemonsSouls() {
+	// KYTY_DS_LINEAR_COPY=0: the copy shader runs as a shader.
+	static const bool supported = [] {
+		if (const char* value = std::getenv("KYTY_DS_LINEAR_COPY"); value != nullptr && value[0] == '0') return false;
+		char title_id[16] {};
+		if (!Loader::SystemContentParamSfoGetString("TITLE_ID", title_id, sizeof(title_id))) return false;
+		const std::string_view title(title_id);
+		return title == "PPSA01340" || title == "PPSA01341" || title == "PPSA01342";
+	}();
+	return supported;
+}
+
+constexpr std::array<uint64_t, 2> Shaders {0xeb7456322124ecc7ULL, 0x81bb2b1b9c751ecaULL};
+
+struct Dispatch {
+	std::span<const uint32_t> user_data;
+	std::array<uint32_t, 3>   threads {};
+	std::array<bool, 3>       group_id {};
+	uint32_t                  thread_ids = 0, workgroup_register = 0;
+	bool                      tg_size = false, thread_dimensions = false;
+};
+
+static Dispatch FromRegisters(const HW::Shader& shaders, uint32_t mode) {
+	const auto& cs   = shaders.GetCs();
+	const auto& regs = cs.cs_regs;
+	return {.user_data          = std::span<const uint32_t> {cs.cs_user_sgpr.value, regs.user_sgpr},
+	        .threads            = {regs.num_thread_x, regs.num_thread_y, regs.num_thread_z},
+	        .group_id           = {regs.tgid_x_en, regs.tgid_y_en, regs.tgid_z_en},
+	        .thread_ids         = regs.tidig_comp_cnt + 1u,
+	        .workgroup_register = regs.user_sgpr,
+	        .tg_size            = regs.tg_size_en,
+	        .thread_dimensions  = (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0};
+}
+
+struct Range {
+	uint64_t src = 0, dst = 0, bytes = 0;
+};
+
+// The copy a dispatch of the shader makes, when it is linear: exact control bits of the V#s
+// (idxen, format_x UInt32), one 64-thread group per 64 elements, no overlap, parameters CPU-clean.
+static std::optional<Range> CopyOf(const Dispatch& dispatch, BufferCache& cache, uint32_t x, uint32_t y, uint32_t z,
+                                   uint32_t mode) {
+	const auto& data = dispatch.user_data;
+	if (data.size() != 12 || dispatch.thread_dimensions || mode != 0x41 || dispatch.threads[0] != 64 ||
+	    dispatch.threads[1] != 1 || dispatch.threads[2] != 1 || !dispatch.group_id[0] || dispatch.group_id[1] ||
+	    dispatch.group_id[2] || dispatch.thread_ids != 1 || dispatch.workgroup_register != 12 || dispatch.tg_size ||
+	    y != 1 || z != 1 || x == 0)
+		return std::nullopt;
+	ShaderBufferResource source, destination, parameters;
+	std::memcpy(source.fields, data.data(), 16);
+	std::memcpy(destination.fields, data.data() + 4, 16);
+	std::memcpy(parameters.fields, data.data() + 8, 16);
+	for (const auto* d: {&source, &destination}) {
+		if (d->fields[3] != 0x00014004 || (d->fields[1] & 0xffff0000u) != 0x00040000u || d->Base48() == 0 ||
+		    (d->Base48() & 3) != 0)
+			return std::nullopt;
+	}
+	if (parameters.fields[3] != 0x0004dfac || (parameters.fields[1] & 0xffff0000u) != 0x00100000u ||
+	    parameters.NumRecords() != 1 || (parameters.Base48() & 3) != 0)
+		return std::nullopt;
+	std::array<uint32_t, 2> controls {};
+	if (cache.HasGpuDirtyBytes(parameters.Base48(), sizeof(controls)) ||
+	    !LibKernel::Memory::TryReadBacking(parameters.Base48(), controls.data(), sizeof(controls)))
+		return std::nullopt;
+	const uint64_t count = controls[0], period = controls[1], bytes = count * 4;
+	if (count == 0 || period < count || count > source.NumRecords() || count > destination.NumRecords() ||
+	    x != (count + 63) / 64 || bytes > 16 * 1024 * 1024)
+		return std::nullopt;
+	const auto src = source.Base48(), dst = destination.Base48();
+	if ((src < dst + bytes && dst < src + bytes) || (parameters.Base48() < dst + bytes && dst < parameters.Base48() + 16))
+		return std::nullopt;
+	if (!LibKernel::Memory::IsBackingReadable(src, bytes) || !LibKernel::Memory::IsBackingReadable(dst, bytes))
+		return std::nullopt;
+	return Range {src, dst, bytes};
+}
+} // namespace DemonsSoulsCopy
+
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                  GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
@@ -272,6 +359,17 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	bindings.shared_memory = {storage.Handle(), 0, size};
 }
 
+// A dispatch of Demon's Souls' copy shader, as the copy it makes (see DemonsSoulsCopy).
+bool RenderExecutor::TryDemonsSoulsCopy(const HW::Shader& shaders, uint32_t x, uint32_t y, uint32_t z, uint32_t mode) {
+	auto&      cache = m_context.GetBufferCache();
+	const auto copy  = DemonsSoulsCopy::CopyOf(DemonsSoulsCopy::FromRegisters(shaders, mode), cache, x, y, z, mode);
+	if (!copy) return false;
+	// A copy is no dispatch: the barrier a dispatch before it deferred is due.
+	FlushDeferredDispatchBarrier();
+	cache.CopyBuffer(copy->dst, copy->src, copy->bytes, false, false);
+	return true;
+}
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
@@ -324,6 +422,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto& cs_regs = sh_ctx.GetCs();
 	const auto& sh_regs = ctx.GetShaderRegisters();
 
+	// Demon's Souls' copy shader, at the address its program was proven at (again every 64 uses).
+	if (cs_regs.cs_regs.data_addr == m_linear_copy_shader && (++m_linear_copy_uses & 63u) != 0 &&
+	    TryDemonsSoulsCopy(sh_ctx, thread_group_x, thread_group_y, thread_group_z, mode)) {
+		return;
+	}
+
 	ShaderComputeInputInfo input_info {};
 	input_info.async_compute = async_compute;
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
@@ -352,6 +456,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
+	if (DemonsSoulsCopy::IsDemonsSouls() &&
+	    std::ranges::find(DemonsSoulsCopy::Shaders, program.shader_hash) != DemonsSoulsCopy::Shaders.end() &&
+	    program.user_data_base == 0) {
+		m_linear_copy_shader = cs_regs.cs_regs.data_addr;
+		if (TryDemonsSoulsCopy(sh_ctx, thread_group_x, thread_group_y, thread_group_z, mode)) {
+			ResetBindings();
+			return;
+		}
+	} else if (cs_regs.cs_regs.data_addr == m_linear_copy_shader) {
+		m_linear_copy_shader = 0;
+	}
 	if (resources.specialization_reads.empty()) {
 		// Cached metadata addresses can be reused as ordinary buffers; preserve their guest writes.
 		UpdateComputeMetaClears(input_info, buffer);

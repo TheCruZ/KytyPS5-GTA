@@ -611,6 +611,10 @@ private:
 	bool                                               m_deferred_barrier        = false;
 	uint32_t                                           m_deferred_barrier_queue  = 0;
 	bool                                               m_dispatch_chained        = false;
+	// Demon's Souls' copy shader: where its program was proven (renderCompute.cpp).
+	bool     TryDemonsSoulsCopy(const HW::Shader& shaders, uint32_t x, uint32_t y, uint32_t z, uint32_t mode);
+	uint64_t m_linear_copy_shader = 0;
+	uint32_t m_linear_copy_uses   = 0;
 	// Reused by every draw; see AcquireDrawRenderState().
 	std::unique_ptr<DrawRenderStorage, void (*)(DrawRenderStorage*)> m_draw_state {nullptr,
 	                                                                               nullptr};
