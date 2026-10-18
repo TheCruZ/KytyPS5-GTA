@@ -20,15 +20,17 @@
 // (NativeXprCaptureState). Anything a table draw cannot prove goes back to the normal path.
 //
 // With native XPR on, table draws take only the pairs native records will not serve (KYTY_TABLE_XPR_COMPLEMENT=0:
-// table draws first, records for what they refuse). Off by default (KYTY_TABLE_XPR=0).
+// table draws first, records for what they refuse). Off by default (KYTY_TABLE_XPR=0), except for Demon's Souls,
+// which runs as chenxiao07's launcher sets it: KYTY_TABLE_XPR=2, table draws first.
 
 namespace {
 
-// KYTY_TABLE_XPR: 0 off (default), 1 table draws, 2 also continued runs.
+// KYTY_TABLE_XPR: 0 off (default; Demon's Souls: 2), 1 table draws, 2 also continued runs.
 uint32_t TableXprMode() {
 	static const uint32_t mode = [] {
 		const char* value = std::getenv("KYTY_TABLE_XPR");
-		return value != nullptr && (value[0] == '1' || value[0] == '2') ? static_cast<uint32_t>(value[0] - '0') : 0u;
+		if (value == nullptr) return Loader::IsDemonsSoulsTitle() ? 2u : 0u;
+		return value[0] == '1' || value[0] == '2' ? static_cast<uint32_t>(value[0] - '0') : 0u;
 	}();
 	return mode;
 }
@@ -400,7 +402,7 @@ RenderExecutor::TableXpr& RenderExecutor::OwnTable() {
 bool RenderExecutor::TableXprComplements() {
 	static const bool complements = [] {
 		const char* value = std::getenv("KYTY_TABLE_XPR_COMPLEMENT");
-		return value == nullptr || value[0] != '0';
+		return value != nullptr ? value[0] != '0' : !Loader::IsDemonsSoulsTitle();
 	}();
 	return complements;
 }

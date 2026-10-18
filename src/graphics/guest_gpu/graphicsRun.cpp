@@ -98,11 +98,12 @@ static void CopyFromGuest(void* destination, const volatile void* source, size_t
 	}
 }
 
-// KYTY_TABLE_XPR=2: table draws continue runs of clean draws (DrawStateObserver, RenderExecutor::TableXprTry).
+// KYTY_TABLE_XPR=2 (Demon's Souls' default): table draws continue runs of clean draws (DrawStateObserver,
+// RenderExecutor::TableXprTry).
 static bool TableContinueEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_TABLE_XPR");
-		return value != nullptr && value[0] == '2';
+		return value != nullptr ? value[0] == '2' : Loader::IsDemonsSoulsTitle();
 	}();
 	return enabled;
 }

@@ -14,8 +14,9 @@ namespace {
 
 bool TableDispatchEnabled() {
 	static const bool enabled = [] {
+		// (Demon's Souls by default, as chenxiao07's launcher sets it.)
 		const char* value = std::getenv("KYTY_TABLE_DISPATCH");
-		return value != nullptr && value[0] == '1';
+		return value != nullptr ? value[0] == '1' : Loader::IsDemonsSoulsTitle();
 	}();
 	return enabled;
 }
