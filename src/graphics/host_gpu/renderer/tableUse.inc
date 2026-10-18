@@ -23,15 +23,15 @@ private:
 	std::atomic_flag& m_flag;
 };
 
-// A dword of guest memory as the use would read it now; false where the normal path must read it (its pages hold
-// bytes the GPU wrote, or nothing is mapped there). Ahead of execution (`reads`), through the resolution's log, which
-// the execution thread checks; memory the GPU may write fails there.
+// A dword of guest memory as the use would read it now; false where the normal path must read it (nothing is mapped
+// there). Ahead of execution (`reads`), through the resolution's log: on pages the GPU may write the backing store can
+// still lack the GPU's bytes, and the execution thread's check of the log (GuestReadLog::StillValid()) reads those
+// around the GPU's writes, as the execution thread reads them, so a stale word invalidates the resolution.
 bool TableReadWord(uint64_t address, uint32_t& word, GuestReadLog* reads) {
 	if ((address & 3u) != 0 || !GuestRange {address, 4}.Valid()) return false;
-	if (Libs::LibKernel::Memory::MayFaultOnGpuRead(address, 4)) {
-		return reads == nullptr && Libs::LibKernel::Memory::TryReadAroundGpuWrites(address, &word, 4);
-	}
 	if (reads != nullptr) return reads->Read(address, &word, 4, false);
+	if (Libs::LibKernel::Memory::MayFaultOnGpuRead(address, 4))
+		return Libs::LibKernel::Memory::TryReadAroundGpuWrites(address, &word, 4);
 	return Libs::LibKernel::Memory::TryReadBacking(address, &word, 4);
 }
 
