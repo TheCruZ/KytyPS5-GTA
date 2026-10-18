@@ -402,6 +402,9 @@ private:
 	std::vector<vk::BufferCopy>                       m_upload_batch_copies;
 	StreamBuffer                                      m_stream_buffer;
 	std::unique_ptr<StreamBuffer>                     m_table_upload;
+	// Small CPU-dirty ranges draws read, in host memory instead of the device-visible stream buffer
+	// (KYTY_STREAM_UPLOAD=1); null when off.
+	std::unique_ptr<StreamBuffer>                     m_host_upload;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;

@@ -312,6 +312,12 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_texture_cache(texture_cache) {
 	// Queried and changed under the renderer's lock only.
 	m_gpu_modified_ranges.AllowFastPath();
+	// chenxiao07's KYTY_STREAM_UPLOAD (5c4da93aa): the small ranges draws stream go through a ring in host memory
+	// (written by the CPU without the device-visible memory's write combining) instead of the stream buffer.
+	if (const char* value = std::getenv("KYTY_STREAM_UPLOAD"); value != nullptr && value[0] == '1') {
+		m_host_upload = std::make_unique<StreamBuffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 64 * MiB,
+		                                               AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress);
+	}
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
@@ -1300,17 +1306,18 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	// it is in the stream buffer and no work wrote cached buffers. A copy made in the window
 	// answers before the CPU-dirty checks: it was made from CPU-dirty pages that the guest has not
 	// written since, and GPU writes advance the generation (or show in the GPU-dirty check).
-	const bool  small_read = !is_written && size <= CACHING_PAGESIZE;
-	StreamMemo* stream     = nullptr;
+	const bool    small_read = !is_written && size <= CACHING_PAGESIZE;
+	StreamBuffer& ring       = m_host_upload ? *m_host_upload : m_stream_buffer;
+	StreamMemo*   stream     = nullptr;
 	uint64_t    window     = 0;
 	if (small_read && !m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
 		window = m_scheduler.Context().GetRenderExecutor().DrawWindow();
 		stream = &(*m_stream_memo)[((vaddr ^ (size << 40u)) * 0x9e3779b97f4a7c15ull >> 32u) %
 		                           StreamMemoSlots];
 		if (stream->vaddr == vaddr && stream->size == size && stream->window == window &&
-		    stream->lap == m_stream_buffer.Lap() &&
+		    stream->lap == ring.Lap() &&
 		    stream->write_generation == m_gpu_write_generation) {
-			return {&m_stream_buffer, stream->offset};
+			return {&ring, stream->offset};
 		}
 	}
 
@@ -1336,17 +1343,17 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (stream != nullptr && m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
-		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
+		auto [mapped, offset] = ring.Map(size, alignment, false);
 		if (mapped != nullptr) {
 			StreamGuestData(mapped, vaddr, size);
-			m_stream_buffer.Commit();
+			ring.Commit();
 			*stream = {.vaddr            = vaddr,
 			           .size             = size,
 			           .window           = window,
-			           .lap              = m_stream_buffer.Lap(),
+			           .lap              = ring.Lap(),
 			           .write_generation = m_gpu_write_generation,
 			           .offset           = offset};
-			return {&m_stream_buffer, offset};
+			return {&ring, offset};
 		}
 	}
 
