@@ -480,8 +480,10 @@ struct PipelineCache::ProgramCache {
 		// Null with `failed` set when the resources do not materialize.
 		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                             uint32_t push_data_cursor, bool& failed) {
+			// SWAPPC programs replace their plan when the called code changes: no guard.
 			if (!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-			                                                specialization)) {
+			                                                specialization,
+			                                                call_source ? nullptr : &specialization_guard)) {
 				failed = true;
 				return nullptr;
 			}
@@ -494,6 +496,9 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		// The shape of the image descriptors the last materialization specialized (all under the
+		// program lock, by the execution thread and by the resolutions ahead).
+		ShaderRecompiler::IR::ResourceSpecializationGuard specialization_guard;
 		// A deque: resolutions ahead of execution keep pointers to programs while new
 		// permutations are added.
 		std::deque<Permutation> permutations;
@@ -773,8 +778,10 @@ struct PipelineCache::ProgramCache {
 			runtime.workgroup_counts = input_info.workgroup_counts;
 			runtime.indirect_args_address = input_info.indirect_args_address;
 		}
+		// Without a call source (checked above): the plan never changes.
 		if (!ShaderRecompiler::IR::MaterializeResources(entry->second.resource_plan, runtime,
-		                                                resources, specialization)) {
+		                                                resources, specialization,
+		                                                &entry->second.specialization_guard)) {
 			ahead.reads.Fail();
 			return {};
 		}

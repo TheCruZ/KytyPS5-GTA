@@ -12,6 +12,7 @@
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
@@ -1682,9 +1683,78 @@ static void VerifyLinearSrt(const ResourcePlan& program, Walker& walker, const s
 	}
 }
 
+// KYTY_SPECIALIZATION_GUARD (chenxiao07's KytyPS5 fork; default on, 0 turns it off): see
+// ResourceSpecializationGuard. These masks cover every image descriptor bit BuildResourceSpecialization()
+// reads for a direct image: dword 1 holds the format, dword 3 the type, the mip range and the swizzle.
+// NullImageDescriptor() also reads dword 0 (kept as the `null` probe).
+static constexpr uint32_t GuardImageFormat         = 0x1ff00000u;
+static constexpr uint32_t GuardImageInterpretation = 0xf00fffffu;
+
+static std::atomic<int> g_specialization_guard_override {-1};
+
+void SetSpecializationGuardEnabledForTesting(bool enabled) {
+	g_specialization_guard_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+static bool SpecializationGuardEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SPECIALIZATION_GUARD");
+		return value == nullptr || value[0] != '0';
+	}();
+	const auto forced = g_specialization_guard_override.load(std::memory_order_relaxed);
+	return forced < 0 ? enabled : forced != 0;
+}
+
+static bool MatchesSpecializationGuard(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                                       const ResourceSpecializationGuard& guard) {
+	if (guard.owner != &program || snapshot.images.size() != guard.images.size()) return false;
+	for (size_t i = 0; i < guard.images.size(); ++i) {
+		const auto& descriptor = snapshot.images[i];
+		const auto& probe      = guard.images[i];
+		if (NullImageDescriptor(descriptor) != probe.null ||
+		    (descriptor.dwords[1] & GuardImageFormat) != probe.format ||
+		    (descriptor.dwords[3] & GuardImageInterpretation) != probe.interpretation) return false;
+	}
+	return true;
+}
+
+// Records the shape of the snapshot in `guard` (invalid until PublishSpecializationGuard()). False for a
+// plan or snapshot whose image specialization is not a function of those bits alone: images selected
+// through indirect descriptors or tables (their specialization reads the flattened SRT and the other
+// candidates), and packed UNorm sampling (ValidatePackedUnormSampling() also reads the T# and the sampler).
+static bool CaptureSpecializationGuard(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                                       ResourceSpecializationGuard& guard) {
+	guard.owner = nullptr;
+	if (snapshot.images.size() != program.info.images.size() || !snapshot.image_tables.empty()) return false;
+	for (const auto& image: program.info.images) {
+		const auto* source = Source(program, image.source);
+		if (source == nullptr || source->indirect_descriptor.has_value() ||
+		    image.indirect_root != ImageResource::NoIndirectImage || image.table_capacity != 0) return false;
+	}
+	guard.images.clear();
+	for (const auto& descriptor: snapshot.images) {
+		const bool null = NullImageDescriptor(descriptor);
+		if (!null && static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu) ==
+		                 Prospero::BufferFormat::k11_11_10UNorm) return false;
+		guard.images.push_back({descriptor.dwords[1] & GuardImageFormat,
+		                        descriptor.dwords[3] & GuardImageInterpretation, null});
+	}
+	return true;
+}
+
+static void PublishSpecializationGuard(const ResourcePlan& program, const ResourceSpecialization& specialization,
+                                       ResourceSpecializationGuard& guard) {
+	guard.specialization = specialization.images;
+	guard.compact_images =
+	    std::ranges::any_of(specialization.images, [](const auto& image) { return image.fmask; });
+	guard.owner = &program;
+	++guard.publication;
+}
+
 template <typename Walker>
 static bool MaterializeWith(const ResourcePlan& program, const SrtRuntime& runtime,
-                            ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+                            ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                            ResourceSpecializationGuard* shape_guard = nullptr) {
 	for (auto& keys: program.selector_keys) keys.resolved = false;
 	if (!program.resource_tracking_complete ||
 	    ((program.requires_specialization_memory || !program.source_reads.empty()) &&
@@ -1934,6 +2004,19 @@ static bool MaterializeWith(const ResourcePlan& program, const SrtRuntime& runti
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+	if (shape_guard != nullptr && SpecializationGuardEnabled()) {
+		if (MatchesSpecializationGuard(program, snapshot, *shape_guard)) {
+			specialization.images = shape_guard->specialization;
+			if (shape_guard->compact_images) {
+				CompactImages(snapshot.images, [&](size_t index) { return !specialization.images[index].fmask; });
+			}
+			return true;
+		}
+		const bool eligible = CaptureSpecializationGuard(program, snapshot, *shape_guard);
+		if (!BuildResourceSpecialization(program, snapshot, specialization)) return false;
+		if (eligible) PublishSpecializationGuard(program, specialization, *shape_guard);
+		return true;
+	}
 	return BuildResourceSpecialization(program, snapshot, specialization);
 }
 
@@ -2016,11 +2099,12 @@ void SetComputeIndirectFloors(size_t keys, size_t images) {
 }
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          ResourceSpecializationGuard* shape_guard) {
 	if (CompileSrtPlan(program) != nullptr) {
-		return MaterializeWith<CompiledSrtWalker>(program, runtime, snapshot, specialization);
+		return MaterializeWith<CompiledSrtWalker>(program, runtime, snapshot, specialization, shape_guard);
 	}
-	return MaterializeWith<SrtWalker>(program, runtime, snapshot, specialization);
+	return MaterializeWith<SrtWalker>(program, runtime, snapshot, specialization, shape_guard);
 }
 
 bool MaterializeResourcesReference(const ResourcePlan& program, const SrtRuntime& runtime,

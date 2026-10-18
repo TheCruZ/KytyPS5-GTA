@@ -1281,6 +1281,108 @@ void TestSignedStorageSpecialization() {
   }
 }
 
+void TestSpecializationGuardMatchesReference() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using F = Libs::Graphics::Prospero::BufferFormat;
+  using T = Libs::Graphics::Prospero::ImageType;
+  constexpr uint32_t swizzle = Libs::Graphics::DstSel(4, 5, 6, 7);
+  const auto words = [](F format, uint32_t last_level, T type, uint32_t image_swizzle = swizzle) {
+    return std::array<uint32_t, 3>{0x100u, uint32_t(format) << 20u,
+                                   image_swizzle | (last_level << 16u) | (uint32_t(type) << 28u)};
+  };
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  program.user_data_count = 3u;
+  auto &block = AddValueBlock(program);
+  // Image 0 follows the user data (address low, format word, interpretation word); image 1 is fixed.
+  DescriptorSource variable, fixed;
+  variable.dword_count = fixed.dword_count = 8u;
+  variable.dwords.fill(Value(0u));
+  fixed.dwords.fill(Value(0u));
+  const auto user = [&](uint32_t index) {
+    return Value(&block.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(index))}));
+  };
+  variable.dwords[0] = user(0);
+  variable.dwords[1] = user(1);
+  variable.dwords[3] = user(2);
+  fixed.dwords[0] = Value(0x200u);
+  fixed.dwords[1] = Value(uint32_t(F::k32Float) << 20u);
+  fixed.dwords[3] = Value(swizzle | (uint32_t(T::kColor2D) << 28u));
+  program.descriptor_sources.push_back(variable);
+  program.descriptor_sources.push_back(fixed);
+  for (const uint32_t source : {0u, 1u})
+    program.info.images.push_back(
+        {.source = source,
+         .resource_class = ImageResourceClass::Sampled,
+         .numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float,
+         .dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D,
+         .mip_mode = ImageMipMode::Dynamic});
+  const auto plan = ExtractResourcePlan(program);
+  const auto other_plan = ExtractResourcePlan(program);
+
+  struct Case {
+    std::array<uint32_t, 3> data;
+    // Change of the guard's publication count: 1 captured a shape, 0 reused it or was not eligible.
+    uint64_t published;
+    const char *text;
+  };
+  auto cube_words = words(F::k16_16_16_16Float, 0u, T::kCube);
+  auto fmask_words = words(F::kFmask8_S2_F1, 0u, T::kColor2D);
+  const std::array cases{
+      Case{words(F::k16_16_16_16Float, 0u, T::kColor2D), 1u, "first shape"},
+      Case{[&] { auto d = words(F::k16_16_16_16Float, 0u, T::kColor2D);
+                 d[0] = 0x300u; d[1] |= 0x7u; return d; }(), 0u, "other address bits"},
+      Case{words(F::k16_16_16_16UInt, 0u, T::kColor2D), 1u, "format"},
+      Case{words(F::k16_16_16_16UScaled, 0u, T::kColor2D), 1u, "converted format"},
+      Case{words(F::k16_16_16_16UScaled, 3u, T::kColor2D), 1u, "mip range"},
+      Case{words(F::k16_16_16_16UScaled, 3u, T::kColor2D, Libs::Graphics::DstSel(5, 4, 1, 0)), 1u, "swizzle"},
+      Case{cube_words, 1u, "cube"},
+      Case{{0u, 0u, 0u}, 1u, "null"},
+      Case{{0x100u, uint32_t(F::k16_16_16_16Float) << 20u, 0u}, 0u, "invalid descriptor reads as null"},
+      Case{fmask_words, 1u, "fmask"},
+      Case{[&] { auto d = fmask_words; d[0] = 0x500u; return d; }(), 0u, "fmask again"},
+      Case{words(F::k16_16_16_16Float, 0u, T::kColor2D), 1u, "back to the first shape"},
+      Case{words(F::k11_11_10UNorm, 0u, T::kColor2D), 0u, "packed UNorm is not captured"},
+      Case{words(F::k11_11_10UNorm, 0u, T::kColor2D), 0u, "packed UNorm again"},
+      Case{words(F::k16_16_16_16Float, 0u, T::kColor2D), 1u, "first shape after packed UNorm"},
+  };
+  SetSpecializationGuardEnabledForTesting(true);
+  ResourceSpecializationGuard guard;
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto run = [&](const ResourcePlan &run_plan, const Case &c, uint64_t published) {
+    const SrtRuntime runtime{.user_data = c.data};
+    ResourceSnapshot reference_snapshot;
+    ResourceSpecialization reference;
+    const bool expected = MaterializeResources(run_plan, runtime, reference_snapshot, reference);
+    const auto before = guard.publication;
+    const bool actual = MaterializeResources(run_plan, runtime, snapshot, specialization, &guard);
+    Check(actual == expected, c.text);
+    Check(guard.publication - before == published, c.text);
+    if (!expected) return;
+    Check(specialization == reference, c.text);
+    Check(snapshot.images.size() == reference_snapshot.images.size(), c.text);
+    for (size_t i = 0; i < snapshot.images.size(); ++i)
+      Check(snapshot.images[i] == reference_snapshot.images[i], c.text);
+    Check(snapshot.buffers.size() == reference_snapshot.buffers.size() &&
+              snapshot.samplers.size() == reference_snapshot.samplers.size(), c.text);
+  };
+  for (const auto &c : cases) run(plan, c, c.published);
+  // The guard of another plan never answers for this one.
+  run(other_plan, cases[0], 1u);
+  run(plan, cases[0], 1u);
+  // Compaction of an FMASK image is replayed on a reused shape.
+  run(plan, cases[9], 1u);
+  run(plan, cases[10], 0u);
+  Check(snapshot.images.size() == 1u && specialization.images.size() == 2u && specialization.images[0].fmask,
+        "reused FMASK shape did not compact the snapshot");
+  // Off: nothing is captured or reused.
+  SetSpecializationGuardEnabledForTesting(false);
+  for (const auto &c : cases) run(plan, c, 0u);
+  SetSpecializationGuardEnabledForTesting(true);
+}
+
 void TestIndirectImageSamplerClasses(bool mixed) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   using Libs::Graphics::Prospero::BufferFormat;
@@ -1955,6 +2057,7 @@ int main() {
   TestEmptyScalarBufferSpecialization();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   TestSignedStorageSpecialization();
+  TestSpecializationGuardMatchesReference();
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);
   TestCompiledWalkerDirectReads();
   TestCompiledWalkerMatchesReference();

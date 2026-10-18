@@ -62,9 +62,34 @@ ResourcePlan ExtractResourcePlan(const Program& program);
 // changes the shader permutation less often. Until it is called, layouts keep exact counts.
 void SetComputeIndirectFloors(size_t keys, size_t images);
 
-// Refreshes cached resources and specialization in place. A failed refresh must not be used.
+// The shape of the image descriptors the last materialization of one plan specialized, and the image
+// specialization it derived (chenxiao07's KYTY_SPECIALIZATION_GUARD, default on; 0 turns it off). A
+// materialization whose descriptors have the same shape (null or not, format, type, mip range and swizzle
+// bits: the only bits the derivation reads) takes the stored image specialization instead of deriving it
+// again. Addresses, sizes, SRT values and sampler payloads always come from the current materialization,
+// and so does the buffer specialization. Only plans of direct images are captured. Owned by whoever
+// serializes the materializations of the plan (the program cache's lock); one guard per plan.
+struct ResourceSpecializationGuard {
+	struct ImageProbe {
+		uint32_t format, interpretation;
+		bool     null;
+	};
+
+	const ResourcePlan*                    owner = nullptr;
+	std::vector<ImageProbe>                images;
+	std::vector<ResourceSpecialization::Image> specialization;
+	bool                                   compact_images = false;
+	// Counts the shapes captured: unchanged by a materialization that reused the stored one.
+	uint64_t                               publication = 0;
+};
+
+// Refreshes cached resources and specialization in place. A failed refresh must not be used. With a guard
+// of the plan, the image specialization is reused when the descriptors' shape is unchanged.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          ResourceSpecializationGuard* shape_guard = nullptr);
+
+void SetSpecializationGuardEnabledForTesting(bool enabled);
 
 // The specialization of resources whose descriptors the caller evaluated (table mode, chenxiao07's KytyPS5 fork):
 // snapshot.buffers, images and samplers hold one descriptor per resource of the plan, as resource materialization
