@@ -49,6 +49,12 @@ uint32_t TableMru() {
 	return mru;
 }
 
+// chenxiao07's KYTY_TABLE_SET_PROOFS (default 1; 0 full checks, 2 verify mode): see TableValidateSet.
+uint32_t TableSetProofs() {
+	static const uint32_t mode = NativeXprNumberSwitch("KYTY_TABLE_SET_PROOFS", 1u);
+	return mode;
+}
+
 // The stages' static input key a pair's programs were compiled for: both stages' code and static input, and whether
 // the pixel stage runs.
 uint64_t TableDrawKey(std::vector<uint32_t>& key, const ShaderParams& vertex_params,
@@ -154,6 +160,9 @@ struct RenderExecutor::TableImageSet {
 		bool                    storage = false; // the shader writes it: GPU-modified at every use (TableTransit)
 		bool                    whole   = false; // bound both as a texture and as storage: the whole image's state
 		bool                    plain   = false; // a plain color texture (TextureCache::IsSampledImageCurrent)
+		// The image's registrations when its use was last proven (KYTY_TABLE_SET_PROOFS): a plain texture's proof holds
+		// while it is the same registration and no registration since overlaps its view.
+		uint32_t                registration = 0;
 	};
 	std::vector<uint32_t> words; // without the LOD statistics fields (NativeXprLodStatsMask)
 	vk::DescriptorSet     set  = nullptr;
@@ -501,10 +510,11 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 				return refuse("a linear image the shader writes");
 			const auto& view = binding.desc.view_info;
 			auto&       dep  = deps[st].emplace_back();
-			dep              = {.id     = binding.image_id,
-			                    .serial = image.serial,
-			                    .range  = {view.base_level, view.level_count, view.base_layer, view.layer_count},
-			                    .desc   = binding.desc};
+			dep              = {.id           = binding.image_id,
+			                    .serial       = image.serial,
+			                    .range        = {view.base_level, view.level_count, view.base_layer, view.layer_count},
+			                    .desc         = binding.desc,
+			                    .registration = image.registrations};
 			if (image.binding.force_general && !image.info.IsDepth()) {
 				dep.layout  = vk::ImageLayout::eGeneral;
 				dep.access  = vk::AccessFlagBits2::eShaderRead |
@@ -518,8 +528,9 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			} else {
 				dep.layout = image.info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
 				                                  : vk::ImageLayout::eShaderReadOnlyOptimal;
-				dep.plain  = binding.desc.type == TextureCache::BindingType::Texture && !binding.desc.info.IsDepth() &&
-				            !binding.desc.info.HasMetadata() && !binding.desc.info.HasStencil();
+				// (What TextureCache::IsSampledImageCurrent can prove, of the image as well as of the view: a color view of
+				// a depth image or of one with metadata, or of a larger image, is proven as the other images are.)
+				dep.plain = textures.IsSampledImageCurrent(binding.image_id, binding.desc);
 			}
 			binding.layout = dep.layout;
 		}
@@ -599,8 +610,11 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 }
 
 // A set's images are the same objects, registered and current (as NativeXprValidateResources proves a record's):
-// once a frame, and again when images were registered or unregistered since.
+// once a frame, and again when images were registered or unregistered since. A plain texture whose proof held is
+// checked again only when its own registration changed or one since overlaps its view (KYTY_TABLE_SET_PROOFS: 0
+// checks all of them in full, 2 does and reports the held proofs that did not pass).
 bool RenderExecutor::TableValidateSet(TableImageSet& set) {
+	const auto mode     = TableSetProofs();
 	auto&      textures = m_context.GetTextureCache();
 	const auto frame    = m_context.FrameNumber();
 	const auto epoch    = textures.ImageSetEpoch();
@@ -619,7 +633,8 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 	};
 	for (auto& dep: set.images) {
 		auto* image = textures.m_slot_images.try_get(dep.id);
-		if (image == nullptr || image->serial != dep.serial || !image->registered || image->binding.needs_rebind)
+		if (image == nullptr || image->serial != dep.serial || !image->registered || image->binding.needs_rebind ||
+		    image->depth_id)
 			return false;
 		// The guest rewrote it (a texture streaming in), or a GPU buffer write its bytes: upload it as the normal
 		// path's FindTexture does.
@@ -629,7 +644,29 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 			image = textures.m_slot_images.try_get(dep.id);
 			if (image == nullptr || image->serial != dep.serial || TextureCache::RefreshPending(*image, dep.desc)) return false;
 		}
-		if (moved && (dep.plain ? !textures.IsSampledImageCurrent(dep.id, dep.desc) : overlapped(dep))) return false;
+		if (moved) {
+			// A plain texture still in the registration its proof saw, with nothing registered over its view since, is
+			// what the proof found (mode 1); else the full check: the texture cache's, or nothing registered over the
+			// view (mode 0, and mode 2, which also counts the held proofs the full check fails).
+			const bool held = mode != 0 && dep.plain && image->registrations == dep.registration && !overlapped(dep);
+			if (!held || mode == 2) {
+				const bool current = dep.plain ? textures.IsSampledImageCurrent(dep.id, dep.desc) : !overlapped(dep);
+				if (!current) {
+					if (held) {
+						static std::atomic<uint32_t> reports {0};
+						if (reports.fetch_add(1, std::memory_order_relaxed) < 16)
+							std::printf("Table: proven image use failed: addr=0x%llx size=0x%llx serial=%llu "
+							            "(image depth %d metadata %d stencil %d)\n",
+							            static_cast<unsigned long long>(dep.desc.info.data.address),
+							            static_cast<unsigned long long>(dep.desc.info.data.size),
+							            static_cast<unsigned long long>(dep.serial), image->info.IsDepth() ? 1 : 0,
+							            image->info.HasMetadata() ? 1 : 0, image->info.HasStencil() ? 1 : 0);
+					}
+					return false;
+				}
+			}
+			dep.registration = image->registrations;
+		}
 		(void)textures.GetImage(dep.id); // LRU, as FindTexture does
 	}
 	set.validated_frame = frame;
