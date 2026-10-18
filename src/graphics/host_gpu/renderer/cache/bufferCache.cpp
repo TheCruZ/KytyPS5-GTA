@@ -310,6 +310,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
+	m_page_manager = &page_manager;
 	// Queried and changed under the renderer's lock only.
 	m_gpu_modified_ranges.AllowFastPath();
 	// chenxiao07's KYTY_STREAM_UPLOAD (5c4da93aa): the small ranges draws stream go through a ring in host memory
@@ -1176,6 +1177,34 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	return id;
 }
 
+// chenxiao07's KYTY_ASYNC_REPROTECT (476ae208b): the page protections a read upload adds (system calls, hundreds a
+// frame) are applied by the host copy thread, before its copies of the uploaded ranges; 0 applies them here.
+static bool AsyncReprotectEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_ASYNC_REPROTECT");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+static uint32_t AsyncUploadMode();
+
+static void ReapplyProtectionCall(void* page_manager, uint64_t vaddr, uint64_t size) {
+	static_cast<PageManager*>(page_manager)->ReapplyProtection(vaddr, size);
+}
+
+void BufferCache::ApplyDeferredProtection(bool queue) {
+	auto* copies = queue ? m_scheduler.HostCopies() : nullptr;
+	for (const auto& [vaddr, size]: m_deferred_protection) {
+		if (copies != nullptr) {
+			copies->Call(&ReapplyProtectionCall, m_page_manager, vaddr, size);
+		} else {
+			m_page_manager->ReapplyProtection(vaddr, size);
+		}
+	}
+	m_deferred_protection.clear();
+}
+
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
 	// A written range the GPU-modified set covers whole has nothing to upload and its pages are GPU-owned already
@@ -1189,13 +1218,30 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
+	// A read upload's new write protections wait until its copies are known: queued with them when they are all
+	// queued (a guest write before the protection lands in the copy, one after it faults), applied here otherwise.
+	const bool defer = !is_written && AsyncReprotectEnabled() && AsyncUploadMode() >= 1 &&
+	                   m_scheduler.HostCopies() != nullptr && m_staging_buffer.IsCoherent() &&
+	                   GuestGpu::IsGpuThread();
+	if (defer) {
+		PageManager::SetDeferredProtectionSink(&m_deferred_protection);
+	}
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
 		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
 		    total_size += bytes;
 	    },
-	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	    [&]() noexcept {
+		    if (defer) {
+			    PageManager::SetDeferredProtectionSink(nullptr);
+		    }
+		    source = UploadCopies(buffer, copies, total_size);
+	    });
+	if (defer) {
+		PageManager::SetDeferredProtectionSink(nullptr);
+		ApplyDeferredProtection(false); // (none were queued: nothing to upload)
+	}
 	if (source && m_upload_batching && source == m_staging_buffer.Handle()) {
 		m_upload_batch_buffers.emplace_back(buffer.Handle(), static_cast<uint32_t>(copies.size()));
 		m_upload_batch_copies.insert(m_upload_batch_copies.end(), copies.begin(), copies.end());
@@ -1268,6 +1314,15 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	// Within a batch of uploads (see FlushUploadBatch()) the staging buffer must not wait for
 	// the current command buffer: that would submit it without the batched copies. A copy that
 	// does not fit then goes through a buffer of its own.
+	// Deferred protections go first, on the copy thread when every copy goes there.
+	if (!m_deferred_protection.empty()) {
+		bool all_queued = AsyncUploadMode() >= 1;
+		for (const auto& copy: copies) {
+			all_queued = all_queued &&
+			             Libs::LibKernel::Memory::FindBackingPointer(buffer.CpuAddress() + copy.dstOffset, copy.size) != nullptr;
+		}
+		ApplyDeferredProtection(all_queued);
+	}
 	const auto source = UploadMemory(m_graphics, m_scheduler, m_staging_buffer, total_size, 4,
 	    vk::BufferUsageFlagBits::eTransferSrc, [&](uint8_t* mapped, uint64_t base_offset) {
 		for (auto& copy: copies) {

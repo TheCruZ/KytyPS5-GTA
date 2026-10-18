@@ -220,7 +220,11 @@ struct PageManager::Impl {
 
 		const auto release_pending = [&] {
 			if (range_bytes != 0) {
-				Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
+				if (track && !is_read && t_deferred_protection != nullptr) {
+					t_deferred_protection->emplace_back(base_addr + range_begin * PAGE_SIZE, range_bytes);
+				} else {
+					Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
+				}
 				range_bytes           = 0;
 				potential_range_bytes = 0;
 			}
@@ -260,6 +264,33 @@ struct PageManager::Impl {
 		release_pending();
 	}
 
+	void ReapplyProtection(uint64_t vaddr, uint64_t size) {
+		ValidateRange(vaddr, size);
+		const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
+		const auto end   = Common::AlignUp(vaddr + size, PAGE_SIZE);
+		for (auto chunk_begin = begin; chunk_begin < end;) {
+			const auto chunk_end   = std::min(end, Common::AlignUp(chunk_begin + 1, REGION_SIZE));
+			const auto region_base = Common::AlignDown(chunk_begin, REGION_SIZE);
+			if (auto* region = FindRegion(chunk_begin); region != nullptr) {
+				SpinGuard  lock(region->lock);
+				const auto first = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
+				const auto last  = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
+				for (size_t page = first; page < last;) {
+					const auto perms = region->pages[page].Perms();
+					auto       run   = page + 1;
+					while (run < last && region->pages[run].Perms() == perms) {
+						run++;
+					}
+					Protect(region_base + page * PAGE_SIZE, (run - page) * PAGE_SIZE, perms);
+					page = run;
+				}
+			}
+			chunk_begin = chunk_end;
+		}
+	}
+
+	inline static thread_local std::vector<std::pair<uint64_t, uint64_t>>* t_deferred_protection = nullptr;
+
 	template <bool track, bool is_read>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 		ValidateRange(vaddr, size);
@@ -289,6 +320,14 @@ static_assert(std::atomic<void*>::is_always_lock_free);
 PageManager::PageManager(): m_impl(std::make_unique<Impl>()) {}
 
 PageManager::~PageManager() = default;
+
+void PageManager::SetDeferredProtectionSink(std::vector<std::pair<uint64_t, uint64_t>>* sink) noexcept {
+	Impl::t_deferred_protection = sink;
+}
+
+void PageManager::ReapplyProtection(uint64_t vaddr, uint64_t size) {
+	m_impl->ReapplyProtection(vaddr, size);
+}
 
 uint64_t PageManager::GetPageSize() const {
 	return PAGE_SIZE;

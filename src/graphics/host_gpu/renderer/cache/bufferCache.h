@@ -408,6 +408,11 @@ private:
 	// KYTY_ASYNC_UPLOAD: queues a copy of guest memory into `destination` (mapped staging memory) on the host copy
 	// thread; false when it must be read here.
 	[[nodiscard]] bool QueueGuestRead(uint8_t* destination, uint64_t vaddr, uint64_t size, uint32_t mode);
+	// KYTY_ASYNC_REPROTECT: the write protections a read upload's synchronization adds, not applied yet.
+	PageManager*                               m_page_manager = nullptr;
+	std::vector<std::pair<uint64_t, uint64_t>> m_deferred_protection;
+	// Applies them here, or queues them on the host copy thread (before copies of their pages).
+	void ApplyDeferredProtection(bool queue);
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;

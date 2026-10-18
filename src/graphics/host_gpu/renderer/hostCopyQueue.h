@@ -61,6 +61,13 @@ public:
 			(void)Flush();
 		}
 	}
+	// Producer: queues a call of `function` on the copy thread, in order with the copies.
+	void Call(void (*function)(void* context, uint64_t a, uint64_t b), void* context, uint64_t a, uint64_t b) {
+		m_pending.jobs[m_pending.count++] = {context, nullptr, 0, function, a, b};
+		if (m_pending.count == BatchSize) {
+			(void)Flush();
+		}
+	}
 	// Producer: queues a copy of `size` bytes from a source that may change once this returns.
 	// The bytes go through a ring of cached host memory that the copy thread copies from.
 	void CopyInline(void* destination, const void* source, size_t size) {
@@ -114,9 +121,11 @@ private:
 	}
 
 	struct Job {
-		void*       destination = nullptr;
+		void*       destination = nullptr; // a call's context
 		const void* source      = nullptr;
 		size_t      size        = 0;
+		void (*call)(void* context, uint64_t a, uint64_t b) = nullptr;
+		uint64_t a = 0, b = 0;
 	};
 	struct Batch {
 		std::array<Job, BatchSize> jobs {};
@@ -137,7 +146,11 @@ private:
 			}
 			for (size_t i = 0; i < batch->count; i++) {
 				const auto& job = batch->jobs[i];
-				std::memcpy(job.destination, job.source, job.size);
+				if (job.call != nullptr) {
+					job.call(job.destination, job.a, job.b);
+				} else {
+					std::memcpy(job.destination, job.source, job.size);
+				}
 			}
 			done += batch->count;
 			m_completed.Publish(done);
