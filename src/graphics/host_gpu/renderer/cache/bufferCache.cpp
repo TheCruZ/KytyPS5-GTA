@@ -318,6 +318,224 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(critical, 2 * GiB));
 }
 
+// KYTY_COPY_FEEDBACK=0: no snapshots of copy destinations.
+static bool CopyFeedbackEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_COPY_FEEDBACK");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// Snapshots of the destinations of copies the GPU makes (ScheduleCopyFeedback()), each in its
+// slot of a host-visible buffer, copied there right after the copy in the same command buffer.
+// Execution thread only. A slot is reused once its copy executed; a GPU write to its range drops
+// it (NoteWrite()). Ported from chenxiao07's KytyPS5 fork (KYTY_COPY_FEEDBACK).
+struct BufferCache::CopyFeedback {
+	static constexpr uint64_t SlotSize  = 64 * 1024;
+	static constexpr size_t   SlotCount = 512;
+	struct Slot {
+		uint64_t   address = 0, size = 0, tick = 0;
+		vk::Buffer owner   = nullptr;
+	};
+	Buffer                      download;
+	std::array<Slot, SlotCount> slots {};
+	// The slot of each snapshot by its guest address, sorted by address.
+	std::vector<std::pair<uint64_t, size_t>> index;
+	size_t                                   cursor = 0;
+	// Snapshots per 16 MiB granule, hashed: a range whose granules count none overlaps none.
+	std::array<uint16_t, 4096> granules {};
+
+	CopyFeedback(GraphicContext& graphics, CommandScheduler& scheduler)
+	    : download(graphics, scheduler, MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst,
+	               SlotCount * SlotSize) {}
+
+	[[nodiscard]] auto LowerBound(uint64_t address) {
+		return std::lower_bound(index.begin(), index.end(), address,
+		                        [](const auto& entry, uint64_t value) { return entry.first < value; });
+	}
+	[[nodiscard]] auto UpperBound(uint64_t address) {
+		return std::upper_bound(index.begin(), index.end(), address,
+		                        [](uint64_t value, const auto& entry) { return value < entry.first; });
+	}
+	void Count(const Slot& slot, int delta) {
+		for (uint64_t g = slot.address >> 24u; g <= (slot.address + slot.size - 1) >> 24u; ++g) {
+			granules[g & 4095u] = static_cast<uint16_t>(granules[g & 4095u] + delta);
+		}
+	}
+	[[nodiscard]] bool MayOverlap(uint64_t vaddr, uint64_t size) const {
+		const uint64_t first = vaddr >> 24u, last = (vaddr + size - 1) >> 24u;
+		if (size == 0 || last - first >= granules.size()) {
+			return true;
+		}
+		for (uint64_t g = first; g <= last; ++g) {
+			if (granules[g & 4095u] != 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+	void Erase(size_t slot) {
+		auto& entry = slots[slot];
+		if (entry.address == 0) {
+			return;
+		}
+		if (const auto it = LowerBound(entry.address); it != index.end() && it->second == slot) {
+			index.erase(it);
+		}
+		Count(entry, -1);
+		entry.address = 0;
+	}
+};
+
+void BufferCache::InvalidateCopyFeedback(uint64_t vaddr, uint64_t size) {
+	if (!m_copy_feedback || m_copy_feedback->index.empty()) {
+		return;
+	}
+	auto& feedback = *m_copy_feedback;
+	if (!feedback.MayOverlap(vaddr, size)) {
+		return;
+	}
+	auto it = feedback.LowerBound(vaddr);
+	if (it != feedback.index.begin()) {
+		const auto& prior = feedback.slots[std::prev(it)->second];
+		if (prior.address + prior.size > vaddr) {
+			--it;
+		}
+	}
+	std::vector<size_t> erased;
+	for (; it != feedback.index.end() && it->first < vaddr + size; ++it) {
+		erased.push_back(it->second);
+	}
+	for (const auto slot: erased) {
+		feedback.Erase(slot);
+	}
+}
+
+// Demon's Souls copies memory the GPU wrote (its cs_memset32 copies, as buffer copies) and then
+// reads the destination on the CPU: each such read was a readback that waited for the GPU.
+void BufferCache::ScheduleCopyFeedback(uint64_t vaddr, uint64_t size) {
+	if (!CopyFeedbackEnabled() || size == 0 || size > CopyFeedback::SlotSize || ((vaddr | size) & 3u) != 0 ||
+	    !GuestRange {vaddr, size}.Valid() || !m_gpu_modified_ranges.Contains(vaddr, size)) {
+		return;
+	}
+	const auto* owner_id = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	auto*       owner    = owner_id != nullptr && *owner_id ? m_slot_buffers.try_get(*owner_id) : nullptr;
+	if (owner == nullptr || owner->is_deleted || !owner->IsInBounds(vaddr, size)) {
+		return;
+	}
+	if (!m_copy_feedback) {
+		m_copy_feedback = std::make_unique<CopyFeedback>(m_graphics, m_scheduler);
+	}
+	auto&  feedback = *m_copy_feedback;
+	auto&  master   = m_scheduler.GetMasterSemaphore();
+	size_t selected = CopyFeedback::SlotCount;
+	for (int refresh = 0; refresh < 2 && selected == CopyFeedback::SlotCount; ++refresh) {
+		if (refresh != 0) {
+			master.Refresh();
+		}
+		const auto completed = master.KnownGpuTick();
+		// An empty slot first, then the oldest finished snapshot. Never a wait for storage.
+		for (int evict = 0; evict < 2 && selected == CopyFeedback::SlotCount; ++evict) {
+			for (size_t n = 0; n < CopyFeedback::SlotCount; ++n) {
+				const auto  i    = (feedback.cursor + n) % CopyFeedback::SlotCount;
+				const auto& slot = feedback.slots[i];
+				if (slot.tick <= completed && (evict != 0 || slot.address == 0)) {
+					selected = i;
+					break;
+				}
+			}
+		}
+	}
+	if (selected == CopyFeedback::SlotCount) {
+		return;
+	}
+	feedback.Erase(selected);
+	InvalidateCopyFeedback(vaddr, size);
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto              native = command.Handle();
+	vk::BufferMemoryBarrier before {};
+	before.srcAccessMask       = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.buffer              = owner->Handle();
+	before.offset              = owner->Offset(vaddr);
+	before.size                = size;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer, {}, 0,
+	                       nullptr, 1, &before, 0, nullptr);
+	const vk::BufferCopy copy {owner->Offset(vaddr), selected * CopyFeedback::SlotSize, size};
+	native.copyBuffer(owner->Handle(), feedback.download.Handle(), 1, &copy);
+	vk::BufferMemoryBarrier after {};
+	after.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+	after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after.buffer              = feedback.download.Handle();
+	after.offset              = selected * CopyFeedback::SlotSize;
+	after.size                = size;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
+	                       1, &after, 0, nullptr);
+	auto& slot = feedback.slots[selected];
+	slot       = {vaddr, size, m_scheduler.CurrentTick(), owner->Handle()};
+	feedback.index.insert(feedback.LowerBound(vaddr), {vaddr, selected});
+	feedback.Count(slot, 1);
+	feedback.cursor = (selected + 1) % CopyFeedback::SlotCount;
+}
+
+// Execution thread: the GPU-written bytes of the range served from finished snapshots, when they
+// hold all of them. They leave the GPU-modified set; the caller makes the range CPU-readable.
+bool BufferCache::TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	if (!m_copy_feedback || m_copy_feedback->index.empty() || !m_copy_feedback->MayOverlap(vaddr, size)) {
+		return false;
+	}
+	auto& feedback = *m_copy_feedback;
+	struct Part {
+		uint64_t address, size, offset;
+	};
+	std::vector<Part>                          parts;
+	std::vector<std::pair<uint64_t, uint64_t>> covered;
+	uint64_t                                   latest = 0;
+	bool                                       served = true;
+	m_memory_tracker.ForEachDownloadRange<false>(vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
+		m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+			for (auto cursor = start; served && cursor < end;) {
+				auto it = feedback.UpperBound(cursor);
+				if (it == feedback.index.begin()) {
+					served = false;
+					break;
+				}
+				--it;
+				const auto& slot = feedback.slots[it->second];
+				if (cursor >= slot.address + slot.size || slot.owner != buffer.Handle()) {
+					served = false;
+					break;
+				}
+				const auto part = std::min(end, slot.address + slot.size) - cursor;
+				parts.push_back({cursor, part, it->second * CopyFeedback::SlotSize + (cursor - slot.address)});
+				latest = std::max(latest, slot.tick);
+				cursor += part;
+			}
+			covered.emplace_back(start, end - start);
+		});
+	});
+	if (!served || parts.empty() || !m_scheduler.IsFree(latest)) {
+		return false;
+	}
+	// Earlier asynchronous publications of these bytes run first, as on the readback paths.
+	m_scheduler.WaitPriorityOperations(latest);
+	for (const auto& part: parts) {
+		feedback.download.Invalidate(part.offset, part.size);
+		Libs::LibKernel::Memory::WriteBacking(part.address, feedback.download.Mapped().data() + part.offset,
+		                                      part.size);
+	}
+	for (const auto& [address, bytes]: covered) {
+		m_gpu_modified_ranges.Subtract(address, bytes);
+	}
+	return true;
+}
+
 BufferCache::~BufferCache() {
 	m_scheduler.SetSubmitHook(nullptr, nullptr);
 	if (m_readback.pool) {
@@ -765,6 +983,16 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+		// Bytes a finished copy snapshot holds need no readback.
+		if (const auto page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE),
+		    end = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+		    buffer.IsInBounds(page, end - page) && TryReadCopyFeedback(buffer, page, end - page)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(page, end - page);
+			if (is_write) {
+				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+			}
+			return;
+		}
 		const auto [begin, bytes] = guest ? ReadbackWindow(buffer, vaddr, size) : std::pair {vaddr, size};
 		if (begin != vaddr || bytes != size) {
 			DrainAsyncReadbacks(begin, bytes);

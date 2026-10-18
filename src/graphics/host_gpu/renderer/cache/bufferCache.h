@@ -100,6 +100,9 @@ public:
 	void FillInternalMemory(uint64_t vaddr, uint64_t size, uint32_t value);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
+	// After a copy the GPU makes into memory the guest reads soon after: a snapshot of the
+	// destination on the host, which a guest access serves without a readback.
+	void ScheduleCopyFeedback(uint64_t vaddr, uint64_t size);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
@@ -266,6 +269,7 @@ private:
 		// Draws bind the same written ranges again and again.
 		if (m_pending_writes.empty() || m_pending_writes.back() != std::pair {vaddr, size}) {
 			m_pending_writes.emplace_back(vaddr, size);
+			InvalidateCopyFeedback(vaddr, size);
 			for (const auto& hot: m_readback_hot) {
 				if (vaddr < hot.end && hot.begin < vaddr + size) {
 					m_flush_requested = true;
@@ -334,6 +338,11 @@ private:
 	};
 	ReadbackQueue m_readback;
 	void DiscardGpuWrites(uint64_t vaddr, uint64_t size);
+	// Snapshots of copy destinations (see ScheduleCopyFeedback()).
+	struct CopyFeedback;
+	std::unique_ptr<CopyFeedback> m_copy_feedback;
+	void                          InvalidateCopyFeedback(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool            TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// The range a guest access of GPU-written memory reads back (see ReadMemory()).
 	[[nodiscard]] std::pair<uint64_t, uint64_t> ReadbackWindow(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Guest reads of GPU-written memory copied on the readback queue while the execution thread

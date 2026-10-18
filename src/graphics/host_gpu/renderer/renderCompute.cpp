@@ -367,6 +367,7 @@ bool RenderExecutor::TryDemonsSoulsCopy(const HW::Shader& shaders, uint32_t x, u
 	// A copy is no dispatch: the barrier a dispatch before it deferred is due.
 	FlushDeferredDispatchBarrier();
 	cache.CopyBuffer(copy->dst, copy->src, copy->bytes, false, false);
+	cache.ScheduleCopyFeedback(copy->dst, copy->bytes);
 	return true;
 }
 
