@@ -128,6 +128,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		EXIT_IF(!inserted);
 		m_register_epoch++;
 		m_buffer_set_epoch++;
+		StampRegionRegistrations(buffer.CpuAddress(), buffer.Size());
 		NoteBufferRegions(buffer, true);
 		m_total_used_memory += buffer.Size();
 		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
@@ -143,6 +144,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		EXIT_IF(found == m_buffers.end() || found->second != id);
 		m_buffers.erase(found);
 		m_buffer_set_epoch++;
+		StampRegionRegistrations(buffer.CpuAddress(), buffer.Size());
 		NoteBufferRegions(buffer, false);
 		EXIT_IF(buffer.Size() > m_total_used_memory);
 		m_total_used_memory -= buffer.Size();
@@ -1384,6 +1386,14 @@ uint64_t BufferCache::StreamUpload(const void* data, uint64_t size, uint64_t ali
 	copies->CopyInline(mapped, data, size);
 	m_stream_buffer.Commit();
 	return offset;
+}
+
+void BufferCache::StampRegionRegistrations(uint64_t vaddr, uint64_t size) {
+	if (size == 0) return;
+	const auto first = vaddr / TRACKER_REGION_SIZE;
+	const auto last  = std::min((vaddr + size - 1) / TRACKER_REGION_SIZE, first + RegionRegistrationSlots - 1);
+	for (auto region = first; region <= last; ++region)
+		m_region_registrations[region & (RegionRegistrationSlots - 1)] = m_buffer_set_epoch;
 }
 
 vk::DeviceAddress BufferCache::TableUpload(const void* data, uint64_t size) {

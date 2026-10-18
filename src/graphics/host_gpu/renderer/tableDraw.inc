@@ -62,6 +62,21 @@ bool TablePackEnabled() {
 	return enabled;
 }
 
+// chenxiao07's KYTY_TABLE_RING_COPIES (default 1; 0 takes ObtainBuffer's stream copy at every use): a small range
+// the guest wrote is read from a copy in the table upload ring, shared by the uses of its V# while it holds
+// (TableXpr::RingCopy).
+bool TableRingCopiesEnabled() {
+	static const bool enabled = NativeXprSwitch("KYTY_TABLE_RING_COPIES");
+	return enabled;
+}
+
+// chenxiao07's KYTY_TABLE_REGION_EPOCHS (default 1; 0: any buffer registration drops every resolved V#): a resolved V#
+// holds across registrations elsewhere (BufferCache::RegionRegistrationEpoch).
+bool TableRegionEpochsEnabled() {
+	static const bool enabled = NativeXprSwitch("KYTY_TABLE_REGION_EPOCHS");
+	return enabled;
+}
+
 // The stages' static input key a pair's programs were compiled for: both stages' code and static input, and whether
 // the pixel stage runs.
 uint64_t TableDrawKey(std::vector<uint32_t>& key, const ShaderParams& vertex_params,
@@ -320,12 +335,28 @@ struct RenderExecutor::TableXpr {
 	// guest wrote none of its range (`cpu_epoch`, the range's CPU-dirty epoch, else the range found clean again). One
 	// whose proof also needs the image starts and the mappings (formatted: an image may start at it; clamped: a
 	// mapping may extend it) holds while `special` is the table's special generation (0: no such need).
+	// One holding a copy in the table upload ring of a range the guest wrote (RingCopy) has `registration` RingCopyMark |
+	// the draw window it was made in, `special` the low half of its command buffer's tick and `cpu_epoch` the range's
+	// CPU-dirty epoch then: a later use takes it on RingCopy's terms, without resolving the V# again.
 	struct alignas(64) ResolvedBuffer {
 		std::array<uint32_t, 4> words {};
 		uint32_t                dwords = 0, special = 0;
 		vk::DeviceAddress       device = 0;
 		uint64_t                address = 0, size = 0, cpu_epoch = 0, registration = 0;
 	};
+	static constexpr uint64_t RingCopyMark = uint64_t {1} << 63u;
+	// A copy in the table upload ring of a small range the guest wrote, direct-mapped by the range: the uses share it
+	// in the same draw window (only draws executed since: as ObtainBuffer's stream copies, the guest wrote nothing they
+	// read), in the same command buffer (the ring keeps it for it), with the range's CPU-dirty epoch unchanged and no
+	// page of it GPU-written. In the fork, a frame's constants read by many draws: ~2950 copies, 11.8 MB a frame at
+	// Latria before, ~1140 and 4.6 MB shared.
+	struct RingCopy {
+		uint64_t          address = 0, size = 0, window = 0, tick = 0, cpu_epoch = 0;
+		vk::DeviceAddress device  = 0;
+	};
+	static constexpr size_t     RingCopies  = 4096;
+	std::unique_ptr<RingCopy[]> ring_copies = std::make_unique<RingCopy[]>(RingCopies);
+	std::vector<uint32_t>       ring_scratch;
 	static constexpr size_t           ResolvedEntries = 65536;
 	std::unique_ptr<ResolvedBuffer[]> resolved = std::make_unique<ResolvedBuffer[]>(ResolvedEntries);
 	uint32_t                          special_generation = 1; // moves with the image set and the mappings
@@ -1034,9 +1065,27 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 				write_buffer(block, plan, i, device, size / 4u, words4);
 				continue;
 			}
-			auto& held    = *entries[i].second;
-			bool  current = held.words == words4 && (held.special == 0 || held.special == table.special_generation) &&
-			               held.registration == buffer_cache.BufferSetEpoch();
+			auto& held = *entries[i].second;
+			if (held.words == words4 && (held.registration & TableXpr::RingCopyMark) != 0) {
+				// Its ring copy, on RingCopy's terms.
+				if (held.registration == (TableXpr::RingCopyMark | DrawWindow()) &&
+				    held.special == static_cast<uint32_t>(m_context.GetCommandScheduler().CurrentTick()) &&
+				    held.cpu_epoch != 0 && buffer_cache.CpuDirtyEpoch(held.address, held.size) == held.cpu_epoch &&
+				    !buffer_cache.IsRegionGpuModified(held.address, held.size)) {
+					write_buffer(block, plan, i, held.device, held.dwords, words4);
+					continue;
+				}
+				held = {};
+			}
+			bool current = held.words == words4 && (held.special == 0 || held.special == table.special_generation);
+			if (current && held.registration != buffer_cache.BufferSetEpoch()) {
+				// Buffers were registered or unregistered since: it holds while none covered its tracker regions.
+				current = held.size != 0 && TableRegionEpochsEnabled();
+				for (auto region = held.address / TRACKER_REGION_SIZE;
+				     current && region <= (held.address + held.size - 1) / TRACKER_REGION_SIZE; ++region)
+					current = buffer_cache.RegionRegistrationEpoch(region * TRACKER_REGION_SIZE) <= held.registration;
+				if (current) held.registration = buffer_cache.BufferSetEpoch();
+			}
 			if (current && held.size != 0) {
 				// Another page of its tracker regions was written: the range itself may still be clean.
 				if (const auto epoch = buffer_cache.CpuDirtyEpoch(held.address, held.size);
@@ -1058,7 +1107,39 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 				// image by ObtainBuffer only (SynchronizeBufferFromImage).
 				if ((address & 3u) != 0 || words4[2] == UINT32_MAX || (texel && textures.HasImageStartingAt(address)))
 					return false;
-				const auto cpu_epoch       = buffer_cache.CpuDirtyEpoch(address, size); // (before the uploads)
+				const auto cpu_epoch = buffer_cache.CpuDirtyEpoch(address, size); // (before the uploads)
+				if (TableRingCopiesEnabled() && size <= BufferCache::CACHING_PAGESIZE &&
+				    buffer_cache.IsRegionCpuModified(address, size) && !buffer_cache.IsRegionGpuModified(address, size)) {
+					// A small range the guest wrote: from a copy in the ring, the one a use made in this window if it still
+					// holds (RingCopy), held for the V#'s later uses.
+					const auto window = DrawWindow();
+					const auto tick   = m_context.GetCommandScheduler().CurrentTick();
+					auto& shared = table.ring_copies[((address ^ (size << 40u)) * 0x9e3779b97f4a7c15ull) >> 52u];
+					vk::DeviceAddress copy = 0;
+					if (cpu_epoch != 0 && shared.address == address && shared.size == size && shared.window == window &&
+					    shared.tick == tick && shared.cpu_epoch == cpu_epoch) {
+						copy = shared.device;
+					} else {
+						table.ring_scratch.resize((size + 3u) / 4u);
+						if (Libs::LibKernel::Memory::TryReadBacking(address, table.ring_scratch.data(), size)) {
+							copy = buffer_cache.TableUpload(table.ring_scratch.data(), size);
+							if (cpu_epoch != 0) shared = {address, size, window, tick, cpu_epoch, copy};
+						}
+					}
+					if (copy != 0) {
+						if (cpu_epoch != 0)
+							held = {.words        = words4,
+							        .dwords       = static_cast<uint32_t>(size / 4u),
+							        .special      = static_cast<uint32_t>(tick),
+							        .device       = copy,
+							        .address      = address,
+							        .size         = size,
+							        .cpu_epoch    = cpu_epoch,
+							        .registration = TableXpr::RingCopyMark | window};
+						write_buffer(block, plan, i, copy, size / 4u, words4);
+						continue;
+					}
+				}
 				const auto [owner, offset] = buffer_cache.ObtainBuffer(address, size, false, texel);
 				if (owner == nullptr) return false;
 				const auto device = owner->BufferDeviceAddress() + offset;

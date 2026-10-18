@@ -133,6 +133,12 @@ public:
 	void EnsureBufferContents(uint64_t vaddr, uint64_t size);
 	// Advances whenever a buffer is registered or unregistered.
 	[[nodiscard]] uint64_t BufferSetEpoch() const noexcept { return m_buffer_set_epoch; }
+	// The BufferSetEpoch of the last registration or unregistration of a buffer over the tracker region of `vaddr`
+	// (direct-mapped by region: a collision gives a later epoch, never an earlier one). A lookup in a range none of whose
+	// regions moved past an epoch finds the buffer it found then (table draws' resolved V#s).
+	[[nodiscard]] uint64_t RegionRegistrationEpoch(uint64_t vaddr) const noexcept {
+		return m_region_registrations[(vaddr / TRACKER_REGION_SIZE) & (RegionRegistrationSlots - 1)];
+	}
 	void               PrepareFaultBuffer() { m_fault_manager.PrepareFaultBuffer(); }
 	void               ProcessFaultBuffer();
 	// Counts the buffers that shaders reached through device addresses since the last call as
@@ -420,6 +426,9 @@ private:
 	uint64_t                                          m_register_epoch     = 0;
 	// Advances whenever a buffer is registered or unregistered.
 	uint64_t m_buffer_set_epoch = 0;
+	static constexpr size_t                                   RegionRegistrationSlots = 65536;
+	std::unique_ptr<uint64_t[]> m_region_registrations = std::make_unique<uint64_t[]>(RegionRegistrationSlots);
+	void                        StampRegionRegistrations(uint64_t vaddr, uint64_t size);
 	// The buffer a read-only binding of a range found, while no buffer was registered or
 	// unregistered and no page of the range became CPU dirty since (see ObtainBuffer()).
 	struct ObtainMemo {
