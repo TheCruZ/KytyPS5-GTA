@@ -197,7 +197,8 @@ public:
 		return true;
 	}
 
-	// Returns nothing once Stop() was called and the ring is empty.
+	// Returns nothing once Stop() was called and the ring is empty, or when Interrupt() was
+	// called while it was empty.
 	[[nodiscard]] std::optional<T> Pop() {
 		const auto head = m_head.load(std::memory_order_relaxed);
 		if (m_consumer_tail == head) {
@@ -227,6 +228,16 @@ public:
 		m_consumer_signal.fetch_add(1, std::memory_order_seq_cst);
 		m_consumer_signal.notify_all();
 	}
+
+	// Any thread: a consumer waiting in Pop() on the empty ring (or the next one to) returns
+	// nothing, once, so it can do other work.
+	void Interrupt() {
+		m_interrupted.store(true, std::memory_order_seq_cst);
+		m_consumer_signal.fetch_add(1, std::memory_order_seq_cst);
+		m_consumer_signal.notify_all();
+	}
+
+	[[nodiscard]] bool Stopped() const noexcept { return m_stopped.load(std::memory_order_acquire); }
 
 	[[nodiscard]] size_t Capacity() const noexcept { return m_capacity; }
 
@@ -302,8 +313,9 @@ private:
 			if (m_consumer_tail != head) {
 				return true;
 			}
-			if (m_stopped.load(std::memory_order_relaxed)) {
-				break;
+			if (m_stopped.load(std::memory_order_relaxed) ||
+			    m_interrupted.exchange(false, std::memory_order_acquire)) {
+				return false;
 			}
 		}
 		bool available = false;
@@ -315,7 +327,8 @@ private:
 				available = true;
 				break;
 			}
-			if (m_stopped.load(std::memory_order_seq_cst)) {
+			if (m_stopped.load(std::memory_order_seq_cst) ||
+			    m_interrupted.exchange(false, std::memory_order_seq_cst)) {
 				break;
 			}
 			m_consumer_signal.wait(signal, std::memory_order_seq_cst);
@@ -335,6 +348,7 @@ private:
 	std::atomic_bool     m_consumer_sleeping {false};
 	std::atomic_uint32_t m_consumer_signal {0};
 	std::atomic_bool     m_stopped {false};
+	std::atomic_bool     m_interrupted {false};
 
 	// Producer side.
 	alignas(64) std::atomic_uint64_t m_tail {0};

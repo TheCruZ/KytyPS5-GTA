@@ -220,9 +220,10 @@ void GuestGpu::SendUrgentCommandSync(Common::UniqueFunction<void>&& command) {
 		});
 		m_urgent_pending.fetch_add(1, std::memory_order_release);
 	}
-	// A busy execution thread runs the command before its next operation; an idle one waits for
-	// operations, so queue one that runs it too.
-	SendCommand([this] { RunUrgentCommands(); });
+	// A busy execution thread runs the command before its next operation; an idle one is woken
+	// from its wait for operations. (Not through the command processor: it may be waiting for the
+	// execution thread itself, which waits for the operation the faulting resolve thread holds.)
+	(m_resolving ? m_resolved : m_operations).Interrupt();
 	done.acquire();
 }
 
@@ -391,7 +392,10 @@ void GuestGpu::ExecutionThread() {
 			unnotified = 0;
 			operation  = operations.Pop();
 			if (!operation) {
-				break;
+				if (operations.Stopped()) {
+					break;
+				}
+				continue; // interrupted for urgent commands
 			}
 		}
 		operation->processor->Execute(*operation);
