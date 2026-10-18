@@ -187,8 +187,25 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
+// Downloads in progress on this thread: a query they make reentrantly can see ranges not yet subtracted from the
+// GPU-modified set whose pages are no longer GPU-owned (see SynchronizeBuffer()).
+static thread_local uint32_t t_download_depth = 0;
+
+// KYTY_BUFFER_RESIDENCY=0: a written range the GPU already owns whole is synchronized as any other.
+static bool BufferResidencyEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BUFFER_RESIDENCY");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	struct DepthScope {
+		DepthScope() { ++t_download_depth; }
+		~DepthScope() { --t_download_depth; }
+	} depth;
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -1153,6 +1170,14 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
+	// A written range the GPU-modified set covers whole has nothing to upload and its pages are GPU-owned already
+	// (chenxiao07's KYTY_BUFFER_RESIDENCY): ranges join the set only after their pages are marked GPU-owned, and a
+	// readback subtracts them before the pages stop being so (CPU writes and unmaps take that path). This skips the
+	// tracker's walk under its region locks; a hole or a partial cover takes it.
+	if (is_written && t_download_depth == 0 && BufferResidencyEnabled() &&
+	    m_gpu_modified_ranges.Contains(vaddr, size)) {
+		return false;
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
