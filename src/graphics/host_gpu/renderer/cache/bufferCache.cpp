@@ -15,10 +15,13 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -170,6 +173,10 @@ void BufferCache::TouchBuffer(const Buffer& buffer) {
 void BufferCache::DeleteBuffer(BufferId id) {
 	if (IsBufferInvalid(id)) {
 		return;
+	}
+	// A copy in flight on the readback queue may still read it.
+	if (std::ranges::any_of(m_async_readbacks, [](const auto& slot) { return slot.request != nullptr; })) {
+		DrainAsyncReadbacks(0, 0, m_slot_buffers[id].Handle());
 	}
 	Unregister(id);
 	if (m_scheduler.Active()) {
@@ -392,29 +399,316 @@ void BufferCache::InvalidateFaultedPage(uint64_t vaddr) {
 	InvalidateMemory(vaddr, 1);
 }
 
+// A guest read of GPU-written memory in flight on the readback queue (see ReadMemory()). Its
+// ranges stay GPU-modified until it is finished: any other access of them waits for it first
+// (DrainAsyncReadbacks()).
+struct BufferCache::AsyncReadback {
+	uint64_t                    vaddr = 0, size = 0;
+	uint64_t                    needed = 0; // the submission whose writes the copy waits for
+	uint64_t                    buffer_address = 0;
+	vk::Buffer                  source;     // the cache buffer copied from
+	std::vector<vk::BufferCopy> copies;     // dstOffset: into the slot's staging buffer
+	size_t                      slot = 0;
+	vk::Device                  device;
+	vk::Fence                   fence;
+	Buffer*                     staging = nullptr;
+	std::atomic_bool            finished {false};
+};
+
+static bool AsyncReadbacksEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GUEST_READBACK_ASYNC");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+// Writes fault inside host code too (file reads into GPU memory, streaming), which may hold locks
+// the execution thread needs between the two urgent commands.
+static bool AsyncWriteReadbacksEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GUEST_WRITE_READBACK_ASYNC");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+std::shared_ptr<BufferCache::AsyncReadback> BufferCache::BeginAsyncReadback(uint64_t vaddr, uint64_t size) {
+	if (!m_graphics.readback_queue || m_device_address_pending || !IsRegionRegistered(vaddr, size)) {
+		return nullptr;
+	}
+	for (auto& slot: m_async_readbacks) {
+		const auto request = slot.request;
+		if (!request || request->finished.load(std::memory_order_acquire)) {
+			continue;
+		}
+		// Another guest thread already waits for these bytes.
+		if (vaddr >= request->vaddr && vaddr + size <= request->vaddr + request->size) {
+			return request;
+		}
+	}
+	// A copy of some of them goes first.
+	DrainAsyncReadbacks(vaddr, size);
+	auto&      buffer         = m_slot_buffers[FindBuffer(vaddr, size)];
+	const auto buffer_address = buffer.CpuAddress();
+	// What DownloadBufferMemory() would copy.
+	std::vector<vk::BufferCopy> copies;
+	uint64_t                    total_size = 0;
+	m_memory_tracker.ForEachDownloadRange<false>(vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
+		m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+			copies.emplace_back(start - buffer_address, total_size, end - start);
+			total_size += Common::AlignUp(end - start, 64);
+		});
+	});
+	if (copies.empty()) {
+		return nullptr;
+	}
+	uint64_t needed = m_device_address_tick;
+	for (const auto& copy: copies) {
+		const auto begin = buffer_address + copy.srcOffset;
+		const auto end   = begin + copy.size;
+		for (const auto& [address, bytes]: m_pending_writes) {
+			if (address < end && begin < address + bytes) {
+				return nullptr;
+			}
+		}
+		needed = std::max(needed, m_write_ticks.Latest(begin, end));
+	}
+	if (needed >= m_scheduler.CurrentTick()) {
+		return nullptr; // the writes are still being recorded
+	}
+	size_t free_slot = AsyncReadbackSlots;
+	for (size_t i = 0; i < AsyncReadbackSlots; i++) {
+		if (!m_async_readbacks[i].request) {
+			free_slot = i;
+			break;
+		}
+	}
+	if (free_slot == AsyncReadbackSlots) {
+		return nullptr;
+	}
+	auto& device = m_graphics.device;
+	if (!m_async_readback_pool) {
+		vk::CommandPoolCreateInfo pool_info {};
+		pool_info.flags            = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+		pool_info.queueFamilyIndex = m_graphics.readback_family;
+		if (device.createCommandPool(&pool_info, nullptr, &m_async_readback_pool) != vk::Result::eSuccess) {
+			EXIT("BufferCache: could not create the asynchronous readback pool\n");
+		}
+	}
+	auto& slot = m_async_readbacks[free_slot];
+	if (!slot.command) {
+		vk::CommandBufferAllocateInfo allocate {};
+		allocate.commandPool        = m_async_readback_pool;
+		allocate.level              = vk::CommandBufferLevel::ePrimary;
+		allocate.commandBufferCount = 1;
+		const vk::FenceCreateInfo fence_info {};
+		if (device.allocateCommandBuffers(&allocate, &slot.command) != vk::Result::eSuccess ||
+		    device.createFence(&fence_info, nullptr, &slot.fence) != vk::Result::eSuccess) {
+			EXIT("BufferCache: could not create the asynchronous readback resources\n");
+		}
+	}
+	if (!slot.staging || slot.staging->Size() < total_size) {
+		slot.staging = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                        vk::BufferUsageFlagBits::eTransferDst,
+		                                        std::max<uint64_t>(Common::AlignUp(total_size, 64 * 1024), 256 * 1024));
+	}
+	// The copy waits for the needed submission on the GPU, but must not be submitted before it
+	// (see DownloadOnReadbackQueue()).
+	while (m_scheduler.SubmittedTick() < needed) {
+		Common::SpinPause();
+	}
+	const auto command = slot.command;
+	(void)command.reset({});
+	vk::CommandBufferBeginInfo begin_info {};
+	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	(void)command.begin(&begin_info);
+	command.copyBuffer(buffer.Handle(), slot.staging->Handle(), static_cast<uint32_t>(copies.size()), copies.data());
+	vk::BufferMemoryBarrier after {};
+	after.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+	after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after.buffer              = slot.staging->Handle();
+	after.offset              = 0;
+	after.size                = total_size;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1,
+	                        &after, 0, nullptr);
+	(void)command.end();
+	const auto                      semaphore  = m_scheduler.GetMasterSemaphore().Handle();
+	const vk::PipelineStageFlags    wait_stage = vk::PipelineStageFlagBits::eTransfer;
+	vk::TimelineSemaphoreSubmitInfo timeline {};
+	timeline.waitSemaphoreValueCount = 1;
+	timeline.pWaitSemaphoreValues    = &needed;
+	vk::SubmitInfo submit {};
+	submit.pNext              = &timeline;
+	submit.waitSemaphoreCount = 1;
+	submit.pWaitSemaphores    = &semaphore;
+	submit.pWaitDstStageMask  = &wait_stage;
+	submit.commandBufferCount = 1;
+	submit.pCommandBuffers    = &command;
+	if (m_graphics.readback_queue.submit(1, &submit, slot.fence) != vk::Result::eSuccess) {
+		EXIT("BufferCache: readback queue submission failed\n");
+	}
+	auto request            = std::make_shared<AsyncReadback>();
+	request->vaddr          = vaddr;
+	request->size           = size;
+	request->needed         = needed;
+	request->buffer_address = buffer_address;
+	request->source         = buffer.Handle();
+	request->copies         = std::move(copies);
+	request->slot           = free_slot;
+	request->device         = device;
+	request->fence          = slot.fence;
+	request->staging        = slot.staging.get();
+	slot.request            = request;
+	return request;
+}
+
+// Any thread: waits for the copy on the GPU. False when the request was finished meanwhile.
+bool BufferCache::WaitAsyncReadback(AsyncReadback& request) {
+	// (The fence is reset only when the request is finished.)
+	for (;;) {
+		if (request.finished.load(std::memory_order_acquire)) {
+			return false;
+		}
+		const auto status = request.device.getFenceStatus(request.fence);
+		if (status == vk::Result::eSuccess) {
+			return true;
+		}
+		if (status != vk::Result::eNotReady) {
+			EXIT("BufferCache: readback queue wait failed: %s\n", vk::to_string(status).c_str());
+		}
+		Common::SpinPause();
+	}
+}
+
+// Execution thread: the copy's bytes go to guest memory (after the asynchronous publications
+// queued before it, as on the synchronous path) and the request is finished.
+void BufferCache::CompleteAsyncReadback(AsyncReadback& request) {
+	if (!WaitAsyncReadback(request)) {
+		return;
+	}
+	m_scheduler.WaitPriorityOperations(request.needed);
+	request.staging->Invalidate(0, request.staging->Size());
+	const auto* mapped = request.staging->Mapped().data();
+	for (const auto& copy: request.copies) {
+		Libs::LibKernel::Memory::WriteBacking(request.buffer_address + copy.srcOffset, mapped + copy.dstOffset,
+		                                      copy.size);
+	}
+	FinishAsyncReadback(request);
+}
+
+// Execution thread, once the bytes were written back: the copied ranges leave the GPU-modified
+// set and the range becomes CPU-readable. When recorded work may have written it since the copy's
+// submission (a store to the range, or any store through device addresses, which names no range),
+// the range is read back here as the synchronous path reads it: the guest waits for this, so it
+// always goes on with current bytes.
+void BufferCache::FinishAsyncReadback(AsyncReadback& request) {
+	if (request.finished.load(std::memory_order_acquire)) {
+		return;
+	}
+	bool rewritten = m_write_ticks.Latest(request.vaddr, request.vaddr + request.size) > request.needed ||
+	                 m_device_address_tick > request.needed || m_device_address_pending;
+	// A write of the operation being recorded supersedes the copy (chenxiao07's KYTY_READBACK_DETACH):
+	// the request is dropped, the range stays GPU-modified and the guest faults again once the write
+	// is recorded, for its bytes, instead of a synchronous readback of bytes about to change.
+	bool superseded = false;
+	for (const auto& [address, bytes]: m_pending_writes) {
+		superseded = superseded || (address < request.vaddr + request.size && request.vaddr < address + bytes);
+	}
+	(void)request.device.resetFences(1, &request.fence);
+	request.finished.store(true, std::memory_order_release);
+	m_async_readbacks[request.slot].request.reset();
+	if (superseded || !IsRegionRegistered(request.vaddr, request.size)) {
+		return;
+	}
+	if (!rewritten) {
+		for (const auto& copy: request.copies) {
+			m_gpu_modified_ranges.Subtract(request.buffer_address + copy.srcOffset, copy.size);
+		}
+		m_memory_tracker.UnmarkRegionAsGpuModified(request.vaddr, request.size);
+		return;
+	}
+	++m_async_readback_rewritten;
+	auto& buffer = m_slot_buffers[FindBuffer(request.vaddr, request.size)];
+	if (DownloadBufferMemory<false>(buffer, request.vaddr, request.size)) {
+		m_memory_tracker.UnmarkRegionAsGpuModified(request.vaddr, request.size);
+	}
+}
+
+
+// Execution thread: the copies in flight of bytes of the range (or of the buffer `source`) are
+// written back and finished, as an access of them that does not wait for them needs.
+void BufferCache::DrainAsyncReadbacks(uint64_t vaddr, uint64_t size, vk::Buffer source) {
+	for (auto& slot: m_async_readbacks) {
+		const auto request = slot.request;
+		if (!request || request->finished.load(std::memory_order_acquire)) {
+			continue;
+		}
+		const bool overlaps = source ? request->source == source
+		                             : vaddr < request->vaddr + request->size && request->vaddr < vaddr + size;
+		if (!overlaps) {
+			continue;
+		}
+		CompleteAsyncReadback(*request);
+	}
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	// The guest reads (or writes) memory the GPU wrote only after a label the execution thread
-	// writes once the work before it executed: the operations queued since cannot be what the
-	// access needs, so the readback runs before them instead of after the whole backlog (a
-	// frame of draws, 100-200 ms while an area streams in).
-	m_scheduler.Context().GetGpu().SendUrgentCommandSync([this, vaddr, size, is_write] {
+	auto& gpu = m_scheduler.Context().GetGpu();
+	// The synchronous path, once the copies in flight are written back: the GPU's bytes, then a
+	// write makes the range CPU-modified.
+	const auto synchronous = [this, vaddr, size, is_write] {
+		DrainAsyncReadbacks(vaddr, size);
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
-
 		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		}
-	});
+	};
+	// KYTY_GUEST_READBACK_ASYNC=1, and KYTY_GUEST_WRITE_READBACK_ASYNC=1 for writes too.
+	if ((!is_write || AsyncWriteReadbacksEnabled()) && !GuestGpu::IsGpuThread() && AsyncReadbacksEnabled()) {
+		std::shared_ptr<AsyncReadback> request;
+		gpu.SendUrgentCommandSync([&] {
+			request = BeginAsyncReadback(vaddr, size);
+			if (!request) {
+				synchronous();
+			}
+		});
+		// The copy completes on the GPU while the execution thread goes on; its bytes are
+		// written back by an urgent command, as the synchronous path writes them. A write then
+		// makes the range CPU-modified (synchronous() finds nothing left to read back).
+		if (request) {
+			const bool copied = WaitAsyncReadback(*request);
+			if (copied || is_write) {
+				gpu.SendUrgentCommandSync([&] {
+					if (copied) {
+						CompleteAsyncReadback(*request);
+					}
+					if (is_write) {
+						synchronous();
+					}
+				});
+			}
+		}
+		return;
+	}
+	// The guest reads (or writes) memory the GPU wrote only after a label the execution thread
+	// writes once the work before it executed: the operations queued since cannot be what the
+	// access needs, so the readback runs before them instead of after the whole backlog (a
+	// frame of draws, 100-200 ms while an area streams in).
+	m_scheduler.Context().GetGpu().SendUrgentCommandSync(synchronous);
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
@@ -1403,6 +1697,8 @@ void BufferCache::RunGarbageCollector() {
 		if (m_record_released) {
 			m_released_ranges.Add(buffer.CpuAddress(), buffer.Size());
 		}
+		// A copy in flight on the readback queue may still read it (DeleteBuffer() does the same).
+		DrainAsyncReadbacks(0, 0, buffer.Handle());
 		Unregister(id);
 		m_slot_buffers.erase(id);
 	}

@@ -11,7 +11,9 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <array>
 #include <map>
+#include <memory>
 #include <span>
 #include <unordered_map>
 #include <utility>
@@ -328,6 +330,25 @@ private:
 		std::unique_ptr<Buffer> staging;
 	};
 	ReadbackQueue m_readback;
+	// Guest reads of GPU-written memory copied on the readback queue while the execution thread
+	// goes on (see ReadMemory()): the guest thread waits for its copy and writes the bytes back.
+	struct AsyncReadback;
+	[[nodiscard]] std::shared_ptr<AsyncReadback> BeginAsyncReadback(uint64_t vaddr, uint64_t size);
+	void                                         FinishAsyncReadback(AsyncReadback& request);
+	static bool WaitAsyncReadback(AsyncReadback& request);
+	void        CompleteAsyncReadback(AsyncReadback& request);
+	void        DrainAsyncReadbacks(uint64_t vaddr, uint64_t size, vk::Buffer source = nullptr);
+	struct AsyncReadbackSlot {
+		vk::CommandBuffer              command = nullptr;
+		vk::Fence                      fence   = nullptr;
+		std::unique_ptr<Buffer>        staging;
+		std::shared_ptr<AsyncReadback> request; // the copy in flight, until its guest thread finished it
+	};
+	// 32, as chenxiao07's KYTY_READBACK_SLOTS: a burst of guest reads did not wait for a free one.
+	static constexpr size_t                         AsyncReadbackSlots = 32;
+	std::array<AsyncReadbackSlot, AsyncReadbackSlots> m_async_readbacks;
+	vk::CommandPool                                 m_async_readback_pool = nullptr;
+	uint64_t                                        m_async_readback_rewritten = 0;
 	// The mirror: each line holds a copy of its bytes in a cached buffer, recorded at the end of
 	// the command buffer `tick` (0: none since the line's last write) into `slot` of a
 	// host-visible buffer. An operation that writes a line clears its tick and queues it for a
