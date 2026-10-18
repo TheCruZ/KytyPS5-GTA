@@ -42,8 +42,24 @@ public:
 	~TileManager();
 	KYTY_CLASS_NO_COPY(TileManager);
 
+	// A piece of a tiled image's mip level that DetileParts detiles: `slice_count` array layers from `first_slice`, to
+	// `linear_offset` of the result.
+	struct Part {
+		uint32_t level        = 0;
+		uint32_t first_slice  = 0;
+		uint32_t slice_count  = 1;
+		uint64_t linear_offset = 0;
+	};
+
 	// Consume scratch results before the next acquisition, or pass their buffer as input.
 	[[nodiscard]] Result Detile(vk::Buffer tiled, uint64_t tiled_offset, const ImageInfo& info);
+	// The parts of a tiled image alone (at most MaxMipLevels). The tiled buffer holds the image's bytes from
+	// `source_origin` on, `tiled_capacity` of them; a part lies in them. `linear_capacity`: the result's size, each
+	// part's linear bytes (their level's linear slices) at its linear_offset.
+	[[nodiscard]] Result DetileParts(vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
+	                                 uint64_t source_origin, uint64_t linear_capacity, const ImageInfo& info,
+	                                 std::span<const Part> parts);
+	static constexpr uint32_t MaxMipLevels = 16;
 	void Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity, vk::Buffer tiled,
 	          uint64_t tiled_offset, uint64_t tiled_capacity, const ImageInfo& info,
 	          uint32_t levels = 0);
@@ -62,7 +78,6 @@ private:
 	static constexpr uint32_t BytesPerElementCount = 5;
 	static constexpr uint32_t DirectionCount       = 2;
 	static constexpr uint32_t PipelineCount = FamilyCount * BytesPerElementCount * DirectionCount;
-	static constexpr uint32_t MaxMipLevels         = 16;
 
 	struct alignas(16) Mip {
 		uint32_t src_base;
@@ -112,7 +127,8 @@ private:
 	                                             uint32_t max_groups) noexcept;
 	[[nodiscard]] Tiling Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_capacity,
 	                             const ImageInfo& info, uint32_t levels, uint64_t source_base,
-	                             uint64_t target_base);
+	                             uint64_t target_base, std::span<const Part> parts = {},
+	                             uint64_t tiled_origin = 0);
 	void                 Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
 	                            vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
 	                            const Tiling& tiling, bool clear_target);

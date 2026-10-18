@@ -97,10 +97,13 @@ TileManager::~TileManager() {
 TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
                                          uint64_t linear_capacity, const ImageInfo& info,
                                          uint32_t levels, uint64_t source_base,
-                                         uint64_t target_base) {
+                                         uint64_t target_base, std::span<const Part> parts,
+                                         uint64_t tiled_origin) {
 	levels = levels != 0 ? levels : info.resources.levels;
-	EXIT_IF(levels == 0 || levels > MaxMipLevels || levels > info.resources.levels ||
-	        tiled_capacity == 0 || linear_capacity == 0);
+	// The parts of a partial transfer take the place of the levels.
+	const auto count = parts.empty() ? levels : static_cast<uint32_t>(parts.size());
+	EXIT_IF(count == 0 || count > MaxMipLevels || (parts.empty() && levels > info.resources.levels) ||
+	        tiled_capacity == 0 || linear_capacity == 0 || (!parts.empty() && info.IsVolume()));
 	EXIT_NOT_IMPLEMENTED(tiled_capacity > UINT32_MAX || linear_capacity > UINT32_MAX);
 
 	const auto& block     = info.tiling.block;
@@ -126,19 +129,27 @@ TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
 	// ImageInfo owns the layout. Upload only the header and active mip records.
 	TilingParams params;
 	params.color_transform = static_cast<uint32_t>(transform);
-	for (uint32_t level = 0; level < levels; ++level) {
+	for (uint32_t index = 0; index < count; ++index) {
+		const auto* part   = parts.empty() ? nullptr : &parts[index];
+		const auto  level  = part != nullptr ? part->level : index;
+		EXIT_IF(level >= info.resources.levels);
 		const auto& mip    = info.mip_layout[level];
 		const auto  extent = info.MipExtent(level);
 		const auto  width  = static_cast<uint32_t>(
 		    (uint64_t {extent.width} + info.tiling.texel_width - 1u) / info.tiling.texel_width);
 		const auto height = static_cast<uint32_t>(
 		    (uint64_t {extent.height} + info.tiling.texel_height - 1u) / info.tiling.texel_height);
-		const auto depth = extent.depth;
+		// The slices the entry covers: all of the level's, or a part's.
+		const auto full_depth  = extent.depth;
+		const auto first_slice = part != nullptr ? part->first_slice : 0u;
+		const auto depth       = part != nullptr ? part->slice_count : full_depth;
+		const auto linear_offset = part != nullptr ? part->linear_offset : mip.linear_offset;
 		const bool tail  = level >= info.first_tail_level;
 		EXIT_NOT_IMPLEMENTED(width == 0 || height == 0 || depth == 0 || mip.linear_pitch < width ||
 		                     mip.linear_size == 0 || mip.size == 0 ||
 		                     (!tail && (mip.pitch < width || mip.height < height)) ||
-		                     (!info.IsVolume() && mip.size % depth != 0));
+		                     (!info.IsVolume() && mip.size % full_depth != 0) ||
+		                     first_slice > full_depth || depth > full_depth - first_slice);
 
 		uint64_t pitch_bytes = 0;
 		EXIT_NOT_IMPLEMENTED(
@@ -158,7 +169,7 @@ TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
 		                     linear_used > mip.linear_size || slice_bytes > UINT32_MAX ||
 		                     !checked_multiply(depth - 1u, slice_bytes, linear_span) ||
 		                     !checked_add(linear_span, mip.linear_size, linear_span) ||
-		                     !valid_range(mip.linear_offset, linear_span, linear_capacity));
+		                     !valid_range(linear_offset, linear_span, linear_capacity));
 
 		const uint64_t columns =
 		    (uint64_t {mip.pitch} + block.block_width - 1u) / block.block_width;
@@ -168,27 +179,34 @@ TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
 			    width > block.block_width - mip.tail_x || mip.tail_y >= block.block_height ||
 			    height > block.block_height - mip.tail_y);
 		}
-		const uint64_t tiled_plane = info.IsVolume() ? mip.size : mip.size / depth;
+		const uint64_t tiled_plane = info.IsVolume() ? mip.size : mip.size / full_depth;
 		const uint64_t tiled_slice = info.tiled_slice_stride;
 		const uint64_t slices     = (uint64_t {depth} + block.block_depth - 1u) / block.block_depth;
 		uint64_t       tiled_span = 0;
+		// The part's first slice, in the tiled bytes the buffer holds (from tiled_origin on).
+		uint64_t tiled_offset = 0;
 		EXIT_NOT_IMPLEMENTED(columns > UINT32_MAX || tiled_slice > UINT32_MAX ||
 		                     (slices > 1 && tiled_slice < tiled_plane) ||
 		                     !checked_multiply(slices - 1u, tiled_slice, tiled_span) ||
 		                     !checked_add(tiled_span, tiled_plane, tiled_span) ||
-		                     !valid_range(mip.offset, tiled_span, tiled_capacity));
+		                     !checked_multiply(first_slice, tiled_slice, tiled_offset) ||
+		                     !checked_add(tiled_offset, mip.offset, tiled_offset) ||
+		                     tiled_offset < tiled_origin ||
+		                     !valid_range(tiled_offset - tiled_origin, tiled_span, tiled_capacity));
+		tiled_offset -= tiled_origin;
 
 		const uint32_t alignment = std::min(block.bytes_per_element, 4u);
 		EXIT_NOT_IMPLEMENTED(
-		    ((mip.linear_offset | mip.offset | pitch_bytes | slice_bytes | tiled_slice) &
+		    ((linear_offset | tiled_offset | pitch_bytes | slice_bytes | tiled_slice) &
 		     (alignment - 1u)) != 0);
 		uint64_t src = 0, dst = 0, texels = 0;
 		EXIT_NOT_IMPLEMENTED(
-		    !checked_add(source_base, tile ? mip.linear_offset : mip.offset, src) ||
-		    !checked_add(target_base, tile ? mip.offset : mip.linear_offset, dst) ||
+		    !checked_add(source_base, tile ? linear_offset : tiled_offset, src) ||
+		    !checked_add(target_base, tile ? tiled_offset : linear_offset, dst) ||
 		    src > UINT32_MAX || dst > UINT32_MAX || !checked_multiply(width, height, texels) ||
 		    !checked_multiply(texels, depth, texels) || texels > UINT32_MAX - params.num_texels);
-		params.mips[level] = {static_cast<uint32_t>(src),
+		// (A slice's swizzle may depend on its index, which a part starting at a later one adds back.)
+		params.mips[index] = {static_cast<uint32_t>(src),
 		                      static_cast<uint32_t>(dst),
 		                      width,
 		                      height,
@@ -196,7 +214,7 @@ TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
 		                      static_cast<uint32_t>(slice_bytes),
 		                      static_cast<uint32_t>(tiled_slice),
 		                      static_cast<uint32_t>(columns),
-		                      mip.surface_z,
+		                      mip.surface_z + first_slice,
 		                      tail ? mip.tail_x : 0u,
 		                      tail ? mip.tail_y : 0u,
 		                      static_cast<uint32_t>(texels)};
@@ -205,7 +223,7 @@ TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
 
 	const auto& limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const auto  params_size =
-	    static_cast<uint16_t>(offsetof(TilingParams, mips) + levels * sizeof(Mip));
+	    static_cast<uint16_t>(offsetof(TilingParams, mips) + count * sizeof(Mip));
 	const auto offset = m_stream_buffer.Copy(
 	    &params, params_size,
 	    std::max<uint64_t>(limits.minUniformBufferOffsetAlignment, alignof(TilingParams)));
@@ -357,6 +375,22 @@ TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
 	const auto tiling  = Prepare(false, info.data.size, linear_capacity, info, 0, source_base, 0);
 	auto scratch = GetScratchBuffer(linear_capacity, tiled);
 	Record(tiled, tiled_offset, info.data.size, scratch.buffer, 0, scratch.size, tiling, true);
+	return {scratch.buffer, 0, linear_capacity};
+}
+
+TileManager::Result TileManager::DetileParts(vk::Buffer tiled, uint64_t tiled_offset,
+                                             uint64_t tiled_capacity, uint64_t source_origin,
+                                             uint64_t linear_capacity, const ImageInfo& info,
+                                             std::span<const Part> parts) {
+	EXIT_IF(parts.empty() || !info.IsTiled());
+	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
+	const uint64_t descriptor_alignment =
+	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
+	const uint64_t source_base = tiled_offset & (descriptor_alignment - 1);
+	const auto     tiling      = Prepare(false, tiled_capacity, linear_capacity, info, 0, source_base, 0,
+	                                     parts, source_origin);
+	auto           scratch     = GetScratchBuffer(linear_capacity, tiled);
+	Record(tiled, tiled_offset, tiled_capacity, scratch.buffer, 0, scratch.size, tiling, true);
 	return {scratch.buffer, 0, linear_capacity};
 }
 

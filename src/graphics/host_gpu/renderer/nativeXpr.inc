@@ -1244,7 +1244,7 @@ bool RenderExecutor::NativeXprValidateResources(NativeXprRecord& record, uint64_
 		if (buffers_clean && !images_clean) {
 			images_clean = std::ranges::none_of(record.images, [&](const auto& dep) {
 				const auto* image = textures.m_slot_images.try_get(dep.id);
-				return image == nullptr || image->serial != dep.serial || TextureCache::RefreshPending(*image);
+				return image == nullptr || image->serial != dep.serial || TextureCache::RefreshPending(*image, dep.desc);
 			});
 			if (images_clean) record.image_dirty_epoch = image_epoch;
 		}
@@ -1274,11 +1274,11 @@ bool RenderExecutor::NativeXprValidateResources(NativeXprRecord& record, uint64_
 		auto* image = textures.m_slot_images.try_get(dep.id);
 		if (image == nullptr || image->serial != dep.serial) return false;
 		// The guest rewrote it (a texture streaming in): upload it as FindTexture does.
-		if (TextureCache::RefreshPending(*image)) {
+		if (TextureCache::RefreshPending(*image, dep.desc)) {
 			if (!image->registered || image->depth_id || image->binding.needs_rebind) return false;
 			(void)textures.FindTexture(dep.id, dep.desc);
 			image = textures.m_slot_images.try_get(dep.id);
-			if (image == nullptr || image->serial != dep.serial || TextureCache::RefreshPending(*image)) return false;
+			if (image == nullptr || image->serial != dep.serial || TextureCache::RefreshPending(*image, dep.desc)) return false;
 		}
 		// An image still in the registration the proof saw keeps the backing and resources it checked (chenxiao07's
 		// KYTY_NATIVE_IMAGE_PROOF): only images registered since are checked again, under the cache's lock.

@@ -188,6 +188,19 @@ private:
 	void                      UntrackImage(ImageId id);
 	void                      UntrackImageHead(ImageId id);
 	void                      UntrackImageTail(ImageId id);
+	// Partial CPU writes of large images (chenxiao07's KYTY_PARTIAL_IMAGE_DIRTY). Caller holds m_lock.
+	[[nodiscard]] static bool PartialDirtyCandidate(const Image& image);
+	// `granule`: the released span grows to these boundaries (counted from the image start).
+	[[nodiscard]] bool        TryInvalidatePartial(Image& image, uint64_t address, uint64_t size, uint64_t granule);
+	// Stops watching the pages of [begin, end) (a hole in the image's tracking until RetrackHoles).
+	void                      UntrackImagePages(Image& image, uint64_t begin, uint64_t end);
+	void                      RetrackHoles(Image& image);
+	// A refresh that uploaded what was dirty: the released pages are watched again, then the image is clean.
+	void                      FinishRefresh(Image& image);
+	// The dirty subresources alone; false (before any GPU work): the refresh uploads all of the image.
+	[[nodiscard]] bool        UploadImagePartial(Image& image);
+	void                      UpdatePartialHashes(Image& image, bool all);
+	[[nodiscard]] bool        CheckPartialHashes(const Image& image);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
 	void                      TrackImageDownload(ImageId id, Image& image);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
