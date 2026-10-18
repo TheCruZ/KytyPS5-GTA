@@ -20,6 +20,8 @@ struct Program;
 namespace DemonsSoulsIdle {
 void Install(Program* program);
 void Clear();
+// Whether the game is Demon's Souls (PPSA01340, PPSA01341, PPSA01342).
+bool IsGame();
 
 // The job workers' idle loop as every build seen has it (01.005.000 and 01.007.000): the call of the poll for
 // work, the test of its result and the loop back, the call's displacement left out (IdleCallAt: the call's

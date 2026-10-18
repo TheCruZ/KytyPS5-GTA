@@ -18,6 +18,7 @@
 #include "kernel/pthread.h"
 #include "loader/demonsSoulsCopy.h"
 #include "loader/demonsSoulsIdle.h"
+#include "loader/demonsSoulsTouchGuard.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/guestInstructionPatcher.h"
@@ -1279,6 +1280,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	}
 	DemonsSoulsIdle::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsCopy::Install(libc);
+	DemonsSoulsTouchGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);
 	}

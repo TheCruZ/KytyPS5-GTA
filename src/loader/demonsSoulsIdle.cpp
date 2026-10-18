@@ -87,6 +87,10 @@ uint64_t FindSpinCall(const Program& program) {
 }
 } // namespace
 
+bool IsGame() {
+	return IsDemonsSouls();
+}
+
 void Install(Program* program) {
 #if defined(__x86_64__) || defined(_M_X64)
 	// KYTY_DS_IDLE=0: the job workers wait as the game does; =2: only the spin's backoff, the idle
