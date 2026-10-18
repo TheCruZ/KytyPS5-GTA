@@ -4,6 +4,7 @@
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/LinearSrt.h"
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
@@ -1656,6 +1657,31 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
+// KYTY_SRT_LINEAR_VERIFY=1: the native evaluation against the interpreter's (printed when they differ).
+template <typename Walker>
+static void VerifyLinearSrt(const ResourcePlan& program, Walker& walker, const std::vector<uint32_t>& flat,
+                            const std::vector<DescriptorValue>& descriptors, const std::vector<uint8_t>& valid) {
+	static std::atomic<uint64_t> checks {0}, mismatches {0};
+	const auto active = program.active_sources;
+	std::vector<uint32_t> expected;
+	const bool ok   = walker.RefreshFlatBuffer(expected);
+	bool       same = ok && expected == flat && active == program.active_sources;
+	for (uint32_t source = 0; source < valid.size() && same; ++source) {
+		DescriptorValue value;
+		same = !valid[source] || (walker.EvaluateDescriptor(source, value) && value == descriptors[source]);
+	}
+	const auto count = checks.fetch_add(1, std::memory_order_relaxed) + 1u;
+	if (!same && mismatches.fetch_add(1, std::memory_order_relaxed) < 32u) {
+		std::printf("SRT linear verify MISMATCH: hash=0x%016llx ok=%d flat=%zu/%zu\n",
+		            static_cast<unsigned long long>(program.shader_hash), ok ? 1 : 0, flat.size(), expected.size());
+	}
+	if (count % 20000u == 0u) {
+		std::printf("SRT linear verify: %llu checks, %llu mismatches\n", static_cast<unsigned long long>(count),
+		            static_cast<unsigned long long>(mismatches.load(std::memory_order_relaxed)));
+		std::fflush(stdout);
+	}
+}
+
 template <typename Walker>
 static bool MaterializeWith(const ResourcePlan& program, const SrtRuntime& runtime,
                             ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
@@ -1679,7 +1705,32 @@ static bool MaterializeWith(const ResourcePlan& program, const SrtRuntime& runti
 	Walker clean(program, CleanRuntime(observed));
 	Walker walker(program, observed,
 	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
-	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
+	// The flat SRT and the direct descriptors natively (LinearSrt.h), when the plan has a linear form; otherwise
+	// the interpreter. Reads captured for specialization keep the interpreter.
+	thread_local std::vector<DescriptorValue> linear_descriptors;
+	thread_local std::vector<uint8_t>         linear_valid;
+	bool                                      linear = false;
+	if constexpr (std::is_same_v<Walker, CompiledSrtWalker>) {
+		if (!capture_reads && observed.read_slot == nullptr && LinearSrtEnabled()) {
+			if (const auto* plan = LinearSrtOf(program, program.requires_specialization_memory)) {
+				struct Walkers {
+					Walker* walker;
+					Walker* clean;
+				} walkers {&walker, &clean};
+				const auto result = EvaluateLinearSrt(
+				    program, *plan, observed, snapshot.flattened_srt, linear_descriptors, linear_valid,
+				    [](void* context, bool clean_read, uint32_t node, uint64_t value) {
+					    auto& seeded = *static_cast<Walkers*>(context);
+					    (clean_read ? seeded.clean : seeded.walker)->Seed(node, value);
+				    },
+				    &walkers);
+				if (result == LinearSrtResult::Failed) return SpecializationFail("native SRT evaluation failed");
+				linear = result == LinearSrtResult::Evaluated;
+				if (linear && LinearSrtVerifyEnabled()) VerifyLinearSrt(program, walker, snapshot.flattened_srt, linear_descriptors, linear_valid);
+			}
+		}
+	}
+	if (!linear && !walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
 		return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
 		    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
 	}
@@ -1719,6 +1770,10 @@ static bool MaterializeWith(const ResourcePlan& program, const SrtRuntime& runti
 			return false;
 		}
 		if (active.empty() || active[source]) {
+			if (linear && source < linear_valid.size() && linear_valid[source] && !(capture_reads && written)) {
+				value = linear_descriptors[source];
+				return true;
+			}
 			return (capture_reads && written ? clean : walker).EvaluateDescriptor(source, value) ||
 			    SpecializationFail(fmt::format("descriptor evaluation source={}", source));
 		}

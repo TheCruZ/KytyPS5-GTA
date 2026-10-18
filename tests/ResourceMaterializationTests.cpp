@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/LinearSrt.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include <algorithm>
@@ -1856,6 +1857,7 @@ void TestCompiledWalkerMatchesReference() {
       const bool reference = MaterializeResourcesReference(
           plan, runtime, reference_snapshot, reference_specialization);
       memory.log = &compiled_reads;
+      SetLinearSrtEnabledForTesting(false);
       const bool compiled = MaterializeResources(plan, runtime, compiled_snapshot,
                                                  compiled_specialization);
       Check(reference == compiled, "compiled walker changed the refresh result");
@@ -1865,6 +1867,27 @@ void TestCompiledWalkerMatchesReference() {
             "compiled walker changed the resource snapshot");
       Check(reference_specialization == compiled_specialization,
             "compiled walker changed the resource specialization");
+      // The native form (LinearSrt.h): the same outcome and resources; on success the same reads, in another order.
+      std::vector<FuzzRead> native_reads;
+      ResourceSnapshot native_snapshot;
+      ResourceSpecialization native_specialization;
+      memory.log = &native_reads;
+      SetLinearSrtEnabledForTesting(true);
+      const bool native = MaterializeResources(plan, runtime, native_snapshot, native_specialization);
+      Check(reference == native, "native SRT changed the refresh result");
+      if (reference) {
+        const auto key = [](const FuzzRead &read) {
+          return std::tuple {read.address, read.bytes, read.strict};
+        };
+        const auto order = [&](const FuzzRead &a, const FuzzRead &b) { return key(a) < key(b); };
+        std::ranges::sort(reference_reads, order);
+        std::ranges::sort(native_reads, order);
+        Check(reference_reads == native_reads, "native SRT changed the guest reads");
+        Check(SameSnapshot(reference_snapshot, native_snapshot),
+              "native SRT changed the resource snapshot");
+        Check(reference_specialization == native_specialization,
+              "native SRT changed the resource specialization");
+      }
       (reference ? successes : failures)++;
     }
   }

@@ -797,6 +797,7 @@ struct UniformFillPlan {
 };
 
 struct CompiledSrtPlan;
+struct LinearSrtPlan;
 
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
@@ -849,6 +850,12 @@ struct ResourcePlan {
 	// every refresh reads.
 	mutable bool                                   compiled_srt_built = false;
 	mutable std::shared_ptr<const CompiledSrtPlan> compiled_srt;
+	// Its native form (LinearSrt.h), built on first use per read policy (without, with a clean evaluator).
+	struct LinearSrtSlot {
+		bool                                 built = false;
+		std::shared_ptr<const LinearSrtPlan> plan;
+	};
+	mutable std::array<LinearSrtSlot, 2> linear_srt;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;

@@ -2226,6 +2226,11 @@ void CompiledSrtWalker::ResetUnknowns() const {
 	}
 }
 
+void CompiledSrtWalker::Seed(uint32_t node, uint64_t value) {
+	if (node >= m_context.values.size()) return;
+	m_context.values[node] = {.value = value, .generation = m_context.generation};
+}
+
 bool CompiledSrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	if (source >= m_plan.descriptors.size()) {
 		return false;

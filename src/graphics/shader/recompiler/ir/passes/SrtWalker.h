@@ -246,6 +246,8 @@ public:
 	// An empty span means that all sources are active.
 	// Refreshes reachable scalar reads and active descriptor sources in one walk.
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
+	// Records a node's value in this refresh's memo (evaluated natively: LinearSrt.h).
+	void Seed(uint32_t node, uint64_t value);
 
 private:
 	// A nested walker that evaluates under an EXEC mask (NoNode: none).
