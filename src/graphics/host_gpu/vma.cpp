@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 #include <mutex>
 #include <vector>
 
@@ -39,15 +40,25 @@ struct RecycledImage {
 	uint64_t            size       = 0;
 };
 
-constexpr size_t   RecycledImagesMax     = 32;
-constexpr uint64_t RecycledImageBytesMax = 256ull * 1024 * 1024;
+// The pool holds up to 1 GiB, or a 16th of the video memory budget when that is less (chenxiao07's KYTY_IMAGE_POOL,
+// 39ec04762: the game aliases transient targets in one heap, so the same images are deleted and created every frame);
+// the count bounds the lookup. KYTY_IMAGE_POOL=0: deleted images are destroyed.
+constexpr size_t RecycledImagesMax = 1024;
+
+bool ImagePoolEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_IMAGE_POOL");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
 
 std::mutex                 g_recycled_mutex;
 std::vector<RecycledImage> g_recycled;
 uint64_t                   g_recycled_bytes = 0;
 
 bool Recyclable(const vk::ImageCreateInfo& create) {
-	return create.pNext == nullptr && create.tiling == vk::ImageTiling::eOptimal &&
+	return ImagePoolEnabled() && create.pNext == nullptr && create.tiling == vk::ImageTiling::eOptimal &&
 	       create.sharingMode == vk::SharingMode::eExclusive &&
 	       create.initialLayout == vk::ImageLayout::eUndefined;
 }
@@ -247,12 +258,16 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	create.sharingMode   = vk::SharingMode::eExclusive;
 	create.initialLayout = vk::ImageLayout::eUndefined;
 	if (image.recyclable) {
-		VmaAllocationInfo allocation_info {};
+		static const uint64_t bytes_max = [&] {
+			const auto budget = GetTotalMemoryBudget();
+			return budget == 0 ? 256ull << 20u : std::min<uint64_t>(1024ull << 20u, budget / 16u);
+		}();
+		VmaAllocationInfo     allocation_info {};
 		vmaGetAllocationInfo(allocator, image.allocation, &allocation_info);
 		std::lock_guard lock(g_recycled_mutex);
 		g_recycled.push_back({create, image.image, image.allocation, allocation_info.size});
 		g_recycled_bytes += allocation_info.size;
-		while (g_recycled.size() > RecycledImagesMax || g_recycled_bytes > RecycledImageBytesMax) {
+		while (g_recycled.size() > RecycledImagesMax || g_recycled_bytes > bytes_max) {
 			const auto& oldest = g_recycled.front();
 			vmaDestroyImage(allocator, oldest.image, oldest.allocation);
 			g_recycled_bytes -= oldest.size;
