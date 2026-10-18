@@ -41,6 +41,8 @@ uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                    uint32_t search_iterations, uint32_t default_resource) {
 	const auto LoadMapping = [&](uint32_t index) {
+		// (A table program's mapping is in its block, at the root's indirect_mapping_offset: IR::TablePlan::IndirectImage.)
+		if (state.program.table_mode) return EmitTableBlockLoad(state, index);
 		const auto pointer = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
 		                          pointer, state.flattened_srt_variable, ConstantU32(state, 0),
@@ -811,6 +813,18 @@ void EmitAccessStore(EmitterState& state, uint32_t pointer, uint32_t value, cons
 // IR::Bindings::TableBlockDword), the slots the shader reads (IR::TablePlan::gpu) and each buffer's device address
 // and size in dwords (IR::TablePlan::BufferDword: the renderer resolved the V#). Ported from chenxiao07's KytyPS5
 // fork.
+uint32_t EmitTableBlockLoad(EmitterState& state, uint32_t index) {
+	const auto u64     = TypeU64(state);
+	const auto offset  = Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, index),
+	                            ConstantU32(state, 2u));
+	const auto address = Binary(state, spv::OpIAdd, u64, state.table_block, offset);
+	const auto pointer = Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), address);
+	const auto value   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer, spv::MemoryAccessAlignedMask,
+	                          static_cast<uint32_t>(sizeof(uint32_t)));
+	return value;
+}
+
 void EmitTableMode(EmitterState& state) {
 	const auto& program = state.program;
 	if (!program.table_mode) return;

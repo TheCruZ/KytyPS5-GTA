@@ -97,6 +97,21 @@ void SetSpecializationGuardEnabledForTesting(bool enabled);
 bool SpecializeDirectResources(const ResourcePlan& program, ResourceSnapshot& snapshot,
                                ResourceSpecialization& specialization);
 
+// Table mode's indirect images (TablePlan::IndirectImage, chenxiao07's KYTY_TABLE_INDIRECT): the candidates of the
+// plan's image `image_index` (its root first, then the candidates materialization appends) and its key mapping, as
+// resource materialization enumerates them over the guest memory `runtime` reads, laid out at `mapping_offset` of the
+// flattened SRT with `search_iterations` search steps. False where materialization would not give that layout (the
+// table program's) or fails.
+bool EnumerateIndirectImage(const ResourcePlan& program, uint32_t image_index, uint32_t mapping_offset,
+                            uint32_t search_iterations, const SrtRuntime& runtime,
+                            std::vector<DescriptorValue>& candidates, std::vector<uint32_t>& mapping);
+
+// SpecializeDirectResources for a table program with indirect images: `specialization` comes in as the program's
+// (its candidates and mappings) and leaves as the snapshot's images give it (the snapshot's images hold the root and
+// its candidates, its flattened SRT the mappings where the program's specialization places them).
+bool SpecializeTableResources(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                              ResourceSpecialization& specialization);
+
 // The same refresh through SrtWalker alone, without the compiled plan; tests compare the two.
 bool MaterializeResourcesReference(const ResourcePlan& program, const SrtRuntime& runtime,
                                    ResourceSnapshot& snapshot,

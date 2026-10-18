@@ -748,6 +748,21 @@ struct TablePlan {
 	// Flat or global memory reads: the renderer readies their page table ranges at every use, as the normal path's
 	// PrepareBda does.
 	bool global_memory = false;
+	// An indirect image whose candidates and key mapping the normal path's materialization makes (an
+	// IndirectDescriptor with a key search: a compute shader's light loop picking one T# of a table by a record's key):
+	// the renderer enumerates them at every use as materialization does (EnumerateIndirectImage), binds them at the
+	// root's `elements` (its indirect_resources, root first) and writes the key mapping ([count, (key, ordinal)...],
+	// `dwords` of it) into the block at `block`, which the shader's search reads there (the root's
+	// indirect_mapping_offset in table mode). `flat_mapping` and `search_iterations` are the mapping's place and size in
+	// the normal path's flattened SRT, which the enumeration must give again (the program's layout).
+	struct IndirectImage {
+		uint32_t              root = 0;
+		uint32_t              flat_mapping = 0, search_iterations = 0;
+		uint32_t              block = 0, dwords = 0;
+		std::vector<uint32_t> elements;
+		bool                  operator==(const IndirectImage&) const = default;
+	};
+	std::vector<IndirectImage> indirect;
 
 	// A buffer's dwords in the block: its device address (2), size in dwords, buffer word and stride, all from the V#
 	// the renderer resolved.
@@ -755,7 +770,11 @@ struct TablePlan {
 	[[nodiscard]] uint32_t BufferDword(size_t buffer) const {
 		return static_cast<uint32_t>(slots.size() + BufferDwords * buffer);
 	}
-	[[nodiscard]] uint32_t BlockDwords() const { return BufferDword(buffers.size()); }
+	[[nodiscard]] uint32_t BlockDwords() const {
+		uint32_t dwords = BufferDword(buffers.size());
+		for (const auto& image: indirect) dwords += image.dwords;
+		return dwords;
+	}
 	bool                   operator==(const TablePlan&) const = default;
 };
 

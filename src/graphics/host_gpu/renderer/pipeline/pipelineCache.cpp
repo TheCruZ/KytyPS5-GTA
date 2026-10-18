@@ -2232,6 +2232,29 @@ bool PipelineCache::SpecializeDirectResources(const ShaderRecompiler::IR::Resour
 	return ShaderRecompiler::IR::SpecializeDirectResources(plan, snapshot, specialization);
 }
 
+bool PipelineCache::SpecializeTableResources(const ShaderRecompiler::IR::ResourcePlan&     plan,
+                                             ShaderRecompiler::IR::ResourceSnapshot&       snapshot,
+                                             ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+	const ProgramLockGuard lock(m_program_lock);
+	return ShaderRecompiler::IR::SpecializeTableResources(plan, snapshot, specialization);
+}
+
+bool PipelineCache::EnumerateTableIndirect(const ShaderRecompiler::IR::ResourcePlan&               plan,
+                                           const ShaderRecompiler::IR::TablePlan::IndirectImage& image,
+                                           std::span<const uint32_t> user_data, uint64_t shader_base,
+                                           std::vector<ShaderRecompiler::IR::DescriptorValue>& candidates,
+                                           std::vector<uint32_t>&                              mapping) {
+	const ShaderRecompiler::IR::SrtRuntime runtime {
+	    .user_data                  = user_data,
+	    .shader_base                = shader_base,
+	    .read_memory                = ReadGuestMemory,
+	    .read_specialization_memory = ReadShaderGuestMemory,
+	};
+	const ProgramLockGuard lock(m_program_lock); // (the plan's selector keys are the materializations' scratch)
+	return ShaderRecompiler::IR::EnumerateIndirectImage(plan, image.root, image.flat_mapping, image.search_iterations,
+	                                                    runtime, candidates, mapping);
+}
+
 std::shared_ptr<PipelineCache::TableTicket> PipelineCache::CompileTableComputeAsync(
     const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh, bool async_compute,
     const ShaderRecompiler::IR::ResourceSpecialization& specialization) {

@@ -250,6 +250,16 @@ public:
 	bool SpecializeDirectResources(const ShaderRecompiler::IR::ResourcePlan& plan,
 	                               ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
 	                               ShaderRecompiler::IR::ResourceSpecialization& specialization);
+	// The same for a table program with indirect images (IR::SpecializeTableResources), and the candidates and key
+	// mapping of one of them as resource materialization enumerates them now (IR::EnumerateIndirectImage).
+	bool SpecializeTableResources(const ShaderRecompiler::IR::ResourcePlan&     plan,
+	                              ShaderRecompiler::IR::ResourceSnapshot&       snapshot,
+	                              ShaderRecompiler::IR::ResourceSpecialization& specialization);
+	bool EnumerateTableIndirect(const ShaderRecompiler::IR::ResourcePlan&               plan,
+	                            const ShaderRecompiler::IR::TablePlan::IndirectImage& image,
+	                            std::span<const uint32_t> user_data, uint64_t shader_base,
+	                            std::vector<ShaderRecompiler::IR::DescriptorValue>& candidates,
+	                            std::vector<uint32_t>&                              mapping);
 	// The stages' parameters and input info GetGraphicsPrograms() looks programs up with (no lookup). False for
 	// tessellation, mesh shading or object IDs (table draws do not take them).
 	bool PrepareGraphicsStages(const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,

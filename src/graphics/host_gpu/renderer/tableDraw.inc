@@ -85,6 +85,13 @@ bool TableTargetReadsEnabled() {
 	return enabled;
 }
 
+// chenxiao07's KYTY_TABLE_INDIRECT (default 1; 0: table programs take no indirect image, and pairs with them the
+// normal path): see IR::TablePlan::IndirectImage.
+bool TableIndirectEnabled() {
+	static const bool enabled = NativeXprSwitch("KYTY_TABLE_INDIRECT");
+	return enabled;
+}
+
 // The stages' static input key a pair's programs were compiled for: both stages' code and static input, and whether
 // the pixel stage runs.
 uint64_t TableDrawKey(std::vector<uint32_t>& key, const ShaderParams& vertex_params,
@@ -323,6 +330,9 @@ struct RenderExecutor::TableXpr {
 	// The draw's T#/S# words (the set's key) and its runs' addresses.
 	std::vector<uint32_t> words;
 	std::vector<uint32_t> static_key; // (scratch)
+	// An indirect image's candidates and key mapping (TableEvaluateDraw's scratch).
+	std::vector<ShaderRecompiler::IR::DescriptorValue> indirect_candidates;
+	std::vector<uint32_t>                              indirect_mapping;
 	// The last table draw: its pair, its variant's index, its draw state and set, and TextureCache::ImagesEpoch after
 	// it.
 	TablePair*                last_pair    = nullptr;
@@ -561,6 +571,24 @@ bool RenderExecutor::TableEvaluateDraw(TablePair& pair, std::array<std::span<con
 	const auto stages = pair.programs[1] != nullptr ? 2u : 1u;
 	auto&      words  = table.words;
 	words.clear();
+	// A stage's indirect images (IR::TablePlan::IndirectImage): their candidates as materialization enumerates them, in
+	// the set's key (root first), their key mapping into the block.
+	const auto indirect = [&](uint32_t st, std::vector<uint32_t>& slots) {
+		for (const auto& entry: pair.programs[st]->table_plan.indirect) {
+			auto& candidates = table.indirect_candidates;
+			auto& mapping    = table.indirect_mapping;
+			if (!TableIndirectEnabled() || pair.plans[st] == nullptr ||
+			    !m_context.GetPipelineCache().EnumerateTableIndirect(*pair.plans[st], entry, user_data[st],
+			                                                        st == 0 ? pair.vs : pair.ps, candidates, mapping) ||
+			    candidates.size() != entry.elements.size() || mapping.size() != entry.dwords ||
+			    entry.block + entry.dwords > slots.size())
+				return false;
+			std::copy(mapping.begin(), mapping.end(), slots.begin() + entry.block);
+			for (const auto& candidate: candidates)
+				for (uint32_t w = 0; w < 8; ++w) words.push_back(candidate.dwords[w] & ~NativeXprLodStatsMask[w]);
+		}
+		return true;
+	};
 	for (uint32_t st = 0; st < stages; ++st) {
 		const auto& program = *pair.programs[st];
 		const auto& plan    = program.table_plan;
@@ -596,6 +624,7 @@ bool RenderExecutor::TableEvaluateDraw(TablePair& pair, std::array<std::span<con
 				at += count;
 			}
 			for (; at < form.image_words.size(); ++at) words.push_back(get(form.image_words[at]));
+			if (!indirect(st, slots)) return false;
 			continue;
 		}
 		const auto value = [&](const ShaderRecompiler::IR::TablePlan::Operand& operand) {
@@ -624,6 +653,7 @@ bool RenderExecutor::TableEvaluateDraw(TablePair& pair, std::array<std::span<con
 			for (uint32_t w = 0; w < descriptor.count; ++w) words.push_back(value(descriptor.words[w]) & ~NativeXprLodStatsMask[w]);
 		for (const auto& descriptor: plan.samplers)
 			for (uint32_t w = 0; w < descriptor.count; ++w) words.push_back(value(descriptor.words[w]));
+		if (!indirect(st, slots)) return false;
 	}
 	return true;
 }
@@ -719,6 +749,18 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		snapshot.samplers.resize(plan.samplers.size());
 		for (size_t i = 0; i < plan.samplers.size(); ++i) take(plan.samplers[i].count, snapshot.samplers[i]);
 		snapshot.flattened_srt.clear();
+		// An indirect image's root and candidates (their words follow the samplers'), and its key mapping where the
+		// program's specialization has it in the flattened SRT (IR::SpecializeTableResources checks it).
+		for (const auto& entry: plan.indirect) {
+			for (const auto element: entry.elements)
+				if (element < snapshot.images.size()) take(8u, snapshot.images[element]);
+			if (snapshot.flattened_srt.size() < entry.flat_mapping + entry.dwords)
+				snapshot.flattened_srt.resize(entry.flat_mapping + entry.dwords, 0u);
+			std::copy_n(table.blocks[st].begin() + entry.block, entry.dwords,
+			            snapshot.flattened_srt.begin() + entry.flat_mapping);
+		}
+		for (auto& image: snapshot.images)
+			if (image.dword_count == 0) image.dword_count = 8u; // (an indirect image's element no candidate filled)
 		// (PrepareBindings copies the user data registers into shader data the set does not use.)
 		uint32_t user_words = 0;
 		for (const auto reg: pair.programs[st]->info.user_data_registers)
@@ -730,7 +772,10 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		snapshot.uniform_fill = {};
 		// (Its images' and samplers' specialization must be the program's: its buffers' are checked at every use.)
 		auto& specialization = table.specialization;
-		if (!m_context.GetPipelineCache().SpecializeDirectResources(*pair.plans[st], snapshot, specialization))
+		if (!plan.indirect.empty()) specialization = pair.tables[st]->specialization;
+		if (!(plan.indirect.empty()
+		          ? m_context.GetPipelineCache().SpecializeDirectResources(*pair.plans[st], snapshot, specialization)
+		          : m_context.GetPipelineCache().SpecializeTableResources(*pair.plans[st], snapshot, specialization)))
 			return refuse("resources that do not specialize");
 		if (specialization.images != pair.tables[st]->specialization.images ||
 		    specialization.samplers != pair.tables[st]->specialization.samplers)

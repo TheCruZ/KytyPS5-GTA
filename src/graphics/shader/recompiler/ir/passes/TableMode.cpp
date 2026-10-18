@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/TableMode.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <optional>
 #include <vector>
 
@@ -52,6 +53,15 @@ std::optional<TablePlan::Operand> TableOperand(Value value, size_t slots) {
 	const auto slot = inst->Arg(1).Resolve();
 	if (!slot.IsImmediate() || slot.GetType() != Type::U32 || slot.U32() >= slots) return std::nullopt;
 	return TablePlan::Operand {Kind::Slot, slot.U32()};
+}
+
+// chenxiao07's KYTY_TABLE_INDIRECT (default 1; 0 refuses indirect images as before): see TablePlan::IndirectImage.
+bool TableIndirectEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TABLE_INDIRECT");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
 }
 
 } // namespace
@@ -122,10 +132,36 @@ bool EnterTableMode(Program& program, std::string& reason) {
 		if (!words_of(buffer.source, 4, plan.buffers.emplace_back()))
 			return refuse("a buffer descriptor table mode cannot evaluate");
 	}
-	for (const auto& image: program.info.images) {
-		if (image.mip_mode != ImageMipMode::None || image.indirect_root != ImageResource::NoIndirectImage ||
-		    image.indirect_search_iterations != 0 || image.table_capacity != 0)
-			return refuse("an indirect image or one of dynamic mip levels");
+	for (uint32_t index = 0; index < program.info.images.size(); ++index) {
+		const auto& image = program.info.images[index];
+		// An indirect image of a compute shader whose candidates the normal path's materialization enumerated for a key
+		// search (TablePlan::IndirectImage): its root and candidates have no words (the renderer enumerates them).
+		if (image.indirect_root != ImageResource::NoIndirectImage) {
+			const auto& root = program.info.images[image.indirect_root];
+			const auto* source =
+			    root.source < program.descriptor_sources.size() ? &program.descriptor_sources[root.source] : nullptr;
+			if (!TableIndirectEnabled() || program.stage != ShaderType::Compute || source == nullptr ||
+			    !source->indirect_descriptor || source->indirect_descriptor->table_array ||
+			    source->indirect_descriptor->workgroup_axis != UINT32_MAX ||
+			    root.indirect_search_iterations == 0 || root.indirect_search_iterations > 16 ||
+			    root.indirect_mapping_offset < program.srt_reads.size() || root.indirect_resources.size() < 2 ||
+			    root.indirect_resources.front() != image.indirect_root || image.mip_mode != ImageMipMode::None ||
+			    image.table_capacity != 0 || image.atomic || image.written ||
+			    image.resource_class == ImageResourceClass::Storage)
+				return refuse("an indirect image");
+			if (image.indirect_root == index) {
+				const uint32_t capacity = 1u << (root.indirect_search_iterations - 1u);
+				plan.indirect.push_back({.root              = index,
+				                         .flat_mapping      = root.indirect_mapping_offset,
+				                         .search_iterations = root.indirect_search_iterations,
+				                         .dwords            = 1u + 2u * capacity,
+				                         .elements          = root.indirect_resources});
+			}
+			plan.images.emplace_back(); // (no words)
+			continue;
+		}
+		if (image.mip_mode != ImageMipMode::None) return refuse("an image of dynamic mip levels");
+		if (image.indirect_search_iterations != 0 || image.table_capacity != 0) return refuse("an image table");
 		if (image.atomic || ((image.written || image.resource_class == ImageResourceClass::Storage) &&
 		                     program.stage != ShaderType::Pixel && program.stage != ShaderType::Compute))
 			return refuse("an image the shader writes");
@@ -185,6 +221,13 @@ bool EnterTableMode(Program& program, std::string& reason) {
 		const auto& read = plan.slots[slot];
 		for (const auto* operand: {&read.low, &read.high, &read.offset, &read.records}) mark(plan.cpu, *operand);
 	}
+	// Each indirect image's key mapping after the buffers in the block, where the shader's search reads it.
+	auto block = plan.BufferDword(plan.buffers.size());
+	for (auto& entry: plan.indirect) {
+		entry.block = block;
+		block += entry.dwords;
+	}
+	for (const auto& entry: plan.indirect) program.info.images[entry.root].indirect_mapping_offset = entry.block;
 	program.table_plan = std::move(plan);
 	program.table_mode = true;
 	return true;

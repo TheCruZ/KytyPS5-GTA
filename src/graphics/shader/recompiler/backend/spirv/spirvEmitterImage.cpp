@@ -747,7 +747,8 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 		ctx.Fail(inst, "has invalid indirect image key provenance");
 	}
 	const auto key = ctx.Def(handle->Arg(0));
-	if (state.flattened_srt_variable == 0 ||
+	// (A table program's mapping is in its block: IR::TablePlan::IndirectImage.)
+	if ((state.flattened_srt_variable == 0 && !state.program.table_mode) ||
 	    image.indirect_resources.size() < 2u) {
 		ctx.Fail(inst, "has no indirect image runtime mapping");
 	}

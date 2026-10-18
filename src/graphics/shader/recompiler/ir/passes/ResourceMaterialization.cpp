@@ -2020,10 +2020,13 @@ static bool MaterializeWith(const ResourcePlan& program, const SrtRuntime& runti
 	return BuildResourceSpecialization(program, snapshot, specialization);
 }
 
-bool SpecializeDirectResources(const ResourcePlan& program, ResourceSnapshot& snapshot,
-                               ResourceSpecialization& specialization) {
-	if (snapshot.buffers.size() != program.info.buffers.size() || snapshot.images.size() != program.info.images.size() ||
-	    snapshot.samplers.size() != program.info.samplers.size()) {
+// `table`: a table program's images (SpecializeTableResources): its indirect images' roots, candidates and mappings.
+static bool SpecializeDirect(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                             ResourceSpecialization& specialization,
+                             const std::vector<ResourceSpecialization::Image>* table) {
+	const auto image_count = table != nullptr ? table->size() : program.info.images.size();
+	if (snapshot.buffers.size() != program.info.buffers.size() || snapshot.images.size() != image_count ||
+	    image_count < program.info.images.size() || snapshot.samplers.size() != program.info.samplers.size()) {
 		return false;
 	}
 	specialization.buffers.assign(program.info.buffers.size(), {});
@@ -2056,12 +2059,17 @@ bool SpecializeDirectResources(const ResourcePlan& program, ResourceSnapshot& sn
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
 		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
 	}
-	specialization.images.resize(program.info.images.size());
-	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
-		const auto& image = program.info.images[i];
+	specialization.images.resize(image_count);
+	for (uint32_t i = 0; i < image_count; ++i) {
+		// (A table program's candidate of an indirect image is specialized as its root, from its own descriptor.)
+		const auto  root       = table != nullptr ? (*table)[i].indirect_root : ImageResource::NoIndirectImage;
+		const auto  base_index = i < program.info.images.size() ? i : root;
+		if (base_index >= program.info.images.size()) return false;
+		const auto& image  = program.info.images[base_index];
 		const auto* source = Source(program, image.source);
-		if (source == nullptr || source->indirect_descriptor.has_value() ||
-		    image.indirect_root != ImageResource::NoIndirectImage || image.table_capacity != 0) {
+		if (source == nullptr || image.table_capacity != 0 ||
+		    source->indirect_descriptor.has_value() != (root != ImageResource::NoIndirectImage) ||
+		    (table == nullptr && image.indirect_root != ImageResource::NoIndirectImage)) {
 			return false;
 		}
 		specialization.images[i] = {
@@ -2072,6 +2080,11 @@ bool SpecializeDirectResources(const ResourcePlan& program, ResourceSnapshot& sn
 		    .shader_swizzle    = image.shader_swizzle,
 		    .cube              = image.cube,
 		};
+		if (table != nullptr) {
+			specialization.images[i].indirect_root              = root;
+			specialization.images[i].indirect_mapping_offset    = (*table)[i].indirect_mapping_offset;
+			specialization.images[i].indirect_search_iterations = (*table)[i].indirect_search_iterations;
+		}
 		if (!ValidImageDescriptor(snapshot.images[i], image.r128)) snapshot.images[i].dwords.fill(0);
 	}
 	specialization.samplers.assign(program.info.samplers.size(), {});
@@ -2088,6 +2101,62 @@ bool SpecializeDirectResources(const ResourcePlan& program, ResourceSnapshot& sn
 		}
 	}
 	return BuildResourceSpecialization(program, snapshot, specialization);
+}
+
+bool SpecializeDirectResources(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                               ResourceSpecialization& specialization) {
+	return SpecializeDirect(program, snapshot, specialization, nullptr);
+}
+
+bool SpecializeTableResources(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                              ResourceSpecialization& specialization) {
+	const auto images = specialization.images; // (the program's: its candidates' roots and mappings)
+	return SpecializeDirect(program, snapshot, specialization, &images);
+}
+
+bool EnumerateIndirectImage(const ResourcePlan& program, uint32_t image_index, uint32_t mapping_offset,
+                            uint32_t search_iterations, const SrtRuntime& runtime,
+                            std::vector<DescriptorValue>& candidates, std::vector<uint32_t>& mapping) {
+	if (image_index >= program.info.images.size()) return false;
+	const auto& image  = program.info.images[image_index];
+	const auto* source = Source(program, image.source);
+	if (source == nullptr || !source->indirect_descriptor || source->indirect_descriptor->table_array) return false;
+	for (auto& keys: program.selector_keys) keys.resolved = false;
+	SrtWalker        clean(program, CleanRuntime(runtime));
+	ResourceSnapshot snapshot;
+	snapshot.flattened_srt.assign(mapping_offset, 0u);
+	std::vector<DescriptorValue>                 descriptors(program.info.images.size(), DescriptorValue {.dword_count = 8u});
+	std::vector<ResourceSpecialization::Image> specializations(program.info.images.size());
+	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
+		const auto& base   = program.info.images[i];
+		specializations[i] = {.numeric_class     = base.numeric_class,
+		                      .dimension         = base.dimension,
+		                      .mip_count         = base.mip_count,
+		                      .conversion_format = base.conversion_format,
+		                      .shader_swizzle    = base.shader_swizzle,
+		                      .indirect_root     = base.indirect_root,
+		                      .cube              = base.cube};
+	}
+	const bool bounded_table = IsBoundedDescriptorTable(program, *source->indirect_descriptor);
+	if (!MaterializeIndirectDescriptor(
+	        program, image.source, image_index, 8u, image.r128 ? 4u : 8u, runtime, clean, snapshot, descriptors,
+	        specializations, UINT32_MAX, [&](DescriptorValue& value) {
+		        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
+		            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension))
+			        value.dwords.fill(0u);
+		        return true;
+	        }))
+		return false;
+	const auto& root = specializations[image_index];
+	if (root.indirect_root != image_index || root.indirect_mapping_offset != mapping_offset ||
+	    root.indirect_search_iterations != search_iterations)
+		return false;
+	candidates.clear();
+	candidates.push_back(descriptors[image_index]);
+	candidates.insert(candidates.end(), descriptors.begin() + static_cast<std::ptrdiff_t>(program.info.images.size()),
+	                  descriptors.end());
+	mapping.assign(snapshot.flattened_srt.begin() + mapping_offset, snapshot.flattened_srt.end());
+	return true;
 }
 
 void SetComputeIndirectFloors(size_t keys, size_t images) {

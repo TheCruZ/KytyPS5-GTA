@@ -479,6 +479,8 @@ uint32_t EmitAccessLoad(EmitterState& state, uint32_t type, uint32_t pointer, co
 void     EmitAccessStore(EmitterState& state, uint32_t pointer, uint32_t value, const MemoryResourceAccess& access);
 // Table mode, at the function's entry (state.table_*).
 void EmitTableMode(EmitterState& state);
+// Table mode: the block's dword `index` (an id: an indirect image's key mapping), by its device address.
+uint32_t EmitTableBlockLoad(EmitterState& state, uint32_t index);
 uint32_t TypePhysicalStorageBufferPointer(EmitterState& state, uint32_t bits);
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
