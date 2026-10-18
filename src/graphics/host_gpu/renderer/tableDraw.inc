@@ -77,6 +77,14 @@ bool TableRegionEpochsEnabled() {
 	return enabled;
 }
 
+// chenxiao07's table sets hold a target of the draw state the shader reads (a decal sampling the depth it tests
+// against) in the target's attachment layout and access, as the normal path's CommitBindings binds it;
+// KYTY_TABLE_TARGET_READS=0 refuses such sets as before (default 1).
+bool TableTargetReadsEnabled() {
+	static const bool enabled = NativeXprSwitch("KYTY_TABLE_TARGET_READS");
+	return enabled;
+}
+
 // The stages' static input key a pair's programs were compiled for: both stages' code and static input, and whether
 // the pixel stage runs.
 uint64_t TableDrawKey(std::vector<uint32_t>& key, const ShaderParams& vertex_params,
@@ -182,6 +190,7 @@ struct RenderExecutor::TableImageSet {
 		bool                    storage = false; // the shader writes it: GPU-modified at every use (TableTransit)
 		bool                    whole   = false; // bound both as a texture and as storage: the whole image's state
 		bool                    plain   = false; // a plain color texture (TextureCache::IsSampledImageCurrent)
+		bool                    target  = false; // a target of the draw state the set was made under (its layout, access)
 		// The image's registrations when its use was last proven (KYTY_TABLE_SET_PROOFS): a plain texture's proof holds
 		// while it is the same registration and no registration since overlaps its view.
 		uint32_t                registration = 0;
@@ -743,10 +752,21 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			if (!binding.image_id) continue; // (a null image: bound as the normal path binds it)
 			auto&      image   = textures.GetImage(binding.image_id);
 			const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
-			if (draw_state != nullptr &&
-			    std::ranges::find(draw_state->targets, binding.image_id, &NativeXprDrawState::Target::id) !=
-			        draw_state->targets.end())
-				return refuse("a target the shader reads");
+			const auto found = draw_state == nullptr ? decltype(draw_state->targets.end()) {}
+			                                         : std::ranges::find(draw_state->targets, binding.image_id,
+			                                                             &NativeXprDrawState::Target::id);
+			const auto* target = draw_state == nullptr || found == draw_state->targets.end() ? nullptr : &*found;
+			// A target the shader reads: in its attachment layout and access, which must hold the shader's reads (the
+			// draw the state was captured from sampled it too) and, of a depth target, the aspects it samples.
+			if (target != nullptr) {
+				if (!TableTargetReadsEnabled() || storage || !(target->access & vk::AccessFlagBits2::eShaderRead))
+					return refuse("a target the shader reads");
+				if (image.info.IsDepth()) {
+					const auto view = std::ranges::find(image.views, binding.image_view, &CachedImageView::view);
+					if (view == image.views.end() || (view->info.aspect & ~DepthReadableAspects(target->layout)))
+						return refuse("a depth target aspect its layout cannot sample");
+				}
+			}
 			if (image.info.data.Empty()) return refuse("an image without data");
 			if ((storage || (image.binding.force_general && image.binding.shader_write)) && !image.info.IsTiled())
 				return refuse("a linear image the shader writes");
@@ -757,7 +777,11 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			                    .range        = {view.base_level, view.level_count, view.base_layer, view.layer_count},
 			                    .desc         = binding.desc,
 			                    .registration = image.registrations};
-			if (image.binding.force_general && !image.info.IsDepth()) {
+			if (target != nullptr) {
+				dep.layout = target->layout;
+				dep.access = target->access;
+				dep.target = true;
+			} else if (image.binding.force_general && !image.info.IsDepth()) {
 				dep.layout  = vk::ImageLayout::eGeneral;
 				dep.access  = vk::AccessFlagBits2::eShaderRead |
 				              (image.binding.shader_write ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlags2 {});
@@ -886,7 +910,7 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 			image = textures.m_slot_images.try_get(dep.id);
 			if (image == nullptr || image->serial != dep.serial || TextureCache::RefreshPending(*image, dep.desc)) return false;
 		}
-		if (moved) {
+		if (moved && !dep.target) {
 			// A plain texture still in the registration its proof saw, with nothing registered over its view since, is
 			// what the proof found (mode 1); else the full check: the texture cache's, or nothing registered over the
 			// view (mode 0, and mode 2, which also counts the held proofs the full check fails).
@@ -1173,9 +1197,15 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, CommandRecorder vk_b
 	for (const auto& dep: set.images) {
 		auto* image = textures.m_slot_images.try_get(dep.id);
 		if (image == nullptr || image->serial != dep.serial) return false;
-		if (draw_state != nullptr &&
-		    std::ranges::find(draw_state->targets, dep.id, &NativeXprDrawState::Target::id) != draw_state->targets.end())
+		// A target of the draw: NativeXprEmitTargets put it in its attachment layout, which the set must have been made
+		// for; an image the set holds as a texture must not be one.
+		const auto found = draw_state == nullptr
+		                       ? decltype(draw_state->targets.end()) {}
+		                       : std::ranges::find(draw_state->targets, dep.id, &NativeXprDrawState::Target::id);
+		const bool is_target = draw_state != nullptr && found != draw_state->targets.end();
+		if (is_target != dep.target || (is_target && (found->layout != dep.layout || found->access != dep.access)))
 			return false;
+		if (is_target) continue;
 		if ((dep.storage && !image->SafeToDownload()) || TextureCache::RefreshPending(*image, dep.desc)) return false;
 		if (dep.desc.info.metadata.kind == ImageMetadataKind::Dcc) {
 			for (uint32_t layer = dep.range.base_layer; layer < dep.range.base_layer + dep.range.layer_count; ++layer)
@@ -1184,8 +1214,9 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, CommandRecorder vk_b
 	}
 	// (In the draw's transit group, as CommitBindings' transitions.)
 	for (const auto& dep: set.images)
-		textures.m_slot_images[dep.id].Transit(dep.layout, dep.access,
-		                                       dep.whole ? std::nullopt : std::optional {dep.range}, vk_buffer);
+		if (!dep.target)
+			textures.m_slot_images[dep.id].Transit(dep.layout, dep.access,
+			                                       dep.whole ? std::nullopt : std::optional {dep.range}, vk_buffer);
 	return true;
 }
 

@@ -1207,13 +1207,20 @@ void RenderExecutor::NativeXprCaptureState(const DrawRenderState& state, const R
 	const auto metadata_of = [](const TextureCache::ImageDesc& desc) {
 		return desc.info.metadata.kind == ImageMetadataKind::None ? uint64_t {0} : desc.info.metadata.range.address;
 	};
+	// A target the draw also sampled has the access its CommitBindings gave it (the attachment's and the shader's
+	// reads): a table draw's image set may then hold it (KYTY_TABLE_TARGET_READS).
+	const auto sampled_access = [](const Image& image) {
+		return image.binding.is_bound && !image.binding.shader_write
+		           ? image.binding.attachment_access | vk::AccessFlagBits2::eShaderRead
+		           : image.binding.attachment_access;
+	};
 	for (uint32_t i = 0; i < state.color_count; ++i) {
 		const auto& target = state.colors[i];
 		const auto& view   = target.desc.view_info;
 		const auto& image  = textures.GetImage(target.image_id);
 		draw_state.targets.push_back({target.image_id, image.serial,
 		                              rendering.color_attachments[target.target_slot].image_layout,
-		                              image.binding.attachment_access,
+		                              sampled_access(image),
 		                              {view.base_level, view.level_count, view.base_layer, view.layer_count},
 		                              metadata_of(target.desc), view.base_layer, target.desc.info});
 	}
@@ -1222,7 +1229,7 @@ void RenderExecutor::NativeXprCaptureState(const DrawRenderState& state, const R
 		const auto& image = textures.GetImage(state.depth->image_id);
 		draw_state.targets.push_back({state.depth->image_id, image.serial,
 		                              rendering.depth_stencil_attachment.image_layout,
-		                              image.binding.attachment_access,
+		                              sampled_access(image),
 		                              {view.base_level, view.level_count, view.base_layer, view.layer_count},
 		                              metadata_of(state.depth->desc), view.base_layer, state.depth->desc.info});
 	}
