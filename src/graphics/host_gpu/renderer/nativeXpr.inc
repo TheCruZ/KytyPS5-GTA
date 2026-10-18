@@ -1648,7 +1648,7 @@ bool RenderExecutor::NativeXprLikely(const HW::Shader& shaders) const noexcept {
 
 bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, uint64_t args_addr, uint64_t index_base,
                                   uint64_t index_bytes, vk::IndexType index_type) {
-	if (!NativeXprEnabled() || buffer.IsInvalid()) return false;
+	if (!NativeXprEnabled() || buffer.IsInvalid() || TableDrawServes(buffer.GetShaders())) return false;
 	// The resolve thread skips the resolution ahead of draws of pairs whose last try drew.
 	const auto pair  = NativeXprPairOf(buffer);
 	bool       drawn = false;

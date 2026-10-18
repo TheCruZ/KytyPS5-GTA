@@ -671,7 +671,25 @@ struct PipelineCache::ProgramCache {
 	const PipelineCache::TableProgram* CompileTableCompute(
 	    const ShaderParams& params, ShaderComputeInputInfo& input_info,
 	    const ShaderRecompiler::IR::ResourceSpecialization& specialization, std::string& refusal) {
-		auto [options, stage_name] = MakeCompileOptions(ShaderType::Compute, params, input_info);
+		return CompileTable(ShaderType::Compute, params, input_info, specialization, 0u, refusal);
+	}
+
+	template <typename InputInfo>
+	const PipelineCache::TableProgram* CompileTableGraphics(
+	    const ShaderParams& params, InputInfo& input_info,
+	    const ShaderRecompiler::IR::ResourceSpecialization& specialization, uint32_t push_data_start_dword,
+	    std::string& refusal) {
+		ShaderType stage = ShaderType::Pixel;
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) stage = input_info.logical_stage;
+		return CompileTable(stage, params, input_info, specialization, push_data_start_dword, refusal);
+	}
+
+	template <typename InputInfo>
+	const PipelineCache::TableProgram* CompileTable(
+	    ShaderType stage, const ShaderParams& params, InputInfo& input_info,
+	    const ShaderRecompiler::IR::ResourceSpecialization& specialization, uint32_t push_data_start_dword,
+	    std::string& refusal) {
+		auto [options, stage_name] = MakeCompileOptions(stage, params, input_info);
 		options.table_mode         = true;
 		options.dump_ir            = false;
 		options.early_dump         = false;
@@ -681,7 +699,7 @@ struct PipelineCache::ProgramCache {
 			return nullptr;
 		}
 		auto result = ShaderRecompiler::CompileProgram(ShaderRecompiler::TranslateProgram(source.decoded, options),
-		                                               options, specialization, 0u);
+		                                               options, specialization, push_data_start_dword);
 		if (result.spirv.empty()) {
 			refusal = result.table_refusal;
 			return nullptr;
@@ -1886,24 +1904,23 @@ void PipelineCache::WriteDriverCache() {
 	                 Common::PathToString(m_driver_cache_path));
 }
 
-PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
+// The part of GetGraphicsPrograms() before the program lookup: the stages' parameters and input info.
+void PipelineCache::PrepareGraphicsStagesImpl(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
-    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
-    ProgramResolution* ahead) {
+    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info, ProgramResolution* ahead,
+    std::array<ShaderParams, 3>& vertex_params, ShaderParams& pixel_params, bool& failed) {
+	failed = false;
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
-	// Ahead of execution, the vertex fetch tables are read through the resolution's log.
-	const ShaderGuestReaderScope reader(ahead != nullptr ? ReadAheadShaderState : nullptr,
-	                                    ahead != nullptr ? &ahead->reads : nullptr);
-	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
 		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
 	} else {
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}
 	if (ahead != nullptr && ahead->reads.Failed()) {
-		return {};
+		failed = true;
+		return;
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	const bool object_primitive_id = context.HasObjectPrimitiveIdOutput();
@@ -1935,7 +1952,6 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			     host_threads, mesh.max_vertices, mesh.max_primitives, mesh.lds_size_dwords);
 		}
 	}
-	ShaderParams pixel_params;
 	if (pixel_active) {
 		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
 		pixel_info.object_primitive_id = object_primitive_id;
@@ -2017,6 +2033,28 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 		clip.enabled = true;
 	}
+}
+
+PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
+    const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
+    const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
+    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
+    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
+    ProgramResolution* ahead) {
+	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
+	const bool object_primitive_id = context.HasObjectPrimitiveIdOutput();
+	// Ahead of execution, the vertex fetch tables are read through the resolution's log.
+	const ShaderGuestReaderScope reader(ahead != nullptr ? ReadAheadShaderState : nullptr,
+	                                    ahead != nullptr ? &ahead->reads : nullptr);
+	std::array<ShaderParams, 3> vertex_params;
+	ShaderParams                pixel_params;
+	bool                        failed = false;
+	PrepareGraphicsStagesImpl(vertex_regs, pixel_regs, sh, context, user_config, target_export_mapping, pixel_active,
+	                          vertex_info, pixel_info, ahead, vertex_params, pixel_params, failed);
+	if (failed) {
+		return {};
+	}
+	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, object_primitive_id);
 	GraphicsPrograms       result;
@@ -2039,6 +2077,41 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
 	}
 	return result;
+}
+
+bool PipelineCache::PrepareGraphicsStages(const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
+                                          const HW::ShaderRegisters& sh, const HW::Context& context,
+                                          const HW::UserConfig&                               user_config,
+                                          std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+                                          bool pixel_active, ShaderVertexInputInfo& vertex_info,
+                                          ShaderPixelInputInfo& pixel_info, ShaderParams& vertex_params,
+                                          ShaderParams& pixel_params) {
+	if (user_config.GetPrimType() == Prospero::PrimitiveType::kPatch || context.HasObjectPrimitiveIdOutput()) {
+		return false;
+	}
+	std::array<ShaderVertexInputInfo, 3> vertex_infos {};
+	std::array<ShaderParams, 3>          params {};
+	bool                                 failed = false;
+	PrepareGraphicsStagesImpl(vertex_regs, pixel_regs, sh, context, user_config, target_export_mapping, pixel_active,
+	                          vertex_infos, pixel_info, nullptr, params, pixel_params, failed);
+	if (failed || vertex_infos[0].logical_stage == ShaderType::Mesh) {
+		return false;
+	}
+	vertex_info   = vertex_infos[0];
+	vertex_params = params[0];
+	return true;
+}
+
+const PipelineCache::TableProgram* PipelineCache::CompileTableGraphics(
+    const ShaderParams& params, ShaderVertexInputInfo* vertex_info, ShaderPixelInputInfo* pixel_info,
+    const ShaderRecompiler::IR::ResourceSpecialization& specialization, uint32_t push_data_start_dword,
+    std::string& refusal) {
+	const ProgramLockGuard lock(m_program_lock);
+	return vertex_info != nullptr
+	           ? m_program_cache->CompileTableGraphics(params, *vertex_info, specialization, push_data_start_dword,
+	                                                   refusal)
+	           : m_program_cache->CompileTableGraphics(params, *pixel_info, specialization, push_data_start_dword,
+	                                                   refusal);
 }
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,

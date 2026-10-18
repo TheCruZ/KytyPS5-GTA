@@ -30,6 +30,8 @@
 
 namespace Libs::Graphics {
 
+struct ShaderParams;
+
 // Guest memory that a resolution ahead of execution read. The execution thread repeats the reads
 // before it uses the resolution: guest memory may have changed in between (operations that
 // execute before the draw write it), and ahead of execution GPU-owned bytes cannot be read.
@@ -238,7 +240,7 @@ public:
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderProgram                                handle;
-		ShaderComputeInputInfo                       input_info; // as compiled (its pipeline's)
+		ShaderComputeInputInfo                       input_info; // a compute program's as compiled (its pipeline's)
 	};
 	// The resource plan and the specialization of a compiled program (by its handle), or null. Both live as long as
 	// the cache.
@@ -248,6 +250,20 @@ public:
 	bool SpecializeDirectResources(const ShaderRecompiler::IR::ResourcePlan& plan,
 	                               ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
 	                               ShaderRecompiler::IR::ResourceSpecialization& specialization);
+	// The stages' parameters and input info GetGraphicsPrograms() looks programs up with (no lookup). False for
+	// tessellation, mesh shading or object IDs (table draws do not take them).
+	bool PrepareGraphicsStages(const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
+	                           const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
+	                           std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+	                           bool pixel_active, ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info,
+	                           ShaderParams& vertex_params, ShaderParams& pixel_params);
+	// Table draws: a vertex or pixel program in table mode (as CompileTableCompute()), its push data from
+	// `push_data_start_dword`.
+	const TableProgram* CompileTableGraphics(const ShaderParams& params, ShaderVertexInputInfo* vertex_info,
+	                                         ShaderPixelInputInfo* pixel_info,
+	                                         const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                                         uint32_t push_data_start_dword, std::string& refusal);
+
 	const TableProgram* CompileTableCompute(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
 	                                        ShaderComputeInputInfo&                             input_info,
 	                                        const ShaderRecompiler::IR::ResourceSpecialization& specialization,
@@ -267,6 +283,14 @@ public:
 	                             const ShaderProgram&          compute_program);
 
 private:
+	void PrepareGraphicsStagesImpl(const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
+	                               const HW::ShaderRegisters& sh, const HW::Context& context,
+	                               const HW::UserConfig&                               user_config,
+	                               std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+	                               bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
+	                               ShaderPixelInputInfo& pixel_info, ProgramResolution* ahead,
+	                               std::array<ShaderParams, 3>& vertex_params, ShaderParams& pixel_params,
+	                               bool& failed);
 	struct ProgramCache;
 
 	struct GraphicsPipelineKey {

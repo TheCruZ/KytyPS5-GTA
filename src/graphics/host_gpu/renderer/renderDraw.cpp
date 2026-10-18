@@ -23,6 +23,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/shader/shaderCompiler.h"
 #include "loader/systemContent.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -56,6 +57,7 @@
 #include <utility>
 #include <string_view>
 #include <vector>
+#include <unordered_set>
 
 namespace Libs::Graphics {
 
@@ -1428,6 +1430,8 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_
 	if (!shaders_resolved) {
 		state.ps_active =
 		    PixelShaderActive(buffer.GetRegisters(), buffer.GetShaders(), color_output_mask);
+	}
+	if (!TableDrawPrograms(buffer, color_output_mask, state) && !shaders_resolved) {
 		RefreshShaders(buffer, draw, color_output_mask, state);
 	}
 	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
@@ -1785,6 +1789,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	PrepareGraphicsBindings(stages, std::span {state.colors, state.color_count});
+	if (m_table_draw_active && !TableDrawBlocks(stages)) {
+		m_table_draw_active = false;
+		ResetBindings();
+		return;
+	}
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
@@ -1881,7 +1890,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);
 	}
 	// After the draw is recorded: storing may clean buffer owners (copies) and so may end
-	// rendering or restart the scheduler.
+	// rendering or restart the scheduler. A table draw stores nothing; a normal one teaches its table pair.
+	if (std::exchange(m_table_draw_active, false)) {
+		m_native_xpr_store = false;
+	} else if (!mesh_active && draw.IsIndexed()) {
+		TableDrawLearn(buffer, state);
+	}
 	if (std::exchange(m_native_xpr_store, false)) {
 		if (!mesh_active && draw.IsIndexed() && (emit.indirect != nullptr || index_source.host_data == nullptr) &&
 		    (vertex_bindings.count == 0 || NativeXprVertexBuffersEnabled()) && draw_dwords == 0) {
@@ -2209,5 +2223,6 @@ bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_
 }
 
 #include "graphics/host_gpu/renderer/nativeXpr.inc"
+#include "graphics/host_gpu/renderer/tableDraw.inc"
 
 } // namespace Libs::Graphics

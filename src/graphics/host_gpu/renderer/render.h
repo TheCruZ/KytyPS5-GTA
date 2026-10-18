@@ -651,6 +651,19 @@ private:
 	struct TableDispatchCache;
 	std::unique_ptr<TableDispatchCache, void (*)(TableDispatchCache*)> m_table_dispatch {nullptr, nullptr};
 	TableDispatchCache& TableDispatchState();
+	// Table draws (tableDraw.inc, KYTY_TABLE_XPR).
+	struct TableDrawCache;
+	std::unique_ptr<TableDrawCache, void (*)(TableDrawCache*)> m_table_draw {nullptr, nullptr};
+	bool m_table_draw_active = false; // the executing draw takes its programs from a table pair
+	TableDrawCache& TableDrawState();
+	// Whether a table pair serves draws of these shaders (native XPR records leave them).
+	bool TableDrawServes(const HW::Shader& shaders);
+	// After a normal draw: its pair's table programs.
+	void TableDrawLearn(CommandBuffer& buffer, const DrawRenderState& state);
+	// The draw's programs from its table pair, when there is one: then true.
+	bool TableDrawPrograms(CommandBuffer& buffer, uint32_t color_output_mask, DrawRenderState& state);
+	// The table stages' blocks, after their bindings.
+	bool TableDrawBlocks(std::span<PreparedBindings* const> stages);
 	// True when the dispatch was recorded from a table program.
 	bool TableDispatch(CommandBuffer& buffer, const HW::ComputeShaderInfo& cs, uint32_t x, uint32_t y, uint32_t z,
 	                   bool async_compute);
