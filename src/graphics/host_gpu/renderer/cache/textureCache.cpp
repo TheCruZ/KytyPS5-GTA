@@ -38,6 +38,15 @@ bool ImageGranulesEnabled() {
 	return value == nullptr || value[0] != '0';
 }
 
+// KYTY_WRITE_WINDOW_HANDOFF=0: every guest write fault takes the cache's lock.
+bool WriteWindowHandoffEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_WRITE_WINDOW_HANDOFF");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 constexpr uint64_t NumFramesBeforeRemoval = 32;
 // Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
 constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
@@ -300,12 +309,20 @@ void TextureCache::UnregisterImage(ImageId id) {
 	if (!m_image_granules.empty() && ++m_image_granule_releases >= 4096u) {
 		// Rebuilt from the images still registered, this one left out.
 		m_image_granule_releases = 0;
-		std::fill(m_image_granules.begin(), m_image_granules.end(), 0);
+		std::vector<uint64_t> rebuilt(m_image_granules.size(), 0);
 		m_slot_images.ForEach([&](ImageId other, const Image& registered) {
-			if (registered.registered && other != id) {
-				MarkImageGranules(registered.info.data.address, registered.info.data.size);
+			const auto address = registered.info.data.address, size = registered.info.data.size;
+			if (!registered.registered || other == id || size == 0 || address >= ImageGranuleSpace) {
+				return;
+			}
+			const auto last = (std::min(address + size, ImageGranuleSpace) - 1u) >> ImageGranuleBits;
+			for (auto granule = address >> ImageGranuleBits; granule <= last; ++granule) {
+				rebuilt[granule / 64u] |= uint64_t {1} << (granule % 64u);
 			}
 		});
+		for (size_t word = 0; word < rebuilt.size(); ++word) {
+			std::atomic_ref(m_image_granules[word]).store(rebuilt[word], std::memory_order_release);
+		}
 	}
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		auto* owners = m_image_page_table.Find(page);
@@ -627,7 +644,8 @@ void TextureCache::MarkImageGranules(uint64_t address, uint64_t size) {
 	const auto first = address >> ImageGranuleBits;
 	const auto last  = (std::min(address + size, ImageGranuleSpace) - 1u) >> ImageGranuleBits;
 	for (auto granule = first; granule <= last; ++granule) {
-		m_image_granules[granule / 64u] |= uint64_t {1} << (granule % 64u);
+		std::atomic_ref(m_image_granules[granule / 64u])
+		    .fetch_or(uint64_t {1} << (granule % 64u), std::memory_order_release);
 	}
 }
 
@@ -639,7 +657,8 @@ bool TextureCache::MayHaveImages(uint64_t address, uint64_t size) const {
 	const auto first = address >> ImageGranuleBits;
 	const auto last  = (address + size - 1u) >> ImageGranuleBits;
 	for (auto granule = first; granule <= last; ++granule) {
-		if ((m_image_granules[granule / 64u] & (uint64_t {1} << (granule % 64u))) != 0) {
+		auto& word = const_cast<uint64_t&>(m_image_granules[granule / 64u]);
+		if ((std::atomic_ref(word).load(std::memory_order_acquire) & (uint64_t {1} << (granule % 64u))) != 0) {
 			return true;
 		}
 	}
@@ -1934,6 +1953,16 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
+	}
+	// A guest write fault where no image was ever registered (on the pages InvalidateCpuAliases() looks at) does not
+	// wait for the cache's lock, which the execution thread holds across its image work (adapted from chenxiao07's
+	// KYTY_WRITE_WINDOW_HANDOFF, which hands the lock off before the fault's page protection). An image registered
+	// meanwhile protects its pages after its bits are set: a write that faulted before that is not its concern.
+	if (WriteWindowHandoffEnabled() &&
+	    !MayHaveImages(Common::AlignDown(address, uint64_t {1} << ImagePageBits),
+	                   Common::AlignUp(address + size, uint64_t {1} << ImagePageBits) -
+	                       Common::AlignDown(address, uint64_t {1} << ImagePageBits))) {
+		return;
 	}
 	std::scoped_lock lock {m_lock};
 	InvalidateCpuAliases(address, size);

@@ -243,7 +243,9 @@ private:
 	ImagePageTable                                    m_image_page_table;
 	// One bit per 64 KiB granule of the guest address space that some registered image reaches (chenxiao07's
 	// KYTY_IMAGE_GRANULES): a region lookup whose granules are all clear finds no image without walking its
-	// pages. Bits are set on registration and cleared only by a rebuild, after enough unregistrations.
+	// pages. Bits are set on registration and cleared only by a rebuild, after enough unregistrations. Written under
+	// m_lock, read without it too (InvalidateMemory()): words are accessed atomically and a rebuild stores each word
+	// at once, from a superset of the registered images' bits to their exact set, so no reader ever misses one.
 	static constexpr uint32_t ImageGranuleBits  = 16;
 	static constexpr uint64_t ImageGranuleSpace = uint64_t {1} << 40u;
 	std::vector<uint64_t>     m_image_granules;
