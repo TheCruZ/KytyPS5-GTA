@@ -207,6 +207,52 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	return id;
 }
 
+bool TextureCache::IsSampledImageCurrent(ImageId id, const ImageDesc& desc) {
+	std::scoped_lock lock {m_lock};
+	if (m_scheduler.Current().IsInvalid() || desc.type != BindingType::Texture ||
+	    desc.info.data.Empty() || desc.info.IsDepth() || desc.info.HasMetadata() ||
+	    desc.info.HasStencil() || desc.info.tile_mode == Prospero::TileMode::kDepth) {
+		return false;
+	}
+	auto* image = m_slot_images.try_get(id);
+	if (image == nullptr || !image->registered || image->depth_id || image->binding.needs_rebind ||
+	    image->info.IsDepth() || image->info.HasMetadata() || image->info.HasStencil() ||
+	    !SameBacking(image->info, desc.info, true) || !(image->info.resources == desc.info.resources)) {
+		return false;
+	}
+	TouchImage(*image);
+	return true;
+}
+
+bool TextureCache::IsTargetCurrent(ImageId id, const ImageInfo& requested) {
+	std::scoped_lock lock {m_lock};
+	ImageId last {};
+	for (const auto candidate: FindImagesInRegion(requested.data.address, requested.data.size, false)) {
+		const auto* image = m_slot_images.try_get(candidate);
+		if (image != nullptr && SameBacking(image->info, requested, false)) {
+			last = candidate;
+		}
+	}
+	// A target found as part of another image (no image with the requested backing) stays found
+	// while none with that backing appears.
+	const auto* target = m_slot_images.try_get(id);
+	if (target == nullptr || !target->registered) {
+		return false;
+	}
+	return last == (SameBacking(target->info, requested, false) ? id : ImageId {});
+}
+
+bool TextureCache::HasImageStartingAt(uint64_t address) {
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, 1, false)) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image != nullptr && image->registered && image->info.data.address == address) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void TextureCache::RegisterImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.registered || image.info.data.Empty()) {

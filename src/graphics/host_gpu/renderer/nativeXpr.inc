@@ -1,0 +1,1330 @@
+// --- Native XPR draws ------------------------------------------------------------------------
+//
+// Included by renderDraw.cpp. Ported from chenxiao07's KytyPS5 fork (src/local/native-xpr.inc)
+// onto this renderer, as a layer the normal draw path backs: a draw the layer cannot prove takes
+// the normal path, which stores a record of it when asked.
+//
+// An indexed indirect draw whose arguments the host GPU reads (TryExecuteDrawIndirectOnGpu) is
+// offered to NativeXprTry() first. Two entries make it native:
+//  * a draw state, keyed by every graphics register except user data: the render targets with
+//    their attachment layouts, and the dynamic state;
+//  * an object record, keyed by the shader addresses and the user data: one descriptor set
+//    written once with the object's buffers, images and samplers; the stage constants (flattened
+//    SRT and shader data, which go into the stream buffer at each draw, at the set's dynamic
+//    offsets); per draw state, the pipeline variant with native bindings (the same SPIR-V); and
+//    what proves the record current.
+// A record is proven current at every use: every guest word the SRT evaluation read still has
+// the logged value, read as the resolution's read log reads it (GuestReadLog); words learned to
+// land only in the flattened SRT (from an earlier store of the same key) are patched. Once per
+// frame, or when the buffer or image set moved: every buffer is still the same live buffer and
+// CPU clean, every image the same registered object, not CPU dirty. Anything else falls back to
+// the normal path, which stores again.
+//
+// On for Demon's Souls (KYTY_NATIVE_XPR=1 for any game, =0 off); KYTY_NATIVE_XPR_STATS=1 prints counters every
+// 300 frames.
+
+namespace {
+
+// On by default for Demon's Souls only: in GTA V the records cost more than they save (55.8 -> 53.8
+// fps in Performance mode). KYTY_NATIVE_XPR=1 turns them on for any game, =0 off.
+bool NativeXprEnabled() {
+	static const bool enabled = [] {
+		if (const char* value = std::getenv("KYTY_NATIVE_XPR"); value != nullptr) return value[0] != '0';
+		char title_id[16] {};
+		if (!Loader::SystemContentParamSfoGetString("TITLE_ID", title_id, sizeof(title_id))) return false;
+		const std::string_view title(title_id);
+		return title == "PPSA01340" || title == "PPSA01341" || title == "PPSA01342";
+	}();
+	return enabled;
+}
+
+bool NativeXprStatsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_NATIVE_XPR_STATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+// A word target in a buffer descriptor's base address (dword 0, or the low half of dword 1).
+int32_t NativeXprBufferPatch(uint32_t stage, uint32_t resource, uint32_t dword) {
+	return -16 - static_cast<int32_t>(stage << 20u | resource << 4u | dword);
+}
+
+struct NativeXprKeyHash {
+	[[nodiscard]] size_t operator()(uint64_t key) const noexcept { return static_cast<size_t>(key); }
+};
+
+uint64_t NativeXprHash(const std::vector<uint32_t>& words) {
+	return XXH3_64bits(words.data(), words.size() * sizeof(uint32_t));
+}
+
+// T# fields that only feed the LOD statistics (MIN_LOD_WARN, MIP_STATS_CNT_EN, MIP_STATS_CNT_ID):
+// Demon's Souls reassigns the counters every frame. They select no image and no view.
+constexpr std::array<uint32_t, 8> NativeXprLodStatsMask {0, 0, 0, 0, 0, (0xfffu << 8u) | (1u << 25u), 0xffu, 0};
+
+bool NativeXprSameImagesButLodStats(const std::vector<ShaderRecompiler::IR::DescriptorValue>& a,
+                                    const std::vector<ShaderRecompiler::IR::DescriptorValue>& b) {
+	if (a.size() != b.size()) return false;
+	for (size_t i = 0; i < a.size(); ++i) {
+		if (a[i].dword_count != b[i].dword_count) return false;
+		for (uint32_t w = 0; w < a[i].dwords.size(); ++w)
+			if ((a[i].dwords[w] & ~NativeXprLodStatsMask[w]) != (b[i].dwords[w] & ~NativeXprLodStatsMask[w]))
+				return false;
+	}
+	return true;
+}
+
+} // namespace
+
+// The render targets as a draw under one state left them, and its dynamic state.
+struct RenderExecutor::NativeXprDrawState {
+	struct Target {
+		ImageId               id;
+		uint64_t              serial   = 0;
+		vk::ImageLayout       layout   = vk::ImageLayout::eUndefined;
+		vk::AccessFlags2      access;
+		ImageSubresourceRange range;
+		uint64_t              metadata = 0; // surface metadata (HTile/DCC) address, 0 none
+		uint32_t              slice    = 0;
+		ImageInfo             requested; // what the registers ask for (TextureCache::IsTargetCurrent)
+	};
+	RenderState         rendering; // without clears: a reopened rendering loads
+	std::vector<Target> targets;
+	DynamicState        dynamic;
+	// ImageSetEpoch under which the targets were what a lookup finds.
+	uint64_t            targets_epoch = 0;
+	uint64_t            used_frame    = 0;
+};
+
+// One object: its resources under the compiled programs it was translated with.
+struct RenderExecutor::NativeXprRecord {
+	struct Stage {
+		const ShaderRecompiler::IR::CompiledShaderInfo* program = nullptr;
+		std::vector<uint32_t> flattened;   // flattened SRT
+		std::vector<uint32_t> shader_data; // push data and/or the shader-data binding
+		bool     srt_binding  = false;
+		bool     data_binding = false;
+		uint32_t push_start   = ShaderRecompiler::IR::PushData::NoStart;
+		// The evaluation's structure, for learning.
+		std::vector<ShaderRecompiler::IR::DescriptorValue> buffers, images, samplers;
+		std::vector<uint32_t>                              user_data;
+	};
+	struct BufferDep {
+		uint64_t   address = 0, size = 0;
+		BufferId   id;
+		vk::Buffer handle  = nullptr;
+		bool       texel   = false;
+		uint32_t   stage = 0, resource = 0, slot = 0; // program.info.buffers[resource], descriptor slot
+	};
+	struct ImageDep {
+		ImageId                 id;
+		uint64_t                serial = 0;
+		vk::ImageLayout         layout = vk::ImageLayout::eUndefined;
+		ImageSubresourceRange   range;
+		TextureCache::ImageDesc desc;
+	};
+	// A dynamic storage buffer of the set: its binding number and what it holds.
+	struct DynamicBinding {
+		uint32_t binding = 0;
+		uint32_t stage   = 0;
+		bool     srt     = false;
+	};
+	std::vector<uint32_t>       key;
+	std::array<Stage, 2>        stages;
+	uint32_t                    stage_count = 1;
+	uint64_t                    vertex_program = 0, pixel_program = 0;
+	vk::DescriptorSet           set  = nullptr;
+	vk::DescriptorPool          pool = nullptr;
+	vk::Buffer                  upload = nullptr; // the stream buffer the dynamic bindings point into
+	std::vector<DynamicBinding> dynamic_bindings;  // by binding number
+	vk::ShaderStageFlags        push_stages;
+	bool                        has_push = false;
+	// Native pipeline variant per draw state this object was drawn under.
+	std::vector<std::pair<uint64_t, const PipelineCache::Pipeline*>> pipelines;
+	// Validation.
+	GuestReadLog           reads;
+	// Per logged word, what its changes reach (learned: NativeXprLearn): word_known 0 unknown (a change
+	// needs a new translation), else word_targets: stage << 24 | flattened index (>= 0) or a buffer base
+	// dword (NativeXprBufferPatch, < 0); none: the change reaches nothing.
+	std::vector<std::vector<int32_t>> word_targets;
+	std::vector<uint8_t>              word_known;
+	// The set's payload, to write a new set when a buffer base moved (NativeXprRebindBuffers).
+	struct WriteSlot {
+		uint32_t           binding = 0, count = 0, start = 0;
+		vk::DescriptorType type {};
+		bool               image = false;
+	};
+	std::vector<WriteSlot>                set_writes;
+	std::vector<vk::DescriptorBufferInfo> set_buffers;
+	std::vector<vk::DescriptorImageInfo>  set_images;
+	std::array<uint32_t, 2>               buffers_start {UINT32_MAX, UINT32_MAX}; // per stage, in set_buffers
+	std::vector<BufferDep> buffers;
+	std::vector<ImageDep>  images;
+	uint64_t mapping_version   = 0;
+	uint64_t buffer_set_epoch  = 0;
+	uint64_t image_set_epoch   = 0;
+	uint64_t cpu_epoch         = 0; // sum of the buffer regions' CPU epochs, 0 unknown
+	uint64_t image_dirty_epoch = 0; // Image::CpuDirtyEpoch() when the images were proven clean
+	uint64_t validated_frame   = UINT64_MAX;
+	uint64_t used_frame        = 0;
+	uint64_t uses              = 0;
+};
+
+struct RenderExecutor::NativeXprCache {
+	vk::Device device;
+	// Per object key, up to MaxVariants records, the last one used first: objects whose resources rotate
+	// through a few values (a texture or buffer double-buffered per frame) keep a record per value.
+	static constexpr size_t MaxVariants = 4;
+	std::unordered_map<uint64_t, std::vector<std::unique_ptr<NativeXprRecord>>, NativeXprKeyHash> records;
+	size_t record_count = 0;
+	std::unordered_map<uint64_t, std::unique_ptr<NativeXprDrawState>, NativeXprKeyHash> states;
+	struct RetiredSet {
+		vk::DescriptorPool pool;
+		vk::DescriptorSet  set;
+		uint64_t           tick = 0;
+	};
+	std::vector<RetiredSet> retired;
+	struct FreeSet {
+		vk::DescriptorPool pool;
+		vk::DescriptorSet  set;
+	};
+	static constexpr size_t FreeSetsPerLayout = 2048, FreeSetsMax = 16384;
+	std::unordered_map<VkDescriptorSetLayout, std::vector<FreeSet>> free_sets;
+	std::unordered_map<VkDescriptorSet, VkDescriptorSetLayout>      set_layouts;
+	size_t                                                          free_count = 0;
+	std::vector<vk::DescriptorPool>                                 pools;
+	// Keys that missed, with the frame of their latest miss: a record pays off only when its key
+	// comes again, so it is stored at the second sighting within two frames.
+	struct SeenKey {
+		uint64_t hash = 0, frame = 0;
+	};
+	std::vector<SeenKey> seen = std::vector<SeenKey>(8192);
+	bool                 SeenAgain(uint64_t hash, uint64_t frame) {
+		hash             = hash != 0 ? hash : 1;
+		const auto mask  = seen.size() - 1;
+		SeenKey*   empty = nullptr;
+		for (uint64_t i = 0, at = hash & mask; i < 8; ++i, at = (at + 1) & mask) {
+			auto& entry = seen[at];
+			if (entry.hash == hash) {
+				const bool again = entry.frame + 2 >= frame;
+				entry.frame      = frame;
+				return again;
+			}
+			if (empty == nullptr && (entry.hash == 0 || entry.frame + 2 < frame)) empty = &entry;
+		}
+		*(empty != nullptr ? empty : &seen[hash & mask]) = {hash, frame};
+		return false;
+	}
+	// Keys whose store was refused: the same refusal would come every frame.
+	static constexpr uint64_t RefuseFrames = 64;
+	std::unordered_map<uint64_t, uint64_t, NativeXprKeyHash> refused;
+	// Per shader-address pair: a pair whose programs cannot be recorded stops asking.
+	std::unordered_map<uint64_t, bool, NativeXprKeyHash> unstorable;
+	// Scratch.
+	std::vector<uint32_t>                      key;
+	std::vector<std::pair<uint32_t, uint32_t>> changed;
+	std::vector<std::pair<uint32_t, uint32_t>> rebind_buffers; // (stage, buffer resource)
+	// The latest try: its keys, for the store the normal path makes when it asks for one.
+	uint64_t tried_hash = 0;
+	uint64_t state_key  = 0;
+	// Resolution of a store's programs with a read log (see NativeXprStore()).
+	std::unique_ptr<DrawRenderStorage, void (*)(DrawRenderStorage*)> scratch {nullptr, nullptr};
+	ProgramResolution                                                 scratch_programs;
+	uint64_t swept_frame    = UINT64_MAX;
+	uint64_t collected_frame = UINT64_MAX;
+	uint64_t reported_frame = 0;
+	struct Counters {
+		uint64_t tries = 0, hits = 0, miss_key = 0, miss_state = 0, miss_target = 0, miss_validate = 0,
+		         miss_emit = 0, stores = 0, stored = 0, refused = 0;
+		uint64_t validate_unmapped = 0, validate_read = 0, validate_unlearned = 0, validate_resources = 0;
+		// Learning: 0 learned, 1 reads, 2 programs, 3 buffers, 4 images, 5 samplers, 6 other structure, 7 unexplained.
+		std::array<uint64_t, 8> learn {};
+		uint64_t target_object = 0, target_lookup = 0, rebinds = 0;
+	} counters;
+	std::unordered_map<std::string_view, uint64_t> refuse_reasons;
+	~NativeXprCache() {
+		for (auto pool: pools) device.destroyDescriptorPool(pool);
+	}
+};
+
+namespace {
+
+// The shader addresses and the user-data counts.
+uint64_t NativeXprPairKey(const std::vector<uint32_t>& key) {
+	return key.size() < 4 ? 0 : XXH3_64bits(key.data(), 4 * sizeof(uint32_t));
+}
+
+// Object identity: both shader addresses and every user-data SGPR (the SRT chains start there).
+void NativeXprKeyOf(const CommandBuffer& buffer, std::vector<uint32_t>& key) {
+	const auto& sh = buffer.GetShaders();
+	const auto  es = sh.GetVs().es_regs.data_addr;
+	const auto  vs = es != 0 ? es : sh.GetVs().gs_regs.data_addr;
+	const auto  ps = sh.GetPs().ps_regs.data_addr;
+	key.clear();
+	key.push_back(static_cast<uint32_t>(vs));
+	key.push_back(static_cast<uint32_t>(vs >> 32u));
+	key.push_back(static_cast<uint32_t>(ps));
+	key.push_back(static_cast<uint32_t>(ps >> 32u));
+	for (const auto* sgprs: {&sh.GetVs().hs_user_sgpr, &sh.GetVs().gs_user_sgpr, &sh.GetPs().ps_user_sgpr}) {
+		const auto count = std::min<uint32_t>(sgprs->count, HW::UserSgprInfo::SGPRS_MAX);
+		key.push_back(count);
+		key.insert(key.end(), sgprs->value, sgprs->value + count);
+	}
+}
+
+// Draw-state identity: the whole graphics context, the user configuration and the graphics shader
+// stage registers with the user-data layout (types and counts) but not the user-data values,
+// which identify the object instead.
+uint64_t NativeXprStateKeyOf(const CommandBuffer& buffer) {
+	const auto& ctx = buffer.GetRegisters();
+	const auto& cfg = buffer.GetUserConfig();
+	const auto& vs  = buffer.GetShaders().GetVs();
+	const auto& ps  = buffer.GetShaders().GetPs();
+	auto hash = XXH3_64bits(&ctx, sizeof(ctx));
+	hash      = XXH3_64bits_withSeed(&cfg, sizeof(cfg), hash);
+	hash      = XXH3_64bits_withSeed(&vs.es_regs, sizeof(vs.es_regs), hash);
+	hash      = XXH3_64bits_withSeed(&vs.ls_regs, sizeof(vs.ls_regs), hash);
+	hash      = XXH3_64bits_withSeed(&vs.hs_regs, sizeof(vs.hs_regs), hash);
+	hash      = XXH3_64bits_withSeed(&vs.gs_regs, sizeof(vs.gs_regs), hash);
+	hash      = XXH3_64bits_withSeed(&ps.ps_regs, sizeof(ps.ps_regs), hash);
+	for (const auto* sgprs: {&vs.hs_user_sgpr, &vs.gs_user_sgpr, &ps.ps_user_sgpr}) {
+		hash = XXH3_64bits_withSeed(sgprs->type, sizeof(sgprs->type), hash);
+		hash = XXH3_64bits_withSeed(&sgprs->count, sizeof(sgprs->count), hash);
+	}
+	return hash;
+}
+
+} // namespace
+
+RenderExecutor::NativeXprCache& RenderExecutor::NativeXprState() {
+	if (!m_native_xpr) {
+		m_native_xpr = {new NativeXprCache {}, [](NativeXprCache* cache) { delete cache; }};
+		m_native_xpr->device  = m_context.GetGraphics().device;
+		m_native_xpr->scratch = {new DrawRenderStorage {}, [](DrawRenderStorage* storage) { delete storage; }};
+	}
+	return *m_native_xpr;
+}
+
+vk::DescriptorSet RenderExecutor::NativeXprAllocateSet(vk::DescriptorSetLayout layout,
+                                                       vk::DescriptorPool&     pool_out) {
+	auto&      cache  = NativeXprState();
+	const auto device = cache.device;
+	if (const auto found = cache.free_sets.find(static_cast<VkDescriptorSetLayout>(layout));
+	    found != cache.free_sets.end() && !found->second.empty()) {
+		const auto item = found->second.back();
+		found->second.pop_back();
+		--cache.free_count;
+		pool_out = item.pool;
+		return item.set;
+	}
+	vk::DescriptorSetAllocateInfo allocate {};
+	allocate.descriptorSetCount = 1;
+	allocate.pSetLayouts        = &layout;
+	vk::DescriptorSet set       = nullptr;
+	// Freed sets return to their pool; try the newest pools first.
+	for (size_t i = 0; i < cache.pools.size() && i < 4; ++i) {
+		const auto pool         = cache.pools[cache.pools.size() - 1 - i];
+		allocate.descriptorPool = pool;
+		if (device.allocateDescriptorSets(&allocate, &set) == vk::Result::eSuccess) {
+			pool_out = pool;
+			cache.set_layouts[static_cast<VkDescriptorSet>(set)] = static_cast<VkDescriptorSetLayout>(layout);
+			return set;
+		}
+	}
+	constexpr uint32_t Sets = 1024;
+	const std::array<vk::DescriptorPoolSize, 5> sizes {{
+	    {vk::DescriptorType::eStorageBuffer, Sets * 16},
+	    {vk::DescriptorType::eStorageBufferDynamic, Sets * 4},
+	    {vk::DescriptorType::eSampledImage, Sets * 32},
+	    {vk::DescriptorType::eSampler, Sets * 8},
+	    {vk::DescriptorType::eStorageImage, Sets * 4},
+	}};
+	vk::DescriptorPoolCreateInfo create {};
+	create.flags         = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet;
+	create.maxSets       = Sets;
+	create.poolSizeCount = static_cast<uint32_t>(sizes.size());
+	create.pPoolSizes    = sizes.data();
+	vk::DescriptorPool pool = nullptr;
+	EXIT_IF(device.createDescriptorPool(&create, nullptr, &pool) != vk::Result::eSuccess);
+	cache.pools.push_back(pool);
+	allocate.descriptorPool = pool;
+	if (device.allocateDescriptorSets(&allocate, &set) != vk::Result::eSuccess) {
+		return nullptr; // a set larger than a pool: the record is refused
+	}
+	pool_out = pool;
+	cache.set_layouts[static_cast<VkDescriptorSet>(set)] = static_cast<VkDescriptorSetLayout>(layout);
+	return set;
+}
+
+// A descriptor set leaves service; it may be in flight until the current tick.
+void RenderExecutor::NativeXprRetireSet(vk::DescriptorPool pool, vk::DescriptorSet set) {
+	if (!set) return;
+	NativeXprState().retired.push_back({pool, set, m_context.GetCommandScheduler().CurrentTick()});
+}
+
+// A record leaves service.
+void RenderExecutor::NativeXprRetire(std::unique_ptr<NativeXprRecord> record) {
+	NativeXprRetireSet(record->pool, record->set);
+	record->set = nullptr;
+	--NativeXprState().record_count;
+}
+
+// Once per frame: records no draw used for a while leave; the retired sets the GPU is done with
+// are kept for reuse or freed.
+void RenderExecutor::NativeXprCollect() {
+	if (!m_native_xpr) return;
+	auto&      cache = *m_native_xpr;
+	const auto frame = m_context.FrameNumber();
+	if (NativeXprStatsEnabled() && frame >= cache.reported_frame + 300) {
+		cache.reported_frame = frame;
+		const auto& c        = cache.counters;
+		std::printf("NativeXpr: frame %llu records %zu states %zu tries %llu hits %llu miss key %llu state %llu "
+		            "target %llu validate %llu emit %llu stores %llu stored %llu refused %llu\n",
+		            static_cast<unsigned long long>(frame), cache.record_count, cache.states.size(),
+		            static_cast<unsigned long long>(c.tries), static_cast<unsigned long long>(c.hits),
+		            static_cast<unsigned long long>(c.miss_key), static_cast<unsigned long long>(c.miss_state),
+		            static_cast<unsigned long long>(c.miss_target),
+		            static_cast<unsigned long long>(c.miss_validate), static_cast<unsigned long long>(c.miss_emit),
+		            static_cast<unsigned long long>(c.stores), static_cast<unsigned long long>(c.stored),
+		            static_cast<unsigned long long>(c.refused));
+		for (const auto& [reason, count]: cache.refuse_reasons)
+			std::printf("NativeXpr:   refused %.*s %llu\n", static_cast<int>(reason.size()), reason.data(),
+			            static_cast<unsigned long long>(count));
+		std::printf("NativeXpr:   validate unmapped %llu read %llu unlearned %llu resources %llu\n",
+		            static_cast<unsigned long long>(c.validate_unmapped), static_cast<unsigned long long>(c.validate_read),
+		            static_cast<unsigned long long>(c.validate_unlearned),
+		            static_cast<unsigned long long>(c.validate_resources));
+		std::printf("NativeXpr:   learn ok %llu reads %llu programs %llu buffers %llu images %llu samplers %llu other %llu "
+		            "unexplained %llu; target object %llu lookup %llu; rebinds %llu\n",
+		            static_cast<unsigned long long>(c.learn[0]), static_cast<unsigned long long>(c.learn[1]),
+		            static_cast<unsigned long long>(c.learn[2]), static_cast<unsigned long long>(c.learn[3]),
+		            static_cast<unsigned long long>(c.learn[4]), static_cast<unsigned long long>(c.learn[5]),
+		            static_cast<unsigned long long>(c.learn[6]), static_cast<unsigned long long>(c.learn[7]),
+		            static_cast<unsigned long long>(c.target_object), static_cast<unsigned long long>(c.target_lookup),
+		            static_cast<unsigned long long>(c.rebinds));
+		std::fflush(stdout);
+	}
+	if (frame - cache.swept_frame >= 8) {
+		cache.swept_frame = frame;
+		constexpr uint64_t KeepFrames = 600;
+		for (auto it = cache.records.begin(); it != cache.records.end();) {
+			auto& variants = it->second;
+			for (auto variant = variants.begin(); variant != variants.end();) {
+				if ((*variant)->used_frame + KeepFrames >= frame) {
+					++variant;
+					continue;
+				}
+				NativeXprRetire(std::move(*variant));
+				variant = variants.erase(variant);
+			}
+			it = variants.empty() ? cache.records.erase(it) : std::next(it);
+		}
+		std::erase_if(cache.refused, [&](const auto& item) { return item.second + NativeXprCache::RefuseFrames <= frame; });
+	}
+	if (cache.collected_frame == frame || cache.retired.empty()) return;
+	cache.collected_frame = frame;
+	auto& scheduler       = m_context.GetCommandScheduler();
+	std::vector<NativeXprCache::RetiredSet> done;
+	std::erase_if(cache.retired, [&](const NativeXprCache::RetiredSet& item) {
+		if (!scheduler.IsFree(item.tick)) return false;
+		const auto layout = cache.set_layouts.find(static_cast<VkDescriptorSet>(item.set));
+		if (layout != cache.set_layouts.end() && cache.free_count < NativeXprCache::FreeSetsMax) {
+			auto& sets = cache.free_sets[layout->second];
+			if (sets.size() < NativeXprCache::FreeSetsPerLayout) {
+				sets.push_back({item.pool, item.set});
+				++cache.free_count;
+				return true;
+			}
+		}
+		if (layout != cache.set_layouts.end()) cache.set_layouts.erase(layout);
+		done.push_back(item);
+		return true;
+	});
+	std::ranges::sort(done, {}, [](const auto& item) { return static_cast<VkDescriptorPool>(item.pool); });
+	std::vector<vk::DescriptorSet> batch;
+	for (size_t first = 0; first < done.size();) {
+		size_t last = first;
+		batch.clear();
+		while (last < done.size() && done[last].pool == done[first].pool) batch.push_back(done[last++].set);
+		(void)cache.device.freeDescriptorSets(done[first].pool, static_cast<uint32_t>(batch.size()), batch.data());
+		first = last;
+	}
+}
+
+// A fresh record replaced a stale one whose logged reads were at the same addresses. A position of
+// the evaluation's output (a flattened SRT entry, or a buffer descriptor's base address) that held
+// a logged word in both evaluations follows that word: its next change is patched there. Changed
+// words that reach no position reach nothing (they are ignored); a moved position no word explains
+// means the output is not a plain copy of the words, and nothing is learned.
+bool RenderExecutor::NativeXprLearn(const NativeXprRecord& stale, NativeXprRecord& fresh) {
+	const auto words = fresh.reads.WordCount();
+	fresh.word_known.assign(words, 0);
+	fresh.word_targets.assign(words, {});
+	auto& learn = m_native_xpr->counters.learn;
+	if (!stale.reads.SameReads(fresh.reads)) return ++learn[1], false;
+	if (stale.stage_count != fresh.stage_count || stale.vertex_program != fresh.vertex_program ||
+	    stale.pixel_program != fresh.pixel_program)
+		return ++learn[2], false;
+	// Everything but the flattened constants and the buffer base addresses must be unchanged (the
+	// memory offset bytes of the shader data follow the bases).
+	for (uint32_t st = 0; st < fresh.stage_count; ++st) {
+		const auto& a = stale.stages[st];
+		const auto& b = fresh.stages[st];
+		if (a.buffers.size() != b.buffers.size()) return ++learn[3], false;
+		for (size_t i = 0; i < a.buffers.size(); ++i) {
+			if (a.buffers[i].dword_count != b.buffers[i].dword_count) return ++learn[3], false;
+			for (uint32_t w = 0; w < a.buffers[i].dwords.size(); ++w) {
+				const uint32_t mask = w == 0 ? 0u : w == 1 ? 0xffff0000u : 0xffffffffu;
+				if ((a.buffers[i].dwords[w] & mask) != (b.buffers[i].dwords[w] & mask)) return ++learn[3], false;
+			}
+		}
+		if (!NativeXprSameImagesButLodStats(a.images, b.images)) return ++learn[4], false;
+		if (a.samplers != b.samplers) return ++learn[5], false;
+		const auto offsets = a.program->bindings.memory_offset_dword;
+		if (a.user_data != b.user_data || a.flattened.size() != b.flattened.size() ||
+		    a.shader_data.size() != b.shader_data.size() ||
+		    !std::equal(a.shader_data.begin(), a.shader_data.begin() + std::min<size_t>(offsets, a.shader_data.size()),
+		                b.shader_data.begin()))
+			return ++learn[6], false;
+	}
+	struct Position {
+		int32_t  code;
+		uint32_t before, now;
+	};
+	std::vector<Position> positions;
+	for (uint32_t st = 0; st < fresh.stage_count; ++st) {
+		const auto& a = stale.stages[st];
+		const auto& b = fresh.stages[st];
+		for (size_t j = 0; j < a.flattened.size(); ++j)
+			if (a.flattened[j] != b.flattened[j])
+				positions.push_back({static_cast<int32_t>(st << 24u | j), a.flattened[j], b.flattened[j]});
+		for (uint32_t i = 0; i < a.buffers.size(); ++i)
+			for (uint32_t w = 0; w < 2; ++w)
+				if (a.buffers[i].dwords[w] != b.buffers[i].dwords[w])
+					positions.push_back({NativeXprBufferPatch(st, i, w), a.buffers[i].dwords[w], b.buffers[i].dwords[w]});
+	}
+	std::vector<uint8_t> explained(positions.size(), 0);
+	for (size_t k = 0; k < words; ++k) {
+		const auto before = stale.reads.Word(k);
+		const auto now    = fresh.reads.Word(k);
+		if (before == now) {
+			// Unchanged: what it reached before still holds.
+			if (stale.word_known.size() == words && stale.word_known[k] != 0) {
+				fresh.word_known[k]   = 1;
+				fresh.word_targets[k] = stale.word_targets[k];
+			}
+			continue;
+		}
+		auto& targets = fresh.word_targets[k];
+		for (size_t p = 0; p < positions.size(); ++p) {
+			// (A buffer's dword 1 holds the address's high half in its low 16 bits.)
+			const bool high = positions[p].code < 0 && ((-16 - positions[p].code) & 0xfu) == 1u;
+			const auto mask = high ? 0xffffu : 0xffffffffu;
+			if ((positions[p].before & mask) == (before & mask) && (positions[p].now & mask) == (now & mask)) {
+				targets.push_back(positions[p].code);
+				explained[p] = 1;
+			}
+		}
+		fresh.word_known[k] = 1;
+	}
+	if (std::ranges::find(explained, uint8_t {0}) != explained.end()) {
+		fresh.word_known.assign(words, 0);
+		fresh.word_targets.assign(words, {});
+		++learn[7];
+		return false;
+	}
+	++learn[0];
+	return true;
+}
+
+// The resolved bindings of the normal draw -> record: the stage data, the runtime proof
+// dependencies and the descriptor set. Returns a reject reason, or nullptr.
+const char* RenderExecutor::NativeXprBindResources(NativeXprRecord& record,
+                                                   std::span<PreparedBindings* const> stages,
+                                                   const PipelineCache::Pipeline& pipeline) {
+	using Kind      = ShaderRecompiler::IR::DescriptorBindingKind;
+	auto& buffers   = m_context.GetBufferCache();
+	auto& textures  = m_context.GetTextureCache();
+	const auto& graphics = m_context.GetGraphics();
+	for (const auto* prepared: stages) {
+		const auto& program = *prepared->runtime->program;
+		// (A record syncs no device-address reads: a program reading memory through them takes the normal path, which
+		// synchronizes them.)
+		if (prepared->gds.buffer != nullptr || program.has_address_writes || program.info.uses_dma)
+			return "dma_gds_or_address_writes";
+		if (!prepared->table_images.empty() || prepared->table_state != nullptr || prepared->tables_reused)
+			return "image_tables";
+		for (const auto& resource: program.info.buffers)
+			if (resource.written || resource.atomic) return "written_buffer";
+		for (const auto& image: program.info.images)
+			if (image.written || image.atomic) return "written_image";
+		for (const auto& image: prepared->images)
+			if (image.desc.type == TextureCache::BindingType::Storage) return "storage_image";
+	}
+	std::vector<NativeXprRecord::BufferDep> buffer_deps;
+	std::vector<NativeXprRecord::ImageDep>  image_deps;
+	const auto alignment = graphics.StorageMinAlignment();
+	const auto max_range = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
+	for (uint32_t st = 0; st < stages.size(); ++st) {
+		auto* const prepared = stages[st];
+		const auto& program  = *prepared->runtime->program;
+		for (uint32_t r = 0; r < program.info.buffers.size(); ++r) {
+			const auto& resource = program.info.buffers[r];
+			const auto  index    = resource.descriptor_index;
+			if (index == UINT32_MAX) continue;
+			const auto& source = prepared->buffer_sources[index];
+			if (source.address == 0 || source.size == 0) continue;
+			const bool texel = resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled());
+			auto id = source.id;
+			if (!id || buffers.GetBufferIfLive(id) == nullptr ||
+			    !buffers.GetBufferIfLive(id)->IsInBounds(source.address, source.size))
+				id = buffers.FindBuffer(source.address, source.size);
+			const auto* owner = buffers.GetBufferIfLive(id);
+			if (owner == nullptr || !owner->IsInBounds(source.address, source.size)) return "buffer_owner";
+			if (prepared->buffers[index].buffer != owner->Handle() ||
+			    buffers.IsRegionCpuModified(source.address, source.size)) {
+				// The normal path streams small ranges (CPU-dirty pages, or a copy it made earlier in
+				// the draw window) and never cleans the owner. Clean it once and bind the owner: a
+				// later CPU write marks the range dirty and the record's proof notices.
+				if (buffers.IsRegionGpuModified(source.address, source.size)) return "buffer_gpu_and_cpu";
+				buffers.EnsureBufferContents(source.address, source.size);
+				if (buffers.IsRegionCpuModified(source.address, source.size)) return "buffer_still_dirty";
+				const auto offset     = owner->Offset(source.address);
+				const auto aligned    = offset - offset % alignment;
+				const auto adjustment = offset - aligned;
+				if (adjustment >= 256 || source.size > max_range - adjustment) return "buffer_alignment";
+				prepared->buffers[index] = {owner->Handle(), aligned, source.size + adjustment};
+				auto&      word  = prepared->shader_data[program.bindings.memory_offset_dword + index / 4u];
+				const auto shift = (index % 4u) * 8u;
+				word = (word & ~(0xffu << shift)) | (static_cast<uint32_t>(adjustment) << shift);
+			}
+			// ObtainBuffer refreshes a texel buffer from an image that starts exactly at its address;
+			// the record cannot.
+			if (texel && textures.HasImageStartingAt(source.address)) return "texel_image";
+			buffer_deps.push_back({source.address, source.size, id, owner->Handle(), texel, st, r, index});
+		}
+		for (const auto& image: prepared->images) {
+			// A null image is bound as the normal path binds it.
+			if (!image.image_id) continue;
+			if (image.layout != vk::ImageLayout::eShaderReadOnlyOptimal) return "image_layout";
+			const auto* owner = textures.m_slot_images.try_get(image.image_id);
+			if (owner == nullptr || owner->binding.is_target || owner->binding.force_general)
+				return "image_binding";
+			if (!textures.IsSampledImageCurrent(image.image_id, image.desc)) return "image_not_current";
+			const auto& view = image.desc.view_info;
+			image_deps.push_back({image.image_id, owner->serial, image.layout,
+			                      {view.base_level, view.level_count, view.base_layer, view.layer_count},
+			                      image.desc});
+		}
+	}
+
+	// Stage data and the descriptor payload, in the order CommitBindings() writes them.
+	struct Pending {
+		vk::WriteDescriptorSet write;
+		size_t                 start = 0;
+		bool                   image = false;
+	};
+	std::vector<Pending>                  pending;
+	std::vector<vk::DescriptorBufferInfo> buffer_infos;
+	std::vector<vk::DescriptorImageInfo>  image_infos;
+	std::vector<NativeXprRecord::DynamicBinding> dynamic_bindings;
+	const auto upload = buffers.GetUtilityBuffer(MemoryUsage::Stream).Handle();
+	vk::ShaderStageFlags push_stages = vk::ShaderStageFlagBits::eFragment;
+	bool                 has_push    = false;
+	for (uint32_t index = 0; index < stages.size(); ++index) {
+		const auto& prepared = *stages[index];
+		const auto& program  = *prepared.runtime->program;
+		const auto& snapshot = *prepared.runtime->resources;
+		auto&       stage    = record.stages[index];
+		stage.program        = &program;
+		stage.flattened      = snapshot.flattened_srt;
+		stage.shader_data    = prepared.shader_data;
+		stage.buffers        = snapshot.buffers;
+		stage.images         = snapshot.images;
+		stage.samplers       = snapshot.samplers;
+		stage.user_data      = snapshot.user_data;
+		stage.srt_binding = stage.data_binding = false;
+		stage.push_start = ShaderRecompiler::IR::PushData::NoStart;
+		if (stage.shader_data.size() != program.bindings.ShaderDataDwords()) return "shader_data";
+		if (program.bindings.UsesPushData()) {
+			stage.push_start = program.bindings.push_data_start_dword;
+			has_push         = true;
+		}
+		push_stages |= NativeShaderStage(program.stage);
+		std::array<size_t, ShaderRecompiler::IR::ImageBindingCount> image_starts {};
+		for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
+			const auto kind_index = std::countr_zero(mask);
+			const auto kind       = static_cast<Kind>(kind_index);
+			Pending    item;
+			item.write.dstBinding      = ShaderRecompiler::IR::NativeBinding(program.stage, kind);
+			item.write.descriptorType  = NativeDescriptorType(kind);
+			item.write.descriptorCount = program.bindings.descriptor_counts[kind_index];
+			if (ShaderRecompiler::IR::ImageBindingResourceClass(kind) != ShaderRecompiler::IR::ImageResourceClass::None) {
+				item.image = true;
+				item.start = image_infos.size();
+				image_starts[ShaderRecompiler::IR::ImageBindingIndex(kind)] = item.start;
+				image_infos.resize(image_infos.size() + item.write.descriptorCount);
+			} else {
+				switch (kind) {
+					case Kind::Buffers:
+						item.start = buffer_infos.size();
+						record.buffers_start[index] = static_cast<uint32_t>(item.start);
+						if (prepared.buffers.size() != item.write.descriptorCount) return "buffer_count";
+						for (const auto& view: prepared.buffers) {
+							if (view.buffer == nullptr) return "null_buffer";
+							buffer_infos.push_back(view);
+						}
+						break;
+					case Kind::BdaPagetable:
+					case Kind::FaultBuffer: {
+						const auto* owner = kind == Kind::BdaPagetable ? buffers.GetBdaPageTableBuffer()
+						                                               : buffers.GetFaultBuffer();
+						item.start = buffer_infos.size();
+						buffer_infos.emplace_back(owner->Handle(), 0, owner->Size());
+						break;
+					}
+					case Kind::FlattenedSrt:
+					case Kind::ShaderData: {
+						const bool  srt    = kind == Kind::FlattenedSrt;
+						const auto& values = srt ? stage.flattened : stage.shader_data;
+						if (values.empty() || item.write.descriptorCount != 1) return "empty_dynamic";
+						(srt ? stage.srt_binding : stage.data_binding) = true;
+						item.write.descriptorType = vk::DescriptorType::eStorageBufferDynamic;
+						item.start                = buffer_infos.size();
+						buffer_infos.emplace_back(upload, 0, values.size() * sizeof(uint32_t));
+						dynamic_bindings.push_back({item.write.dstBinding, index, srt});
+						break;
+					}
+					case Kind::Samplers:
+						item.image = true;
+						item.start = image_infos.size();
+						for (const auto sampler: prepared.samplers) {
+							if (sampler == nullptr) return "null_sampler";
+							image_infos.emplace_back(sampler, nullptr, vk::ImageLayout::eUndefined);
+						}
+						if (prepared.samplers.size() != item.write.descriptorCount) return "sampler_count";
+						break;
+					default: return "binding_kind";
+				}
+			}
+			pending.push_back(item);
+		}
+		if (prepared.images.size() != program.info.images.size()) return "image_count";
+		for (uint32_t i = 0; i < program.info.images.size(); ++i) {
+			const auto& resource = program.info.images[i];
+			const auto& texture  = prepared.images[i];
+			if (texture.image_id && resource.mip_count != (texture.mip_views.empty() ? 1u : texture.mip_views.size()))
+				return "image_mips";
+			const auto kind  = *ShaderRecompiler::IR::DescriptorBindingForImage(resource);
+			const auto start = image_starts[ShaderRecompiler::IR::ImageBindingIndex(kind)] + resource.descriptor_index;
+			for (uint32_t mip = 0; mip < resource.mip_count; ++mip) {
+				if (start + mip >= image_infos.size()) return "image_slot";
+				image_infos[start + mip] = MakeImageInfo(texture, mip);
+			}
+		}
+	}
+	// The dynamic offsets follow binding order.
+	std::ranges::sort(dynamic_bindings, {}, &NativeXprRecord::DynamicBinding::binding);
+
+	record.stage_count      = static_cast<uint32_t>(stages.size());
+	record.push_stages      = push_stages;
+	record.has_push         = has_push;
+	record.upload           = upload;
+	record.dynamic_bindings = std::move(dynamic_bindings);
+	record.buffers          = std::move(buffer_deps);
+	record.images           = std::move(image_deps);
+	record.mapping_version  = m_context.MappedRangesVersion();
+	record.buffer_set_epoch = buffers.BufferSetEpoch();
+	record.image_set_epoch  = textures.ImageSetEpoch();
+	uint64_t cpu_epoch      = 0;
+	for (const auto& dep: record.buffers) {
+		const auto epoch = buffers.CpuDirtyEpoch(dep.address, dep.size);
+		if (epoch == 0) {
+			cpu_epoch = 0;
+			break;
+		}
+		cpu_epoch += epoch;
+	}
+	record.cpu_epoch         = cpu_epoch;
+	record.image_dirty_epoch = Image::CpuDirtyEpoch();
+	record.validated_frame   = m_context.FrameNumber();
+
+	record.set = NativeXprAllocateSet(pipeline.descriptor_set_layout, record.pool);
+	if (!record.set) return "set_allocation";
+	std::vector<vk::WriteDescriptorSet> writes;
+	writes.reserve(pending.size());
+	for (auto& item: pending) {
+		item.write.dstSet = record.set;
+		if (item.image) item.write.pImageInfo = image_infos.data() + item.start;
+		else item.write.pBufferInfo = buffer_infos.data() + item.start;
+		writes.push_back(item.write);
+	}
+	if (!writes.empty())
+		m_context.GetGraphics().device.updateDescriptorSets(static_cast<uint32_t>(writes.size()), writes.data(), 0,
+		                                                    nullptr);
+	record.set_writes.clear();
+	for (const auto& item: pending)
+		record.set_writes.push_back({item.write.dstBinding, item.write.descriptorCount, static_cast<uint32_t>(item.start),
+		                             item.write.descriptorType, item.image});
+	record.set_buffers = std::move(buffer_infos);
+	record.set_images  = std::move(image_infos);
+	return nullptr;
+}
+
+// Called by ExecutePreparedDraw() after the draw is recorded, for a draw whose try requested a
+// store.
+void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState& state,
+                                    vk::PrimitiveTopology topology, bool primitive_restart_enable,
+                                    const RenderState& rendering, std::span<PreparedBindings* const> stages,
+                                    const DynamicState& dynamic_state) {
+	auto& cache = NativeXprState();
+	++cache.counters.stores;
+	const auto frame  = m_context.FrameNumber();
+	const auto refuse = [&](const char* reason) {
+		++cache.counters.refused;
+		cache.refused[cache.tried_hash] = frame;
+		++cache.refuse_reasons[reason];
+	};
+	const auto refuse_program = [&](const char* reason) {
+		refuse(reason);
+		std::vector<uint32_t> key;
+		NativeXprKeyOf(buffer, key);
+		cache.unstorable[NativeXprPairKey(key)] = true;
+	};
+	if (stages.empty() || stages.size() > 2 || (stages.size() == 2) != state.ps_active ||
+	    state.programs.VertexStageCount() != 1) {
+		return refuse_program("stages");
+	}
+	for (const auto* prepared: stages) {
+		const auto& program = *prepared->runtime->program;
+		if (prepared->gds.buffer != nullptr || program.has_address_writes || program.info.uses_dma)
+			return refuse_program("dma_gds");
+		for (const auto& resource: program.info.buffers)
+			if (resource.written || resource.atomic) return refuse_program("written_buffer");
+		for (const auto& image: program.info.images)
+			if (image.written || image.atomic) return refuse_program("written_image");
+	}
+	auto record = std::make_unique<NativeXprRecord>();
+	NativeXprKeyOf(buffer, record->key);
+	if (NativeXprHash(record->key) != cache.tried_hash) return refuse("key_moved");
+	const auto state_key = cache.state_key;
+
+	// The reads of the programs' SRT evaluation: the same resolution again, with a read log (the
+	// draw's own resolution may not have one), which must give the same resources.
+	auto& scratch = cache.scratch->state;
+	ResetDrawRenderState(scratch, cache.scratch->tessellation_stages_written);
+	cache.scratch->tessellation_stages_written = false;
+	cache.scratch_programs.Reset();
+	const auto& ctx               = buffer.GetRegisters();
+	const auto  color_output_mask = DrawColorOutputMask(ctx);
+	scratch.ps_active             = state.ps_active;
+	RefreshShaderPrograms(m_context.GetPipelineCache(), ctx, buffer.GetShaders(), buffer.GetUserConfig(),
+	                      color_output_mask, scratch, &cache.scratch_programs);
+	auto& reads = cache.scratch_programs.reads;
+	if (reads.Failed() || !reads.DwordAligned() || reads.WordCount() > 4096) return refuse("reads");
+	if (scratch.programs.vertex[0].id != state.programs.vertex[0].id ||
+	    (state.ps_active && scratch.programs.pixel.id != state.programs.pixel.id))
+		return refuse("programs_moved");
+	const std::array<const ShaderStageRuntime*, 2> fresh_stages {&scratch.vertex_info[0].stage,
+	                                                             &scratch.ps_input_info.stage};
+	for (uint32_t st = 0; st < stages.size(); ++st) {
+		const auto& a = *stages[st]->runtime->resources;
+		const auto& b = *fresh_stages[st]->resources;
+		if (fresh_stages[st]->program != stages[st]->runtime->program || a.buffers != b.buffers ||
+		    a.images != b.images || a.samplers != b.samplers || a.flattened_srt != b.flattened_srt ||
+		    a.user_data != b.user_data || !b.image_tables.empty())
+			return refuse("resources_moved");
+	}
+
+	auto* const pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
+	    std::span {state.colors, state.color_count}, *state.depth,
+	    std::span {state.vertex_info.data(), 1}, buffer, state.ps_active ? &state.ps_input_info : nullptr, topology,
+	    primitive_restart_enable, state.programs, false, true);
+	if (pipeline == nullptr || !pipeline->native_bindings || pipeline->uses_push_descriptors) return refuse("pipeline");
+	record->vertex_program = state.programs.vertex[0].id;
+	record->pixel_program  = state.ps_active ? state.programs.pixel.id : 0;
+	record->pipelines.emplace_back(state_key, pipeline);
+	if (const char* reason = NativeXprBindResources(*record, stages, *pipeline)) {
+		NativeXprRetireSet(record->pool, record->set);
+		return refuse(reason);
+	}
+	record->reads = reads;
+
+	// The draw state: the targets as this draw left them and the dynamic state.
+	{
+		auto& textures  = m_context.GetTextureCache();
+		auto  draw_state = std::make_unique<NativeXprDrawState>();
+		draw_state->rendering = rendering;
+		for (auto& attachment: draw_state->rendering.color_attachments) attachment.is_clear = false;
+		draw_state->rendering.depth_stencil_attachment.depth_clear   = false;
+		draw_state->rendering.depth_stencil_attachment.stencil_clear = false;
+		const auto metadata_of = [](const TextureCache::ImageDesc& desc) {
+			return desc.info.metadata.kind == ImageMetadataKind::None ? uint64_t {0} : desc.info.metadata.range.address;
+		};
+		for (uint32_t i = 0; i < state.color_count; ++i) {
+			const auto& target = state.colors[i];
+			const auto& view   = target.desc.view_info;
+			const auto& image  = textures.GetImage(target.image_id);
+			draw_state->targets.push_back({target.image_id, image.serial,
+			                               rendering.color_attachments[target.target_slot].image_layout,
+			                               image.binding.attachment_access,
+			                               {view.base_level, view.level_count, view.base_layer, view.layer_count},
+			                               metadata_of(target.desc), view.base_layer, target.desc.info});
+		}
+		if (state.depth->image_id) {
+			const auto& view  = state.depth->desc.view_info;
+			const auto& image = textures.GetImage(state.depth->image_id);
+			draw_state->targets.push_back({state.depth->image_id, image.serial,
+			                               rendering.depth_stencil_attachment.image_layout,
+			                               image.binding.attachment_access,
+			                               {view.base_level, view.level_count, view.base_layer, view.layer_count},
+			                               metadata_of(state.depth->desc), view.base_layer, state.depth->desc.info});
+		}
+		draw_state->dynamic       = dynamic_state;
+		draw_state->targets_epoch = textures.ImageSetEpoch();
+		draw_state->used_frame    = frame;
+		cache.states[state_key]   = std::move(draw_state);
+	}
+
+	const auto hash    = NativeXprHash(record->key);
+	record->used_frame = frame;
+	auto& variants = cache.records[hash];
+	if (!variants.empty() && variants.front()->key != record->key) {
+		// A hash collision: the other object's records leave.
+		for (auto& variant: variants) NativeXprRetire(std::move(variant));
+		variants.clear();
+	}
+	// Pipelines depend on the programs and the draw state only: every variant shares them.
+	for (const auto& variant: variants)
+		if (variant->vertex_program == record->vertex_program && variant->pixel_program == record->pixel_program)
+			for (const auto& entry: variant->pipelines)
+				if (std::ranges::find(record->pipelines, entry.first,
+				                      &std::pair<uint64_t, const PipelineCache::Pipeline*>::first) == record->pipelines.end())
+					record->pipelines.push_back(entry);
+	// Learn the constants from a variant with the same resources; that variant is the one this
+	// store replaces (its words changed in a way it had not learned).
+	auto replaced = variants.end();
+	for (auto it = variants.begin(); it != variants.end(); ++it)
+		if (NativeXprLearn(**it, *record)) {
+			replaced = it;
+			break;
+		}
+	if (record->word_known.size() != record->reads.WordCount()) {
+		record->word_known.assign(record->reads.WordCount(), 0);
+		record->word_targets.assign(record->reads.WordCount(), {});
+	}
+	if (replaced != variants.end()) {
+		NativeXprRetire(std::move(*replaced));
+		variants.erase(replaced);
+	} else if (variants.size() >= NativeXprCache::MaxVariants) {
+		NativeXprRetire(std::move(variants.back()));
+		variants.pop_back();
+	}
+	variants.insert(variants.begin(), std::move(record));
+	++cache.record_count;
+	++cache.counters.stored;
+}
+
+// Buffers and images: once per frame, or when the buffer or image set moved.
+bool RenderExecutor::NativeXprValidateResources(NativeXprRecord& record, uint64_t frame, bool mapping_moved) {
+	auto& buffers  = m_context.GetBufferCache();
+	auto& textures = m_context.GetTextureCache();
+	const auto cpu_epoch_now = [&] {
+		uint64_t sum = 0;
+		for (const auto& dep: record.buffers) {
+			const auto epoch = buffers.CpuDirtyEpoch(dep.address, dep.size);
+			if (epoch == 0) return uint64_t {0};
+			sum += epoch;
+		}
+		return sum;
+	};
+	if (!mapping_moved && record.validated_frame == frame && record.buffer_set_epoch == buffers.BufferSetEpoch() &&
+	    record.image_set_epoch == textures.ImageSetEpoch()) {
+		const auto cpu_epoch     = cpu_epoch_now();
+		const bool buffers_clean = record.buffers.empty() || (cpu_epoch != 0 && cpu_epoch == record.cpu_epoch) ||
+		                           std::ranges::none_of(record.buffers, [&](const auto& dep) {
+			                           return buffers.IsRegionCpuModified(dep.address, dep.size);
+		                           });
+		const auto image_epoch  = Image::CpuDirtyEpoch();
+		bool       images_clean = image_epoch == record.image_dirty_epoch;
+		if (buffers_clean && !images_clean) {
+			images_clean = std::ranges::none_of(record.images, [&](const auto& dep) {
+				const auto* image = textures.m_slot_images.try_get(dep.id);
+				return image == nullptr || image->serial != dep.serial || TextureCache::RefreshPending(*image);
+			});
+			if (images_clean) record.image_dirty_epoch = image_epoch;
+		}
+		if (buffers_clean && images_clean) return true;
+	}
+	const auto image_epoch_at_proof = Image::CpuDirtyEpoch();
+	const auto cpu_epoch            = cpu_epoch_now();
+	const bool cpu_proven           = !mapping_moved && cpu_epoch != 0 && cpu_epoch == record.cpu_epoch;
+	for (const auto& dep: record.buffers) {
+		if (mapping_moved && m_context.UnmappedSince(record.mapping_version, dep.address, dep.size)) return false;
+		if (!buffers.TouchLiveBuffer(dep.id, dep.handle, dep.address, dep.size)) return false;
+		if (cpu_proven || !buffers.IsRegionCpuModified(dep.address, dep.size)) continue;
+		// The guest rewrote the range: bring the owner up to date as the store did.
+		if (buffers.IsRegionGpuModified(dep.address, dep.size)) return false;
+		buffers.EnsureBufferContents(dep.address, dep.size);
+		if (buffers.IsRegionCpuModified(dep.address, dep.size)) return false;
+	}
+	record.cpu_epoch        = cpu_epoch_now();
+	record.buffer_set_epoch = buffers.BufferSetEpoch();
+	const bool images_moved = textures.ImageSetEpoch() != record.image_set_epoch;
+	if (images_moved) {
+		// Texel buffers: still no image starting at one.
+		for (const auto& dep: record.buffers)
+			if (dep.texel && textures.HasImageStartingAt(dep.address)) return false;
+	}
+	for (const auto& dep: record.images) {
+		auto* image = textures.m_slot_images.try_get(dep.id);
+		if (image == nullptr || image->serial != dep.serial) return false;
+		// The guest rewrote it (a texture streaming in): upload it as FindTexture does.
+		if (TextureCache::RefreshPending(*image)) {
+			if (!image->registered || image->depth_id || image->binding.needs_rebind) return false;
+			(void)textures.FindTexture(dep.id, dep.desc);
+			image = textures.m_slot_images.try_get(dep.id);
+			if (image == nullptr || image->serial != dep.serial || TextureCache::RefreshPending(*image)) return false;
+		}
+		if (images_moved && !textures.IsSampledImageCurrent(dep.id, dep.desc)) return false;
+		(void)textures.GetImage(dep.id); // LRU, as FindTexture does
+	}
+	record.image_set_epoch   = textures.ImageSetEpoch();
+	record.mapping_version   = m_context.MappedRangesVersion();
+	record.validated_frame   = frame;
+	record.image_dirty_epoch = image_epoch_at_proof;
+	return true;
+}
+
+// Buffer descriptors whose base address moved (a ring of constants, a per-frame allocation): the
+// slots are resolved again as FindBuffers and the store resolve them (a live, CPU-clean owner, no
+// image starting at a texel range) and a new set is written with them. False when a slot does not
+// resolve to what a record may hold.
+bool RenderExecutor::NativeXprRebindBuffers(NativeXprRecord& record, std::span<const std::pair<uint32_t, uint32_t>> slots) {
+	if (record.pipelines.empty() || record.set_writes.empty()) return false;
+	auto&       buffers   = m_context.GetBufferCache();
+	auto&       textures  = m_context.GetTextureCache();
+	const auto& graphics  = m_context.GetGraphics();
+	const auto  alignment = graphics.StorageMinAlignment();
+	const auto  max_range = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
+	for (const auto& [st, r]: slots) {
+		auto& stage = record.stages[st];
+		if (r >= stage.program->info.buffers.size() || r >= stage.buffers.size() || record.buffers_start[st] == UINT32_MAX)
+			return false;
+		const auto& resource = stage.program->info.buffers[r];
+		const auto  slot     = resource.descriptor_index;
+		if (slot == UINT32_MAX || resource.written || resource.atomic) return false;
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(stage.buffers[r]);
+		const auto address    = descriptor.Base48();
+		auto       size       = descriptor.GetSize();
+		if (address == 0 || size == 0 || descriptor.NumRecords() == UINT32_MAX) return false;
+		size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+		if (size == 0 || size > max_range) return false;
+		const auto  id    = buffers.FindBuffer(address, size);
+		const auto* owner = buffers.GetBufferIfLive(id);
+		if (owner == nullptr || !owner->IsInBounds(address, size)) return false;
+		if (buffers.IsRegionCpuModified(address, size)) {
+			if (buffers.IsRegionGpuModified(address, size)) return false;
+			buffers.EnsureBufferContents(address, size);
+			if (buffers.IsRegionCpuModified(address, size)) return false;
+		}
+		const bool texel = resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled());
+		if (texel && textures.HasImageStartingAt(address)) return false;
+		const auto offset     = owner->Offset(address);
+		const auto aligned    = offset - offset % alignment;
+		const auto adjustment = offset - aligned;
+		if (adjustment >= 256 || size > max_range - adjustment) return false;
+		const auto position = record.buffers_start[st] + slot;
+		if (position >= record.set_buffers.size()) return false;
+		record.set_buffers[position] = {owner->Handle(), aligned, size + adjustment};
+		auto&      word  = stage.shader_data[stage.program->bindings.memory_offset_dword + slot / 4u];
+		const auto shift = (slot % 4u) * 8u;
+		word             = (word & ~(0xffu << shift)) | (static_cast<uint32_t>(adjustment) << shift);
+		const NativeXprRecord::BufferDep dep {address, size, id, owner->Handle(), texel, st, r, slot};
+		const auto found = std::ranges::find_if(record.buffers, [&](const auto& item) {
+			return item.stage == st && item.resource == r;
+		});
+		if (found != record.buffers.end()) *found = dep;
+		else record.buffers.push_back(dep);
+	}
+	// The new set is written with the rest of the payload too: none of it may be gone since the record was proven.
+	for (const auto& dep: record.buffers) {
+		const auto* owner = buffers.GetBufferIfLive(dep.id);
+		if (owner == nullptr || owner->Handle() != dep.handle) return false;
+	}
+	for (const auto& dep: record.images) {
+		const auto* image = textures.m_slot_images.try_get(dep.id);
+		if (image == nullptr || image->serial != dep.serial) return false;
+	}
+	// The set may be in flight: a new one with the payload.
+	NativeXprRetireSet(record.pool, record.set);
+	record.set = NativeXprAllocateSet(record.pipelines.front().second->descriptor_set_layout, record.pool);
+	if (!record.set) return false;
+	std::vector<vk::WriteDescriptorSet> writes;
+	writes.reserve(record.set_writes.size());
+	for (const auto& slot: record.set_writes) {
+		vk::WriteDescriptorSet write {};
+		write.dstSet          = record.set;
+		write.dstBinding      = slot.binding;
+		write.descriptorCount = slot.count;
+		write.descriptorType  = slot.type;
+		if (slot.image) write.pImageInfo = record.set_images.data() + slot.start;
+		else write.pBufferInfo = record.set_buffers.data() + slot.start;
+		writes.push_back(write);
+	}
+	graphics.device.updateDescriptorSets(static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+	// The new buffers are proven with the rest of the resources.
+	record.validated_frame = UINT64_MAX;
+	return true;
+}
+
+// At every use: is the record's content still what a fresh translation gives?
+bool RenderExecutor::NativeXprValidate(NativeXprRecord& record, uint64_t frame, bool& broken) {
+	auto&      cache         = *m_native_xpr;
+	broken                   = false;
+	const bool mapping_moved = m_context.MappedRangesVersion() != record.mapping_version;
+	if (mapping_moved) {
+		// An unmap can take words the record reads.
+		bool unmapped = false;
+		record.reads.ForEachRead([&](uint64_t address, uint64_t size) {
+			unmapped = unmapped || m_context.UnmappedSince(record.mapping_version, address, size);
+		});
+		if (unmapped) return ++cache.counters.validate_unmapped, broken = true, false;
+	}
+	auto& changed = cache.changed;
+	changed.clear();
+	if (!record.reads.CollectChanges(changed)) return ++cache.counters.validate_read, broken = true, false;
+	for (const auto& [index, value]: changed)
+		if (record.word_known[index] == 0) return ++cache.counters.validate_unlearned, false;
+	// Only learned words moved: patch what they reach.
+	auto& rebind = cache.rebind_buffers;
+	rebind.clear();
+	for (const auto& [index, value]: changed) {
+		for (const auto target: record.word_targets[index]) {
+			if (target >= 0) {
+				const auto at = static_cast<uint32_t>(target);
+				record.stages[at >> 24u].flattened[at & 0xffffffu] = value;
+				continue;
+			}
+			const auto code     = static_cast<uint32_t>(-16 - target);
+			const auto st       = code >> 20u;
+			const auto resource = (code >> 4u) & 0xffffu;
+			const auto dword    = code & 0xfu;
+			auto&      held     = record.stages[st].buffers[resource].dwords[dword];
+			held                = dword == 1 ? (held & 0xffff0000u) | (value & 0xffffu) : value;
+			rebind.emplace_back(st, resource);
+		}
+		record.reads.SetWord(index, value);
+	}
+	if (!rebind.empty()) {
+		std::ranges::sort(rebind);
+		rebind.erase(std::unique(rebind.begin(), rebind.end()), rebind.end());
+		++cache.counters.rebinds;
+		if (!NativeXprRebindBuffers(record, rebind)) return ++cache.counters.validate_resources, broken = true, false;
+	}
+	if (!NativeXprValidateResources(record, frame, mapping_moved))
+		return ++cache.counters.validate_resources, broken = true, false;
+	return true;
+}
+
+// The targets in the state's layouts. What the normal path's acquisition establishes must still
+// hold: the image is the same registered object, GPU owned (so CPU reads download it) and CPU
+// clean, and no fast clear is pending in its metadata.
+bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, CommandRecorder vk_buffer) {
+	auto& textures = m_context.GetTextureCache();
+	for (const auto& target: draw_state.targets) {
+		auto* image = textures.m_slot_images.try_get(target.id);
+		if (image == nullptr || image->serial != target.serial || !image->registered || image->binding.needs_rebind ||
+		    !image->SafeToDownload())
+			return false;
+		if (target.metadata != 0 && textures.IsMetaCleared(target.metadata, target.slice)) return false;
+	}
+	for (const auto& target: draw_state.targets) {
+		auto& image = textures.GetImage(target.id); // LRU, as acquisition does
+		image.Transit(target.layout, target.access, target.range, vk_buffer);
+	}
+	return true;
+}
+
+// A deleted target image took the state's attachment views along, and an image registered over
+// a target may be what the registers now select: the normal path captures the state again.
+bool RenderExecutor::NativeXprTargetsCurrent(NativeXprDrawState& draw_state) {
+	auto&      textures = m_context.GetTextureCache();
+	const auto current  = textures.ImageSetEpoch();
+	if (draw_state.targets_epoch == current) return true;
+	for (const auto& target: draw_state.targets) {
+		const auto* image = textures.m_slot_images.try_get(target.id);
+		if (image == nullptr || image->serial != target.serial || !image->registered)
+			return ++m_native_xpr->counters.target_object, false;
+	}
+	// A lookup of a target's range finds the same image while no image over that range was
+	// registered or unregistered since the targets were proven (the lookups only see the range).
+	bool       moved = false;
+	const bool known = textures.ForEachImageSetChangeSince(draw_state.targets_epoch, [&](uint64_t address, uint64_t size) {
+		for (const auto& target: draw_state.targets)
+			moved = moved || ImageRangeOverlaps(address, size, target.requested.data.address, target.requested.data.size);
+	});
+	if (!known || moved) {
+		// Images were registered or unregistered over a target's range: a lookup still finds the
+		// target when it is the last image with the requested backing there.
+		for (const auto& target: draw_state.targets)
+			if (!textures.IsTargetCurrent(target.id, target.requested)) return ++m_native_xpr->counters.target_lookup, false;
+	}
+	draw_state.targets_epoch = current;
+	return true;
+}
+
+bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& record, NativeXprDrawState& draw_state,
+                                   const PipelineCache::Pipeline& pipeline, uint64_t args_addr, uint64_t index_base,
+                                   uint64_t index_bytes, vk::IndexType index_type) {
+	auto& buffer_cache = m_context.GetBufferCache();
+	auto& stream       = buffer_cache.GetUtilityBuffer(MemoryUsage::Stream);
+	if (stream.Handle() != record.upload) return false;
+	// Constants into the stream buffer, at the set's dynamic offsets (binding order).
+	const auto& limits    = m_context.GetGraphics().GetPhysicalDeviceProperties().limits;
+	const auto  alignment = std::max<uint64_t>({256, limits.minUniformBufferOffsetAlignment,
+	                                            limits.minStorageBufferOffsetAlignment});
+	std::array<uint32_t, 8>        offsets {};
+	ShaderRecompiler::IR::PushData push_data;
+	if (record.dynamic_bindings.size() > offsets.size()) return false;
+	for (size_t i = 0; i < record.dynamic_bindings.size(); ++i) {
+		const auto& binding = record.dynamic_bindings[i];
+		const auto& stage   = record.stages[binding.stage];
+		const auto& values  = binding.srt ? stage.flattened : stage.shader_data;
+		offsets[i]          = static_cast<uint32_t>(
+            buffer_cache.StreamUpload(values.data(), values.size() * sizeof(uint32_t), alignment));
+	}
+	for (uint32_t i = 0; i < record.stage_count; ++i) {
+		const auto& stage = record.stages[i];
+		if (stage.push_start != ShaderRecompiler::IR::PushData::NoStart) {
+			if (stage.push_start + stage.shader_data.size() > push_data.dwords.size()) return false;
+			std::ranges::copy(stage.shader_data, push_data.dwords.begin() + stage.push_start);
+		}
+	}
+	// Indices and arguments are read by the GPU; lookups may restart the scheduler, so the command
+	// buffer handle is taken after them.
+	if (index_bytes <= BufferCache::CACHING_PAGESIZE && buffer_cache.IsRegionCpuModified(index_base, index_bytes) &&
+	    !buffer_cache.IsRegionGpuModified(index_base, index_bytes))
+		buffer_cache.EnsureBufferContents(index_base, index_bytes);
+	const auto [indices, index_offset] = buffer_cache.ObtainBuffer(index_base, index_bytes, false);
+	const auto [arguments, args_offset] =
+	    buffer_cache.ObtainBuffer(args_addr, sizeof(vk::DrawIndexedIndirectCommand), false);
+	if (indices == nullptr || arguments == nullptr || buffer.IsInvalid()) return false;
+	auto vk_buffer = buffer.Handle();
+
+	auto& textures = m_context.GetTextureCache();
+	if (!NativeXprEmitTargets(draw_state, vk_buffer)) return false;
+	for (const auto& dep: record.images) {
+		auto* image = textures.m_slot_images.try_get(dep.id);
+		if (image == nullptr) return false;
+		image->Transit(dep.layout, vk::AccessFlagBits2::eShaderRead, dep.range, vk_buffer);
+	}
+	auto& scheduler = m_context.GetCommandScheduler();
+	auto& dynamic   = scheduler.GetDynamicState();
+	dynamic.Assign(draw_state.dynamic);
+	dynamic.Commit(m_context.GetGraphics(), vk_buffer);
+	scheduler.BeginRendering(draw_state.rendering);
+	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	vk_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline.pipeline_layout, 0, 1, &record.set,
+	                             static_cast<uint32_t>(record.dynamic_bindings.size()), offsets.data());
+	if (record.has_push)
+		vk_buffer.pushConstants(pipeline.pipeline_layout, record.push_stages, 0, sizeof(push_data),
+		                        push_data.dwords.data());
+	vk_buffer.bindIndexBuffer(indices->Handle(), index_offset, index_type);
+	vk_buffer.drawIndexedIndirect(arguments->Handle(), args_offset, 1, sizeof(vk::DrawIndexedIndirectCommand));
+	draw_state.used_frame = m_context.FrameNumber();
+	return true;
+}
+
+// An indexed indirect draw of one object, its arguments read by the host GPU.
+bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, uint64_t args_addr, uint64_t index_base,
+                                  uint64_t index_bytes, vk::IndexType index_type) {
+	if (!NativeXprEnabled() || buffer.IsInvalid() || index_base == 0 || index_bytes == 0) return false;
+	auto& cache = NativeXprState();
+	m_context.GetCommandScheduler().PopPendingOperations();
+	Common::LockGuard lock(m_context.GetMutex());
+	NativeXprCollect();
+	const auto& ucfg = buffer.GetUserConfig();
+	const auto& ctx  = buffer.GetRegisters();
+	// What a record holds: an indexed triangle list of a vertex and a pixel stage that fetch their
+	// own vertices, with no draw data pushed (object id) and no metadata color operation (color
+	// writes off or normal; the store refuses tessellation).
+	if (ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList || ctx.HasObjectPrimitiveIdOutput() ||
+	    ctx.GetColorControl().mode > 1u || (ucfg.GetPrimitiveResetControl() & 0x1u) != 0)
+		return false;
+	++cache.counters.tries;
+	const auto frame = m_context.FrameNumber();
+	cache.state_key  = NativeXprStateKeyOf(buffer);
+	NativeXprKeyOf(buffer, cache.key);
+	const auto hash  = NativeXprHash(cache.key);
+	cache.tried_hash = hash;
+	const auto request_store = [&] { m_native_xpr_store = true; };
+	const auto found = cache.records.find(hash);
+	if (found == cache.records.end() || found->second.empty() || found->second.front()->key != cache.key) {
+		++cache.counters.miss_key;
+		if (cache.unstorable.contains(NativeXprPairKey(cache.key))) return false;
+		if (const auto refused = cache.refused.find(hash);
+		    refused != cache.refused.end() && refused->second + NativeXprCache::RefuseFrames > frame)
+			return false;
+		if (!cache.SeenAgain(hash, frame)) return false;
+		request_store();
+		return false;
+	}
+	// The variant whose words and resources still hold (the last one used first).
+	auto&            variants = found->second;
+	NativeXprRecord* chosen   = nullptr;
+	for (size_t i = 0; i < variants.size();) {
+		bool broken = false;
+		if (NativeXprValidate(*variants[i], frame, broken)) {
+			chosen = variants[i].get();
+			if (i != 0)
+				std::rotate(variants.begin(), variants.begin() + static_cast<std::ptrdiff_t>(i),
+				            variants.begin() + static_cast<std::ptrdiff_t>(i) + 1);
+			break;
+		}
+		if (broken) {
+			NativeXprRetire(std::move(variants[i]));
+			variants.erase(variants.begin() + static_cast<std::ptrdiff_t>(i));
+			continue;
+		}
+		++i;
+	}
+	if (chosen == nullptr) {
+		++cache.counters.miss_validate;
+		if (variants.empty()) cache.records.erase(found);
+		request_store();
+		return false;
+	}
+	auto& record      = *chosen;
+	record.used_frame = frame;
+	++record.uses;
+	const auto state_it = cache.states.find(cache.state_key);
+	const auto pipeline_it =
+	    std::ranges::find(record.pipelines, cache.state_key, &std::pair<uint64_t, const PipelineCache::Pipeline*>::first);
+	if (state_it == cache.states.end() || pipeline_it == record.pipelines.end()) {
+		++cache.counters.miss_state;
+		request_store();
+		return false;
+	}
+	auto& draw_state = *state_it->second;
+	if (!NativeXprTargetsCurrent(draw_state)) {
+		++cache.counters.miss_target;
+		request_store();
+		return false;
+	}
+	// A sampled image that is also a render target takes the normal path.
+	for (const auto& dep: record.images)
+		for (const auto& target: draw_state.targets)
+			if (dep.id == target.id) {
+				++cache.counters.miss_target;
+				return false;
+			}
+	if (!NativeXprEmit(buffer, record, draw_state, *pipeline_it->second, args_addr, index_base, index_bytes,
+	                   index_type)) {
+		++cache.counters.miss_emit;
+		return false;
+	}
+	++cache.counters.hits;
+	return true;
+}

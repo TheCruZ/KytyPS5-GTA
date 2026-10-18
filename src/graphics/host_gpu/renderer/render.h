@@ -37,6 +37,7 @@ struct DrawCallInfo;
 struct DrawEmitInfo;
 struct DrawIndexBufferSource;
 struct DrawRenderState;
+struct DynamicState;
 class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
@@ -269,7 +270,39 @@ public:
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
 
+	// Native XPR draws (nativeXpr.inc; KYTY_NATIVE_XPR=0 turns them off): an indexed indirect
+	// draw whose arguments the host GPU reads, drawn from a record of its object when the record
+	// is proven current. False when the normal path draws it (and, when that helps, stores a
+	// record).
+	[[nodiscard]] bool NativeXprTry(CommandBuffer& buffer, uint64_t args_addr, uint64_t index_base,
+	                                uint64_t index_bytes, vk::IndexType index_type);
+	// The draw a try offered is done (drawn or skipped by the normal path).
+	void NativeXprEndDraw() noexcept { m_native_xpr_store = false; }
+
 private:
+	struct NativeXprCache;
+	struct NativeXprRecord;
+	struct NativeXprDrawState;
+	NativeXprCache&   NativeXprState();
+	vk::DescriptorSet NativeXprAllocateSet(vk::DescriptorSetLayout layout, vk::DescriptorPool& pool_out);
+	void              NativeXprRetireSet(vk::DescriptorPool pool, vk::DescriptorSet set);
+	void              NativeXprRetire(std::unique_ptr<NativeXprRecord> record);
+	void              NativeXprCollect();
+	bool              NativeXprLearn(const NativeXprRecord& stale, NativeXprRecord& fresh);
+	const char*       NativeXprBindResources(NativeXprRecord& record, std::span<PreparedBindings* const> stages,
+	                                         const PipelineCache::Pipeline& pipeline);
+	void NativeXprStore(CommandBuffer& buffer, const DrawRenderState& state, vk::PrimitiveTopology topology,
+	                    bool primitive_restart_enable, const RenderState& rendering,
+	                    std::span<PreparedBindings* const> stages, const DynamicState& dynamic_state);
+	bool NativeXprValidateResources(NativeXprRecord& record, uint64_t frame, bool mapping_moved);
+	bool NativeXprValidate(NativeXprRecord& record, uint64_t frame, bool& broken);
+	bool NativeXprRebindBuffers(NativeXprRecord& record, std::span<const std::pair<uint32_t, uint32_t>> slots);
+	bool NativeXprEmitTargets(const NativeXprDrawState& draw_state, CommandRecorder vk_buffer);
+	bool NativeXprTargetsCurrent(NativeXprDrawState& draw_state);
+	bool NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& record, NativeXprDrawState& draw_state,
+	                   const PipelineCache::Pipeline& pipeline, uint64_t args_addr, uint64_t index_base,
+	                   uint64_t index_bytes, vk::IndexType index_type);
+
 	// Whether an indirect draw with the bound registers can leave its arguments to the GPU
 	// (see DrawIndirectSource); `index_type` is the guest index type of an indexed draw.
 	[[nodiscard]] bool CanDrawIndirectOnGpu(const CommandBuffer& buffer, bool indexed,
@@ -595,6 +628,9 @@ private:
 	uint64_t m_draw_window           = 0;
 	std::unique_ptr<IndirectThreadPass, void (*)(IndirectThreadPass*)> m_indirect_thread_pass {
 	    nullptr, nullptr};
+	std::unique_ptr<NativeXprCache, void (*)(NativeXprCache*)> m_native_xpr {nullptr, nullptr};
+	// The try of the executing draw asked the normal path to store a record.
+	bool m_native_xpr_store = false;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

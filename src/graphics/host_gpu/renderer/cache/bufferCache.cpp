@@ -147,6 +147,20 @@ void BufferCache::ChangeRegister(BufferId id) {
 	}
 }
 
+bool BufferCache::TouchLiveBuffer(BufferId id, vk::Buffer handle, uint64_t vaddr, uint64_t size) {
+	auto* buffer = GetBufferIfLive(id);
+	if (buffer == nullptr || buffer->Handle() != handle || !buffer->IsInBounds(vaddr, size)) {
+		return false;
+	}
+	TouchBuffer(*buffer);
+	return true;
+}
+
+void BufferCache::EnsureBufferContents(uint64_t vaddr, uint64_t size) {
+	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+	(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
+}
+
 void BufferCache::TouchBuffer(const Buffer& buffer) {
 	if (!buffer.is_deleted) {
 		m_lru_cache.Touch(buffer.lru_id, m_gc_tick);

@@ -17,11 +17,13 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/dynamicState.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "loader/systemContent.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -43,6 +45,8 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
+#include <xxhash.h>
 #include <new>
 #include <optional>
 #include <span>
@@ -50,6 +54,7 @@
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
+#include <string_view>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -1868,6 +1873,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);
 	}
+	// After the draw is recorded: storing may clean buffer owners (copies) and so may end
+	// rendering or restart the scheduler.
+	if (std::exchange(m_native_xpr_store, false)) {
+		if (!mesh_active && draw.IsIndexed() && emit.indirect != nullptr && vertex_bindings.count == 0 &&
+		    draw_dwords == 0) {
+			NativeXprStore(buffer, state, topology, primitive_restart_enable, rendering, stages, dynamic_state);
+		}
+	}
 }
 
 bool RenderExecutor::CanDrawIndirectOnGpu(const CommandBuffer& buffer, bool indexed,
@@ -2185,5 +2198,7 @@ bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_
 	                    {dst.desc.view_info.base_level, 1, dst.desc.view_info.base_layer, 1});
 	return true;
 }
+
+#include "graphics/host_gpu/renderer/nativeXpr.inc"
 
 } // namespace Libs::Graphics

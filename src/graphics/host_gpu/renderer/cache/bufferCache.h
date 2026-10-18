@@ -108,6 +108,20 @@ public:
 	}
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// Native XPR records (RenderExecutor::NativeXpr*) bind cached buffers across frames.
+	// The buffer `id` names while it is registered, else null.
+	[[nodiscard]] Buffer* GetBufferIfLive(BufferId id) {
+		return IsBufferInvalid(id) ? nullptr : &m_slot_buffers[id];
+	}
+	// Whether `id` is still the registered buffer with `handle` over the range; touches it for
+	// the garbage collector as a use would.
+	[[nodiscard]] bool TouchLiveBuffer(BufferId id, vk::Buffer handle, uint64_t vaddr, uint64_t size);
+	// Uploads the CPU writes of the range into the buffer that holds it (ObtainBuffer() would
+	// stream a small CPU-dirty range instead): afterwards the range is CPU clean, and a later CPU
+	// write marks it dirty again.
+	void EnsureBufferContents(uint64_t vaddr, uint64_t size);
+	// Advances whenever a buffer is registered or unregistered.
+	[[nodiscard]] uint64_t BufferSetEpoch() const noexcept { return m_buffer_set_epoch; }
 	void               PrepareFaultBuffer() { m_fault_manager.PrepareFaultBuffer(); }
 	void               ProcessFaultBuffer();
 	// Counts the buffers that shaders reached through device addresses since the last call as

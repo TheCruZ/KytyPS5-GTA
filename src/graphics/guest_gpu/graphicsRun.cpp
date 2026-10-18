@@ -1670,12 +1670,21 @@ bool CommandProcessor::TryExecuteDrawIndirectOnGpu(const GpuOperation& operation
 	m_gpu_indirect_instances      = source;
 	// The counts and offsets are placeholders for the ones the GPU reads.
 	if (indirect.indexed) {
+		auto& executor = m_renderer.GetRenderExecutor();
+		// A single draw of an object may come from its native XPR record (nativeXpr.inc).
+		if (indirect.count_addr == nullptr && indirect.max_count == 1 &&
+		    executor.NativeXprTry(CurrentBuffer(), args_addr, indirect.index_base, index_bytes,
+		                          indirect.index_type == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32)) {
+			NoteRecordedWork();
+			return true;
+		}
 		ExecuteDrawIndex(operation, {.index_count         = 1,
 		                             .index_addr          = reinterpret_cast<const void*>(indirect.index_base),
 		                             .instance_count      = 1,
 		                             .index_type_and_size = indirect.index_type,
 		                             .offset_source       = DrawOffsetSource::IndirectArgs,
 		                             .gpu_indirect        = &source});
+		executor.NativeXprEndDraw();
 	} else {
 		ExecuteDrawAuto(operation, {.vertex_count   = 1,
 		                            .instance_count = 1,

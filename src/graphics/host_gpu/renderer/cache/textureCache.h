@@ -95,6 +95,21 @@ public:
 	void ProcessDownloadImages();
 	// Advances whenever an image is registered or unregistered.
 	[[nodiscard]] uint64_t ImageSetEpoch() const { return m_image_set_epoch; }
+	// Native XPR records (RenderExecutor::NativeXpr*) keep sampled images across image
+	// registrations elsewhere: the image is still registered, not being rebound, and has the
+	// backing and resources of `desc` (a plain color texture: no depth, stencil or metadata).
+	[[nodiscard]] bool IsSampledImageCurrent(ImageId id, const ImageDesc& desc);
+	// Whether FindTexture with `desc` would upload anything first (guest bytes the CPU or a GPU
+	// buffer write changed).
+	[[nodiscard]] static bool RefreshPending(const Image& image) {
+		return image.IsBufferModified() || image.IsCpuDirty();
+	}
+	// Whether a registered image starts exactly at `address` (a texel buffer there is refreshed
+	// from it: BufferCache::SynchronizeBufferFromImage).
+	[[nodiscard]] bool HasImageStartingAt(uint64_t address);
+	// Whether a render target lookup of `requested` still finds `id`: it is the last registered
+	// image over the range with the requested backing (what FindImageImpl() takes).
+	[[nodiscard]] bool IsTargetCurrent(ImageId id, const ImageInfo& requested);
 	// The ImageSetEpoch of the last registration or unregistration of an image overlapping the
 	// range's pages: while it is unchanged, a lookup in the range finds the same images.
 	[[nodiscard]] uint64_t ImageEpochInRegion(uint64_t address, uint64_t size);

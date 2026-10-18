@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
+#include <atomic>
 #include <compare>
 #include <limits>
 #include <optional>
@@ -70,8 +71,16 @@ public:
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
 
 	void MarkCpuDirty() {
+		if (!m_cpu_dirty) {
+			s_cpu_dirty_epoch.fetch_add(1, std::memory_order_relaxed);
+		}
 		m_cpu_dirty       = true;
 		m_maybe_cpu_dirty = false;
+	}
+	// Advances whenever an image becomes (maybe) CPU dirty or GPU-buffer modified: images found
+	// clean stay so while it does not move (native XPR records' proofs).
+	[[nodiscard]] static uint64_t CpuDirtyEpoch() noexcept {
+		return s_cpu_dirty_epoch.load(std::memory_order_relaxed);
 	}
 
 	[[nodiscard]] bool IsCpuDirty() const { return m_cpu_dirty || m_maybe_cpu_dirty; }
@@ -81,6 +90,7 @@ public:
 		if (!IsCpuDirty()) {
 			m_maybe_cpu_hash  = HashGuestEdges();
 			m_maybe_cpu_dirty = true;
+			s_cpu_dirty_epoch.fetch_add(1, std::memory_order_relaxed);
 		}
 	}
 	[[nodiscard]] bool ResolveMaybeCpuHash(uint64_t hash) {
@@ -105,7 +115,12 @@ public:
 	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
-	void               MarkBufferModified() noexcept { m_buffer_modified = true; }
+	void               MarkBufferModified() noexcept {
+		if (!m_buffer_modified) {
+			s_cpu_dirty_epoch.fetch_add(1, std::memory_order_relaxed);
+		}
+		m_buffer_modified = true;
+	}
 	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
 
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
@@ -122,6 +137,8 @@ public:
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
 
+	// Unique per image object (an ImageId slot can hold another image later).
+	uint64_t         serial = s_next_serial.fetch_add(1, std::memory_order_relaxed) + 1;
 	ImageInfo        info;
 	VulkanImage      backing;
 	std::vector<CachedImageView> views;
@@ -161,6 +178,9 @@ private:
 	bool              m_maybe_cpu_dirty = false;
 	bool              m_gpu_modified    = false;
 	bool              m_buffer_modified = false;
+
+	inline static std::atomic<uint64_t> s_next_serial {0};
+	inline static std::atomic<uint64_t> s_cpu_dirty_epoch {1};
 };
 
 namespace ImageOps {

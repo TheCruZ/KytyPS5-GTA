@@ -254,6 +254,75 @@ bool GuestReadLog::StillValid() const {
 	return true;
 }
 
+bool GuestReadLog::DwordAligned() const {
+	return std::ranges::all_of(m_entries, [](const Entry& entry) {
+		return entry.address % 4u == 0 && entry.size % 4u == 0 && entry.offset % 4u == 0;
+	});
+}
+
+uint32_t GuestReadLog::Word(size_t index) const {
+	uint32_t value = 0;
+	std::memcpy(&value, m_bytes.data() + index * 4u, 4);
+	return value;
+}
+
+void GuestReadLog::SetWord(size_t index, uint32_t value) {
+	std::memcpy(m_bytes.data() + index * 4u, &value, 4);
+}
+
+bool GuestReadLog::SameReads(const GuestReadLog& other) const {
+	return m_entries.size() == other.m_entries.size() &&
+	       std::ranges::equal(m_entries, other.m_entries, [](const Entry& a, const Entry& b) {
+		       return a.address == b.address && a.size == b.size && a.offset == b.offset &&
+		              a.strict == b.strict;
+	       });
+}
+
+bool GuestReadLog::CollectChanges(std::vector<std::pair<uint32_t, uint32_t>>& changed) const {
+	if (m_failed) {
+		return false;
+	}
+	static thread_local std::vector<uint8_t> current;
+	for (const auto& entry: m_entries) {
+		if (entry.address % 4u != 0 || entry.size % 4u != 0 || entry.offset % 4u != 0) {
+			return false;
+		}
+		const auto* recorded = m_bytes.data() + entry.offset;
+		current.resize(entry.size);
+		bool read = false;
+		if (entry.strict) {
+			read = Libs::LibKernel::Memory::TryReadGpuCleanBacking(entry.address, current.data(),
+			                                                       entry.size);
+		} else {
+			// As StillValid(): bytes the GPU did not write compare from the backing store on
+			// GPU-owned pages; other pages take a plain load.
+			if (Libs::LibKernel::Memory::MayFaultOnGpuRead(entry.address, entry.size)) {
+				read = Libs::LibKernel::Memory::TryReadAroundGpuWrites(entry.address, current.data(),
+				                                                       entry.size);
+			}
+			if (!read) {
+				std::memcpy(current.data(), reinterpret_cast<const void*>(entry.address), entry.size);
+				read = true;
+			}
+		}
+		if (!read) {
+			return false;
+		}
+		if (std::memcmp(current.data(), recorded, entry.size) == 0) {
+			continue;
+		}
+		for (uint32_t at = 0; at < entry.size; at += 4u) {
+			uint32_t now = 0, before = 0;
+			std::memcpy(&now, current.data() + at, 4);
+			std::memcpy(&before, recorded + at, 4);
+			if (now != before) {
+				changed.emplace_back((entry.offset + at) / 4u, now);
+			}
+		}
+	}
+	return true;
+}
+
 namespace {
 
 class ProgramLockGuard {
@@ -1574,6 +1643,7 @@ PipelineCache::~PipelineCache() {
 		}
 	};
 	destroy(m_graphics_pipelines);
+	destroy(m_native_graphics_pipelines);
 	destroy(m_compute_pipelines);
 	destroy(m_precreated_graphics);
 	destroy(m_precreated_compute);
@@ -1923,7 +1993,8 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
-    bool primitive_restart_enable, const GraphicsPrograms& programs, bool allow_async) {
+    bool primitive_restart_enable, const GraphicsPrograms& programs, bool allow_async,
+    bool native_bindings) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -2091,6 +2162,19 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 		}
 	}
 
+	if (native_bindings) {
+		// The native XPR variant: the same key in its own map, created here.
+		if (auto iter = m_native_graphics_pipelines.find(key); iter != m_native_graphics_pipelines.end()) {
+			return iter->second.get();
+		}
+		auto cached             = std::make_unique<Pipeline>();
+		cached->native_bindings = true;
+		CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
+		                       ps_input_info, programs, static_params, m_driver_cache);
+		m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
+		EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr || cached->pipeline_layout == nullptr);
+		return m_native_graphics_pipelines.emplace(std::move(key), std::move(cached)).first->second.get();
+	}
 	// Consecutive draws mostly use the pipeline of the draw before.
 	if (m_last_graphics_pipeline != nullptr && key == m_last_graphics_key) {
 		return m_last_graphics_pipeline;

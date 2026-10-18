@@ -52,6 +52,24 @@ public:
 	// Execution thread: whether every read still gives the recorded bytes.
 	[[nodiscard]] bool StillValid() const;
 
+	// Native XPR records (RenderExecutor::NativeXpr*) keep a log and compare it word by word.
+	// Whether every read is whole dwords (the log's bytes are then words, in read order).
+	[[nodiscard]] bool     DwordAligned() const;
+	[[nodiscard]] size_t   WordCount() const { return m_bytes.size() / 4u; }
+	[[nodiscard]] uint32_t Word(size_t index) const;
+	void                   SetWord(size_t index, uint32_t value);
+	// The same reads at the same addresses, in the same order.
+	[[nodiscard]] bool     SameReads(const GuestReadLog& other) const;
+	// Execution thread: appends (word index, value now) for every logged word whose value changed,
+	// read as StillValid() reads it. False when a read fails (or the log is not DwordAligned()).
+	[[nodiscard]] bool     CollectChanges(std::vector<std::pair<uint32_t, uint32_t>>& changed) const;
+	template <typename Function>
+	void ForEachRead(Function&& function) const {
+		for (const auto& entry: m_entries) {
+			function(entry.address, uint64_t {entry.size});
+		}
+	}
+
 private:
 	static constexpr uint64_t StrictCheckBytes = 64;
 	struct Entry {
@@ -187,6 +205,9 @@ public:
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
+		// Native XPR variant (RenderExecutor::NativeXpr*): the same shaders with an ordinary
+		// descriptor set, the flattened SRT and shader data as dynamic storage buffers.
+		bool                    native_bindings       = false;
 	};
 
 	struct GraphicsPrograms {
@@ -218,7 +239,8 @@ public:
 	                              std::span<const ShaderVertexInputInfo> vertex_info,
 	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
 	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
-	                              const GraphicsPrograms& programs, bool allow_async);
+	                              const GraphicsPrograms& programs, bool allow_async,
+	                              bool native_bindings = false);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 
@@ -266,6 +288,9 @@ private:
 	std::jthread                  m_save_thread;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
+	// Native XPR variants of graphics pipelines, created on demand (never asynchronously).
+	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
+	                                                        m_native_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	// The pipeline the last lookup found; pipelines are never removed while the cache lives.
 	GraphicsPipelineKey m_last_graphics_key {};
