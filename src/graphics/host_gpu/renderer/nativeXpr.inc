@@ -1477,6 +1477,7 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	auto vk_buffer = buffer.Handle();
 
 	auto& textures = m_context.GetTextureCache();
+	const TransitGroup transit_group; // the transitions of a guest draw (see TransitGroup)
 	if (!NativeXprEmitTargets(draw_state, vk_buffer)) return false;
 	for (const auto& dep: record.images) {
 		auto* image = textures.m_slot_images.try_get(dep.id);

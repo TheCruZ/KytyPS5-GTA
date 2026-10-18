@@ -130,6 +130,8 @@ struct VulkanImageState {
 	vk::PipelineStageFlags2 pl_stage    = vk::PipelineStageFlagBits2::eAllCommands;
 	vk::AccessFlags2        access_mask = vk::AccessFlagBits2::eNone;
 	vk::ImageLayout         layout      = vk::ImageLayout::eUndefined;
+	// Set by a transition for a guest draw or dispatch (inside a transit group, see image.h).
+	bool                    guest = false;
 };
 
 struct VulkanImage {

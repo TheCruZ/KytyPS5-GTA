@@ -1923,6 +1923,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
+	// Every transition below prepares the one draw or dispatch that follows (see TransitGroup).
+	const TransitGroup transit_group;
 	KYTY_PROFILER_FUNCTION();
 	auto   vk_buffer        = buffer.Handle();
 	size_t image_descriptor_count = 0;

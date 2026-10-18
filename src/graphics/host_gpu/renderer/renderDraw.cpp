@@ -931,8 +931,18 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			             : vk::ImageLayout::eGeneral;
 		}
 		// The attachment store writes even when guest depth/stencil tests do not.
-		const auto access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
-		                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+		auto access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+		              vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+		// A target shaders sampled in this layout keeps the shader reads in its access while no aspect this draw
+		// samples is written as an attachment (no hazard between the two uses): draws alternating between them (a
+		// stencil mark, then a decal sampling depth) need no barrier, nor a render pass break, each (chenxiao07's
+		// 397112a04).
+		if (const auto& current = image.backing.state;
+		    image.backing.subresource_states.empty() && current.layout == layout &&
+		    static_cast<bool>(current.access_mask & vk::AccessFlagBits2::eShaderRead) &&
+		    !static_cast<bool>(sampled_aspects & depth.AttachmentWriteAspects())) {
+			access |= vk::AccessFlagBits2::eShaderRead;
+		}
 		image.binding.attachment_layout = layout;
 		image.binding.attachment_access = access;
 		const auto& view                = depth.desc.view_info;

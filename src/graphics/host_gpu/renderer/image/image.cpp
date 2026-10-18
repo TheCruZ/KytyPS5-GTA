@@ -118,10 +118,51 @@ vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 	}
 }
 
+namespace {
+// Opened and read by the thread that records the transitions; 0: no group.
+thread_local uint64_t g_transit_group = 0;
+std::atomic<uint64_t> g_transit_group_next {1};
+
+bool DedupeTransitGroups() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_IMAGE_BARRIER_DEDUPE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+bool DropGuestWriteBarriers() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GUEST_WRITE_BARRIERS");
+		return value == nullptr || value[0] != '1';
+	}();
+	return enabled;
+}
+} // namespace
+
+void BeginTransitGroup() noexcept {
+	g_transit_group = g_transit_group_next.fetch_add(1, std::memory_order_relaxed);
+}
+
+void EndTransitGroup() noexcept {
+	g_transit_group = 0;
+}
+
 Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
                                    std::optional<ImageSubresourceRange> range) {
+	const bool guest = g_transit_group != 0;
+	// Whether a state already holds this transition: the same layout and access, and for a write, a repeat of a guest
+	// write or of this group's own transition.
+	const auto in_place = [&](const VulkanImageState& current, uint64_t group) {
+		constexpr auto write_access = vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderWrite |
+		                              vk::AccessFlagBits2::eMemoryWrite;
+		const bool repeated_write = static_cast<bool>(current.access_mask & write_access);
+		return current.layout == destination_layout && current.access_mask == destination_access &&
+		       (!repeated_write || (guest && current.guest && DropGuestWriteBarriers()) ||
+		        (guest && DedupeTransitGroups() && group == g_transit_group));
+	};
 	auto& state              = backing.state;
 	auto& subresource_states = backing.subresource_states;
 	if (range && info.IsVolume()) {
@@ -150,13 +191,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 				EXIT_IF(index >= subresource_states.size());
 				auto& subresource_state = subresource_states[index];
 
-				constexpr auto write_access = vk::AccessFlagBits2::eTransferWrite |
-				                              vk::AccessFlagBits2::eShaderWrite |
-				                              vk::AccessFlagBits2::eMemoryWrite;
-				const bool     repeated_write =
-				    static_cast<bool>(subresource_state.access_mask & write_access);
-				if (subresource_state.layout != destination_layout ||
-				    subresource_state.access_mask != destination_access || repeated_write) {
+				if (!in_place(subresource_state, transit_group)) {
 					vk::ImageMemoryBarrier2 barrier {};
 					barrier.srcStageMask                    = subresource_state.pl_stage;
 					barrier.srcAccessMask                   = subresource_state.access_mask;
@@ -173,7 +208,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 					barrier.subresourceRange.baseArrayLayer = layer;
 					barrier.subresourceRange.layerCount     = 1;
 					barriers.push_back(barrier);
-					subresource_state = {destination_stage, destination_access, destination_layout};
+					subresource_state = {destination_stage, destination_access, destination_layout, guest};
 				}
 			}
 		}
@@ -182,12 +217,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 			subresource_states.clear();
 		}
 	} else {
-		constexpr auto write_access   = vk::AccessFlagBits2::eTransferWrite |
-		                                vk::AccessFlagBits2::eShaderWrite |
-		                                vk::AccessFlagBits2::eMemoryWrite;
-		const bool     repeated_write = static_cast<bool>(state.access_mask & write_access);
-		if (state.layout == destination_layout && state.access_mask == destination_access &&
-		    !repeated_write) {
+		if (in_place(state, transit_group)) {
 			return {};
 		}
 
@@ -209,7 +239,8 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		barriers.push_back(barrier);
 	}
 
-	state = {destination_stage, destination_access, destination_layout};
+	state         = {destination_stage, destination_access, destination_layout, guest};
+	transit_group = g_transit_group;
 	return barriers;
 }
 

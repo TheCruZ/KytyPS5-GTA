@@ -46,6 +46,23 @@ struct ImageBinding {
 	bool             shader_write  = false;
 };
 
+
+// The transitions of one guest draw or dispatch (RenderExecutor::CommitBindings()), from chenxiao07's KytyPS5 fork
+// (397112a04 and KYTY_IMAGE_BARRIER_DEDUPE): a shader write that guest draws and dispatches repeat in the same layout
+// and access gets no barrier between them (the guest's own partial flushes and cache events record full barriers,
+// EmitGlobalBarrier, as on the console; a repeated write after any other access keeps its barrier), and with
+// KYTY_IMAGE_BARRIER_DEDUPE (default on) a transition repeated inside one group is dropped. The recording thread's
+// own transitions are in no group. KYTY_GUEST_WRITE_BARRIERS=1 keeps the barriers between guest writes.
+void BeginTransitGroup() noexcept;
+void EndTransitGroup() noexcept;
+class TransitGroup final {
+public:
+	TransitGroup() noexcept { BeginTransitGroup(); }
+	~TransitGroup() { EndTransitGroup(); }
+	TransitGroup(const TransitGroup&)            = delete;
+	TransitGroup& operator=(const TransitGroup&) = delete;
+};
+
 class Image final {
 public:
 	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info);
@@ -54,6 +71,8 @@ public:
 
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
+	// The transit group that last set the image's state (see TransitGroup).
+	uint64_t transit_group = 0;
 	[[nodiscard]] Barriers GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,
 	                                   vk::PipelineStageFlags2              destination_stage,
