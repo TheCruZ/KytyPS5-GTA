@@ -16,6 +16,7 @@
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "loader/demonsSoulsCopy.h"
 #include "loader/demonsSoulsIdle.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
@@ -1277,6 +1278,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 		}
 	}
 	DemonsSoulsIdle::Install(m_programs.empty() ? nullptr : m_programs.front());
+	DemonsSoulsCopy::Install(libc);
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);
 	}
