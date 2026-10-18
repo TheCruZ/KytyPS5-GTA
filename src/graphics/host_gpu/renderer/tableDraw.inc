@@ -41,6 +41,14 @@ uint32_t TableStoreBudget() {
 	return budget;
 }
 
+// chenxiao07's KYTY_TABLE_MRU (default 7): table lookups ask their last answer first. Bit 1: TableTry's pair cache
+// has 4096 entries (else 256; a frame's draws use ~600 pairs); 2: a pair tries the variant it found last first; 4:
+// TableSet asks the pair's set before the last before the words' hash (a pass's draws alternate two materials' sets).
+uint32_t TableMru() {
+	static const uint32_t mru = NativeXprNumberSwitch("KYTY_TABLE_MRU", 7u);
+	return mru;
+}
+
 // The stages' static input key a pair's programs were compiled for: both stages' code and static input, and whether
 // the pixel stage runs.
 uint64_t TableDrawKey(std::vector<uint32_t>& key, const ShaderParams& vertex_params,
@@ -191,6 +199,9 @@ struct RenderExecutor::TablePair {
 	uint64_t                         store_frame = UINT64_MAX, store_state = 0; // the last store request
 	std::unordered_map<uint64_t, std::unique_ptr<TableImageSet>, NativeXprKeyHash> sets; // by T#/S# words
 	TableImageSet*                   last_set = nullptr;
+	// The set before the last (KYTY_TABLE_MRU bit 4), cleared with last_set.
+	TableImageSet*                   previous_set = nullptr;
+	uint32_t                         variant_hint = 0; // the variant TableTry found last (KYTY_TABLE_MRU bit 2)
 	// The table programs' compilation (on a worker): until it is done the pair's draws take the normal path.
 	std::shared_ptr<PipelineCache::TableTicket> pending;
 	uint64_t                                    used_frame = 0;
@@ -198,6 +209,12 @@ struct RenderExecutor::TablePair {
 
 struct RenderExecutor::TableXpr {
 	std::unordered_map<uint64_t, TablePair, NativeXprKeyHash> pairs; // by NativeXprPairHash
+	// The pairs found last, direct-mapped by their hash (KYTY_TABLE_MRU bit 1: else its first 256 only), and the one
+	// TableTry found last by its shaders (consecutive draws mostly keep them). Pairs do not move until they leave.
+	static constexpr size_t                                 PairCacheEntries = 4096;
+	std::array<std::pair<uint64_t, TablePair*>, PairCacheEntries> pair_cache {};
+	std::array<uint64_t, 2>                                  found_key {};
+	TablePair*                                               found_pair = nullptr;
 	// Pairs no draw used for PairKeepFrames leave (every PairSweepFrames, past PairsKept): they are keyed by the
 	// shaders' addresses, and a new area loads its shaders elsewhere.
 	static constexpr uint64_t PairSweepFrames = 600, PairKeepFrames = 3600;
@@ -407,6 +424,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		if (slot) {
 			if (table.last_set == slot.get()) table.last_set = nullptr;
 			if (pair.last_set == slot.get()) pair.last_set = nullptr;
+			if (pair.previous_set == slot.get()) pair.previous_set = nullptr;
 			NativeXprRetireSet(slot->pool, slot->set);
 		}
 		slot = std::move(set);
@@ -629,10 +647,20 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 	const auto  frame = m_context.FrameNumber();
 	auto*       set   = pair.last_set;
 	if (set == nullptr || set->words != words) {
-		const auto found = pair.sets.find(XXH3_64bits(words.data(), words.size() * sizeof(uint32_t)));
-		set              = found != pair.sets.end() && found->second->words == words ? found->second.get() : nullptr;
-		if (set == nullptr || (set->refused && frame >= set->validated_frame + TableImageSet::RetryFrames))
-			set = TableResolveSet(buffer, pair, variant, draw_state);
+		auto* const last     = set;
+		auto* const previous = pair.previous_set;
+		// (The set before the last next, without the words' hash or the map's cold bucket and node.)
+		if ((TableMru() & 4u) != 0 && previous != nullptr && previous != last && !previous->refused &&
+		    previous->words == words) {
+			set = previous;
+		} else {
+			const auto found = pair.sets.find(XXH3_64bits(words.data(), words.size() * sizeof(uint32_t)));
+			set = found != pair.sets.end() && found->second->words == words ? found->second.get() : nullptr;
+			if (set == nullptr || (set->refused && frame >= set->validated_frame + TableImageSet::RetryFrames))
+				set = TableResolveSet(buffer, pair, variant, draw_state);
+		}
+		// (TableResolveSet may have cleared both: a set it replaced.)
+		if (last != nullptr && pair.last_set == last) pair.previous_set = last;
 		pair.last_set = set;
 	}
 	set->used_frame = frame;
@@ -640,7 +668,8 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 	if (!TableValidateSet(*set)) {
 		// Resolved again at the next draw that uses it.
 		if (table.last_set == set) table.last_set = nullptr;
-		pair.last_set = nullptr;
+		pair.last_set     = nullptr;
+		pair.previous_set = nullptr;
 		NativeXprRetireSet(set->pool, set->set);
 		pair.sets.erase(XXH3_64bits(set->words.data(), set->words.size() * sizeof(uint32_t)));
 		return nullptr;
@@ -652,6 +681,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 			std::erase_if(held.sets, [&](auto& item) {
 				if (item.second->used_frame + 60 >= frame) return false;
 				if (held.last_set == item.second.get()) held.last_set = nullptr;
+				if (held.previous_set == item.second.get()) held.previous_set = nullptr;
 				if (table.last_set == item.second.get()) table.last_set = nullptr;
 				NativeXprRetireSet(item.second->pool, item.second->set);
 				return true;
@@ -1034,20 +1064,36 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, uint
 				return true;
 			});
 			if (table.pairs.size() != before) {
-				table.store     = nullptr;
-				table.gathered  = nullptr;
-				table.last_pair = nullptr;
-				table.last_set  = nullptr;
+				table.store      = nullptr;
+				table.gathered   = nullptr;
+				table.last_pair  = nullptr;
+				table.last_set   = nullptr;
+				table.pair_cache = {};
+				table.found_pair = nullptr;
 			}
 		}
 	}
 	const auto vs_address = vs.es_regs.data_addr, ps_address = sh.GetPs().ps_regs.data_addr;
-	auto [found, fresh]   = table.pairs.try_emplace(NativeXprPairHash(vs_address, ps_address));
-	auto& pair            = found->second;
-	if (fresh) {
-		pair.vs = vs_address;
-		pair.ps = ps_address;
+	const std::array<uint64_t, 2> pair_key {vs_address, ps_address};
+	auto* known = table.found_pair != nullptr && table.found_key == pair_key ? table.found_pair : nullptr;
+	if (known == nullptr) {
+		const auto hash    = NativeXprPairHash(vs_address, ps_address);
+		const auto entries = (TableMru() & 1u) != 0 ? TableXpr::PairCacheEntries : 256;
+		auto&      cached  = table.pair_cache[hash & (entries - 1)];
+		known              = cached.first == hash ? cached.second : nullptr;
+		if (known == nullptr) {
+			auto [found, fresh] = table.pairs.try_emplace(hash);
+			if (fresh) {
+				found->second.vs = vs_address;
+				found->second.ps = ps_address;
+			}
+			known  = &found->second;
+			cached = {hash, known};
+		}
+		table.found_key  = pair_key;
+		table.found_pair = known;
 	}
+	auto& pair = *known;
 	pair.used_frame = frame;
 	if (pair.vs != vs_address || pair.ps != ps_address) return TableResult::Native;
 	if (const auto generation = ShaderMapGeneration(); generation != pair.generation) {
@@ -1102,7 +1148,12 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, uint
 		table.store_state = state_key;
 		return TableResult::Store;
 	};
-	const auto variant = std::ranges::find(pair.variants, state_key, &TableVariant::state);
+	// (The variant found last first: a pair's draws mostly keep their state.)
+	const bool hint    = (TableMru() & 2u) != 0 && pair.variant_hint < pair.variants.size() &&
+	                  pair.variants[pair.variant_hint].state == state_key;
+	const auto variant = hint ? pair.variants.begin() + pair.variant_hint
+	                          : std::ranges::find(pair.variants, state_key, &TableVariant::state);
+	if (variant != pair.variants.end()) pair.variant_hint = static_cast<uint32_t>(variant - pair.variants.begin());
 	if (variant != pair.variants.end() && variant->refused) return TableResult::Native;
 	if (pair.programs[0] == nullptr || variant == pair.variants.end() || variant->pipeline == nullptr)
 		return request_store();
