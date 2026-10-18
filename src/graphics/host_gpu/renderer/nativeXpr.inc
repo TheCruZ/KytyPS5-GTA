@@ -1668,6 +1668,22 @@ RenderExecutor::NativeXprRecord* RenderExecutor::NativeXprRelocated(uint64_t fra
 	return record;
 }
 
+// Whether native XPR records will not draw this draw's pair: off, a shape records do not hold, a pair that cannot be
+// stored or one resting after its tries stored nothing.
+bool RenderExecutor::NativeXprWontServe(const CommandBuffer& buffer) {
+	if (!NativeXprEnabled() || !m_native_xpr) return true;
+	const auto& ucfg = buffer.GetUserConfig();
+	const auto& ctx  = buffer.GetRegisters();
+	if (ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList || ctx.HasObjectPrimitiveIdOutput() ||
+	    ctx.GetColorControl().mode > 1u || (ucfg.GetPrimitiveResetControl() & 0x1u) != 0)
+		return true;
+	const auto& cache = *m_native_xpr;
+	const auto  pair  = NativeXprPairOfShaders(buffer.GetShaders());
+	if (cache.unstorable.contains(pair)) return true;
+	const auto use = cache.pairs.find(pair);
+	return use != cache.pairs.end() && use->second.resting_until > m_context.FrameNumber();
+}
+
 // A direct indexed draw of one object: as an indirect one (NativeXprTry()), drawn with its counts.
 bool RenderExecutor::NativeXprTryDirect(CommandBuffer& buffer, const DrawIndexArgs& args) {
 	if (!NativeXprEnabled() || !NativeXprDirectEnabled() || args.gpu_indirect != nullptr || args.offset_source != DrawOffsetSource::DrawState ||
@@ -1691,7 +1707,8 @@ bool RenderExecutor::NativeXprLikely(const HW::Shader& shaders) const noexcept {
 
 bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, uint64_t args_addr, uint64_t index_base,
                                   uint64_t index_bytes, vk::IndexType index_type) {
-	if (!NativeXprEnabled() || buffer.IsInvalid() || TableDrawServes(buffer.GetShaders())) return false;
+	if (!NativeXprEnabled() || buffer.IsInvalid() || (!TableXprComplements() && TableDrawServes(buffer.GetShaders())))
+		return false;
 	// The resolve thread skips the resolution ahead of draws of pairs whose last try drew.
 	const auto pair  = NativeXprPairOf(buffer);
 	bool       drawn = false;

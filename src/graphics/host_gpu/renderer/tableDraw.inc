@@ -8,7 +8,10 @@
 //
 // A pair (the stages' code and static input) is learnt after a normal draw of it (TableDrawLearn): both programs are
 // compiled in table mode for that draw's specializations. A draw whose descriptors select others compiles a variant
-// (a few per frame) or takes the normal path. Native XPR records leave the pairs table draws serve to them.
+// (a few per frame) or takes the normal path. Native XPR records draw an object for less (a draw of a pair whose record
+// is valid takes 2 us of the execution thread, a table draw 5-9): table draws only learn the pairs native XPR records
+// do not serve (shapes they do not hold, pairs they cannot store or that rest after their tries stored nothing), and
+// records come first (KYTY_TABLE_XPR_COMPLEMENT=0: table draws take every pair they learn, and records leave them).
 //
 // The resolve thread evaluates the blocks and selects the programs ahead of the draw (TableDrawAhead) instead of the
 // normal resolution, reading guest memory through the resolution's log; the execution thread then only gives the
@@ -73,6 +76,14 @@ RenderExecutor::TableDrawCache& RenderExecutor::TableDrawState() {
 	return *m_table_draw;
 }
 
+bool RenderExecutor::TableXprComplements() {
+	static const bool complements = [] {
+		const char* value = std::getenv("KYTY_TABLE_XPR_COMPLEMENT");
+		return value == nullptr || value[0] != '0';
+	}();
+	return complements;
+}
+
 bool RenderExecutor::TableDrawServes(const HW::Shader& shaders) {
 	return TableXprEnabled() && TableDrawState().served.contains(NativeXprPairOfShaders(shaders));
 }
@@ -111,6 +122,7 @@ void RenderExecutor::TableDrawLearn(CommandBuffer& buffer, const DrawRenderState
 	    state.vertex_info[0].logical_stage == ShaderType::Mesh || state.vertex_info[0].stage.program == nullptr ||
 	    state.vertex_info[0].stage.program->table_mode)
 		return;
+	if (TableXprComplements() && !NativeXprWontServe(buffer)) return;
 	auto&      cache = TableDrawState();
 	const auto& ctx  = buffer.GetRegisters();
 	const auto& sh   = buffer.GetShaders();

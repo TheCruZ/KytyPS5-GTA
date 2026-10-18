@@ -671,6 +671,9 @@ private:
 	TableDrawCache& TableDrawState();
 	// Whether a table pair serves draws of these shaders (native XPR records leave them).
 	bool TableDrawServes(const HW::Shader& shaders);
+	// Table draws only serve the pairs native XPR records do not (KYTY_TABLE_XPR=1 with native XPR on).
+	static bool TableXprComplements();
+	bool        NativeXprWontServe(const CommandBuffer& buffer);
 	// After a normal draw: its pair's table programs.
 	void TableDrawLearn(CommandBuffer& buffer, const DrawRenderState& state);
 	// The draw's programs from its table pair, when there is one: then true.
