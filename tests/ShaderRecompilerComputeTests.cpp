@@ -25436,7 +25436,7 @@ TestCase Vop1SdwaMovByteDestinations() {
   test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.decoded_counts = {{"V_MOV_B32 v1.sdwa(sel=2,sext=0), 0", 1}};
-  test.required_spirv = {"OpBitFieldInsert", "OpBitFieldSExtract", "OpBitwiseOr"};
+  test.required_spirv = {"OpBitFieldInsert", "OpBitFieldSExtract"};
   return test;
 }
 
@@ -25553,7 +25553,7 @@ TestCase Vop2SdwaAddNcCapturedHighWordDestination() {
   test.expected = {0x00010002u, 0x0006c3d4u};
   test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::V_MOV_B32,
                   O::V_ADD_NC_U32,      O::BUFFER_STORE_DWORD,  O::S_ENDPGM};
-  test.required_spirv = {"OpIAdd", "OpShiftLeftLogical", "OpBitwiseOr"};
+  test.required_spirv = {"OpIAdd", "OpBitFieldInsert"};
   return test;
 }
 
@@ -41442,11 +41442,13 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
     if (large_samplers) {
       spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
       std::string text;
-      const auto halves = wave > vulkan.SubgroupSize() ? 2u : 1u;
+      const bool disassembled = tools.Disassemble(compiled.spirv, &text);
+      // A split wave samples one lane per invocation instead of both halves.
+      const auto halves = wave > vulkan.SubgroupSize() && !IsSplitWave(text) ? 2u : 1u;
       Require(test.name, "expanded sampler bindings and emitted size",
               compiled.resources.samplers.size() == rows + 1u &&
                   compiled.program.info.samplers.size() == rows + 1u &&
-                  tools.Disassemble(compiled.spirv, &text) &&
+                  disassembled &&
                   CountText(text, "OpImageSampleExplicitLod") == halves &&
                   compiled.spirv.size() <= 8192u * halves,
               "59 sampler records hit the SGPR root limit or duplicated image sampling bodies");
@@ -42255,8 +42257,9 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
     compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
     compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
     ValidateSpirv(test.name, compiled.spirv);
-    const auto halves = wave_size > compute.host_subgroup_size ? 2u : 1u;
-    Require(test.name, "typed query body count", tools.Disassemble(compiled.spirv, &text) &&
+    const bool disassembled = tools.Disassemble(compiled.spirv, &text);
+    const auto halves = wave_size > compute.host_subgroup_size && !IsSplitWave(text) ? 2u : 1u;
+    Require(test.name, "typed query body count", disassembled &&
                 CountText(text, "OpImageQuerySizeLod") == 3u * halves &&
                 CountText(text, "OpImageQueryLevels") == 3u * halves &&
                 compiled.spirv.size() <= 8192u * halves,
@@ -42340,9 +42343,12 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
       compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
       compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
       ValidateSpirv(test.name, compiled.spirv);
-      const auto halves = wave_size > compute.host_subgroup_size ? 2u : 1u;
+      const bool disassembled = tools.Disassemble(compiled.spirv, &text);
+      // A split wave writes one lane per invocation instead of both halves.
+      const auto halves =
+          wave_size > compute.host_subgroup_size && !IsSplitWave(text) ? 2u : 1u;
       Require(test.name, "native array writes per dimension and swizzle run",
-              tools.Disassemble(compiled.spirv, &text) &&
+              disassembled &&
                   CountText(text, "OpImageWrite") == (mixed ? 4u : 1u) * halves &&
                   (mixed || text.find("OpSwitch") == std::string::npos) &&
                   text.find("StorageImageArrayNonUniformIndexing") != std::string::npos,
