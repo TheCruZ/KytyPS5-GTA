@@ -5,14 +5,22 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 
 namespace Libs::Graphics {
 
 class RangeSet final {
 public:
+	// Queries keep a hint of the range they found (see HintCovers()): only for a set whose users serialize all their
+	// accesses, queries included.
+	void AllowFastPath() { m_fast = true; }
+
 	void Add(uint64_t address, uint64_t size) {
 		const auto end = End(address, size);
+		if (HintCovers(address, end)) {
+			return;
+		}
 		// Written ranges are added again for every draw that binds them: extend a range that
 		// begins at or before the address in place, and allocate a node only for a new range.
 		auto it = m_ranges.upper_bound(address);
@@ -41,6 +49,7 @@ public:
 
 	void Subtract(uint64_t address, uint64_t size) {
 		const auto end = End(address, size);
+		m_hint_end     = 0;
 		auto       it  = m_ranges.lower_bound(address);
 		if (it != m_ranges.begin() && std::prev(it)->second > address) {
 			it = std::prev(it);
@@ -59,7 +68,10 @@ public:
 		}
 	}
 
-	void Clear() { m_ranges.clear(); }
+	void Clear() {
+		m_ranges.clear();
+		m_hint_end = 0;
+	}
 
 	template <typename Func>
 	void ForEach(Func&& func) const {
@@ -79,12 +91,20 @@ public:
 
 	[[nodiscard]] bool Contains(uint64_t address, uint64_t size) const {
 		const auto end = End(address, size);
-		auto       it  = m_ranges.upper_bound(address);
+		if (HintCovers(address, end)) {
+			return true;
+		}
+		auto it = m_ranges.upper_bound(address);
 		if (it == m_ranges.begin()) {
 			return false;
 		}
 		--it;
-		return it->first <= address && it->second >= end;
+		if (it->first <= address && it->second >= end) {
+			m_hint_begin = it->first;
+			m_hint_end   = it->second;
+			return true;
+		}
+		return false;
 	}
 
 	template <typename Func>
@@ -106,6 +126,19 @@ public:
 	[[nodiscard]] bool Empty() const { return m_ranges.empty(); }
 
 private:
+	// The range the last Contains() found (chenxiao07's KYTY_RANGE_SET_FAST): buffers are queried again and again
+	// for the same ranges. Add() only grows the ranges, so the hint holds until Subtract() or Clear().
+	static bool FastEnabled() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_RANGE_SET_FAST");
+			return value == nullptr || value[0] != '0';
+		}();
+		return enabled;
+	}
+	[[nodiscard]] bool HintCovers(uint64_t address, uint64_t end) const {
+		return m_fast && m_hint_begin <= address && end <= m_hint_end && FastEnabled();
+	}
+
 	static uint64_t End(uint64_t address, uint64_t size) {
 		if (size == 0 || size > UINT64_MAX - address) {
 			EXIT("invalid range-set address or size\n");
@@ -114,6 +147,9 @@ private:
 	}
 
 	std::map<uint64_t, uint64_t> m_ranges;
+	mutable uint64_t             m_hint_begin = 0;
+	mutable uint64_t             m_hint_end   = 0;
+	bool                         m_fast       = false;
 };
 
 } // namespace Libs::Graphics
