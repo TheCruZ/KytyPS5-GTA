@@ -30,8 +30,9 @@ bool Verified(const Program& program, const Build& build) {
 void Install(Program* program) {
 #if defined(__x86_64__) || defined(_M_X64)
     // KYTY_GPU_BUFFER_PAGES=1: the two CBuffer allocation calls and the render-context call.
+    // (On by default, as chenxiao07's Demon's Souls launcher sets it; KYTY_GPU_BUFFER_PAGES=0 turns it off.)
     const auto* enabled = std::getenv("KYTY_GPU_BUFFER_PAGES");
-    if (!enabled || std::strcmp(enabled, "1") != 0 || cave || !program ||
+    if ((enabled != nullptr && std::strcmp(enabled, "1") != 0) || cave || !program ||
         program->file_name.filename() != "eboot.bin" ||
         !DemonsSoulsIdle::IsGame() || program->mapped_size >= CaveOffset ||
         program->base_vaddr > UINT64_MAX - CaveOffset - ImageSize ||

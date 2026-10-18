@@ -678,4 +678,14 @@ bool SystemContentGetChunksNum(uint32_t* num) {
 	return sc->playgo.GetChunksNum(num);
 }
 
+bool IsDemonsSoulsTitle() {
+	static const bool demons_souls = [] {
+		char title_id[16] {};
+		if (!SystemContentParamSfoGetString("TITLE_ID", title_id, sizeof(title_id))) return false;
+		const std::string_view title(title_id);
+		return title == "PPSA01340" || title == "PPSA01341" || title == "PPSA01342";
+	}();
+	return demons_souls;
+}
+
 } // namespace Loader

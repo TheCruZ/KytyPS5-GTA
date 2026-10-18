@@ -19,6 +19,7 @@
 #include "kernel/memory.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
+#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -1228,11 +1229,15 @@ bool GuestGpu::Process(Submission& submission) {
 			// The guest prepares the next frame once the host GPU finished this one (the default),
 			// KYTY_FRAME_PIPELINE=exec once the execution thread reached the point, =cp once the
 			// command processor consumed it. (Demon's Souls corrupts its job data with cp: its
-			// threads overwrite memory the resolve and execution threads still read.)
+			// threads overwrite memory the resolve and execution threads still read.) chenxiao07's launcher
+			// sets its KYTY_FRAME_PIPELINE=1 for Demon's Souls, exec here (also accepted as 1), but with our
+			// pipelined GPU it ran the game at 14.5 fps in game against 22.7: the default stays gpu.
 			static const int release = [] {
 				const char* value = std::getenv("KYTY_FRAME_PIPELINE");
 				if (value == nullptr) return 2;
-				return std::strcmp(value, "cp") == 0 ? 0 : std::strcmp(value, "exec") == 0 ? 1 : 2;
+				return std::strcmp(value, "cp") == 0                                       ? 0
+				       : std::strcmp(value, "exec") == 0 || std::strcmp(value, "1") == 0 ? 1
+				                                                                           : 2;
 			}();
 			if (release == 0) {
 				m_suspend_point_ready->release();

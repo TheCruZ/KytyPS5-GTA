@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
+#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <atomic>
@@ -315,7 +316,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	m_gpu_modified_ranges.AllowFastPath();
 	// chenxiao07's KYTY_STREAM_UPLOAD (5c4da93aa): the small ranges draws stream go through a ring in host memory
 	// (written by the CPU without the device-visible memory's write combining) instead of the stream buffer.
-	if (const char* value = std::getenv("KYTY_STREAM_UPLOAD"); value != nullptr && value[0] == '1') {
+	// (Demon's Souls by default, as chenxiao07's launcher sets it.)
+	if (const char* value = std::getenv("KYTY_STREAM_UPLOAD");
+	    value != nullptr ? value[0] == '1' : Loader::IsDemonsSoulsTitle()) {
 		m_host_upload = std::make_unique<StreamBuffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 64 * MiB,
 		                                               AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	}
@@ -707,10 +710,11 @@ struct BufferCache::AsyncReadback {
 	std::atomic_bool            finished {false};
 };
 
+// Demon's Souls by default (chenxiao07's launcher: KYTY_FRAME_PIPELINE, KYTY_READBACK_DETACH, ...).
 static bool AsyncReadbacksEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_GUEST_READBACK_ASYNC");
-		return value != nullptr && value[0] == '1';
+		return value != nullptr ? value[0] == '1' : Loader::IsDemonsSoulsTitle();
 	}();
 	return enabled;
 }
@@ -720,7 +724,7 @@ static bool AsyncReadbacksEnabled() {
 static bool AsyncWriteReadbacksEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_GUEST_WRITE_READBACK_ASYNC");
-		return value != nullptr && value[0] == '1';
+		return value != nullptr ? value[0] == '1' : Loader::IsDemonsSoulsTitle();
 	}();
 	return enabled;
 }

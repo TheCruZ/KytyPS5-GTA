@@ -14,6 +14,9 @@ void     SystemContentLoadParamSfo(const std::filesystem::path& file_name);
 bool     SystemContentParamSfoGetInt(const char* name, int32_t* value);
 bool     SystemContentParamSfoGetString(const char* name, std::string* value);
 bool     SystemContentParamSfoGetString(const char* name, char* value, size_t value_size);
+// Whether the game is Demon's Souls (PPSA01340, PPSA01341, PPSA01342): switches that chenxiao07's launcher turns on
+// for it default on for it.
+bool     IsDemonsSoulsTitle();
 uint64_t SystemContentGetFlexibleMemorySize();
 bool     SystemContentGetIconPath(std::filesystem::path* path);
 bool     SystemContentGetChunksNum(uint32_t* num);
