@@ -20,6 +20,12 @@
 // CPU clean, every image the same registered object, not CPU dirty. Anything else falls back to
 // the normal path, which stores again.
 //
+// Relocated records serve objects whose user data move between frames (GTA V's SRT pointers
+// point into per-frame memory, so no key comes again): when the key misses, the draw's resolution
+// ahead (the resolve thread evaluated its programs; the guest words it read still hold) is looked
+// up by its programs and descriptors. A record with the same programs, images, samplers and buffer
+// descriptors takes the fresh flattened SRT and user data; one whose buffer bases moved is rebound.
+//
 // On for Demon's Souls (KYTY_NATIVE_XPR=1 for any game, =0 off); KYTY_NATIVE_XPR_STATS=1 prints counters every
 // 300 frames.
 
@@ -169,6 +175,10 @@ struct RenderExecutor::NativeXprRecord {
 	uint64_t validated_frame   = UINT64_MAX;
 	uint64_t used_frame        = 0;
 	uint64_t uses              = 0;
+	// Relocated records (no read log): their hashes (NativeXprRelocationHashes).
+	bool     relocated  = false;
+	uint64_t full_hash  = 0;
+	uint64_t shape_hash = 0;
 };
 
 struct RenderExecutor::NativeXprCache {
@@ -200,7 +210,8 @@ struct RenderExecutor::NativeXprCache {
 		uint64_t hash = 0, frame = 0;
 	};
 	std::vector<SeenKey> seen = std::vector<SeenKey>(8192);
-	bool                 SeenAgain(uint64_t hash, uint64_t frame) {
+	bool SeenAgain(uint64_t hash, uint64_t frame) { return SeenAgainIn(seen, hash, frame); }
+	static bool SeenAgainIn(std::vector<SeenKey>& seen, uint64_t hash, uint64_t frame) {
 		hash             = hash != 0 ? hash : 1;
 		const auto mask  = seen.size() - 1;
 		SeenKey*   empty = nullptr;
@@ -221,6 +232,13 @@ struct RenderExecutor::NativeXprCache {
 	std::unordered_map<uint64_t, uint64_t, NativeXprKeyHash> refused;
 	// Per shader-address pair: a pair whose programs cannot be recorded stops asking.
 	std::unordered_map<uint64_t, bool, NativeXprKeyHash> unstorable;
+	// Relocated records by the full hash of their programs and descriptors, and the latest record
+	// of each shape (the same but the buffer bases).
+	std::unordered_map<uint64_t, std::unique_ptr<NativeXprRecord>, NativeXprKeyHash> relocated;
+	std::unordered_map<uint64_t, NativeXprRecord*, NativeXprKeyHash>                 relocated_shapes;
+	std::vector<SeenKey> relocated_seen = std::vector<SeenKey>(8192);
+	bool                 store_relocated = false; // the store asked for is a relocated one
+	uint64_t             relocated_full = 0, relocated_shape = 0;
 	// Scratch.
 	std::vector<uint32_t>                      key;
 	std::vector<std::pair<uint32_t, uint32_t>> changed;
@@ -241,6 +259,8 @@ struct RenderExecutor::NativeXprCache {
 		// Learning: 0 learned, 1 reads, 2 programs, 3 buffers, 4 images, 5 samplers, 6 other structure, 7 unexplained.
 		std::array<uint64_t, 8> learn {};
 		uint64_t target_object = 0, target_lookup = 0, rebinds = 0;
+		uint64_t relocated_hits = 0, relocated_rebinds = 0, relocated_unresolved = 0, relocated_miss = 0,
+		         relocated_stored = 0, relocated_broken = 0;
 	} counters;
 	std::unordered_map<std::string_view, uint64_t> refuse_reasons;
 	~NativeXprCache() {
@@ -293,6 +313,48 @@ uint64_t NativeXprStateKeyOf(const CommandBuffer& buffer) {
 		hash = XXH3_64bits_withSeed(&sgprs->count, sizeof(sgprs->count), hash);
 	}
 	return hash;
+}
+
+// What a relocated record is looked up by: a stage's program and descriptors.
+struct NativeXprStageView {
+	const ShaderRecompiler::IR::CompiledShaderInfo*           program  = nullptr;
+	const std::vector<ShaderRecompiler::IR::DescriptorValue>* buffers  = nullptr;
+	const std::vector<ShaderRecompiler::IR::DescriptorValue>* images   = nullptr;
+	const std::vector<ShaderRecompiler::IR::DescriptorValue>* samplers = nullptr;
+};
+
+// The buffer descriptor dwords that do not hold the base address.
+constexpr std::array<uint32_t, 8> NativeXprBufferShapeMask {0u, 0xffff0000u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
+
+// Full: every descriptor dword but the LOD statistics fields; shape: the buffer bases left out.
+std::pair<uint64_t, uint64_t> NativeXprRelocationHashes(uint64_t vertex_program, uint64_t pixel_program,
+                                                        std::span<const NativeXprStageView> stages) {
+	const std::array<uint64_t, 3> ids {vertex_program, pixel_program, stages.size()};
+	auto full  = XXH3_64bits(ids.data(), sizeof(ids));
+	auto shape = full;
+	const auto mix = [](uint64_t seed, const std::vector<ShaderRecompiler::IR::DescriptorValue>& values,
+	                    const std::array<uint32_t, 8>* mask) {
+		std::array<uint32_t, 9> words {};
+		for (const auto& value: values) {
+			words[0] = value.dword_count;
+			for (uint32_t w = 0; w < 8; ++w) words[1 + w] = value.dwords[w] & (mask != nullptr ? (*mask)[w] : ~0u);
+			seed = XXH3_64bits_withSeed(words.data(), sizeof(words), seed);
+		}
+		const uint64_t count = values.size();
+		return XXH3_64bits_withSeed(&count, sizeof(count), seed);
+	};
+	std::array<uint32_t, 8> image_mask {};
+	for (uint32_t w = 0; w < 8; ++w) image_mask[w] = ~NativeXprLodStatsMask[w];
+	for (const auto& stage: stages) {
+		const auto program = reinterpret_cast<uintptr_t>(stage.program);
+		full  = XXH3_64bits_withSeed(&program, sizeof(program), full);
+		shape = XXH3_64bits_withSeed(&program, sizeof(program), shape);
+		full  = mix(full, *stage.buffers, nullptr);
+		shape = mix(shape, *stage.buffers, &NativeXprBufferShapeMask);
+		full  = mix(mix(full, *stage.images, &image_mask), *stage.samplers, nullptr);
+		shape = mix(mix(shape, *stage.images, &image_mask), *stage.samplers, nullptr);
+	}
+	return {full, shape};
 }
 
 } // namespace
@@ -403,6 +465,13 @@ void RenderExecutor::NativeXprCollect() {
 		            static_cast<unsigned long long>(c.learn[6]), static_cast<unsigned long long>(c.learn[7]),
 		            static_cast<unsigned long long>(c.target_object), static_cast<unsigned long long>(c.target_lookup),
 		            static_cast<unsigned long long>(c.rebinds));
+		std::printf("NativeXpr:   relocated records %zu hits %llu rebinds %llu unresolved %llu miss %llu stored %llu "
+		            "broken %llu\n",
+		            cache.relocated.size(), static_cast<unsigned long long>(c.relocated_hits),
+		            static_cast<unsigned long long>(c.relocated_rebinds),
+		            static_cast<unsigned long long>(c.relocated_unresolved),
+		            static_cast<unsigned long long>(c.relocated_miss), static_cast<unsigned long long>(c.relocated_stored),
+		            static_cast<unsigned long long>(c.relocated_broken));
 		std::fflush(stdout);
 	}
 	if (frame - cache.swept_frame >= 8) {
@@ -420,6 +489,10 @@ void RenderExecutor::NativeXprCollect() {
 			}
 			it = variants.empty() ? cache.records.erase(it) : std::next(it);
 		}
+		std::vector<NativeXprRecord*> old;
+		for (auto& [full, record]: cache.relocated)
+			if (record->used_frame + KeepFrames < frame) old.push_back(record.get());
+		for (auto* record: old) NativeXprDropRelocated(*record);
 		std::erase_if(cache.refused, [&](const auto& item) { return item.second + NativeXprCache::RefuseFrames <= frame; });
 	}
 	if (cache.collected_frame == frame || cache.retired.empty()) return;
@@ -781,9 +854,10 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
 	auto& cache = NativeXprState();
 	++cache.counters.stores;
 	const auto frame  = m_context.FrameNumber();
-	const auto refuse = [&](const char* reason) {
+	const bool relocated = cache.store_relocated;
+	const auto refuse    = [&](const char* reason) {
 		++cache.counters.refused;
-		cache.refused[cache.tried_hash] = frame;
+		cache.refused[relocated ? cache.relocated_full : cache.tried_hash] = frame;
 		++cache.refuse_reasons[reason];
 	};
 	const auto refuse_program = [&](const char* reason) {
@@ -809,6 +883,12 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
 	NativeXprKeyOf(buffer, record->key);
 	if (NativeXprHash(record->key) != cache.tried_hash) return refuse("key_moved");
 	const auto state_key = cache.state_key;
+	if (relocated) {
+		for (const auto* prepared: stages)
+			if (!prepared->runtime->resources->image_tables.empty()) return refuse("image_tables");
+		return NativeXprStoreRecord(std::move(record), buffer, state, topology, primitive_restart_enable, rendering,
+		                            stages, dynamic_state, nullptr);
+	}
 
 	// The reads of the programs' SRT evaluation: the same resolution again, with a read log (the
 	// draw's own resolution may not have one), which must give the same resources.
@@ -836,7 +916,26 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
 		    a.user_data != b.user_data || !b.image_tables.empty())
 			return refuse("resources_moved");
 	}
+	NativeXprStoreRecord(std::move(record), buffer, state, topology, primitive_restart_enable, rendering, stages,
+	                     dynamic_state, &reads);
+}
 
+// The record of a store: its pipeline, resources and draw state; `reads` the SRT evaluation's
+// read log, null for a relocated record.
+void RenderExecutor::NativeXprStoreRecord(std::unique_ptr<NativeXprRecord> record, CommandBuffer& buffer,
+                                          const DrawRenderState& state, vk::PrimitiveTopology topology,
+                                          bool primitive_restart_enable, const RenderState& rendering,
+                                          std::span<PreparedBindings* const> stages,
+                                          const DynamicState& dynamic_state, const GuestReadLog* reads) {
+	auto&      cache     = *m_native_xpr;
+	const auto frame     = m_context.FrameNumber();
+	const auto state_key = cache.state_key;
+	const bool relocated = reads == nullptr;
+	const auto refuse    = [&](const char* reason) {
+		++cache.counters.refused;
+		cache.refused[relocated ? cache.relocated_full : cache.tried_hash] = frame;
+		++cache.refuse_reasons[reason];
+	};
 	auto* const pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.colors, state.color_count}, *state.depth,
 	    std::span {state.vertex_info.data(), 1}, buffer, state.ps_active ? &state.ps_input_info : nullptr, topology,
@@ -849,7 +948,7 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
 		NativeXprRetireSet(record->pool, record->set);
 		return refuse(reason);
 	}
-	record->reads = reads;
+	if (reads != nullptr) record->reads = *reads;
 
 	// The draw state: the targets as this draw left them and the dynamic state.
 	{
@@ -885,6 +984,37 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
 		draw_state->targets_epoch = textures.ImageSetEpoch();
 		draw_state->used_frame    = frame;
 		cache.states[state_key]   = std::move(draw_state);
+	}
+
+	if (relocated) {
+		std::array<NativeXprStageView, 2> views {};
+		for (uint32_t st = 0; st < record->stage_count; ++st) {
+			const auto& stage = record->stages[st];
+			views[st]         = {stage.program, &stage.buffers, &stage.images, &stage.samplers};
+		}
+		const auto [full, shape] = NativeXprRelocationHashes(record->vertex_program, record->pixel_program,
+		                                                     std::span {views.data(), record->stage_count});
+		record->relocated  = true;
+		record->full_hash  = full;
+		record->shape_hash = shape;
+		record->used_frame = frame;
+		if (const auto other = cache.relocated.find(full); other != cache.relocated.end()) {
+			// The record of other draw states: its pipelines stay.
+			if (other->second->vertex_program == record->vertex_program &&
+			    other->second->pixel_program == record->pixel_program)
+				for (const auto& entry: other->second->pipelines)
+					if (std::ranges::find(record->pipelines, entry.first,
+					                      &std::pair<uint64_t, const PipelineCache::Pipeline*>::first) ==
+					    record->pipelines.end())
+						record->pipelines.push_back(entry);
+			NativeXprDropRelocated(*other->second);
+		}
+		cache.relocated_shapes[shape] = record.get();
+		cache.relocated.emplace(full, std::move(record));
+		++cache.record_count;
+		++cache.counters.relocated_stored;
+		++cache.counters.stored;
+		return;
 	}
 
 	const auto hash    = NativeXprHash(record->key);
@@ -1237,6 +1367,150 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	return true;
 }
 
+// A relocated record leaves its maps and service.
+void RenderExecutor::NativeXprDropRelocated(NativeXprRecord& record) {
+	auto& cache = *m_native_xpr;
+	if (const auto shape = cache.relocated_shapes.find(record.shape_hash);
+	    shape != cache.relocated_shapes.end() && shape->second == &record)
+		cache.relocated_shapes.erase(shape);
+	const auto found = cache.relocated.find(record.full_hash);
+	if (found != cache.relocated.end() && found->second.get() == &record) {
+		auto owned = std::move(found->second);
+		cache.relocated.erase(found);
+		NativeXprRetire(std::move(owned));
+	}
+}
+
+// The key missed: the relocated record of the draw's resolution ahead, by its programs and
+// descriptors (see the top of this file), with the resolution's constants. Null when there is
+// none; then `store` when one should be stored (the same descriptors came again).
+RenderExecutor::NativeXprRecord* RenderExecutor::NativeXprRelocated(uint64_t frame, bool& store) {
+	auto& cache = *m_native_xpr;
+	store       = false;
+	auto* resolved = m_resolved_draw;
+	if (resolved == nullptr || !resolved->programs.reads.StillValid()) {
+		++cache.counters.relocated_unresolved;
+		return nullptr;
+	}
+	const auto& state = resolved->storage.state;
+	if (state.programs.VertexStageCount() != 1) return nullptr;
+	const std::array<const ShaderStageRuntime*, 2> runtimes {&state.vertex_info[0].stage, &state.ps_input_info.stage};
+	const uint32_t                                 stage_count = state.ps_active ? 2u : 1u;
+	std::array<NativeXprStageView, 2>              views {};
+	for (uint32_t st = 0; st < stage_count; ++st) {
+		const auto& runtime = *runtimes[st];
+		if (!runtime) return nullptr;
+		const auto& snapshot = *runtime.resources;
+		if (!snapshot.image_tables.empty()) return nullptr;
+		views[st] = {runtime.program, &snapshot.buffers, &snapshot.images, &snapshot.samplers};
+	}
+	const auto vertex_program = state.programs.vertex[0].id;
+	const auto pixel_program  = state.ps_active ? state.programs.pixel.id : 0;
+	const auto [full, shape] =
+	    NativeXprRelocationHashes(vertex_program, pixel_program, std::span {views.data(), stage_count});
+	const auto matches = [&](const NativeXprRecord& record, bool same_bases) {
+		if (record.stage_count != stage_count || record.vertex_program != vertex_program ||
+		    record.pixel_program != pixel_program)
+			return false;
+		for (uint32_t st = 0; st < stage_count; ++st) {
+			const auto& stage    = record.stages[st];
+			const auto& snapshot = *runtimes[st]->resources;
+			if (stage.program != runtimes[st]->program || stage.samplers != snapshot.samplers ||
+			    !NativeXprSameImagesButLodStats(stage.images, snapshot.images) ||
+			    stage.buffers.size() != snapshot.buffers.size() || stage.flattened.size() != snapshot.flattened_srt.size() ||
+			    stage.user_data.size() != snapshot.user_data.size())
+				return false;
+			for (size_t i = 0; i < stage.buffers.size(); ++i) {
+				const auto& a = stage.buffers[i];
+				const auto& b = snapshot.buffers[i];
+				if (a.dword_count != b.dword_count) return false;
+				for (uint32_t w = 0; w < 8; ++w) {
+					const auto mask = same_bases ? ~0u : NativeXprBufferShapeMask[w];
+					if ((a.dwords[w] & mask) != (b.dwords[w] & mask)) return false;
+				}
+			}
+		}
+		return true;
+	};
+	NativeXprRecord* record = nullptr;
+	bool             moved  = false;
+	if (const auto found = cache.relocated.find(full); found != cache.relocated.end() && matches(*found->second, true)) {
+		record = found->second.get();
+	} else if (const auto similar = cache.relocated_shapes.find(shape);
+	           similar != cache.relocated_shapes.end() && matches(*similar->second, false)) {
+		record = similar->second;
+		moved  = true;
+	}
+	const auto ask_store = [&] {
+		if (const auto refused = cache.refused.find(full);
+		    refused != cache.refused.end() && refused->second + NativeXprCache::RefuseFrames > frame)
+			return;
+		store                 = true;
+		cache.relocated_full  = full;
+		cache.relocated_shape = shape;
+	};
+	if (record == nullptr) {
+		++cache.counters.relocated_miss;
+		if (NativeXprCache::SeenAgainIn(cache.relocated_seen, full, frame)) ask_store();
+		return nullptr;
+	}
+	// The resolution's constants: the flattened SRT and the user data part of the shader data (the
+	// memory offsets after it are the record's buffers').
+	auto& rebind = cache.rebind_buffers;
+	rebind.clear();
+	for (uint32_t st = 0; st < stage_count; ++st) {
+		auto&       stage    = record->stages[st];
+		const auto& program  = *stage.program;
+		const auto& snapshot = *runtimes[st]->resources;
+		const auto& regs     = program.info.user_data_registers;
+		if (regs.size() > stage.shader_data.size()) {
+			NativeXprDropRelocated(*record);
+			ask_store();
+			return nullptr;
+		}
+		std::ranges::copy(snapshot.flattened_srt, stage.flattened.begin());
+		std::ranges::copy(snapshot.user_data, stage.user_data.begin());
+		for (size_t i = 0; i < regs.size(); ++i) stage.shader_data[i] = snapshot.user_data[regs[i] - program.user_data_base];
+		std::ranges::copy(snapshot.images, stage.images.begin());
+		if (moved) {
+			for (uint32_t i = 0; i < stage.buffers.size(); ++i) {
+				if (stage.buffers[i] == snapshot.buffers[i]) continue;
+				stage.buffers[i] = snapshot.buffers[i];
+				rebind.emplace_back(st, i);
+			}
+		}
+	}
+	if (moved) {
+		++cache.counters.relocated_rebinds;
+		if (!rebind.empty() && !NativeXprRebindBuffers(*record, rebind)) {
+			++cache.counters.relocated_broken;
+			NativeXprDropRelocated(*record);
+			ask_store();
+			return nullptr;
+		}
+		// Now found by its new descriptors.
+		auto owner = cache.relocated.find(record->full_hash);
+		EXIT_IF(owner == cache.relocated.end() || owner->second.get() != record);
+		auto owned = std::move(owner->second);
+		cache.relocated.erase(owner);
+		if (const auto other = cache.relocated.find(full); other != cache.relocated.end())
+			NativeXprDropRelocated(*other->second);
+		record->full_hash  = full;
+		record->shape_hash = shape;
+		cache.relocated.emplace(full, std::move(owned));
+		cache.relocated_shapes[shape] = record;
+	}
+	const bool mapping_moved = m_context.MappedRangesVersion() != record->mapping_version;
+	if (!NativeXprValidateResources(*record, frame, mapping_moved)) {
+		++cache.counters.relocated_broken;
+		NativeXprDropRelocated(*record);
+		ask_store();
+		return nullptr;
+	}
+	++cache.counters.relocated_hits;
+	return record;
+}
+
 // An indexed indirect draw of one object, its arguments read by the host GPU.
 bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, uint64_t args_addr, uint64_t index_base,
                                   uint64_t index_bytes, vk::IndexType index_type) {
@@ -1260,21 +1534,38 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, uint64_t args_addr, uin
 	const auto hash  = NativeXprHash(cache.key);
 	cache.tried_hash = hash;
 	const auto request_store = [&] { m_native_xpr_store = true; };
+	cache.store_relocated    = false;
 	const auto found = cache.records.find(hash);
+	NativeXprRecord* chosen = nullptr;
 	if (found == cache.records.end() || found->second.empty() || found->second.front()->key != cache.key) {
 		++cache.counters.miss_key;
 		if (cache.unstorable.contains(NativeXprPairKey(cache.key))) return false;
 		if (const auto refused = cache.refused.find(hash);
 		    refused != cache.refused.end() && refused->second + NativeXprCache::RefuseFrames > frame)
 			return false;
-		if (!cache.SeenAgain(hash, frame)) return false;
-		request_store();
-		return false;
+		// A key that comes again gets a record of its own; otherwise the user data move (see the top
+		// of this file).
+		if (cache.SeenAgain(hash, frame)) {
+			request_store();
+			return false;
+		}
+		bool store_relocated = false;
+		chosen               = NativeXprRelocated(frame, store_relocated);
+		if (chosen == nullptr) {
+			if (store_relocated) {
+				cache.store_relocated = true;
+				request_store();
+			}
+			return false;
+		}
+		cache.store_relocated = true;
+		cache.relocated_full  = chosen->full_hash;
+		cache.relocated_shape = chosen->shape_hash;
 	}
 	// The variant whose words and resources still hold (the last one used first).
-	auto&            variants = found->second;
-	NativeXprRecord* chosen   = nullptr;
-	for (size_t i = 0; i < variants.size();) {
+	auto* const variants_of = chosen == nullptr ? &found->second : nullptr;
+	for (size_t i = 0; variants_of != nullptr && i < variants_of->size();) {
+		auto& variants = *variants_of;
 		bool broken = false;
 		if (NativeXprValidate(*variants[i], frame, broken)) {
 			chosen = variants[i].get();
@@ -1292,7 +1583,7 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, uint64_t args_addr, uin
 	}
 	if (chosen == nullptr) {
 		++cache.counters.miss_validate;
-		if (variants.empty()) cache.records.erase(found);
+		if (found->second.empty()) cache.records.erase(found);
 		request_store();
 		return false;
 	}

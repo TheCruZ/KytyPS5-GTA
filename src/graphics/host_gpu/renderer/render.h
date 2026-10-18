@@ -297,6 +297,13 @@ private:
 	bool NativeXprValidateResources(NativeXprRecord& record, uint64_t frame, bool mapping_moved);
 	bool NativeXprValidate(NativeXprRecord& record, uint64_t frame, bool& broken);
 	bool NativeXprRebindBuffers(NativeXprRecord& record, std::span<const std::pair<uint32_t, uint32_t>> slots);
+	NativeXprRecord* NativeXprRelocated(uint64_t frame, bool& store);
+	void             NativeXprDropRelocated(NativeXprRecord& record);
+	void NativeXprStoreRecord(std::unique_ptr<NativeXprRecord> record, CommandBuffer& buffer,
+	                          const DrawRenderState& state, vk::PrimitiveTopology topology,
+	                          bool primitive_restart_enable, const RenderState& rendering,
+	                          std::span<PreparedBindings* const> stages, const DynamicState& dynamic_state,
+	                          const GuestReadLog* reads);
 	bool NativeXprEmitTargets(const NativeXprDrawState& draw_state, CommandRecorder vk_buffer);
 	bool NativeXprTargetsCurrent(NativeXprDrawState& draw_state);
 	bool NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& record, NativeXprDrawState& draw_state,
