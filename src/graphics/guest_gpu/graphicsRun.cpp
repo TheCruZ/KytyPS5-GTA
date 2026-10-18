@@ -702,6 +702,21 @@ void CommandProcessor::NoteRecordedWork() {
 		m_batch_work = 0;
 	}
 	m_batch_work++;
+	// A long run of draws and dispatches reaches the GPU in parts while it is still being
+	// translated, whenever the GPU ran out of work (chenxiao07's dispatch and draw batches): whole,
+	// the GPU idled through its translation and ran it late. KYTY_WORK_BATCH=0 turns it off.
+	static const uint32_t batch = [] {
+		const char* value = std::getenv("KYTY_WORK_BATCH");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 128u;
+	}();
+	if (batch != 0 && m_batch_work >= batch && m_batch_work % 16u == 0) {
+		auto& scheduler = GetScheduler();
+		auto& master    = scheduler.GetMasterSemaphore();
+		master.Refresh();
+		if (master.KnownGpuTick() >= scheduler.SubmittedTick()) {
+			scheduler.Flush();
+		}
+	}
 }
 
 void CommandProcessor::BufferFlushIfBatchReady() {
