@@ -356,6 +356,10 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_precreated_graphics;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_precreated_compute;
+	// Native XPR variants a background thread created (KYTY_ASYNC_XPR_PIPELINES), pending and failed ones.
+	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash> m_precreated_native;
+	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_async_pending_native;
+	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_async_failed_native;
 	std::vector<std::jthread>                               m_precreate_threads;
 	// Table program compilations (CompileTable*Async), on their thread.
 	std::mutex                                              m_table_mutex;

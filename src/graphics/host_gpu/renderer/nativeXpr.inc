@@ -78,6 +78,32 @@ bool NativeXprImageProofEnabled() {
 	return enabled;
 }
 
+// chenxiao07's KYTY_ASYNC_XPR_PIPELINES (default on; 0 creates them on the execution thread): a record's pipeline
+// variant is created on a background thread; its store waits for it (the draws take the normal path meanwhile).
+bool NativeXprAsyncPipelines() {
+	static const bool enabled = NativeXprSwitch("KYTY_ASYNC_XPR_PIPELINES");
+	return enabled;
+}
+
+uint32_t NativeXprNumberSwitch(const char* name, uint32_t default_value) {
+	const char* value = std::getenv(name);
+	return value != nullptr && value[0] != '\0' ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : default_value;
+}
+
+// chenxiao07's KYTY_NATIVE_XPR_STORE_BUDGET (default 256; 0: no limit): record stores asked for per frame. Walking
+// brings a thousand or more new objects a frame, and storing them all at once made 60-90 ms frames.
+uint32_t NativeXprStoreBudget() {
+	static const uint32_t budget = NativeXprNumberSwitch("KYTY_NATIVE_XPR_STORE_BUDGET", 256u);
+	return budget;
+}
+
+// chenxiao07's KYTY_NATIVE_XPR_KEEP_FRAMES (default 600, at least 2): the frames an unused record stays; past
+// NativeXprCache::RecordsSoftCap records, 2.
+uint64_t NativeXprKeepFrames() {
+	static const uint64_t keep = std::max<uint64_t>(2u, NativeXprNumberSwitch("KYTY_NATIVE_XPR_KEEP_FRAMES", 600u));
+	return keep;
+}
+
 // KYTY_NATIVE_XPR_PREDICT=0: no prefetch of the record the next draw used last time.
 bool NativeXprPredictEnabled() {
 	static const bool enabled = NativeXprSwitch("KYTY_NATIVE_XPR_PREDICT");
@@ -253,6 +279,10 @@ struct RenderExecutor::NativeXprCache {
 	static constexpr size_t MaxVariants = 4;
 	std::unordered_map<uint64_t, std::vector<std::unique_ptr<NativeXprRecord>>, NativeXprKeyHash> records;
 	size_t record_count = 0;
+	static constexpr size_t RecordsSoftCap = 49152;
+	// Store requests of this frame (KYTY_NATIVE_XPR_STORE_BUDGET).
+	uint64_t store_frame    = UINT64_MAX;
+	uint32_t store_requests = 0;
 	uint64_t last_hash = 0; // the key hash of the last native draw's record (KYTY_NATIVE_XPR_PREDICT)
 	std::unordered_map<uint64_t, std::unique_ptr<NativeXprDrawState>, NativeXprKeyHash> states;
 	struct RetiredSet {
@@ -335,6 +365,7 @@ struct RenderExecutor::NativeXprCache {
 		uint64_t target_object = 0, target_lookup = 0, rebinds = 0;
 		uint64_t relocated_hits = 0, relocated_rebinds = 0, relocated_unresolved = 0, relocated_miss = 0,
 		         relocated_stored = 0, relocated_broken = 0;
+		uint64_t budget_denied = 0, pipeline_pending = 0;
 	} counters;
 	std::unordered_map<std::string_view, uint64_t> refuse_reasons;
 	~NativeXprCache() {
@@ -575,7 +606,8 @@ void RenderExecutor::NativeXprCollect() {
 	}
 	if (frame - cache.swept_frame >= 8) {
 		cache.swept_frame = frame;
-		constexpr uint64_t KeepFrames = 600;
+		const uint64_t KeepFrames =
+		    cache.record_count > NativeXprCache::RecordsSoftCap ? uint64_t {2} : NativeXprKeepFrames();
 		for (auto it = cache.records.begin(); it != cache.records.end();) {
 			auto& variants = it->second;
 			for (auto variant = variants.begin(); variant != variants.end();) {
@@ -1038,7 +1070,11 @@ void RenderExecutor::NativeXprStoreRecord(std::unique_ptr<NativeXprRecord> recor
 	auto* const pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.colors, state.color_count}, *state.depth,
 	    std::span {state.vertex_info.data(), 1}, buffer, state.ps_active ? &state.ps_input_info : nullptr, topology,
-	    primitive_restart_enable, state.programs, false, true);
+	    primitive_restart_enable, state.programs, NativeXprAsyncPipelines(), true);
+	if (pipeline == nullptr && NativeXprAsyncPipelines()) {
+		++cache.counters.pipeline_pending; // a background thread creates it: a later store takes it
+		return;
+	}
 	if (pipeline == nullptr || !pipeline->native_bindings || pipeline->uses_push_descriptors) return refuse("pipeline");
 	record->vertex_program = state.programs.vertex[0].id;
 	record->fetch_embedded = state.vertex_info[0].fetch_embedded;
@@ -1744,7 +1780,20 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, uint64_t args_addr, uin
 	NativeXprKeyOf(buffer, cache.key);
 	const auto hash  = NativeXprHash(cache.key);
 	cache.tried_hash = hash;
-	const auto request_store = [&] { m_native_xpr_store = true; };
+	const auto request_store = [&] {
+		if (const auto budget = NativeXprStoreBudget(); budget != 0u) {
+			if (cache.store_frame != frame) {
+				cache.store_frame    = frame;
+				cache.store_requests = 0;
+			}
+			if (cache.store_requests >= budget) {
+				++cache.counters.budget_denied; // asked again by a later draw of the object
+				return;
+			}
+			++cache.store_requests;
+		}
+		m_native_xpr_store = true;
+	};
 	cache.store_relocated    = false;
 	cache.resolution_valid   = false;
 	const auto found = cache.records.find(hash);

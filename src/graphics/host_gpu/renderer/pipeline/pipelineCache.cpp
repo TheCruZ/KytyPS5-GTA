@@ -1540,6 +1540,7 @@ bool PipelineCache::PrecreatePipeline(const StoredPipeline& stored) {
 
 struct PipelineCache::AsyncPipelineJob {
 	bool compute = false;
+	bool native  = false; // a native XPR variant (native bindings, not recorded in the store)
 	// Graphics.
 	GraphicsPipelineKey                  key {};
 	std::array<ShaderVertexInputInfo, 3> vertex_info;
@@ -1601,6 +1602,7 @@ void PipelineCache::AsyncPipelineWorker() {
 		}
 		auto pipeline = std::make_unique<Pipeline>();
 		bool created  = false;
+		pipeline->native_bindings = job->native;
 		try {
 			Common::SoftExitScope soft_exit(true);
 			if (job->compute) {
@@ -1621,7 +1623,7 @@ void PipelineCache::AsyncPipelineWorker() {
 			m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
 			if (job->compute) {
 				RecordComputePipeline(job->compute_info, job->compute_program.id);
-			} else {
+			} else if (!job->native) {
 				RecordGraphicsPipeline(job->key,
 				                       std::span {job->vertex_info.data(), job->vertex_stages},
 				                       job->pixel_info ? &*job->pixel_info : nullptr);
@@ -1636,6 +1638,13 @@ void PipelineCache::AsyncPipelineWorker() {
 				        .second;
 			}
 			m_async_pending_compute.erase(job->compute_program.id);
+		} else if (job->native) {
+			if (created) {
+				kept = m_precreated_native.try_emplace(job->key, std::move(pipeline)).second;
+			} else {
+				m_async_failed_native.insert(job->key);
+			}
+			m_async_pending_native.erase(job->key);
 		} else {
 			if (created) {
 				kept = m_precreated_graphics.try_emplace(job->key, std::move(pipeline)).second;
@@ -2420,9 +2429,37 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 	}
 
 	if (native_bindings) {
-		// The native XPR variant: the same key in its own map, created here.
+		// The native XPR variant: the same key in its own map, created here or, with `allow_async`, on a background
+		// thread (chenxiao07's KYTY_ASYNC_XPR_PIPELINES; null until it is there).
 		if (auto iter = m_native_graphics_pipelines.find(key); iter != m_native_graphics_pipelines.end()) {
 			return iter->second.get();
+		}
+		if (allow_async && !m_async_threads.empty()) {
+			std::unique_lock lock(m_precreated_mutex);
+			if (auto node = m_precreated_native.extract(key); !node.empty()) {
+				lock.unlock();
+				return m_native_graphics_pipelines.insert(std::move(node)).position->second.get();
+			}
+			if (m_async_pending_native.contains(key)) return nullptr;
+			if (!m_async_failed_native.contains(key)) {
+				m_async_pending_native.insert(key);
+				lock.unlock();
+				auto job           = std::make_unique<AsyncPipelineJob>();
+				job->native        = true;
+				job->key           = key;
+				job->vertex_stages = static_cast<uint32_t>(vertex_info.size());
+				for (uint32_t i = 0; i < job->vertex_stages; i++) {
+					job->vertex_info[i]                 = vertex_info[i];
+					job->vertex_info[i].stage.resources = &g_no_resources;
+				}
+				if (ps_active) {
+					job->pixel_info.emplace(*ps_input_info);
+					job->pixel_info->stage.resources = &g_no_resources;
+				}
+				job->programs = programs;
+				QueueAsyncPipeline(std::move(job));
+				return nullptr;
+			}
 		}
 		auto cached             = std::make_unique<Pipeline>();
 		cached->native_bindings = true;
