@@ -1616,6 +1616,18 @@ KYTY_CP_OP_PARSER(CpOpDrawIndex) {
 	return 1;
 }
 
+// chenxiao07's draw runs (180859885): consecutive indexed indirect draws with the same registers, nothing between them,
+// share one preparation. Here a run whose argument records are evenly spaced is one multi-draw (the operation the
+// MULTI packet makes): drawn as one indirect multi-draw on the GPU, or one by one as before. KYTY_DRAW_RUNS=1 (off by
+// default: Demon's Souls' native XPR records draw those objects one by one for less, 25 -> 20 fps in game with runs).
+static bool DrawRunsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAW_RUNS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1628,6 +1640,32 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 	const IndirectDrawRegisters registers {
 	    buffer[1] & 0xffffu, buffer[2] & 0xffffu,
 	    indexed && (buffer[2] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP};
+
+	if (indexed && DrawRunsEnabled() && dw >= 10) {
+		// The packets after this one (header and 4 dwords each, the header with no predication bit).
+		constexpr uint32_t MaxRun = 64;
+		const auto         available = (dw - 5u) / 5u;
+		uint32_t           count     = 1;
+		uint32_t           stride    = 0;
+		while (count < MaxRun && count <= available) {
+			const auto* next = buffer + 5u * count - 1u;
+			if (next[0] != 0xc0032500u || next[2] != buffer[1] || next[3] != buffer[2] || next[4] != buffer[3]) break;
+			const auto previous = buffer[5u * (count - 1u)];
+			if (next[1] <= previous) break;
+			const auto step = next[1] - previous;
+			if (count == 1) {
+				if (step < 20u || (step & 3u) != 0) break; // (20: an argument record)
+				stride = step;
+			} else if (step != stride) {
+				break;
+			}
+			++count;
+		}
+		if (count > 1) {
+			cp.DrawIndirectMulti(data_offset, count, nullptr, stride, registers, draw_initiator, indexed);
+			return 4u + 5u * (count - 1u);
+		}
+	}
 
 	cp.DrawIndirect(data_offset, registers, draw_initiator, indexed);
 
