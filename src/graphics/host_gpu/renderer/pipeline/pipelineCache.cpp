@@ -477,10 +477,14 @@ struct PipelineCache::ProgramCache {
 
 		// Materializes the resources and finds the permutation they select (see
 		// ProgramCache::FindPermutation()).
+		// Null with `failed` set when the resources do not materialize.
 		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
-		                             uint32_t push_data_cursor) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    resource_plan, runtime, resources, specialization));
+		                             uint32_t push_data_cursor, bool& failed) {
+			if (!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
+			                                                specialization)) {
+				failed = true;
+				return nullptr;
+			}
 			const auto found =
 			    ProgramCache::FindPermutation(*this, specialization, push_data_cursor);
 			return found != permutations.end() ? &*found : nullptr;
@@ -642,6 +646,18 @@ struct PipelineCache::ProgramCache {
 		return found;
 	}
 
+	// The resources of a use of a program did not materialize (descriptors the guest left stale or
+	// of formats the specialization cannot take, as Demon's Souls' leaves some): the draw or dispatch
+	// is skipped instead of the emulator exiting.
+	static ShaderProgram MaterializationFailed(const ShaderParams& params) {
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::printf("Shaders: skipped a use of shader 0x%016llx whose resources do not materialize\n",
+			            static_cast<unsigned long long>(params.hash));
+		}
+		return {};
+	}
+
 	// Resolves a stage ahead of execution: only programs and permutations that exist, into the
 	// storage of the resolution, reading guest memory through its log.
 	template <typename InputInfo>
@@ -740,14 +756,18 @@ struct PipelineCache::ProgramCache {
 			runtime.indirect_args_address = input_info.indirect_args_address;
 		}
 		bool source_changed = false;
+		bool failed         = false;
 		if (entry != programs.end()) {
 			auto& cached = entry->second;
 			Permutation* permutation = nullptr;
 			if (cached.call_source) {
 				source_changed = cached.RefreshCallSource(runtime);
-				if (!source_changed) permutation = cached.FindPermutation(runtime, push_data_cursor);
+				if (!source_changed) permutation = cached.FindPermutation(runtime, push_data_cursor, failed);
 			} else {
-				permutation = cached.FindPermutation(runtime, push_data_cursor);
+				permutation = cached.FindPermutation(runtime, push_data_cursor, failed);
+			}
+			if (failed) {
+				return MaterializationFailed(params);
 			}
 			if (permutation != nullptr) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
@@ -782,15 +802,20 @@ struct PipelineCache::ProgramCache {
 			auto retained = source.call ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			if (!ShaderRecompiler::IR::MaterializeResources(
+			        entry->second.resource_plan, runtime, entry->second.resources,
+			        entry->second.specialization)) {
+				return MaterializationFailed(params);
+			}
 		} else if (source_changed) {
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-			if (const auto* permutation = entry->second.FindPermutation(runtime, push_data_cursor)) {
+			if (const auto* permutation = entry->second.FindPermutation(runtime, push_data_cursor, failed)) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
+			}
+			if (failed) {
+				return MaterializationFailed(params);
 			}
 		}
 		entry->second.permutations.push_back(CompilePermutation(

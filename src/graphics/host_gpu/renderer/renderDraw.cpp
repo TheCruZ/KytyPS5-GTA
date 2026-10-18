@@ -1430,6 +1430,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_
 		    PixelShaderActive(buffer.GetRegisters(), buffer.GetShaders(), color_output_mask);
 		RefreshShaders(buffer, draw, color_output_mask, state);
 	}
+	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
+		return false; // a stage whose resources do not materialize
+	}
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {

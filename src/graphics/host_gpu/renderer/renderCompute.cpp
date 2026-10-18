@@ -449,6 +449,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (!TakeResolvedDispatch(input_info, compute_program)) {
 		compute_program = m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	}
+	if (!compute_program) {
+		return;
+	}
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -861,6 +864,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		input_info.indirect_args_address = args_addr;
 		compute_program = m_context.GetPipelineCache().GetComputeProgram(
 		    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	}
+	if (!compute_program) {
+		return;
 	}
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
