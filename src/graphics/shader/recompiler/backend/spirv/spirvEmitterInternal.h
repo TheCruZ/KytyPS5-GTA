@@ -140,6 +140,12 @@ struct EmitterState {
 	uint32_t                                         push_constant_variable  = 0;
 	uint32_t                                         shader_data_storage_variable = 0;
 	uint32_t                                         flattened_srt_variable  = 0;
+	// Table mode (IR::Program::table_mode, EmitTableMode): the block's device address, each slot the shader reads (0:
+	// not given), and each buffer's device address and size in dwords.
+	uint32_t                                         table_block             = 0;
+	std::vector<uint32_t>                            table_slot_values;
+	std::vector<uint32_t>                            table_bases;
+	std::vector<uint32_t>                            table_lengths;
 	uint32_t                                         uniform_buffer_variable = 0;
 	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;
 	uint32_t                                         lds_base_dwords         = 0;
@@ -463,7 +469,17 @@ struct MemoryResourceAccess {
 	uint32_t              element_bits     = 32;
 	bool                  non_uniform      = false;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
+	// Table mode: object_pointer is a physical storage buffer pointer (EmitTableMode); loads and stores through it
+	// carry their alignment (EmitAccessLoad, EmitAccessStore).
+	bool                  physical         = false;
 };
+
+// A load or store through a buffer access's element pointer (with the alignment a physical pointer needs).
+uint32_t EmitAccessLoad(EmitterState& state, uint32_t type, uint32_t pointer, const MemoryResourceAccess& access);
+void     EmitAccessStore(EmitterState& state, uint32_t pointer, uint32_t value, const MemoryResourceAccess& access);
+// Table mode, at the function's entry (state.table_*).
+void EmitTableMode(EmitterState& state);
+uint32_t TypePhysicalStorageBufferPointer(EmitterState& state, uint32_t bits);
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                    uint32_t search_iterations, uint32_t default_resource);

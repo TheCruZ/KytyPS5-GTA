@@ -151,6 +151,8 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 	    .user_data_count = user_data_count,
 	    .scratch_dwords  = scratch_dwords,
 	    .has_address_writes = has_address_writes,
+	    .table_mode      = table_mode,
+	    .table_plan      = std::move(table_plan),
 	    .info            = std::move(info),
 	    .bindings        = std::move(bindings),
 	    .srt_reads_after_buffer_writes = std::move(srt_reads_after_writes),

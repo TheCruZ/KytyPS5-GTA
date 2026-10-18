@@ -539,10 +539,14 @@ struct Bindings {
 	uint32_t push_data_start_dword = PushData::NoStart;
 	uint32_t dispatch_thread_dword = PushData::NoStart;
 	uint32_t memory_offset_dword = 0;
+	uint32_t table_block_dwords  = 0; // table mode: the block's device address (TablePlan)
 
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	[[nodiscard]] uint32_t TableBlockDword() const {
 		return memory_offset_dword +
 		       (descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] + 3u) / 4u;
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return TableBlockDword() + table_block_dwords;
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
@@ -706,6 +710,55 @@ struct ResourceBlock {
 	std::vector<uint32_t> srt_reads;
 };
 
+// Table mode (Program::table_mode, chenxiao07's KytyPS5 fork): the flattened SRT's slots, the V#s of the buffers the
+// shader reads by device address, and the T#s and S#s of its images and samplers. Slot s holds the dword at
+// ((high:low) & 0xffff'ffff'ffff) + (offset & ~3) + immediate, dword aligned (a bounded slot, read through a V#: high and
+// `records` are its words 1 and 2, and a read past its range, NUM_RECORDS bytes or NUM_RECORDS times the stride, fails
+// the evaluation, as the normal path's); a descriptor is its words. An operand is an immediate, a user data register or
+// a lower slot. For each dispatch or draw the renderer evaluates the slots `cpu` marks (those the shader reads, `gpu`,
+// the image and sampler words, which choose its descriptors, and what their addresses are read through) as the guest
+// memory holds them then, and gives the shader a block: dword s is slot s; from BufferDword(i), buffer i's device
+// address (two dwords), size in dwords (0: none), buffer word and stride, resolved from its V#. The shader reads the
+// block through its device address (Bindings::TableBlockDword).
+struct TablePlan {
+	struct Operand {
+		// ShaderBaseLow/High: the low or high dword of the stage's code address plus `value` (a V# of constants the
+		// code embeds, addressed from s_getpc_b64; the renderer has the address from the registers).
+		enum class Kind : uint8_t { Immediate, UserData, Slot, ShaderBaseLow, ShaderBaseHigh };
+		Kind     kind  = Kind::Immediate;
+		uint32_t value = 0; // the immediate, the scalar register, the slot or the offset from the code address
+		bool     operator==(const Operand&) const = default;
+	};
+	struct Slot {
+		Operand low, high, offset;
+		int32_t immediate = 0; // dword aligned
+		Operand records;       // a bounded slot's V# word 2
+		bool    bounded = false;
+		bool    operator==(const Slot&) const = default;
+	};
+	struct Descriptor {
+		std::array<Operand, 8> words {};
+		uint32_t               count = 0;
+		bool                   operator==(const Descriptor&) const = default;
+	};
+	std::vector<Slot>                   slots;
+	std::vector<std::array<Operand, 4>> buffers;
+	std::vector<Descriptor>             images, samplers;
+	std::vector<uint8_t>                gpu, cpu; // per slot
+	// Flat or global memory reads: the renderer readies their page table ranges at every use, as the normal path's
+	// PrepareBda does.
+	bool global_memory = false;
+
+	// A buffer's dwords in the block: its device address (2), size in dwords, buffer word and stride, all from the V#
+	// the renderer resolved.
+	static constexpr uint32_t BufferDwords = 5;
+	[[nodiscard]] uint32_t BufferDword(size_t buffer) const {
+		return static_cast<uint32_t>(slots.size() + BufferDwords * buffer);
+	}
+	[[nodiscard]] uint32_t BlockDwords() const { return BufferDword(buffers.size()); }
+	bool                   operator==(const TablePlan&) const = default;
+};
+
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
 struct CompiledShaderInfo {
 	ShaderType                    stage               = ShaderType::Unknown;
@@ -716,6 +769,8 @@ struct CompiledShaderInfo {
 	uint32_t                      scratch_dwords      = 0;
 	uint32_t                      param_export_mask   = 0;
 	bool                          has_address_writes  = false;
+	bool                          table_mode          = false; // see Program::table_mode
+	TablePlan                     table_plan;
 	ShaderInfo                    info;
 	Bindings                      bindings;
 	// For each flat SRT slot, the written info.buffers that a store or atomic of the shader
@@ -833,6 +888,10 @@ struct Program: ResourcePlan {
 	bool                          has_address_writes = false;
 	bool                          shader_info_complete = false;
 	Bindings                      bindings;
+	// Table mode (EnterTableMode): the SRT reads and the buffers' V#s come from a block the renderer fills for each use,
+	// read through its device address; no flattened SRT or buffer descriptors.
+	bool                          table_mode = false;
+	TablePlan                     table_plan;
 
 };
 

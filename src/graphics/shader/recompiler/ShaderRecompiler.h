@@ -24,6 +24,7 @@ struct CompileOptions {
 	bool                        emit_debug_info            = false;
 	bool                        maintenance8_enabled       = false;
 	bool                        robust_buffer_access2      = false;
+	bool                        table_mode                 = false; // IR::EnterTableMode
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
@@ -37,7 +38,8 @@ struct TranslateResult {
 };
 
 struct CompileResult {
-	std::vector<uint32_t>  spirv;
+	std::vector<uint32_t>  spirv; // empty when table mode was asked for and refused (table_refusal)
+	std::string            table_refusal;
 	std::string            decoded_dump;
 	std::string            ir_dump;
 	IR::Program            program;

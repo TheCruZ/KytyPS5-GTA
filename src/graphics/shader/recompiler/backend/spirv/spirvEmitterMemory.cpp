@@ -300,7 +300,11 @@ uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
                      uint32_t prefix = 0) {
 	if (mem.kind == IR::ResourceKind::Buffer) {
 		const auto resource = ctx.state.program.info.buffers.at(mem.resource).descriptor_index;
-		if (prefix == 0u) prefix = ctx.state.memory_byte_offsets[resource];
+		// (Table mode addresses each buffer from its V#'s base: EmitTableMode.)
+		if (prefix == 0u) {
+			prefix = ctx.state.program.table_mode ? ConstantU32(ctx.state, 0)
+			                                      : ctx.state.memory_byte_offsets[resource];
+		}
 		const auto address = Binary(ctx.state, spv::OpIAdd, TypeU32(ctx.state),
 		                            BufferByteAddress(ctx, inst, mem), prefix);
 		// The host binding prefix must not wrap an out-of-range guest address into the buffer.
@@ -426,7 +430,7 @@ uint32_t BufferIndexInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
 	const auto index = DwordIndex(ctx, inst, mem, resource.byte_offset);
-	if (ctx.state.robust_buffer_access2 && resource.element_bits == 32u &&
+	if (ctx.state.robust_buffer_access2 && resource.element_bits == 32u && !resource.physical &&
 	    (resource.kind == IR::ResourceKind::Buffer ||
 	     resource.kind == IR::ResourceKind::ScalarBuffer)) {
 		// The device reads zero past the descriptor's range, which OpArrayLength measures.
@@ -459,22 +463,16 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                           uint32_t index) {
-	const auto value   = ctx.state.builder.AllocateId();
-	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
-	ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), value, pointer,
-	                              resource.memory_access);
-	return value;
+	return EmitAccessLoad(ctx.state, TypeU32(ctx.state), EmitMemoryElementPointer(ctx.state, resource, index),
+	                      resource);
 }
 
 uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                              uint32_t address, uint32_t index, uint32_t bits, bool sign_extend) {
 	uint32_t value;
 	if (resource.element_bits < 32u) {
-		const auto loaded = ctx.state.builder.AllocateId();
-		ctx.state.builder.AddFunction(spv::OpLoad,
-		                              ctx.state.storage_buffers[bits == 8u ? 0 : 1].element_type, loaded,
-		                              EmitMemoryElementPointer(ctx.state, resource, index),
-		                              resource.memory_access);
+		const auto loaded = EmitAccessLoad(ctx.state, ctx.state.storage_buffers[bits == 8u ? 0 : 1].element_type,
+		                                   EmitMemoryElementPointer(ctx.state, resource, index), resource);
 		value = Unary(ctx.state, spv::OpUConvert, TypeU32(ctx.state), loaded);
 	} else {
 		const auto word = LoadWordInBounds(ctx, resource, index);
@@ -575,11 +573,10 @@ void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                           uint32_t bits, uint32_t data) {
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
 	if (resource.element_bits < 32u) {
-		ctx.state.builder.AddFunction(
-		    spv::OpStore, pointer,
-		    Unary(ctx.state, spv::OpUConvert,
-		          ctx.state.storage_buffers[bits == 8u ? 0 : 1].element_type, data),
-		    resource.memory_access);
+		EmitAccessStore(ctx.state, pointer,
+		                Unary(ctx.state, spv::OpUConvert, ctx.state.storage_buffers[bits == 8u ? 0 : 1].element_type,
+		                      data),
+		                resource);
 		return;
 	}
 	const auto shift   = Binary(ctx.state, spv::OpShiftLeftLogical, TypeU32(ctx.state),
@@ -631,9 +628,7 @@ void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo me
 
 void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
                        uint32_t data) {
-	ctx.state.builder.AddFunction(spv::OpStore,
-	                              EmitMemoryElementPointer(ctx.state, resource, index), data,
-	                              resource.memory_access);
+	EmitAccessStore(ctx.state, EmitMemoryElementPointer(ctx.state, resource, index), data, resource);
 }
 
 template <typename Fn>
@@ -1674,6 +1669,14 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 uint32_t EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
+	if (state.program.table_mode) {
+		// A slot the block does not give the shader only addresses planning-only loads (IR::EnterTableMode), which
+		// emit nothing.
+		const auto slot = inst.Arg(1).Resolve().U32();
+		return slot < state.table_slot_values.size() && state.table_slot_values[slot] != 0
+		           ? state.table_slot_values[slot]
+		           : ConstantU32(state, 0);
+	}
 	if (state.flattened_srt_variable == 0) {
 		ctx.Fail(inst, "requires the flattened SRT descriptor");
 	}
@@ -1719,7 +1722,7 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto element = Binary(
 	    state, spv::OpIAdd, TypeU32(state), index,
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.byte_offset, ConstantU32(state, 2)));
-	if (state.robust_buffer_access2) {
+	if (state.robust_buffer_access2 && !access.physical) {
 		// The device reads zero past the descriptor's range, which OpArrayLength measures.
 		ctx.Define(inst, EmitNative<spv::OpLoad, IR::Type::U32>(
 		                     state, EmitMemoryElementPointer(state, access, element)));
@@ -1727,8 +1730,8 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	const auto condition = EmitMemoryElementInBounds(state, access, element);
 	ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
-		           return EmitNative<spv::OpLoad, IR::Type::U32>(
-		               state, EmitMemoryElementPointer(state, access, element));
+		           return EmitAccessLoad(state, TypeU32(state), EmitMemoryElementPointer(state, access, element),
+		                                 access);
 	           }));
 }
 
