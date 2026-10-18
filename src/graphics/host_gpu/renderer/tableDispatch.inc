@@ -8,7 +8,7 @@
 // block, its read-only V#s resolved once, its written ones obtained as written at every dispatch (the buffer cache
 // tracks the GPU's writes), its images and samplers in an image set (TableSet) bound with its native pipeline; the
 // barriers as the normal path's DispatchDirect. Shaders a special path of the normal path takes (Demon's Souls' copy),
-// thread-dimension dispatches and programs that write images or use LDS storage stay on the normal path.
+// thread-dimension dispatches, uniform fills and programs that use LDS storage stay on the normal path.
 
 namespace {
 
@@ -24,20 +24,33 @@ uint64_t TableDispatchKey(const HW::ComputeShaderInfo& cs, bool async_compute) {
 	return XXH3_64bits_withSeed(&cs.cs_regs, sizeof(cs.cs_regs), async_compute ? 1u : 0u);
 }
 
+// chenxiao07's table dispatches write storage images (the async culling chain's, the downsampling passes'): the set
+// binds them in General as CommitBindings does, a use proven GPU-owned and CPU-clean (TableTransit).
+// KYTY_TABLE_DISPATCH_STORAGE=0 leaves such programs to the normal path as before (default 1).
+bool TableDispatchStorageEnabled() {
+	static const bool enabled = NativeXprSwitch("KYTY_TABLE_DISPATCH_STORAGE");
+	return enabled;
+}
+
 // What table dispatches serve: a table program whose shader data fits the push constants and whose set holds only
-// images it reads, samplers and the page table (TableResolveSet).
-bool TableDispatchServes(const PipelineCache::TableProgram* table) {
-	if (table == nullptr) return false;
+// images, samplers and the page table (TableResolveSet). Null, or why not.
+const char* TableDispatchRefusal(const PipelineCache::TableProgram* table) {
+	if (table == nullptr) return "no table mode program";
 	const auto& program = table->program;
 	using Kind          = ShaderRecompiler::IR::DescriptorBindingKind;
-	return program.table_mode && program.bindings.UsesPushData() && !program.info.uses_gds &&
-	       program.bindings.dispatch_thread_dword == ShaderRecompiler::IR::PushData::NoStart &&
-	       !table->input_info.lds_storage &&
-	       program.bindings.descriptor_counts[static_cast<size_t>(Kind::SharedMemory)] == 0 &&
-	       std::ranges::none_of(program.info.images, [](const ShaderRecompiler::IR::ImageResource& image) {
-		       return image.written || image.atomic ||
-		              image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
-	       });
+	if (!program.table_mode) return "no table mode program";
+	if (!program.bindings.UsesPushData()) return "shader data that does not fit the push constants";
+	if (program.info.uses_gds) return "GDS";
+	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) return "thread counts";
+	if (table->input_info.lds_storage || program.bindings.descriptor_counts[static_cast<size_t>(Kind::SharedMemory)] != 0)
+		return "LDS storage";
+	for (const auto& image: program.info.images) {
+		if (image.atomic) return "an image atomic";
+		if ((image.written || image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage) &&
+		    !TableDispatchStorageEnabled())
+			return "a storage image (KYTY_TABLE_DISPATCH_STORAGE=0)";
+	}
+	return nullptr;
 }
 
 } // namespace
@@ -122,12 +135,11 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, const HW::ComputeShade
 		// The table program, once compiled.
 		if (pair.pending == nullptr || !pair.pending->done.load(std::memory_order_acquire)) return false;
 		const auto* program = pair.pending->programs[0];
-		if (!TableDispatchServes(program)) {
+		if (const char* refusal = TableDispatchRefusal(program); refusal != nullptr) {
 			static std::atomic<uint32_t> reports {0};
 			if (reports.fetch_add(1, std::memory_order_relaxed) < 64)
 				std::printf("Table: CS 0x%llx refused: %s\n", static_cast<unsigned long long>(pair.vs),
-				            program == nullptr && !pair.pending->refusal.empty() ? pair.pending->refusal.c_str()
-				                                                                 : "no table dispatch program");
+				            program == nullptr && !pair.pending->refusal.empty() ? pair.pending->refusal.c_str() : refusal);
 			pair.refused = true;
 			pair.pending.reset();
 			return false;
@@ -190,7 +202,11 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, const HW::ComputeShade
 	push_data.dwords[start + bindings.TableBlockDword() + 1u] = static_cast<uint32_t>(blocks[0] >> 32u);
 	vk_buffer.pushConstants(pipeline.pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
 	                        (start + bindings.ShaderDataDwords()) * sizeof(uint32_t), push_data.dwords.data());
-	// As DispatchDirect(): a dispatch the guest did not order after the previous one of its queue overlaps it.
+	// As DispatchDirect(): storage image writes order as buffer writes; a dispatch the guest did not order after the
+	// previous one of its queue overlaps it.
+	writes = writes || std::ranges::any_of(program.info.images, [](const ShaderRecompiler::IR::ImageResource& image) {
+		         return image.written && image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
+	         });
 	const bool chained = std::exchange(m_dispatch_chained, false) && m_deferred_barrier;
 	if (writes && !chained) ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
