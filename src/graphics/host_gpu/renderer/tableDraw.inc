@@ -55,6 +55,13 @@ uint32_t TableSetProofs() {
 	return mode;
 }
 
+// chenxiao07's KYTY_TABLE_PACK (default 1; 0 evaluates by the plans' operands): a pair's stages are evaluated from
+// their packed flat form (TablePack).
+bool TablePackEnabled() {
+	static const bool enabled = NativeXprSwitch("KYTY_TABLE_PACK");
+	return enabled;
+}
+
 // The stages' static input key a pair's programs were compiled for: both stages' code and static input, and whether
 // the pixel stage runs.
 uint64_t TableDrawKey(std::vector<uint32_t>& key, const ShaderParams& vertex_params,
@@ -183,6 +190,29 @@ struct RenderExecutor::TableImageSet {
 	static constexpr uint64_t RetryFrames = 300;
 };
 
+// A stage's flat form as TableRuns makes it (TablePack packs it into the pair): every operand an index into one of
+// three arrays (the stage's user data, its block's slots, the stage's constants).
+struct RenderExecutor::TableFlatStage {
+	struct Operand {
+		uint32_t index = 0;
+		uint32_t base  = 2; // 0: user data, 1: slots, 2: constants
+	};
+	struct Run {
+		std::array<Operand, 3> address; // low, high, offset
+		int32_t                immediate = 0;
+		uint32_t               first = 0, count = 0;
+		Operand                records; // a bounded run's (TablePlan::Slot::bounded)
+		bool                   bounded = false;
+	};
+	std::vector<Run>      runs;         // the runs in level order
+	std::vector<uint32_t> level_ends;   // the run after each level
+	std::vector<Operand>  image_words;  // every image's words, then every sampler's
+	std::vector<uint32_t> image_counts;
+	std::vector<Operand>  buffer_words; // every buffer's four V# words (TableGather)
+	std::vector<uint32_t> constants;
+	uint32_t              user_words = 0; // the user data it reads: below this
+};
+
 struct RenderExecutor::TablePair {
 	// Evaluated slots at consecutive addresses (the same base, immediates 4 apart): one read, at the address of the
 	// first. Ordered by level: a run whose address is made of slots is read after the runs of those slots.
@@ -204,6 +234,28 @@ struct RenderExecutor::TablePair {
 	std::array<uint64_t, 2>          code_hashes {};
 	uint64_t                         generation = UINT64_MAX;
 	std::array<std::vector<Run>, 2>  runs;
+	// TableEvaluateDraw's form of a stage's plan (TableRuns, TablePack): every operand an index into one of three arrays
+	// (the stage's user data, its block's slots, its constants), so an evaluation branches on no operand kind. Both
+	// stages' arrays in one block, each operand 16 bits (its array in the top two, its index in the low 14), each run
+	// 16 bytes: a pair a draw switches to is cold, and its arrays were a dozen allocations, as many cold lines (in the
+	// fork, same process: Stonefang standing render 8.94 -> 8.75 ms, Latria 13.47 -> 13.31).
+	struct PackedRun {
+		std::array<uint16_t, 3>   address {}; // low, high, offset
+		uint16_t                  records   = NotBounded;
+		int32_t                   immediate = 0;
+		uint16_t                  first = 0, count = 0;
+		static constexpr uint16_t NotBounded = 0xffff;
+	};
+	struct PackedStage {
+		std::span<const PackedRun> runs;
+		std::span<const uint16_t>  level_ends, image_words, buffer_words;
+		std::span<const uint8_t>   image_counts;
+		std::span<const uint32_t>  constants;
+		uint32_t                   user_words = 0;
+		bool                       valid      = false; // (else an index or a count past its packed width)
+	};
+	std::array<PackedStage, 2>   packed;
+	std::unique_ptr<std::byte[]> packed_block;
 	std::vector<TableVariant>        variants;
 	uint64_t                         store_frame = UINT64_MAX, store_state = 0; // the last store request
 	std::unordered_map<uint64_t, std::unique_ptr<TableImageSet>, NativeXprKeyHash> sets; // by T#/S# words
@@ -319,6 +371,7 @@ void RenderExecutor::TableReset(TablePair& pair) {
 // The pair's runs (TablePair::Run): the slots its stages evaluate, in reads of consecutive slots, by level.
 void RenderExecutor::TableRuns(TablePair& pair) {
 	using Kind = ShaderRecompiler::IR::TablePlan::Operand::Kind;
+	std::array<TableFlatStage, 2> flat_forms; // (packed into the pair: TablePack)
 	for (uint32_t st = 0; st < 2; ++st) {
 		pair.runs[st].clear();
 		if (pair.programs[st] == nullptr) continue;
@@ -349,6 +402,115 @@ void RenderExecutor::TableRuns(TablePair& pair) {
 			first += count;
 		}
 		std::ranges::stable_sort(pair.runs[st], {}, &TablePair::Run::level);
+		// The flat form: a user data register by its index (one of 64 and up is the constant 0, which a stage's user
+		// data never reach), a slot by its index, an immediate or a code address word from the constants (the first 0).
+		const auto& program = *pair.programs[st];
+		auto&       flat    = flat_forms[st];
+		flat.constants.push_back(0);
+		const auto flat_of = [&](const ShaderRecompiler::IR::TablePlan::Operand& operand) -> TableFlatStage::Operand {
+			if (operand.kind == Kind::Slot) return {operand.value, 1};
+			if (operand.kind == Kind::UserData) {
+				const auto index = operand.value - program.user_data_base;
+				if (index >= 64) return {0, 2};
+				flat.user_words = std::max(flat.user_words, index + 1);
+				return {index, 0};
+			}
+			flat.constants.push_back(TableOperandValue(operand, program, nullptr, {}, st == 0 ? pair.vs : pair.ps));
+			return {static_cast<uint32_t>(flat.constants.size() - 1), 2};
+		};
+		const auto& runs = pair.runs[st];
+		for (size_t i = 0; i < runs.size(); ++i) {
+			const auto& run = runs[i];
+			flat.runs.push_back({{flat_of(run.read.low), flat_of(run.read.high), flat_of(run.read.offset)},
+			                     run.read.immediate, run.first, run.count, flat_of(run.read.records), run.read.bounded});
+			if (i + 1 == runs.size() || runs[i + 1].level != run.level) flat.level_ends.push_back(static_cast<uint32_t>(i + 1));
+		}
+		for (const auto& descriptor: plan.images) {
+			flat.image_counts.push_back(descriptor.count);
+			for (uint32_t w = 0; w < descriptor.count; ++w) flat.image_words.push_back(flat_of(descriptor.words[w]));
+		}
+		for (const auto& descriptor: plan.samplers)
+			for (uint32_t w = 0; w < descriptor.count; ++w) flat.image_words.push_back(flat_of(descriptor.words[w]));
+		for (const auto& words: plan.buffers)
+			for (const auto& word: words) flat.buffer_words.push_back(flat_of(word));
+	}
+	TablePack(pair, flat_forms);
+}
+
+// The pair's flat forms packed into one block (TablePair::packed): a stage whose operand indices, counts or levels do
+// not fit their packed widths is left invalid (evaluated by its plan's operands).
+void RenderExecutor::TablePack(TablePair& pair, const std::array<TableFlatStage, 2>& flat_forms) {
+	using Pair        = TablePair;
+	pair.packed       = {};
+	pair.packed_block = nullptr;
+	const auto operand = [](const TableFlatStage::Operand& from, bool& fits) -> uint16_t {
+		if (from.base > 2 || from.index >= 0x4000u) fits = false;
+		return static_cast<uint16_t>(from.base << 14u | (from.index & 0x3fffu));
+	};
+	const auto align = [](size_t at, size_t to) { return (at + to - 1) / to * to; };
+	// (Layout per stage: runs, constants, level ends, image words, buffer words, image counts.)
+	std::array<std::array<size_t, 6>, 2> offsets {};
+	size_t                               bytes = 0;
+	std::array<bool, 2>                  fits {};
+	for (uint32_t st = 0; st < 2; ++st) {
+		if (pair.programs[st] == nullptr) continue;
+		const auto& flat = flat_forms[st];
+		fits[st]         = flat.runs.size() < 0x10000 && flat.image_words.size() < 0x10000;
+		for (const auto end: flat.level_ends) fits[st] = fits[st] && end < 0x10000;
+		for (const auto count: flat.image_counts) fits[st] = fits[st] && count < 0x100;
+		for (const auto& run: flat.runs) fits[st] = fits[st] && run.first < 0x10000 && run.count < 0x10000;
+		if (!fits[st]) continue;
+		bytes          = align(bytes, 64);
+		offsets[st][0] = bytes;
+		bytes += flat.runs.size() * sizeof(Pair::PackedRun);
+		offsets[st][1] = bytes;
+		bytes += flat.constants.size() * sizeof(uint32_t);
+		offsets[st][2] = bytes;
+		bytes += flat.level_ends.size() * sizeof(uint16_t);
+		offsets[st][3] = bytes;
+		bytes += flat.image_words.size() * sizeof(uint16_t);
+		offsets[st][4] = bytes;
+		bytes += flat.buffer_words.size() * sizeof(uint16_t);
+		offsets[st][5] = bytes;
+		bytes += flat.image_counts.size();
+	}
+	if (bytes == 0) return;
+	pair.packed_block = std::make_unique<std::byte[]>(bytes + 64);
+	auto* base        = reinterpret_cast<std::byte*>(align(reinterpret_cast<uintptr_t>(pair.packed_block.get()), 64));
+	for (uint32_t st = 0; st < 2; ++st) {
+		if (!fits[st]) continue;
+		const auto& flat         = flat_forms[st];
+		auto&       packed       = pair.packed[st];
+		bool        operand_fits = true;
+		auto*       runs         = reinterpret_cast<Pair::PackedRun*>(base + offsets[st][0]);
+		for (size_t i = 0; i < flat.runs.size(); ++i) {
+			const auto& run = flat.runs[i];
+			runs[i]         = {.address   = {operand(run.address[0], operand_fits), operand(run.address[1], operand_fits),
+			                               operand(run.address[2], operand_fits)},
+			                   .records   = run.bounded ? operand(run.records, operand_fits) : Pair::PackedRun::NotBounded,
+			                   .immediate = run.immediate,
+			                   .first     = static_cast<uint16_t>(run.first),
+			                   .count     = static_cast<uint16_t>(run.count)};
+			if (run.bounded && runs[i].records == Pair::PackedRun::NotBounded) operand_fits = false;
+		}
+		auto* constants = reinterpret_cast<uint32_t*>(base + offsets[st][1]);
+		std::copy(flat.constants.begin(), flat.constants.end(), constants);
+		auto* level_ends = reinterpret_cast<uint16_t*>(base + offsets[st][2]);
+		for (size_t i = 0; i < flat.level_ends.size(); ++i) level_ends[i] = static_cast<uint16_t>(flat.level_ends[i]);
+		auto* image_words = reinterpret_cast<uint16_t*>(base + offsets[st][3]);
+		for (size_t i = 0; i < flat.image_words.size(); ++i) image_words[i] = operand(flat.image_words[i], operand_fits);
+		auto* buffer_words = reinterpret_cast<uint16_t*>(base + offsets[st][4]);
+		for (size_t i = 0; i < flat.buffer_words.size(); ++i) buffer_words[i] = operand(flat.buffer_words[i], operand_fits);
+		auto* image_counts = reinterpret_cast<uint8_t*>(base + offsets[st][5]);
+		for (size_t i = 0; i < flat.image_counts.size(); ++i) image_counts[i] = static_cast<uint8_t>(flat.image_counts[i]);
+		packed = {.runs         = {runs, flat.runs.size()},
+		          .level_ends   = {level_ends, flat.level_ends.size()},
+		          .image_words  = {image_words, flat.image_words.size()},
+		          .buffer_words = {buffer_words, flat.buffer_words.size()},
+		          .image_counts = {image_counts, flat.image_counts.size()},
+		          .constants    = {constants, flat.constants.size()},
+		          .user_words   = flat.user_words,
+		          .valid        = operand_fits};
 	}
 }
 
@@ -366,6 +528,36 @@ bool RenderExecutor::TableEvaluateDraw(TablePair& pair, std::array<std::span<con
 		// (Slots no stage reads keep what an earlier draw left: the block carries them unread.)
 		auto& slots = table.blocks[st];
 		slots.resize(plan.BlockDwords());
+		const auto& form = pair.packed[st];
+		if (TablePackEnabled() && form.valid && form.runs.size() == pair.runs[st].size() &&
+		    user_data[st].size() >= form.user_words && user_data[st].size() <= 64) {
+			// The flat form (TablePair::packed): every operand one load from one of three arrays.
+			const std::array<const uint32_t*, 3> bases {user_data[st].data(), slots.data(), form.constants.data()};
+			const auto get = [&](uint16_t operand) { return bases[operand >> 14u][operand & 0x3fffu]; };
+			for (const auto& run: form.runs) {
+				uint64_t address = 0;
+				if (run.records != TablePair::PackedRun::NotBounded) {
+					const auto high    = get(run.address[1]);
+					const auto records = get(run.records);
+					const auto stride  = (high >> 16u) & 0x3fffu;
+					const auto range   = stride == 0 ? uint64_t {records} : uint64_t {stride} * records;
+					if (run.immediate < 0 || static_cast<uint64_t>(run.immediate) + run.count * 4ull > range) return false;
+					address = (uint64_t {get(run.address[0])} | uint64_t {high & 0xffffu} << 32u) +
+					          static_cast<uint64_t>(run.immediate);
+				} else {
+					address = ((uint64_t {get(run.address[0])} | uint64_t {get(run.address[1])} << 32u) & 0x0000fffffffffffcull) +
+					          (get(run.address[2]) & ~3u) + static_cast<uint64_t>(int64_t {run.immediate});
+				}
+				if (!TableReadRun(address, run.count, slots.data() + run.first)) return false;
+			}
+			size_t at = 0;
+			for (const auto count: form.image_counts) {
+				for (uint32_t w = 0; w < count; ++w) words.push_back(get(form.image_words[at + w]) & ~NativeXprLodStatsMask[w]);
+				at += count;
+			}
+			for (; at < form.image_words.size(); ++at) words.push_back(get(form.image_words[at]));
+			continue;
+		}
 		const auto value = [&](const ShaderRecompiler::IR::TablePlan::Operand& operand) {
 			return TableOperandValue(operand, program, slots.data(), user_data[st], code);
 		};
@@ -407,10 +599,20 @@ void RenderExecutor::TableGather(const TablePair& pair, std::array<std::span<con
 		const auto  code    = st == 0 ? pair.vs : pair.ps;
 		auto&       entries = table.entries[st];
 		entries.resize(plan.buffers.size());
+		const auto& form = pair.packed[st];
+		const bool  flat = TablePackEnabled() && form.valid && form.buffer_words.size() == 4 * plan.buffers.size() &&
+		                  user_data[st].size() >= form.user_words && user_data[st].size() <= 64;
+		const std::array<const uint32_t*, 3> bases {user_data[st].data(), table.blocks[st].data(), form.constants.data()};
 		for (size_t i = 0; i < plan.buffers.size(); ++i) {
 			auto& [words4, entry] = entries[i];
-			for (uint32_t w = 0; w < 4; ++w)
-				words4[w] = TableOperandValue(plan.buffers[i][w], program, table.blocks[st].data(), user_data[st], code);
+			for (uint32_t w = 0; w < 4; ++w) {
+				if (flat) {
+					const auto operand = form.buffer_words[4 * i + w];
+					words4[w]          = bases[operand >> 14u][operand & 0x3fffu];
+				} else {
+					words4[w] = TableOperandValue(plan.buffers[i][w], program, table.blocks[st].data(), user_data[st], code);
+				}
+			}
 			entry = &table.resolved[XXH3_64bits(words4.data(), sizeof(words4)) & (TableXpr::ResolvedEntries - 1)];
 			_mm_prefetch(reinterpret_cast<const char*>(entry), _MM_HINT_T0);
 		}
