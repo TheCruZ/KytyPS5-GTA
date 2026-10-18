@@ -1524,7 +1524,16 @@ void CommandProcessor::ExecuteDrawIndex(const GpuOperation& operation, DrawIndex
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
 		     args.base_vertex, args.first_instance);
 	}
-	m_renderer.GetRenderExecutor().DrawIndex(operation.submit_id, CurrentBuffer(), args);
+	auto& executor = m_renderer.GetRenderExecutor();
+	// A direct draw of an object may come from its native XPR record (nativeXpr.inc); indirect
+	// ones were offered in TryExecuteDrawIndirectOnGpu().
+	if (args.gpu_indirect == nullptr && executor.NativeXprTryDirect(CurrentBuffer(), args)) {
+		return;
+	}
+	executor.DrawIndex(operation.submit_id, CurrentBuffer(), args);
+	if (args.gpu_indirect == nullptr) {
+		executor.NativeXprEndDraw();
+	}
 }
 
 void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count) {

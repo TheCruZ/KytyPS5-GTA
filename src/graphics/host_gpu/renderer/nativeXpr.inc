@@ -175,6 +175,7 @@ struct RenderExecutor::NativeXprRecord {
 	uint64_t validated_frame   = UINT64_MAX;
 	uint64_t used_frame        = 0;
 	uint64_t uses              = 0;
+	bool     fetch_embedded = false; // the vertex program fetches (ResolveDrawOffsets())
 	// Relocated records (no read log): their hashes (NativeXprRelocationHashes).
 	bool     relocated  = false;
 	uint64_t full_hash  = 0;
@@ -942,6 +943,7 @@ void RenderExecutor::NativeXprStoreRecord(std::unique_ptr<NativeXprRecord> recor
 	    primitive_restart_enable, state.programs, false, true);
 	if (pipeline == nullptr || !pipeline->native_bindings || pipeline->uses_push_descriptors) return refuse("pipeline");
 	record->vertex_program = state.programs.vertex[0].id;
+	record->fetch_embedded = state.vertex_info[0].fetch_embedded;
 	record->pixel_program  = state.ps_active ? state.programs.pixel.id : 0;
 	record->pipelines.emplace_back(state_key, pipeline);
 	if (const char* reason = NativeXprBindResources(*record, stages, *pipeline)) {
@@ -1337,10 +1339,12 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	if (index_bytes <= BufferCache::CACHING_PAGESIZE && buffer_cache.IsRegionCpuModified(index_base, index_bytes) &&
 	    !buffer_cache.IsRegionGpuModified(index_base, index_bytes))
 		buffer_cache.EnsureBufferContents(index_base, index_bytes);
+	const auto* direct                 = m_native_xpr_direct;
 	const auto [indices, index_offset] = buffer_cache.ObtainBuffer(index_base, index_bytes, false);
 	const auto [arguments, args_offset] =
-	    buffer_cache.ObtainBuffer(args_addr, sizeof(vk::DrawIndexedIndirectCommand), false);
-	if (indices == nullptr || arguments == nullptr || buffer.IsInvalid()) return false;
+	    direct != nullptr ? std::pair<Buffer*, uint64_t> {nullptr, 0}
+	                      : buffer_cache.ObtainBuffer(args_addr, sizeof(vk::DrawIndexedIndirectCommand), false);
+	if (indices == nullptr || (direct == nullptr && arguments == nullptr) || buffer.IsInvalid()) return false;
 	auto vk_buffer = buffer.Handle();
 
 	auto& textures = m_context.GetTextureCache();
@@ -1362,7 +1366,28 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 		vk_buffer.pushConstants(pipeline.pipeline_layout, record.push_stages, 0, sizeof(push_data),
 		                        push_data.dwords.data());
 	vk_buffer.bindIndexBuffer(indices->Handle(), index_offset, index_type);
-	vk_buffer.drawIndexedIndirect(arguments->Handle(), args_offset, 1, sizeof(vk::DrawIndexedIndirectCommand));
+	if (direct != nullptr) {
+		// The offsets as DrawIndex() resolves them (ResolveDrawOffsets()).
+		auto     vertex_offset   = static_cast<int32_t>(buffer.GetUserConfig().GetIndexOffset());
+		uint32_t instance_offset = 0;
+		if (record.fetch_embedded) {
+			const auto& program   = *record.stages[0].program;
+			const auto& user_data = record.stages[0].user_data;
+			const auto  base      = static_cast<int32_t>(program.user_data_base);
+			if (vertex_offset == 0 && program.info.vertex_offset_sgpr >= base) {
+				const auto index = static_cast<uint32_t>(program.info.vertex_offset_sgpr - base);
+				if (index < user_data.size()) vertex_offset = static_cast<int32_t>(user_data[index]);
+			}
+			if (program.info.instance_offset_sgpr >= base) {
+				const auto index = static_cast<uint32_t>(program.info.instance_offset_sgpr - base);
+				if (index < user_data.size()) instance_offset = user_data[index];
+			}
+		}
+		vk_buffer.drawIndexed(direct->index_count, direct->instance_count, 0, vertex_offset + direct->base_vertex,
+		                      instance_offset);
+	} else {
+		vk_buffer.drawIndexedIndirect(arguments->Handle(), args_offset, 1, sizeof(vk::DrawIndexedIndirectCommand));
+	}
 	draw_state.used_frame = m_context.FrameNumber();
 	return true;
 }
@@ -1509,6 +1534,20 @@ RenderExecutor::NativeXprRecord* RenderExecutor::NativeXprRelocated(uint64_t fra
 	}
 	++cache.counters.relocated_hits;
 	return record;
+}
+
+// A direct indexed draw of one object: as an indirect one (NativeXprTry()), drawn with its counts.
+bool RenderExecutor::NativeXprTryDirect(CommandBuffer& buffer, const DrawIndexArgs& args) {
+	if (!NativeXprEnabled() || args.gpu_indirect != nullptr || args.offset_source != DrawOffsetSource::DrawState ||
+	    args.index_addr == nullptr || args.index_count == 0 || args.instance_count == 0 ||
+	    args.render_target_slice_offset != 0 || args.first_instance != 0 || args.index_type_and_size > 1)
+		return false;
+	const auto index_bytes = uint64_t {args.index_count} * (args.index_type_and_size == 0 ? 2u : 4u);
+	m_native_xpr_direct    = &args;
+	const bool drawn = NativeXprTry(buffer, 0, reinterpret_cast<uint64_t>(args.index_addr), index_bytes,
+	                                args.index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32);
+	m_native_xpr_direct = nullptr;
+	return drawn;
 }
 
 // An indexed indirect draw of one object, its arguments read by the host GPU.

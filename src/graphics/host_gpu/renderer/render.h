@@ -276,6 +276,8 @@ public:
 	// record).
 	[[nodiscard]] bool NativeXprTry(CommandBuffer& buffer, uint64_t args_addr, uint64_t index_base,
 	                                uint64_t index_bytes, vk::IndexType index_type);
+	// The same for a direct indexed draw.
+	[[nodiscard]] bool NativeXprTryDirect(CommandBuffer& buffer, const DrawIndexArgs& args);
 	// The draw a try offered is done (drawn or skipped by the normal path).
 	void NativeXprEndDraw() noexcept { m_native_xpr_store = false; }
 
@@ -640,6 +642,7 @@ private:
 	std::unique_ptr<IndirectThreadPass, void (*)(IndirectThreadPass*)> m_indirect_thread_pass {
 	    nullptr, nullptr};
 	std::unique_ptr<NativeXprCache, void (*)(NativeXprCache*)> m_native_xpr {nullptr, nullptr};
+	const DrawIndexArgs* m_native_xpr_direct = nullptr; // the direct draw a try is for
 	// The try of the executing draw asked the normal path to store a record.
 	bool m_native_xpr_store = false;
 

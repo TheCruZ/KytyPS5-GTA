@@ -1876,8 +1876,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// After the draw is recorded: storing may clean buffer owners (copies) and so may end
 	// rendering or restart the scheduler.
 	if (std::exchange(m_native_xpr_store, false)) {
-		if (!mesh_active && draw.IsIndexed() && emit.indirect != nullptr && vertex_bindings.count == 0 &&
-		    draw_dwords == 0) {
+		if (!mesh_active && draw.IsIndexed() && (emit.indirect != nullptr || index_source.host_data == nullptr) &&
+		    vertex_bindings.count == 0 && draw_dwords == 0) {
 			NativeXprStore(buffer, state, topology, primitive_restart_enable, rendering, stages, dynamic_state);
 		}
 	}
