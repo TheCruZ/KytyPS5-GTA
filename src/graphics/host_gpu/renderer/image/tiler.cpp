@@ -145,11 +145,17 @@ TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
 		const auto depth       = part != nullptr ? part->slice_count : full_depth;
 		const auto linear_offset = part != nullptr ? part->linear_offset : mip.linear_offset;
 		const bool tail  = level >= info.first_tail_level;
+		// A band of rows: a shorter surface of the same width, starting at its first row of blocks.
+		const bool band       = part != nullptr && part->rows != 0;
+		const auto band_first = band ? part->first_row : 0u;
+		const auto rows       = band ? part->rows : height;
 		EXIT_NOT_IMPLEMENTED(width == 0 || height == 0 || depth == 0 || mip.linear_pitch < width ||
 		                     mip.linear_size == 0 || mip.size == 0 ||
 		                     (!tail && (mip.pitch < width || mip.height < height)) ||
 		                     (!info.IsVolume() && mip.size % full_depth != 0) ||
-		                     first_slice > full_depth || depth > full_depth - first_slice);
+		                     first_slice > full_depth || depth > full_depth - first_slice ||
+		                     (band && (!RowBandable(info, level) || depth != 1 || band_first >= height ||
+		                               band_first % block.block_height != 0 || rows > height - band_first)));
 
 		uint64_t pitch_bytes = 0;
 		EXIT_NOT_IMPLEMENTED(
@@ -161,14 +167,14 @@ TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
 		uint64_t linear_used = 0;
 		uint64_t bytes         = 0;
 		uint64_t linear_span   = 0;
-		EXIT_NOT_IMPLEMENTED(!checked_multiply(pitch_bytes, height, minimum_slice) ||
+		EXIT_NOT_IMPLEMENTED(!checked_multiply(pitch_bytes, rows, minimum_slice) ||
 		                     (depth > 1 && slice_bytes < minimum_slice) ||
-		                     !checked_multiply(height - 1u, pitch_bytes, linear_used) ||
+		                     !checked_multiply(rows - 1u, pitch_bytes, linear_used) ||
 		                     !checked_multiply(width, block.bytes_per_element, bytes) ||
 		                     !checked_add(linear_used, bytes, linear_used) ||
 		                     linear_used > mip.linear_size || slice_bytes > UINT32_MAX ||
 		                     !checked_multiply(depth - 1u, slice_bytes, linear_span) ||
-		                     !checked_add(linear_span, mip.linear_size, linear_span) ||
+		                     !checked_add(linear_span, band ? minimum_slice : mip.linear_size, linear_span) ||
 		                     !valid_range(linear_offset, linear_span, linear_capacity));
 
 		const uint64_t columns =
@@ -179,18 +185,24 @@ TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
 			    width > block.block_width - mip.tail_x || mip.tail_y >= block.block_height ||
 			    height > block.block_height - mip.tail_y);
 		}
-		const uint64_t tiled_plane = info.IsVolume() ? mip.size : mip.size / full_depth;
+		uint64_t       tiled_plane = info.IsVolume() ? mip.size : mip.size / full_depth;
 		const uint64_t tiled_slice = info.tiled_slice_stride;
 		const uint64_t slices     = (uint64_t {depth} + block.block_depth - 1u) / block.block_depth;
 		uint64_t       tiled_span = 0;
-		// The part's first slice, in the tiled bytes the buffer holds (from tiled_origin on).
+		// The part's first slice (and row of blocks), in the tiled bytes the buffer holds (from tiled_origin on).
 		uint64_t tiled_offset = 0;
+		uint64_t band_offset  = 0;
+		if (band) {
+			const uint64_t row_bytes = columns * block.block_size;
+			tiled_plane              = (uint64_t {rows} + block.block_height - 1u) / block.block_height * row_bytes;
+			band_offset              = uint64_t {band_first} / block.block_height * row_bytes;
+		}
 		EXIT_NOT_IMPLEMENTED(columns > UINT32_MAX || tiled_slice > UINT32_MAX ||
 		                     (slices > 1 && tiled_slice < tiled_plane) ||
 		                     !checked_multiply(slices - 1u, tiled_slice, tiled_span) ||
 		                     !checked_add(tiled_span, tiled_plane, tiled_span) ||
 		                     !checked_multiply(first_slice, tiled_slice, tiled_offset) ||
-		                     !checked_add(tiled_offset, mip.offset, tiled_offset) ||
+		                     !checked_add(tiled_offset, mip.offset + band_offset, tiled_offset) ||
 		                     tiled_offset < tiled_origin ||
 		                     !valid_range(tiled_offset - tiled_origin, tiled_span, tiled_capacity));
 		tiled_offset -= tiled_origin;
@@ -203,13 +215,13 @@ TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
 		EXIT_NOT_IMPLEMENTED(
 		    !checked_add(source_base, tile ? linear_offset : tiled_offset, src) ||
 		    !checked_add(target_base, tile ? tiled_offset : linear_offset, dst) ||
-		    src > UINT32_MAX || dst > UINT32_MAX || !checked_multiply(width, height, texels) ||
+		    src > UINT32_MAX || dst > UINT32_MAX || !checked_multiply(width, rows, texels) ||
 		    !checked_multiply(texels, depth, texels) || texels > UINT32_MAX - params.num_texels);
 		// (A slice's swizzle may depend on its index, which a part starting at a later one adds back.)
 		params.mips[index] = {static_cast<uint32_t>(src),
 		                      static_cast<uint32_t>(dst),
 		                      width,
-		                      height,
+		                      rows,
 		                      static_cast<uint32_t>(pitch_bytes),
 		                      static_cast<uint32_t>(slice_bytes),
 		                      static_cast<uint32_t>(tiled_slice),
@@ -392,6 +404,36 @@ TileManager::Result TileManager::DetileParts(vk::Buffer tiled, uint64_t tiled_of
 	auto           scratch     = GetScratchBuffer(linear_capacity, tiled);
 	Record(tiled, tiled_offset, tiled_capacity, scratch.buffer, 0, scratch.size, tiling, true);
 	return {scratch.buffer, 0, linear_capacity};
+}
+
+uint64_t TileManager::PartLinearSize(const ImageInfo& info, const Part& part) {
+	const auto& mip = info.mip_layout[part.level];
+	if (part.rows != 0) {
+		return uint64_t {part.rows} * mip.linear_pitch * info.tiling.block.bytes_per_element;
+	}
+	const uint64_t slice_bytes = info.linear_slice_stride != 0 ? info.linear_slice_stride : mip.linear_size;
+	return uint64_t {part.slice_count - 1u} * slice_bytes + mip.linear_size;
+}
+
+bool TileManager::RowBandable(const ImageInfo& info, uint32_t level) {
+	const auto& block = info.tiling.block;
+	if (!info.IsTiled() || info.IsVolume() || level >= info.resources.levels || level >= info.mip_layout.size() ||
+	    level >= info.first_tail_level || block.block_depth != 1 || block.block_width == 0 ||
+	    block.block_height == 0 || block.block_size == 0 || info.resources.layers == 0) {
+		return false;
+	}
+	switch (block.family) {
+		case TileBlockFamily::Standard256B:
+		case TileBlockFamily::Standard4KB:
+		case TileBlockFamily::Standard64KB:
+		case TileBlockFamily::Prt64KB: break;
+		default: return false;
+	}
+	// Whole rows of blocks make the slice.
+	const auto&    mip       = info.mip_layout[level];
+	const uint64_t row_bytes = (uint64_t {mip.pitch} + block.block_width - 1u) / block.block_width * block.block_size;
+	return mip.height != 0 && mip.height % block.block_height == 0 && mip.size % info.resources.layers == 0 &&
+	       row_bytes * (mip.height / block.block_height) == mip.size / info.resources.layers;
 }
 
 void TileManager::Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity,

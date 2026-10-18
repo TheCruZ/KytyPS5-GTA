@@ -76,6 +76,45 @@ constexpr uint64_t PartialUploadMaxShare = 2;
 // Subresources closer than this are staged and detiled from one piece of guest memory.
 constexpr uint64_t PartialStageGap = uint64_t {64} << 10;
 
+// chenxiao07's KYTY_PARTIAL_ROW_BANDS (default on; 0: a partial upload takes whole subresources): inside a partial
+// upload, the game streams into small parts of large textures (mip 0 of an 8192x8192 BC texture is 64 MiB of an 85 MiB
+// image), and a refresh that picks whole subresources then uploads more than half the image, i.e. all of it. A
+// subresource of a family TileManager::RowBandable takes uploads only the rows of blocks over the dirty ranges.
+bool PartialRowBandsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PARTIAL_ROW_BANDS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// A fragmented dirty set uploads the whole subresource rather than many small dispatches.
+constexpr size_t MaxBandsPerSubresource = 16;
+
+struct RowBand {
+	uint32_t first = 0; // block rows [first, last)
+	uint32_t last  = 0;
+};
+
+// The rows of blocks of one subresource [begin, end) (rows of row_bytes) that the dirty ranges touch.
+void DirtyRowBands(const std::vector<std::pair<uint64_t, uint64_t>>& dirty, uint64_t begin, uint64_t end,
+                   uint64_t row_bytes, uint32_t rows, std::vector<RowBand>& bands) {
+	bands.clear();
+	auto at = std::upper_bound(dirty.begin(), dirty.end(), begin,
+	                           [](uint64_t value, const auto& range) { return value < range.second; });
+	for (; at != dirty.end() && at->first < end; ++at) {
+		const uint64_t lo    = std::max(at->first, begin) - begin;
+		const uint64_t hi    = std::min(at->second, end) - begin;
+		const auto     first = static_cast<uint32_t>(lo / row_bytes);
+		const auto     last  = static_cast<uint32_t>(std::min<uint64_t>(rows, (hi + row_bytes - 1) / row_bytes));
+		if (!bands.empty() && first <= bands.back().last) {
+			bands.back().last = std::max(bands.back().last, last);
+		} else {
+			bands.push_back({first, last});
+		}
+	}
+}
+
 // Whether the sorted, disjoint `ranges` hold a byte of [begin, end).
 [[nodiscard]] bool IntersectsRanges(const std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t begin,
                                     uint64_t end) {
@@ -1544,8 +1583,10 @@ bool TextureCache::UploadImagePartial(Image& image) {
 		uint64_t          begin = 0; // guest bytes the part reads
 		uint64_t          end   = 0;
 	};
-	const auto&         dirty = image.CpuDirtyRanges();
+	const auto&         dirty    = image.CpuDirtyRanges();
+	const bool          bands_on = PartialRowBandsEnabled();
 	std::vector<Picked> picked;
+	std::vector<RowBand> bands;
 	uint64_t            picked_bytes = 0;
 	for (uint32_t level = 0; level < info.resources.levels; ++level) {
 		const auto& mip = info.mip_layout[level];
@@ -1561,15 +1602,38 @@ bool TextureCache::UploadImagePartial(Image& image) {
 			if (!IntersectsRanges(dirty, begin, begin + plane)) {
 				continue;
 			}
+			// The rows of blocks over the dirty ranges alone, where the subresource has them in a row of its own.
+			if (bands_on && TileManager::RowBandable(info, level)) {
+				const auto&    block       = info.tiling.block;
+				const uint64_t row_bytes   = (uint64_t {mip.pitch} + block.block_width - 1u) / block.block_width * block.block_size;
+				const uint32_t block_rows  = mip.height / block.block_height;
+				const uint32_t texel_rows  = (info.MipExtent(level).height + info.tiling.texel_height - 1u) / info.tiling.texel_height;
+				DirtyRowBands(dirty, begin, begin + plane, row_bytes, block_rows, bands);
+				const bool whole = bands.size() == 1 && bands.front().first == 0 && bands.front().last == block_rows;
+				if (block_rows > 1 && !whole && bands.size() <= MaxBandsPerSubresource) {
+					for (const auto& band: bands) {
+						// Rows past the last row of elements are padding only.
+						const uint32_t first = band.first * block.block_height;
+						if (first >= texel_rows) {
+							continue;
+						}
+						const uint32_t rows = std::min((band.last - band.first) * block.block_height, texel_rows - first);
+						picked.push_back({{level, slice, 1, first, rows, 0}, begin + band.first * row_bytes,
+						                  begin + band.last * row_bytes});
+						picked_bytes += uint64_t {band.last - band.first} * row_bytes;
+					}
+					continue;
+				}
+			}
 			picked_bytes += plane;
-			if (!picked.empty() && picked.back().part.level == level &&
+			if (!picked.empty() && picked.back().part.level == level && picked.back().part.rows == 0 &&
 			    picked.back().part.first_slice + picked.back().part.slice_count == slice &&
 			    begin - picked.back().end <= PartialStageGap) {
 				picked.back().part.slice_count++;
 				picked.back().end = begin + plane;
 				continue;
 			}
-			picked.push_back({{level, slice, 1, 0}, begin, begin + plane});
+			picked.push_back({{level, slice, 1, 0, 0, 0}, begin, begin + plane});
 		}
 	}
 	// (Of a fragmented set, a whole upload is cheaper than many small dispatches.)
@@ -1607,11 +1671,17 @@ bool TextureCache::UploadImagePartial(Image& image) {
 			for (size_t index = chunk; index < chunk_end; index++) {
 				auto part          = picked[index].part;
 				part.linear_offset = (linear_total + 255) & ~uint64_t {255};
-				linear_total       = part.linear_offset + uint64_t {part.slice_count} * info.mip_layout[part.level].linear_size;
+				linear_total       = part.linear_offset + TileManager::PartLinearSize(info, part);
 				auto region        = copies[part.level];
 				region.bufferOffset                    = part.linear_offset;
 				region.imageSubresource.baseArrayLayer = part.first_slice;
 				region.imageSubresource.layerCount     = part.slice_count;
+				if (part.rows != 0) {
+					// A band: the image rows of its elements.
+					region.imageOffset.y      = static_cast<int32_t>(part.first_row * info.tiling.texel_height);
+					region.imageExtent.height = std::min(part.rows * info.tiling.texel_height,
+					                                     region.imageExtent.height - part.first_row * info.tiling.texel_height);
+				}
 				parts.push_back(part);
 				regions.push_back(region);
 			}

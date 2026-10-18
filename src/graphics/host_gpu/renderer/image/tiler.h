@@ -42,12 +42,16 @@ public:
 	~TileManager();
 	KYTY_CLASS_NO_COPY(TileManager);
 
-	// A piece of a tiled image's mip level that DetileParts detiles: `slice_count` array layers from `first_slice`, to
-	// `linear_offset` of the result.
+	static constexpr uint32_t MaxMipLevels = 16;
+	// A piece of a tiled image's mip level that DetileParts detiles, to `linear_offset` of the result: `slice_count`
+	// array layers from `first_slice`, or (`rows` != 0: one layer, in a level that is RowBandable) the `rows` element
+	// rows from `first_row` on, a multiple of the block height.
 	struct Part {
-		uint32_t level        = 0;
-		uint32_t first_slice  = 0;
-		uint32_t slice_count  = 1;
+		uint32_t level         = 0;
+		uint32_t first_slice   = 0;
+		uint32_t slice_count   = 1;
+		uint32_t first_row     = 0;
+		uint32_t rows          = 0;
 		uint64_t linear_offset = 0;
 	};
 
@@ -55,11 +59,16 @@ public:
 	[[nodiscard]] Result Detile(vk::Buffer tiled, uint64_t tiled_offset, const ImageInfo& info);
 	// The parts of a tiled image alone (at most MaxMipLevels). The tiled buffer holds the image's bytes from
 	// `source_origin` on, `tiled_capacity` of them; a part lies in them. `linear_capacity`: the result's size, each
-	// part's linear bytes (their level's linear slices) at its linear_offset.
+	// part's linear bytes (PartLinearSize) at its linear_offset.
 	[[nodiscard]] Result DetileParts(vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
 	                                 uint64_t source_origin, uint64_t linear_capacity, const ImageInfo& info,
 	                                 std::span<const Part> parts);
-	static constexpr uint32_t MaxMipLevels = 16;
+	[[nodiscard]] static uint64_t PartLinearSize(const ImageInfo& info, const Part& part);
+	// Whether the level's rows of blocks detile alone as a shorter surface of the same width (chenxiao07's
+	// KYTY_PARTIAL_ROW_BANDS): blocks run row by row within a slice, and the standard and PRT families swizzle inside
+	// a block with the coordinate bits of the block alone. Render-target and depth blocks xor the parity of their
+	// block row into the in-block offset, and the levels of the mip tail share one block: those go whole.
+	[[nodiscard]] static bool RowBandable(const ImageInfo& info, uint32_t level);
 	void Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity, vk::Buffer tiled,
 	          uint64_t tiled_offset, uint64_t tiled_capacity, const ImageInfo& info,
 	          uint32_t levels = 0);
