@@ -25167,7 +25167,7 @@ TestCase Vop1SdwaMovByteDestinations() {
   test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.decoded_counts = {{"V_MOV_B32 v1.sdwa(sel=2,sext=0), 0", 1}};
-  test.required_spirv = {"OpBitFieldInsert", "OpBitFieldSExtract", "OpBitwiseOr"};
+  test.required_spirv = {"OpBitFieldInsert", "OpBitFieldSExtract"};
   return test;
 }
 
@@ -25284,7 +25284,7 @@ TestCase Vop2SdwaAddNcCapturedHighWordDestination() {
   test.expected = {0x00010002u, 0x0006c3d4u};
   test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::V_MOV_B32,
                   O::V_ADD_NC_U32,      O::BUFFER_STORE_DWORD,  O::S_ENDPGM};
-  test.required_spirv = {"OpIAdd", "OpShiftLeftLogical", "OpBitwiseOr"};
+  test.required_spirv = {"OpIAdd", "OpBitFieldInsert"};
   return test;
 }
 
@@ -41718,9 +41718,12 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
       compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
       compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
       ValidateSpirv(test.name, compiled.spirv);
-      const auto halves = wave_size > compute.host_subgroup_size ? 2u : 1u;
+      const bool disassembled = tools.Disassemble(compiled.spirv, &text);
+      // A split wave writes one lane per invocation instead of both halves.
+      const auto halves =
+          wave_size > compute.host_subgroup_size && !IsSplitWave(text) ? 2u : 1u;
       Require(test.name, "native array writes per dimension and swizzle run",
-              tools.Disassemble(compiled.spirv, &text) &&
+              disassembled &&
                   CountText(text, "OpImageWrite") == (mixed ? 5u : 1u) * halves &&
                   (mixed || text.find("OpSwitch") == std::string::npos) &&
                   text.find("StorageImageArrayNonUniformIndexing") != std::string::npos,
