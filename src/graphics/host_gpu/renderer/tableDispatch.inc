@@ -1,22 +1,14 @@
-// Table dispatches (chenxiao07's KytyPS5 fork, src/local/table-xpr.inc TableDispatch; KYTY_TABLE_DISPATCH=1).
+// --- Table dispatches --------------------------------------------------------------------------
 //
-// A compute program translated in table mode (ShaderRecompiler::IR::EnterTableMode) reads its SRT slots and its
-// buffers from a block the renderer writes for each dispatch: the slots its plan marks, evaluated from guest memory
-// as it holds them now, and each buffer's device address and size, resolved from its V#. The dispatch needs no
-// resource materialization (the SRT walk), no buffer descriptors and no flattened SRT upload: the block's device
-// address goes in the push constants with the user data. Its images and samplers, words the plan evaluates too, are
-// bound as the normal path binds them, and so is the page table of flat and global memory reads.
+// Ported from chenxiao07's KytyPS5 fork (src/local/table-xpr.inc, TableDispatch). Included by renderDraw.cpp after
+// tableDraw.inc, whose pairs, image sets and blocks they share.
 //
-// A program is learnt from the normal path's lookup of one of its dispatches (TableDispatchLearn): its table program
-// is compiled for that dispatch's specialization; later dispatches whose descriptors select another specialization
-// get one compiled for it. Compilations run on a background thread, the dispatches taking the normal path until they
-// are done. Programs table mode cannot serve (indirect descriptors and images, GDS, ...) take it for good.
-//
-// The resolve thread evaluates the block and selects the program ahead of the dispatch (TableDispatchAhead) instead
-// of the normal resolution, reading guest memory through the resolution's log; the execution thread then only gives
-// the buffers their device addresses.
-//
-// Included by renderCompute.cpp.
+// KYTY_TABLE_DISPATCH=1: a compute shader the normal path dispatched (its resources evaluated in full), whose program
+// allows table mode (ShaderRecompiler::IR::EnterTableMode), is dispatched as table draws are drawn: its slots in a
+// block, its read-only V#s resolved once, its written ones obtained as written at every dispatch (the buffer cache
+// tracks the GPU's writes), its images and samplers in an image set (TableSet) bound with its native pipeline; the
+// barriers as the normal path's DispatchDirect. Shaders a special path of the normal path takes (Demon's Souls' copy),
+// thread-dimension dispatches and programs that write images or use LDS storage stay on the normal path.
 
 namespace {
 
@@ -32,260 +24,178 @@ uint64_t TableDispatchKey(const HW::ComputeShaderInfo& cs, bool async_compute) {
 	return XXH3_64bits_withSeed(&cs.cs_regs, sizeof(cs.cs_regs), async_compute ? 1u : 0u);
 }
 
-// What table dispatches serve: a table program whose shader data fits the push constants.
-bool TableServes(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+// What table dispatches serve: a table program whose shader data fits the push constants and whose set holds only
+// images it reads, samplers and the page table (TableResolveSet).
+bool TableDispatchServes(const PipelineCache::TableProgram* table) {
+	if (table == nullptr) return false;
+	const auto& program = table->program;
+	using Kind          = ShaderRecompiler::IR::DescriptorBindingKind;
 	return program.table_mode && program.bindings.UsesPushData() && !program.info.uses_gds &&
-	       program.bindings.dispatch_thread_dword == ShaderRecompiler::IR::PushData::NoStart;
+	       program.bindings.dispatch_thread_dword == ShaderRecompiler::IR::PushData::NoStart &&
+	       !table->input_info.lds_storage &&
+	       program.bindings.descriptor_counts[static_cast<size_t>(Kind::SharedMemory)] == 0 &&
+	       std::ranges::none_of(program.info.images, [](const ShaderRecompiler::IR::ImageResource& image) {
+		       return image.written || image.atomic ||
+		              image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
+	       });
 }
 
 } // namespace
 
-struct RenderExecutor::TableDispatchCache {
-	struct Entry {
-		const ShaderRecompiler::IR::ResourcePlan*                 plan = nullptr; // the normal program's
-		std::vector<const PipelineCache::TableProgram*>           variants;
-		std::vector<ShaderRecompiler::IR::ResourceSpecialization> refused_specializations;
-		bool                                                      refused = false;
-		// A compilation in flight (execution thread only) and the specialization it is for.
-		std::shared_ptr<PipelineCache::TableTicket>  pending;
-		ShaderRecompiler::IR::ResourceSpecialization pending_specialization;
-	};
-	// The execution thread changes entries under the lock; the resolve thread reads them under it.
-	std::unordered_map<uint64_t, Entry> entries;
-	std::atomic_flag                    lock;
-	// Compilations in flight, at most MaxPending.
-	static constexpr uint32_t MaxPending = 32;
-	uint32_t                  pending    = 0;
-	// The dispatch's resources (its bindings refer to them until the next operation) and scratch.
-	ShaderRecompiler::IR::ResourceSnapshot       snapshot;
-	ShaderRecompiler::IR::ResourceSpecialization specialization;
-	std::vector<uint32_t>                        block;
-	ShaderComputeInputInfo                       input;
-
-	// Execution thread: takes the entry's finished compilation in.
-	void Poll(Entry& entry) {
-		if (entry.pending == nullptr || !entry.pending->done.load(std::memory_order_acquire)) return;
-		const auto* table = entry.pending->programs[0];
-		const TableLockGuard guard(lock);
-		if (table != nullptr && TableServes(table->program) &&
-		    (entry.variants.empty() || table->program.table_plan == entry.variants.front()->program.table_plan)) {
-			entry.variants.push_back(table);
-		} else if (entry.variants.empty()) {
-			entry.refused = true;
-		} else {
-			entry.refused_specializations.push_back(entry.pending_specialization);
-		}
-		entry.pending.reset();
-		--pending;
-	}
-	// Execution thread: queues the compilation of the entry's table program for a specialization.
-	void Queue(Entry& entry, PipelineCache& pipelines, const HW::ComputeShaderInfo& cs, const HW::ShaderRegisters& sh,
-	           bool async_compute, const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
-		if (entry.pending != nullptr || pending >= MaxPending) return;
-		entry.pending                = pipelines.CompileTableComputeAsync(cs, sh, async_compute, specialization);
-		entry.pending_specialization = specialization;
-		++pending;
-	}
-};
-
-RenderExecutor::TableDispatchCache& RenderExecutor::TableDispatchState() {
-	std::call_once(m_table_dispatch_once, [this] {
-		m_table_dispatch = {new TableDispatchCache {}, [](TableDispatchCache* cache) { delete cache; }};
-	});
-	return *m_table_dispatch;
-}
-
 void RenderExecutor::TableDispatchLearn(const HW::ComputeShaderInfo& cs, const HW::ShaderRegisters& sh,
                                         const ShaderComputeInputInfo& input_info, const ShaderProgram& compute_program,
-                                        bool async_compute) {
+                                        bool async_compute, bool special) {
 	if (!TableDispatchEnabled() || input_info.dispatch_thread_dimensions || input_info.stage.program == nullptr) return;
-	auto&       cache   = TableDispatchState();
-	const auto  key     = TableDispatchKey(cs, async_compute);
-	auto        found   = cache.entries.find(key);
+	auto& table           = OwnTable();
+	auto [found, fresh]   = table.dispatches.try_emplace(TableDispatchKey(cs, async_compute));
+	auto& pair            = found->second;
+	if (fresh) pair.vs = cs.cs_regs.data_addr;
+	pair.used_frame = m_context.FrameNumber();
+	if (pair.refused || pair.programs[0] != nullptr || pair.pending != nullptr || pair.vs != cs.cs_regs.data_addr)
+		return;
 	const auto& program = *input_info.stage.program;
-	if (found != cache.entries.end() && (found->second.refused || !found->second.variants.empty())) return;
-	if (found == cache.entries.end()) {
-		const TableLockGuard lock(cache.lock);
-		found = cache.entries.emplace(key, TableDispatchCache::Entry {}).first;
-	}
-	auto& entry = found->second;
-	cache.Poll(entry);
-	if (entry.refused || !entry.variants.empty() || entry.pending != nullptr) return;
-	const auto refuse = [&] {
-		const TableLockGuard lock(cache.lock);
-		entry.refused = true;
-	};
-	if (std::ranges::find(DemonsSoulsCopy::Shaders, program.shader_hash) != DemonsSoulsCopy::Shaders.end() ||
-	    program.info.uses_gds || program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
-		refuse();
-		return;
-	}
-	auto&      pipelines                 = m_context.GetPipelineCache();
+	auto&       pipelines              = m_context.GetPipelineCache();
 	const auto [plan, specialization] = pipelines.ProgramPlanOf(compute_program);
-	if (plan == nullptr || specialization == nullptr) {
-		refuse();
+	// (A uniform fill the normal path makes a clear or a known fill of: ResolveComputeBufferFill,
+	// TryConsumeComputeImageClear.)
+	const bool fill = input_info.stage.resources != nullptr &&
+	                  input_info.stage.resources->uniform_fill.kind != ShaderRecompiler::IR::UniformFillKind::None;
+	if (special || fill || plan == nullptr || specialization == nullptr || program.info.uses_gds ||
+	    program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
+		pair.refused = true;
 		return;
 	}
-	{
-		const TableLockGuard lock(cache.lock);
-		entry.plan = plan;
-	}
-	cache.Queue(entry, pipelines, cs, sh, async_compute, *specialization);
-}
-
-// The table program of a dispatch and its resources, into `snapshot`; null when the normal path takes it. Ahead of
-// execution (`reads`) guest memory is read through the resolution's log and no program is compiled.
-const PipelineCache::TableProgram* RenderExecutor::TableDispatchSelect(
-    const HW::ComputeShaderInfo& cs, const HW::ShaderRegisters* sh, bool async_compute,
-    ShaderRecompiler::IR::ResourceSnapshot& snapshot, ShaderRecompiler::IR::ResourceSpecialization& specialization,
-    GuestReadLog* reads) {
-	auto&                                     cache     = TableDispatchState();
-	const auto                                key       = TableDispatchKey(cs, async_compute);
-	const ShaderRecompiler::IR::ResourcePlan* plan      = nullptr;
-	const PipelineCache::TableProgram*        reference = nullptr;
-	{
-		std::optional<TableLockGuard> lock;
-		if (reads != nullptr) lock.emplace(cache.lock);
-		const auto found = cache.entries.find(key);
-		if (found == cache.entries.end() || found->second.refused || found->second.variants.empty()) return nullptr;
-		plan      = found->second.plan;
-		reference = found->second.variants.front();
-	}
-	const auto user_data = std::span<const uint32_t>(cs.cs_user_sgpr.value).first(cs.cs_regs.user_sgpr);
-	auto&      pipelines = m_context.GetPipelineCache();
-	if (!TableEvaluate(reference->program, user_data, snapshot, reads) ||
-	    !pipelines.SpecializeDirectResources(*plan, snapshot, specialization))
-		return nullptr;
-	if (reads != nullptr) {
-		const TableLockGuard lock(cache.lock);
-		for (const auto* variant: cache.entries.find(key)->second.variants) {
-			if (variant->specialization == specialization) return variant;
-		}
-		return nullptr;
-	}
-	auto& entry = cache.entries.find(key)->second;
-	cache.Poll(entry);
-	for (const auto* variant: entry.variants) {
-		if (variant->specialization == specialization) return variant;
-	}
-	if (std::ranges::find(entry.refused_specializations, specialization) == entry.refused_specializations.end())
-		cache.Queue(entry, pipelines, cs, *sh, async_compute, specialization);
-	return nullptr;
-}
-
-const PipelineCache::TableProgram* RenderExecutor::TableDispatchAhead(const HW::ComputeShaderInfo& cs,
-                                                                      bool async_compute, ProgramResolution& ahead) {
-	if (!TableDispatchEnabled()) return nullptr;
-	return TableDispatchSelect(cs, nullptr, async_compute, ahead.resources[0], ahead.specializations[0],
-	                           &ahead.reads);
+	pair.plans       = {plan, nullptr};
+	pair.code_hashes = {ShaderHashAt(pair.vs), 0};
+	pair.generation  = ShaderMapGeneration();
+	pair.pending     = pipelines.CompileTableComputeAsync(cs, sh, async_compute, *specialization);
 }
 
 bool RenderExecutor::TableDispatch(CommandBuffer& buffer, const HW::ComputeShaderInfo& cs, uint32_t x, uint32_t y,
                                    uint32_t z, bool async_compute) {
 	if (!TableDispatchEnabled()) return false;
-	auto&                                   cache    = TableDispatchState();
-	const PipelineCache::TableProgram*      table    = nullptr;
-	ShaderRecompiler::IR::ResourceSnapshot* resolved = nullptr;
-	if (!TakeResolvedTable(table, resolved)) {
-		table = TableDispatchSelect(cs, &buffer.GetRegisters().GetShaderRegisters(), async_compute, cache.snapshot,
-		                            cache.specialization, nullptr);
-		if (table == nullptr) return false;
-		resolved = &cache.snapshot;
-	}
-	auto&       snapshot  = *resolved;
-	const auto& slots     = snapshot.flattened_srt;
-	const auto& plan      = table->program.table_plan;
-	auto&       pipelines = m_context.GetPipelineCache();
-	const auto& program = table->program;
-	auto&       input   = cache.input;
-	input               = table->input_info;
-	input.workgroup_counts[0] = x;
-	input.workgroup_counts[1] = y;
-	input.workgroup_counts[2] = z;
-	input.stage               = {.program = &program, .resources = &snapshot};
-	// As DispatchDirect(): the metadata clears of the images it writes, and the clears it is.
-	if (!program.info.images.empty()) {
-		UpdateComputeMetaClears(input, buffer);
-		if (TryConsumeComputeImageClear(input, buffer, x, y, z, 0x41u)) {
-			ResetBindings();
-			return true;
+	auto&      table = OwnTable();
+	const auto frame = m_context.FrameNumber();
+	// The dispatches' pairs no dispatch used for PairKeepFrames leave, as the draws' (TableTry).
+	if (frame - table.dispatches_swept >= TableXpr::PairSweepFrames) {
+		table.dispatches_swept = frame;
+		if (table.dispatches.size() > TableXpr::PairsKept) {
+			const auto before = table.dispatches.size();
+			std::erase_if(table.dispatches, [&](auto& item) {
+				auto& held = item.second;
+				if (held.used_frame + TableXpr::PairKeepFrames >= frame || held.pending != nullptr) return false;
+				for (auto& [words, set]: held.sets) NativeXprRetireSet(set->pool, set->set);
+				return true;
+			});
+			if (table.dispatches.size() != before) {
+				table.gathered       = nullptr;
+				table.last_set       = nullptr;
+				table.found_dispatch = nullptr;
+			}
 		}
 	}
-	buffer.EndRendering();
-	auto& pipeline = pipelines.GetComputePipeline(input, table->handle);
-	auto& bindings = m_compute_bindings;
-	PrepareBindings(input.stage, bindings);
-	PreparedBindings* descriptor_stage = &bindings;
-	FindBuffers(std::span {&descriptor_stage, 1u});
-	if (program.info.uses_dma) {
-		m_context.CacheDmaBases(input.stage);
-		const ShaderStageRuntime* const dma_stage = &input.stage;
-		const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
-		m_context.PrepareBda(program.has_address_writes, !reach_synchronized);
+	// (The pair found last again without its lookup: runs of dispatches keep their program.)
+	const auto key   = TableDispatchKey(cs, async_compute);
+	auto*      known = table.found_dispatch != nullptr && table.found_dispatch_key == key ? table.found_dispatch : nullptr;
+	if (known == nullptr) {
+		const auto found = table.dispatches.find(key);
+		if (found == table.dispatches.end()) return false;
+		known                    = &found->second;
+		table.found_dispatch_key = key;
+		table.found_dispatch     = known;
 	}
-	// Each buffer's device address and size. A registration (a new buffer joining older ones) may replace a buffer
-	// an earlier lookup gave: the addresses are resolved again until none moved.
-	auto& cache_buffers = m_context.GetBufferCache();
-	auto& block         = cache.block;
-	bool  writes        = false;
-	for (int attempt = 0;; ++attempt) {
-		if (attempt == 3) {
-			ResetBindings();
+	auto& pair      = *known;
+	pair.used_frame = frame;
+	if (pair.refused || pair.vs != cs.cs_regs.data_addr) return false;
+	if (const auto generation = ShaderMapGeneration(); generation != pair.generation) {
+		if (pair.programs[0] != nullptr && ShaderHashAt(pair.vs) != pair.code_hashes[0]) {
+			// Learnt again from the normal path's next dispatch.
+			TableReset(pair);
+			pair.generation = generation;
 			return false;
 		}
-		const auto epoch = cache_buffers.BufferSetEpoch();
-		block.assign(plan.BlockDwords(), 0);
-		std::copy(slots.begin(), slots.end(), block.begin());
-		for (size_t i = 0; i < plan.buffers.size(); ++i) {
-			const auto  v_sharp  = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
-			const auto& resource = program.info.buffers[i];
-			if (!resource.live || v_sharp.Type() != 0) continue;
-			const auto address = v_sharp.Base48();
-			auto       size    = v_sharp.GetSize();
-			if (address == 0 || size == 0) continue;
-			if ((address & 3u) != 0 || v_sharp.NumRecords() == UINT32_MAX) {
-				ResetBindings();
-				return false;
-			}
-			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
-			if (size == 0) continue;
-			auto [owner, owner_offset] = cache_buffers.ObtainBuffer(
-			    address, size, resource.written,
-			    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()));
-			if (resource.written) {
-				m_context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
-				writes = true;
-			}
-			const auto device = owner->BufferDeviceAddress() + owner_offset;
-			const auto first  = plan.BufferDword(i);
-			block[first]      = static_cast<uint32_t>(device);
-			block[first + 1]  = static_cast<uint32_t>(device >> 32u);
-			block[first + 2]  = static_cast<uint32_t>(std::min<uint64_t>(size / 4u, UINT32_MAX));
-			block[first + 4]  = v_sharp.Stride();
-		}
-		if (cache_buffers.BufferSetEpoch() == epoch) break;
+		pair.generation = generation;
 	}
-	RebindImages(bindings);
-	BindSharedMemory(m_context, input, bindings);
-	RebindBuffers(bindings);
-	const auto block_address = cache_buffers.TableUpload(block.data(), block.size() * sizeof(uint32_t));
-	bindings.shader_data[program.bindings.TableBlockDword()]      = static_cast<uint32_t>(block_address);
-	bindings.shader_data[program.bindings.TableBlockDword() + 1u] = static_cast<uint32_t>(block_address >> 32u);
+	NativeXprCollect(); // (the retired sets)
+	auto& pipelines = m_context.GetPipelineCache();
+	if (pair.programs[0] == nullptr) {
+		// The table program, once compiled.
+		if (pair.pending == nullptr || !pair.pending->done.load(std::memory_order_acquire)) return false;
+		const auto* program = pair.pending->programs[0];
+		if (!TableDispatchServes(program)) {
+			static std::atomic<uint32_t> reports {0};
+			if (reports.fetch_add(1, std::memory_order_relaxed) < 64)
+				std::printf("Table: CS 0x%llx refused: %s\n", static_cast<unsigned long long>(pair.vs),
+				            program == nullptr && !pair.pending->refusal.empty() ? pair.pending->refusal.c_str()
+				                                                                 : "no table dispatch program");
+			pair.refused = true;
+			pair.pending.reset();
+			return false;
+		}
+		pair.pending.reset();
+		pair.tables       = {program, nullptr};
+		pair.programs     = {&program->program, nullptr};
+		pair.compute_info = program->input_info;
+		pair.compute_info.stage = {.program = &program->program, .resources = &g_table_no_resources};
+		TableRuns(pair);
+	}
+	if (pair.pipeline == nullptr) pair.pipeline = &pipelines.GetNativeComputePipeline(pair.compute_info, pair.tables[0]->handle);
+	const std::array<std::span<const uint32_t>, 2> user_data {
+	    std::span<const uint32_t>(cs.cs_user_sgpr.value,
+	                              std::min<uint32_t>(cs.cs_regs.user_sgpr, HW::UserSgprInfo::SGPRS_MAX)),
+	    std::span<const uint32_t> {}};
+	if (!TableEvaluateDraw(pair, user_data)) return false;
+	TableGather(pair, user_data);
+	// A buffer it writes over surface metadata: the normal path's UpdateComputeMetaClears records the clear.
+	auto& textures = m_context.GetTextureCache();
+	for (size_t i = 0; i < pair.programs[0]->info.buffers.size(); ++i) {
+		const auto& resource = pair.programs[0]->info.buffers[i];
+		if (!resource.written || i >= table.entries[0].size()) continue;
+		ShaderBufferResource descriptor;
+		std::copy_n(table.entries[0][i].first.begin(), 4, descriptor.fields);
+		if (textures.IsMeta(descriptor.Base48())) return false;
+	}
+	auto* set = TableSet(buffer, pair, *pair.pipeline, nullptr);
+	if (set == nullptr) return false;
+	std::array<vk::DeviceAddress, 2> blocks {};
+	bool                             writes       = false;
+	auto&                            buffer_cache = m_context.GetBufferCache();
+	TablePrepareBda(pair, user_data); // (as TableDraw's: before the blocks)
+	const auto registration = buffer_cache.BufferSetEpoch();
+	if (!TableBlocks(pair, user_data, blocks, writes) || buffer_cache.BufferSetEpoch() != registration ||
+	    buffer.IsInvalid())
+		return false;
+	// Emission, as DispatchDirect's.
+	buffer.EndRendering();
 	auto vk_buffer = buffer.Handle();
-	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline, std::span {&descriptor_stage, 1u});
-	writes = writes || bindings.shared_memory.buffer != nullptr ||
-	         std::ranges::any_of(program.info.images, [](const auto& image) {
-		         return image.written && image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
-	         });
+	// (As a draw's: the set's images as its last dispatch's transit left them, while no image changed since.)
+	if (set->transit_epoch != textures.ImagesEpoch() || set->transit_state != nullptr) {
+		const TransitGroup transit_group;
+		if (!TableTransit(*set, vk_buffer, nullptr)) return false;
+		set->transit_epoch = textures.ImagesEpoch();
+		set->transit_state = nullptr;
+	}
+	const auto& pipeline = *pair.pipeline;
+	const auto& program  = *pair.programs[0];
+	const auto& bindings = program.bindings;
+	vk_buffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline.pipeline_layout, 0, 1, &set->set, 0, nullptr);
+	ShaderRecompiler::IR::PushData push_data;
+	const auto                     start     = bindings.push_data_start_dword;
+	const auto&                    registers = program.info.user_data_registers;
+	for (size_t i = 0; i < registers.size(); ++i) {
+		const auto index            = registers[i] - program.user_data_base;
+		push_data.dwords[start + i] = index < user_data[0].size() ? user_data[0][index] : 0u;
+	}
+	push_data.dwords[start + bindings.TableBlockDword()]      = static_cast<uint32_t>(blocks[0]);
+	push_data.dwords[start + bindings.TableBlockDword() + 1u] = static_cast<uint32_t>(blocks[0] >> 32u);
+	vk_buffer.pushConstants(pipeline.pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+	                        (start + bindings.ShaderDataDwords()) * sizeof(uint32_t), push_data.dwords.data());
 	// As DispatchDirect(): a dispatch the guest did not order after the previous one of its queue overlaps it.
 	const bool chained = std::exchange(m_dispatch_chained, false) && m_deferred_barrier;
-	if (writes && !chained) {
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-	}
+	if (writes && !chained) ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatch(x, y, z);
 	m_deferred_barrier       = true;
 	m_deferred_barrier_queue = m_guest_queue;
-	ResetBindings();
 	return true;
 }

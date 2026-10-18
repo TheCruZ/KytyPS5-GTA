@@ -287,6 +287,9 @@ public:
 	                              bool native_bindings = false);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
+	// The compute pipeline of a table program (table dispatches, RenderExecutor::TableDispatch) with native bindings: an
+	// ordinary descriptor set the dispatch's image set is written into. Created here, kept by program.
+	Pipeline& GetNativeComputePipeline(const ShaderComputeInputInfo& input_info, const ShaderProgram& compute_program);
 
 private:
 	void PrepareGraphicsStagesImpl(const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
@@ -344,6 +347,7 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_native_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_native_compute_pipelines;
 	// The pipeline the last lookup found; pipelines are never removed while the cache lives.
 	GraphicsPipelineKey m_last_graphics_key {};
 	Pipeline*           m_last_graphics_pipeline = nullptr;

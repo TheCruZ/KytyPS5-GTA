@@ -495,8 +495,6 @@ struct RenderExecutor::ResolvedDraw {
 	// A dispatch resolved ahead: its program and stage input (pointing into `programs`).
 	ShaderComputeInputInfo compute;
 	ShaderProgram          compute_program;
-	// A dispatch's table program (tableDispatch.inc), its resources in `programs`.
-	const PipelineCache::TableProgram* table = nullptr;
 	std::atomic_bool       busy {false};
 };
 
@@ -1326,7 +1324,6 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(const HW::Context
 	}
 	ring.next   = (ring.next + 1) % ResolvedDrawRing::Size;
 	draw.compute_program = {};
-	draw.table           = nullptr;
 	auto& state = draw.storage.state;
 	ResetDrawRenderState(state, draw.storage.tessellation_stages_written);
 	draw.storage.tessellation_stages_written =
@@ -1376,15 +1373,6 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDispatchAhead(const HW::Con
 		const auto size = slot.compute.dispatch_thread_dimensions ? std::max(group_sizes[axis], 1u) : 1u;
 		slot.compute.workgroup_counts[axis] = groups[axis] / size + (groups[axis] % size != 0u);
 	}
-	slot.table = nullptr;
-	if (!slot.compute.dispatch_thread_dimensions) {
-		slot.table = TableDispatchAhead(cs_regs, async_compute, slot.programs);
-		if (slot.table != nullptr) {
-			slot.busy.store(true, std::memory_order_relaxed);
-			return &slot;
-		}
-		slot.programs.Reset();
-	}
 	slot.compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, context.GetShaderRegisters(), slot.compute, &slot.programs);
 	if (slot.programs.reads.Failed() || !slot.compute_program) {
@@ -1415,7 +1403,6 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveIndirectDispatchAhead(
 	}
 	ring.next = (ring.next + 1) % ResolvedDrawRing::Size;
 	slot.programs.Reset();
-	slot.table = nullptr;
 	ValueInitialize(slot.compute);
 	slot.compute.async_compute = async_compute;
 	// As DispatchIndirect() and DispatchIndirectThreads() look the program up: the workgroup
@@ -1433,21 +1420,6 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveIndirectDispatchAhead(
 	}
 	slot.busy.store(true, std::memory_order_relaxed);
 	return &slot;
-}
-
-bool RenderExecutor::TakeResolvedTable(const PipelineCache::TableProgram*&      table,
-                                       ShaderRecompiler::IR::ResourceSnapshot*& snapshot) {
-	auto* resolved = m_resolved_draw;
-	if (resolved == nullptr || resolved->table == nullptr) {
-		return false;
-	}
-	m_resolved_draw = nullptr;
-	if (!resolved->programs.reads.StillValid()) {
-		return false;
-	}
-	table    = resolved->table;
-	snapshot = &resolved->programs.resources[0];
-	return true;
 }
 
 bool RenderExecutor::TakeResolvedDispatch(ShaderComputeInputInfo& input_info,
@@ -2297,5 +2269,6 @@ bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_
 
 #include "graphics/host_gpu/renderer/nativeXpr.inc"
 #include "graphics/host_gpu/renderer/tableDraw.inc"
+#include "graphics/host_gpu/renderer/tableDispatch.inc"
 
 } // namespace Libs::Graphics

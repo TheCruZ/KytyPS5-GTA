@@ -458,7 +458,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 	if (!use_thread_dimensions) {
-		TableDispatchLearn(cs_regs, sh_regs, input_info, compute_program, async_compute);
+		TableDispatchLearn(cs_regs, sh_regs, input_info, compute_program, async_compute,
+		                   input_info.stage.program != nullptr &&
+		                       std::ranges::find(DemonsSoulsCopy::Shaders, input_info.stage.program->shader_hash) !=
+		                           DemonsSoulsCopy::Shaders.end());
 	}
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
@@ -935,7 +938,5 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	ResetBindings();
 }
 
-#include "graphics/host_gpu/renderer/tableUse.inc"
-#include "graphics/host_gpu/renderer/tableDispatch.inc"
 
 } // namespace Libs::Graphics

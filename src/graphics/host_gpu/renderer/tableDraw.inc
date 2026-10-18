@@ -213,11 +213,19 @@ struct RenderExecutor::TablePair {
 	uint32_t                         variant_hint = 0; // the variant TableTry found last (KYTY_TABLE_MRU bit 2)
 	// The table programs' compilation (on a worker): until it is done the pair's draws take the normal path.
 	std::shared_ptr<PipelineCache::TableTicket> pending;
+	// A dispatch's (tableDispatch.inc): its program's input and native pipeline.
+	ShaderComputeInputInfo         compute_info;
+	const PipelineCache::Pipeline* pipeline = nullptr;
 	uint64_t                                    used_frame = 0;
 };
 
 struct RenderExecutor::TableXpr {
 	std::unordered_map<uint64_t, TablePair, NativeXprKeyHash> pairs; // by NativeXprPairHash
+	// Table dispatches' pairs, by the compute stage's registers (TableDispatchKey), and the one found last.
+	std::unordered_map<uint64_t, TablePair, NativeXprKeyHash> dispatches;
+	uint64_t                                                 found_dispatch_key = 0;
+	TablePair*                                               found_dispatch     = nullptr;
+	uint64_t                                                 dispatches_swept   = 0;
 	// The pairs found last, direct-mapped by their hash (KYTY_TABLE_MRU bit 1: else its first 256 only), and the one
 	// TableTry found last by its shaders (consecutive draws mostly keep them). Pairs do not move until they leave.
 	static constexpr size_t                                 PairCacheEntries = 4096;
@@ -416,8 +424,8 @@ void RenderExecutor::TableGather(const TablePair& pair, std::array<std::span<con
 // Refused (published as such) for another specialization, or when an image cannot be held in a set (a target of the
 // draw, an image without data, a linear image the shader writes).
 RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& buffer, TablePair& pair,
-                                                               const TableVariant&       variant,
-                                                               const NativeXprDrawState& draw_state) {
+                                                               const PipelineCache::Pipeline& pipeline,
+                                                               const NativeXprDrawState*      draw_state) {
 	(void)buffer;
 	auto&      table    = OwnTable();
 	auto&      textures = m_context.GetTextureCache();
@@ -502,8 +510,9 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			if (!binding.image_id) continue; // (a null image: bound as the normal path binds it)
 			auto&      image   = textures.GetImage(binding.image_id);
 			const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
-			if (std::ranges::find(draw_state.targets, binding.image_id, &NativeXprDrawState::Target::id) !=
-			    draw_state.targets.end())
+			if (draw_state != nullptr &&
+			    std::ranges::find(draw_state->targets, binding.image_id, &NativeXprDrawState::Target::id) !=
+			        draw_state->targets.end())
 				return refuse("a target the shader reads");
 			if (image.info.data.Empty()) return refuse("an image without data");
 			if ((storage || (image.binding.force_general && image.binding.shader_write)) && !image.info.IsTiled())
@@ -593,7 +602,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		}
 		set->images.insert(set->images.end(), deps[st].begin(), deps[st].end());
 	}
-	set->set = NativeXprAllocateSet(variant.pipeline->descriptor_set_layout, set->pool);
+	set->set = NativeXprAllocateSet(pipeline.descriptor_set_layout, set->pool);
 	if (!set->set) return refuse("no descriptor set");
 	std::vector<vk::WriteDescriptorSet> writes;
 	writes.reserve(pending.size());
@@ -677,8 +686,8 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 // The image set of the words TableEvaluateDraw made: the last one when they are the same, else the pair's set for
 // them, proven current. Null: the normal path takes the draw.
 RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, TablePair& pair,
-                                                        const TableVariant&       variant,
-                                                        const NativeXprDrawState& draw_state) {
+                                                        const PipelineCache::Pipeline& pipeline,
+                                                        const NativeXprDrawState*      draw_state) {
 	auto&       table = OwnTable();
 	const auto& words = table.words;
 	const auto  frame = m_context.FrameNumber();
@@ -694,7 +703,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 			const auto found = pair.sets.find(XXH3_64bits(words.data(), words.size() * sizeof(uint32_t)));
 			set = found != pair.sets.end() && found->second->words == words ? found->second.get() : nullptr;
 			if (set == nullptr || (set->refused && frame >= set->validated_frame + TableImageSet::RetryFrames))
-				set = TableResolveSet(buffer, pair, variant, draw_state);
+				set = TableResolveSet(buffer, pair, pipeline, draw_state);
 		}
 		// (TableResolveSet may have cleared both: a set it replaced.)
 		if (last != nullptr && pair.last_set == last) pair.previous_set = last;
@@ -714,15 +723,16 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 	// Unused image sets leave once a second.
 	if (frame >= table.collected + 60) {
 		table.collected = frame;
-		for (auto& [key, held]: table.pairs)
-			std::erase_if(held.sets, [&](auto& item) {
-				if (item.second->used_frame + 60 >= frame) return false;
-				if (held.last_set == item.second.get()) held.last_set = nullptr;
-				if (held.previous_set == item.second.get()) held.previous_set = nullptr;
-				if (table.last_set == item.second.get()) table.last_set = nullptr;
-				NativeXprRetireSet(item.second->pool, item.second->set);
-				return true;
-			});
+		for (auto* pairs: {&table.pairs, &table.dispatches})
+			for (auto& [key, held]: *pairs)
+				std::erase_if(held.sets, [&](auto& item) {
+					if (item.second->used_frame + 60 >= frame) return false;
+					if (held.last_set == item.second.get()) held.last_set = nullptr;
+					if (held.previous_set == item.second.get()) held.previous_set = nullptr;
+					if (table.last_set == item.second.get()) table.last_set = nullptr;
+					NativeXprRetireSet(item.second->pool, item.second->set);
+					return true;
+				});
 	}
 	return set;
 }
@@ -746,7 +756,9 @@ void RenderExecutor::TablePrepareBda(const TablePair& pair, std::array<std::span
 	}
 	if (count == 0) return;
 	const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {stages.data(), count});
-	m_context.PrepareBda(false, !reach_synchronized);
+	const bool writes = (pair.programs[0] != nullptr && pair.programs[0]->has_address_writes) ||
+	                    (pair.programs[1] != nullptr && pair.programs[1]->has_address_writes);
+	m_context.PrepareBda(writes, !reach_synchronized);
 }
 
 // The pair's blocks (TableEvaluateDraw read their slots): each stage's buffers' device addresses and sizes in dwords
@@ -873,12 +885,13 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 // targets are not those the set was made for or an image needs what the normal path's acquisition does first (an
 // upload, a pending fast clear, a storage image the GPU does not own).
 bool RenderExecutor::TableTransit(const TableImageSet& set, CommandRecorder vk_buffer,
-                                  const NativeXprDrawState& draw_state) {
+                                  const NativeXprDrawState* draw_state) {
 	auto& textures = m_context.GetTextureCache();
 	for (const auto& dep: set.images) {
 		auto* image = textures.m_slot_images.try_get(dep.id);
 		if (image == nullptr || image->serial != dep.serial) return false;
-		if (std::ranges::find(draw_state.targets, dep.id, &NativeXprDrawState::Target::id) != draw_state.targets.end())
+		if (draw_state != nullptr &&
+		    std::ranges::find(draw_state->targets, dep.id, &NativeXprDrawState::Target::id) != draw_state->targets.end())
 			return false;
 		if ((dep.storage && !image->SafeToDownload()) || TextureCache::RefreshPending(*image, dep.desc)) return false;
 		if (dep.desc.info.metadata.kind == ImageMetadataKind::Dcc) {
@@ -909,7 +922,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	                              std::min<uint32_t>(sh.GetPs().ps_regs.rsrc2.user_sgpr, HW::UserSgprInfo::SGPRS_MAX))};
 	if (!TableEvaluateDraw(pair, user_data)) return TableResult::Native;
 	TableGather(pair, user_data);
-	auto* set = TableSet(buffer, pair, variant, draw_state);
+	auto* set = TableSet(buffer, pair, *variant.pipeline, &draw_state);
 	if (set == nullptr) return TableResult::Native;
 
 	// Emission, as NativeXprEmit's: indices and arguments are read by the GPU; lookups may restart the scheduler, so
@@ -986,7 +999,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 			return TableResult::Native;
 		if ((set->transit_epoch != images_epoch || set->transit_state != &draw_state ||
 		     set->transit_capture != draw_state.captures) &&
-		    !TableTransit(*set, vk_buffer, draw_state))
+		    !TableTransit(*set, vk_buffer, &draw_state))
 			return TableResult::Native;
 		// (Neither moves what the other placed: a target is no image the set holds.)
 		draw_state.emitted_epoch = set->transit_epoch = textures.ImagesEpoch();

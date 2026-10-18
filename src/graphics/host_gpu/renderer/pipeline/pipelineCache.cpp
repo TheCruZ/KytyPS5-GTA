@@ -1765,6 +1765,7 @@ PipelineCache::~PipelineCache() {
 	destroy(m_graphics_pipelines);
 	destroy(m_native_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	destroy(m_native_compute_pipelines);
 	destroy(m_precreated_graphics);
 	destroy(m_precreated_compute);
 	if (m_driver_cache != nullptr) {
@@ -2558,6 +2559,20 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 	EXIT_IF(!inserted);
 
 	return iter->second.get();
+}
+
+PipelineCache::Pipeline& PipelineCache::GetNativeComputePipeline(const ShaderComputeInputInfo& input_info,
+                                                                const ShaderProgram&          compute_program) {
+	EXIT_IF(!compute_program);
+	if (auto iter = m_native_compute_pipelines.find(compute_program.id); iter != m_native_compute_pipelines.end()) {
+		return *iter->second;
+	}
+	auto cached             = std::make_unique<Pipeline>();
+	cached->native_bindings = true;
+	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
+	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr || cached->pipeline_layout == nullptr);
+	return *m_native_compute_pipelines.emplace(compute_program.id, std::move(cached)).first->second;
 }
 
 PipelineCache::Pipeline&

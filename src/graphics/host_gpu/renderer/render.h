@@ -660,22 +660,6 @@ private:
 	std::unique_ptr<IndirectThreadPass, void (*)(IndirectThreadPass*)> m_indirect_thread_pass {
 	    nullptr, nullptr};
 	std::unique_ptr<NativeXprCache, void (*)(NativeXprCache*)> m_native_xpr {nullptr, nullptr};
-	// Table dispatches (tableDispatch.inc, KYTY_TABLE_DISPATCH): compute programs translated in table mode read
-	// their SRT slots and buffers from a block written for each dispatch, instead of the normal path's resolution.
-	struct TableDispatchCache;
-	std::unique_ptr<TableDispatchCache, void (*)(TableDispatchCache*)> m_table_dispatch {nullptr, nullptr};
-	std::once_flag      m_table_dispatch_once;
-	TableDispatchCache& TableDispatchState();
-	const PipelineCache::TableProgram* TableDispatchSelect(const HW::ComputeShaderInfo& cs,
-	                                                       const HW::ShaderRegisters* sh, bool async_compute,
-	                                                       ShaderRecompiler::IR::ResourceSnapshot&       snapshot,
-	                                                       ShaderRecompiler::IR::ResourceSpecialization& specialization,
-	                                                       GuestReadLog*                                 reads);
-	// Resolve thread: the table program of a dispatch and its resources, into `ahead`; null when it has none.
-	const PipelineCache::TableProgram* TableDispatchAhead(const HW::ComputeShaderInfo& cs, bool async_compute,
-	                                                      ProgramResolution& ahead);
-	// Execution thread: the table program and resources a dispatch resolved ahead, when its reads still hold.
-	bool TakeResolvedTable(const PipelineCache::TableProgram*& table, ShaderRecompiler::IR::ResourceSnapshot*& snapshot);
 	// Table draws (tableDraw.inc, KYTY_TABLE_XPR).
 	struct TableXpr;
 	struct TablePair;
@@ -706,12 +690,13 @@ private:
 	void        TablePack(TablePair& pair, const std::array<TableFlatStage, 2>& flat_forms);
 	bool        TableEvaluateDraw(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
 	void        TableGather(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
-	TableImageSet* TableSet(CommandBuffer& buffer, TablePair& pair, const TableVariant& variant,
-	                        const NativeXprDrawState& draw_state);
-	TableImageSet* TableResolveSet(CommandBuffer& buffer, TablePair& pair, const TableVariant& variant,
-	                               const NativeXprDrawState& draw_state);
+	// (`draw_state` null: a dispatch's.)
+	TableImageSet* TableSet(CommandBuffer& buffer, TablePair& pair, const PipelineCache::Pipeline& pipeline,
+	                        const NativeXprDrawState* draw_state);
+	TableImageSet* TableResolveSet(CommandBuffer& buffer, TablePair& pair, const PipelineCache::Pipeline& pipeline,
+	                               const NativeXprDrawState* draw_state);
 	bool        TableValidateSet(TableImageSet& set);
-	bool        TableTransit(const TableImageSet& set, CommandRecorder vk_buffer, const NativeXprDrawState& draw_state);
+	bool        TableTransit(const TableImageSet& set, CommandRecorder vk_buffer, const NativeXprDrawState* draw_state);
 	void        TablePrepareBda(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
 	bool        TableBlocks(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
 	                        std::array<vk::DeviceAddress, 2>& blocks, bool& writes);
@@ -720,14 +705,15 @@ private:
 	void TableStore(CommandBuffer& buffer, const DrawRenderState& state, vk::PrimitiveTopology topology,
 	                bool primitive_restart_enable, const RenderState& rendering, const DynamicState& dynamic_state,
 	                bool storable);
-	// True when the dispatch was recorded from a table program.
+	// Table dispatches (tableDispatch.inc, KYTY_TABLE_DISPATCH): true when the dispatch was recorded from its pair's
+	// table program and image set.
 	bool TableDispatch(CommandBuffer& buffer, const HW::ComputeShaderInfo& cs, uint32_t x, uint32_t y, uint32_t z,
 	                   bool async_compute);
-	// After the normal path's lookup of a dispatch's program: a table program for its specialization, when table
-	// mode can serve the program (compiled within a budget per frame).
+	// After the normal path's lookup of a dispatch's program (`special`: a special path of the normal path takes the
+	// shader): its pair's table program, compiled for its specialization when table mode can serve the program.
 	void TableDispatchLearn(const HW::ComputeShaderInfo& cs, const HW::ShaderRegisters& sh,
 	                        const ShaderComputeInputInfo& input_info, const ShaderProgram& compute_program,
-	                        bool async_compute);
+	                        bool async_compute, bool special);
 	const DrawIndexArgs* m_native_xpr_direct = nullptr; // the direct draw a try is for
 	// The try of the executing draw asked the normal path to store a record.
 	bool m_native_xpr_store = false;
