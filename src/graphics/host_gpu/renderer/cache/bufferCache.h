@@ -330,6 +330,8 @@ private:
 		std::unique_ptr<Buffer> staging;
 	};
 	ReadbackQueue m_readback;
+	// The range a guest access of GPU-written memory reads back (see ReadMemory()).
+	[[nodiscard]] std::pair<uint64_t, uint64_t> ReadbackWindow(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Guest reads of GPU-written memory copied on the readback queue while the execution thread
 	// goes on (see ReadMemory()): the guest thread waits for its copy and writes the bytes back.
 	struct AsyncReadback;

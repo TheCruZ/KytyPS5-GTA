@@ -22,6 +22,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -449,7 +450,11 @@ std::shared_ptr<BufferCache::AsyncReadback> BufferCache::BeginAsyncReadback(uint
 	}
 	// A copy of some of them goes first.
 	DrainAsyncReadbacks(vaddr, size);
-	auto&      buffer         = m_slot_buffers[FindBuffer(vaddr, size)];
+	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+	if (const auto window = ReadbackWindow(buffer, vaddr, size); window.second != size) {
+		std::tie(vaddr, size) = window;
+		DrainAsyncReadbacks(vaddr, size);
+	}
 	const auto buffer_address = buffer.CpuAddress();
 	// What DownloadBufferMemory() would copy.
 	std::vector<vk::BufferCopy> copies;
@@ -655,6 +660,49 @@ void BufferCache::DrainAsyncReadbacks(uint64_t vaddr, uint64_t size, vk::Buffer 
 	}
 }
 
+// KYTY_READBACK_WINDOW=0: a guest access of GPU-written memory reads back its page only.
+static bool ReadbackWindowEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READBACK_WINDOW");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// What a guest access of GPU-written memory reads back. The guest reads (and fills) such memory in
+// long runs, faulting page after page, and each page was a round trip to the execution thread and
+// the GPU: Demon's Souls takes thousands a second. The readback takes the GPU-written bytes of the
+// 512 KiB around the access with it (as chenxiao07's KytyPS5 fork does), within the access's
+// buffer and guest mappings, when the readback queue can copy all of them without waiting for
+// work still being recorded; otherwise only the access's page.
+std::pair<uint64_t, uint64_t> BufferCache::ReadbackWindow(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	constexpr uint64_t WindowSize = 512 * 1024;
+	const std::pair<uint64_t, uint64_t> exact {vaddr, size};
+	if (!ReadbackWindowEnabled() || !m_graphics.readback_queue || m_device_address_pending) {
+		return exact;
+	}
+	const auto buffer_begin = buffer.CpuAddress();
+	const auto buffer_end   = buffer_begin + buffer.Size();
+	const auto begin        = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
+	const auto end          = std::min(Common::AlignDown(vaddr, WindowSize) + WindowSize, buffer_end);
+	if (begin > vaddr || end < vaddr + size || !m_scheduler.Context().IsMapped(begin, end - begin)) {
+		return exact;
+	}
+	for (const auto& [address, bytes]: m_pending_writes) {
+		if (address < end && begin < address + bytes) {
+			return exact;
+		}
+	}
+	const auto current = m_scheduler.CurrentTick();
+	bool       ready   = true;
+	m_memory_tracker.ForEachDownloadRange<false>(begin, end - begin, [&](uint64_t address, uint64_t bytes) noexcept {
+		m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t stop) {
+			ready = ready && m_write_ticks.Latest(start, stop) < current;
+		});
+	});
+	return ready ? std::pair {begin, end - begin} : exact;
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
@@ -664,14 +712,20 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	auto& gpu = m_scheduler.Context().GetGpu();
 	// The synchronous path, once the copies in flight are written back: the GPU's bytes, then a
 	// write makes the range CPU-modified.
-	const auto synchronous = [this, vaddr, size, is_write] {
+	// (Reads of the GPU threads themselves, for the work they record, keep to their range.)
+	const bool guest       = !GuestGpu::IsGpuThread();
+	const auto synchronous = [this, vaddr, size, is_write, guest] {
 		DrainAsyncReadbacks(vaddr, size);
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
-		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+		const auto [begin, bytes] = guest ? ReadbackWindow(buffer, vaddr, size) : std::pair {vaddr, size};
+		if (begin != vaddr || bytes != size) {
+			DrainAsyncReadbacks(begin, bytes);
+		}
+		if (DownloadBufferMemory<false>(buffer, begin, bytes)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(begin, bytes);
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
