@@ -88,6 +88,19 @@ bool PartialRowBandsEnabled() {
 	return enabled;
 }
 
+// chenxiao07's KYTY_TEXTURE_LEVELS (default on, and inert unless KYTY_PARTIAL_IMAGE_DIRTY is 1; 0: a sampled view
+// refreshes the whole texture, not only its levels): the game streams a texture in from its smallest levels, and its
+// T# starts at the first level loaded (BASE_LEVEL; min_lod stays 0). The larger levels hold bytes the game has not
+// written yet, and a refresh that uploaded the whole image at first use and again after each level it streamed in
+// moved hundreds of megabytes while the view turned.
+bool TextureLevelsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TEXTURE_LEVELS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 // A fragmented dirty set uploads the whole subresource rather than many small dispatches.
 constexpr size_t MaxBandsPerSubresource = 16;
 
@@ -733,6 +746,29 @@ void TextureCache::RetrackHoles(Image& image) {
 		m_page_manager.UpdatePageWatchers<true>(hole_begin, hole_end - hole_begin);
 	}
 	image.untracked_holes.clear();
+}
+
+void TextureCache::RetrackHoles(Image& image, uint64_t begin, uint64_t end) {
+	if (image.untracked_holes.empty()) {
+		return;
+	}
+	if (!image.IsTracked()) {
+		EXIT("TextureCache: untracked image keeps page holes\n");
+	}
+	std::vector<std::pair<uint64_t, uint64_t>> kept;
+	kept.reserve(image.untracked_holes.size() + 1);
+	for (const auto& [hole_begin, hole_end]: image.untracked_holes) {
+		const auto from = std::max(hole_begin, begin);
+		const auto to   = std::min(hole_end, end);
+		if (from >= to) {
+			kept.emplace_back(hole_begin, hole_end);
+			continue;
+		}
+		m_page_manager.UpdatePageWatchers<true>(from, to - from);
+		if (hole_begin < from) kept.emplace_back(hole_begin, from);
+		if (to < hole_end) kept.emplace_back(to, hole_end);
+	}
+	image.untracked_holes = std::move(kept);
 }
 
 void TextureCache::FinishRefresh(Image& image) {
@@ -1562,7 +1598,7 @@ bool TextureCache::CheckPartialHashes(const Image& image) {
 // bytes of each piece of them (ObtainBufferForImage, as a whole upload takes the image's), detiled where they are:
 // the GPU's other bytes of the image stay. False, before any GPU work: the upload takes all of the image (they cover
 // more than half of it, or its layout is not one this takes).
-bool TextureCache::UploadImagePartial(Image& image) {
+bool TextureCache::UploadImagePartial(Image& image, uint64_t window_begin, uint64_t window_end) {
 	const auto& info    = image.info;
 	const auto  binding = UploadBinding(image);
 	const auto  base    = info.data.address;
@@ -1599,7 +1635,8 @@ bool TextureCache::UploadImagePartial(Image& image) {
 			if (begin + plane > info.data.End()) {
 				return false;
 			}
-			if (!IntersectsRanges(dirty, begin, begin + plane)) {
+			const auto from = std::max(begin, window_begin), to = std::min(begin + plane, window_end);
+			if (from >= to || !IntersectsRanges(dirty, from, to)) {
 				continue;
 			}
 			// The rows of blocks over the dirty ranges alone, where the subresource has them in a row of its own.
@@ -1636,8 +1673,9 @@ bool TextureCache::UploadImagePartial(Image& image) {
 			picked.push_back({{level, slice, 1, 0, 0, 0}, begin, begin + plane});
 		}
 	}
-	// (Of a fragmented set, a whole upload is cheaper than many small dispatches.)
-	if (picked_bytes > info.data.size / PartialUploadMaxShare) {
+	// (A window's refresh leaves the rest dirty: no whole upload instead. Of a fragmented set, a whole upload is cheaper than
+	// many small dispatches.)
+	if (window_begin == 0 && window_end == UINT64_MAX && picked_bytes > info.data.size / PartialUploadMaxShare) {
 		return false;
 	}
 	const auto copies = info.BufferCopies(0);
@@ -1697,6 +1735,107 @@ bool TextureCache::UploadImagePartial(Image& image) {
 	}
 	if (PartialImageDirtyMode() == 2) {
 		UpdatePartialHashes(image, false);
+	}
+	return true;
+}
+
+bool TextureCache::LevelRefreshCandidate(const Image& image) {
+	// Textures the CPU writes and the GPU only samples (one written as a target or storage keeps whole refreshes),
+	// without layers (a level is one range of bytes), on whole pages.
+	const auto& info = image.info;
+	return TextureLevelsEnabled() && PartialImageDirtyMode() == 1 && PartialDirtyCandidate(image) &&
+	       image.registered && !image.IsGpuModified() && !image.IsBufferModified() && !image.usage.storage &&
+	       !image.usage.render_target && !image.usage.video_out && !image.binding.is_target && !info.IsDepth() &&
+	       !info.HasMetadata() && info.resources.layers == 1 && info.resources.levels > 1 &&
+	       info.resources.levels <= info.mip_layout.size() && info.data.address % TRACKER_PAGE_SIZE == 0 &&
+	       info.data.End() % TRACKER_PAGE_SIZE == 0;
+}
+
+bool TextureCache::ViewLevelBytes(const Image& image, const ImageViewInfo& view, uint64_t& begin, uint64_t& end) {
+	const auto& info   = image.info;
+	const auto  levels = info.resources.levels;
+	begin              = 0;
+	end                = 0;
+	if (view.base_level == 0 || levels > info.mip_layout.size() || view.base_level >= levels || view.level_count == 0 ||
+	    view.level_count > levels - view.base_level) {
+		return false;
+	}
+	uint64_t first = UINT64_MAX, last = 0;
+	for (uint32_t level = view.base_level; level < view.base_level + view.level_count; ++level) {
+		first = std::min(first, info.mip_layout[level].offset);
+		last  = std::max(last, info.mip_layout[level].offset + info.mip_layout[level].size);
+	}
+	// Every level whose bytes the range touches is in it whole (the levels of the mip tail share one block).
+	for (bool grew = true; grew;) {
+		grew = false;
+		for (uint32_t level = 0; level < levels; ++level) {
+			const auto& mip = info.mip_layout[level];
+			if (mip.size == 0 || mip.offset >= last || mip.offset + mip.size <= first) {
+				continue;
+			}
+			if (mip.offset < first || mip.offset + mip.size > last) {
+				first = std::min(first, mip.offset);
+				last  = std::max(last, mip.offset + mip.size);
+				grew  = true;
+			}
+		}
+	}
+	// Levels left out (the range is not the whole image), on pages of their own: the range ends on page boundaries.
+	const auto from = info.data.address + first;
+	const auto to   = info.data.address + std::min(last, info.data.size);
+	if (first >= last || from >= to || (first == 0 && last >= info.data.size) || from % TRACKER_PAGE_SIZE != 0 ||
+	    to % TRACKER_PAGE_SIZE != 0) {
+		return false;
+	}
+	begin = from;
+	end   = to;
+	return true;
+}
+
+bool TextureCache::DirtyForView(const Image& image, const ImageDesc& desc) {
+	uint64_t begin = 0, end = 0;
+	return !image.IsPartiallyCpuDirty() || desc.type != BindingType::Texture || !LevelRefreshCandidate(image) ||
+	       !ViewLevelBytes(image, desc.view_info, begin, end) || IntersectsRanges(image.CpuDirtyRanges(), begin, end);
+}
+
+// A sampled view reads its levels only. Of a texture dirty below the view's levels, only the dirty bytes of its levels
+// (and of the levels sharing their pages) are uploaded; the others stay dirty, their pages released (no write faults
+// while the game streams them in), until a view covers them (the game lowers the T#'s base level once a level is
+// loaded). A texture dirty as a whole (new, or after a write that released all its pages) watches the pages of the
+// view's levels alone first.
+bool TextureCache::RefreshTextureLevels(ImageId id, const ImageViewInfo& view) {
+	auto&       image = m_slot_images[id];
+	const auto& info  = image.info;
+	uint64_t    begin = 0, end = 0;
+	if (!image.IsDefinitelyCpuDirty() || image.IsMaybeCpuDirty() || !LevelRefreshCandidate(image) ||
+	    !ViewLevelBytes(image, view, begin, end)) {
+		return false;
+	}
+	const bool whole = !image.IsPartiallyCpuDirty();
+	if (whole ? image.IsTracked()
+	          : image.track_addr != info.data.address || image.track_addr_end != info.data.End()) {
+		return false;
+	}
+	if (!whole && !IntersectsRanges(image.CpuDirtyRanges(), begin, end)) {
+		return true; // its levels are current
+	}
+	// Watched before the guest bytes are read (as RefreshImage's TrackImage): a write after the read faults.
+	if (whole) {
+		image.track_addr     = info.data.address;
+		image.track_addr_end = info.data.End();
+		m_page_manager.UpdatePageWatchers<true>(begin, end - begin);
+		if (info.data.address < begin) Image::AddRange(image.untracked_holes, info.data.address, begin);
+		if (end < info.data.End()) Image::AddRange(image.untracked_holes, end, info.data.End());
+		image.NarrowCpuDirty();
+	} else {
+		RetrackHoles(image, begin, end);
+	}
+	if (!UploadImagePartial(image, begin, end)) {
+		return false; // (RefreshImage watches the rest again and uploads what is dirty)
+	}
+	image.RefreshRangeComplete(begin, end);
+	if (!image.IsCpuDirty()) {
+		RetrackHoles(image);
 	}
 	return true;
 }
@@ -2079,7 +2218,9 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	if (desc.type == BindingType::Storage) {
 		image.MarkGpuModified();
 	}
-	RefreshImage(id);
+	if (desc.type != BindingType::Texture || !RefreshTextureLevels(id, desc.view_info)) {
+		RefreshImage(id);
+	}
 	if (image.info.HasStencil() &&
 	    desc.info.data.address >= image.info.stencil.address &&
 	    desc.info.data.End() <= image.info.stencil.End()) {

@@ -100,9 +100,13 @@ public:
 	// backing and resources of `desc` (a plain color texture: no depth, stencil or metadata).
 	[[nodiscard]] bool IsSampledImageCurrent(ImageId id, const ImageDesc& desc);
 	// Whether FindTexture with `desc` would upload anything first (guest bytes the CPU or a GPU
-	// buffer write changed).
-	[[nodiscard]] static bool RefreshPending(const Image& image) {
-		return image.IsBufferModified() || image.IsCpuDirty();
+	// buffer write changed). A sampled view of a texture whose levels below it stay dirty
+	// (RefreshTextureLevels) needs the bytes of its own levels only.
+	[[nodiscard]] static bool RefreshPending(const Image& image, const ImageDesc& desc) {
+		if (image.IsBufferModified() || image.IsMaybeCpuDirty()) {
+			return true;
+		}
+		return image.IsDefinitelyCpuDirty() && DirtyForView(image, desc);
 	}
 	// Whether a registered image starts exactly at `address` (a texel buffer there is refreshed
 	// from it: BufferCache::SynchronizeBufferFromImage).
@@ -197,8 +201,22 @@ private:
 	void                      RetrackHoles(Image& image);
 	// A refresh that uploaded what was dirty: the released pages are watched again, then the image is clean.
 	void                      FinishRefresh(Image& image);
-	// The dirty subresources alone; false (before any GPU work): the refresh uploads all of the image.
-	[[nodiscard]] bool        UploadImagePartial(Image& image);
+	// The pages of the holes inside [begin, end) only (page-aligned); the other holes stay released.
+	void                      RetrackHoles(Image& image, uint64_t begin, uint64_t end);
+	// The dirty subresources over [window_begin, window_end) alone; false (before any GPU work): the refresh uploads
+	// all of the image.
+	[[nodiscard]] bool        UploadImagePartial(Image& image, uint64_t window_begin = 0,
+	                                             uint64_t window_end = UINT64_MAX);
+	// RefreshPending of a CPU-dirty image: dirty where the binding reads.
+	[[nodiscard]] static bool DirtyForView(const Image& image, const ImageDesc& desc);
+	// Images a sampled view may refresh in its levels only (RefreshTextureLevels).
+	[[nodiscard]] static bool LevelRefreshCandidate(const Image& image);
+	// The guest bytes [begin, end) of the view's levels and every level sharing them, when that leaves levels out whose
+	// pages are theirs alone; false: the view needs the whole image.
+	[[nodiscard]] static bool ViewLevelBytes(const Image& image, const ImageViewInfo& view, uint64_t& begin,
+	                                         uint64_t& end);
+	// A sampled view's refresh of its levels (the others stay dirty); false: RefreshImage's.
+	[[nodiscard]] bool        RefreshTextureLevels(ImageId id, const ImageViewInfo& view);
 	void                      UpdatePartialHashes(Image& image, bool all);
 	[[nodiscard]] bool        CheckPartialHashes(const Image& image);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);

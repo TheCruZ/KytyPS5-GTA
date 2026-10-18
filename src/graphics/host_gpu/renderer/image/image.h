@@ -91,9 +91,8 @@ public:
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
 
 	void MarkCpuDirty() {
-		if (!m_cpu_dirty) {
-			s_cpu_dirty_epoch.fetch_add(1, std::memory_order_relaxed);
-		}
+		// (Also where the image is dirty already: a view that read only its clean part is not clean any more.)
+		s_cpu_dirty_epoch.fetch_add(1, std::memory_order_relaxed);
 		m_cpu_dirty       = true;
 		m_maybe_cpu_dirty = false;
 		DropPartialDirty();
@@ -109,8 +108,8 @@ public:
 		if (!CanTakePartialDirty() || begin >= end) {
 			EXIT("image cannot take a partial CPU write\n");
 		}
+		s_cpu_dirty_epoch.fetch_add(1, std::memory_order_relaxed);
 		if (!m_cpu_dirty) {
-			s_cpu_dirty_epoch.fetch_add(1, std::memory_order_relaxed);
 			m_cpu_dirty     = true;
 			m_partial_dirty = true;
 			m_dirty_ranges.clear();
@@ -122,10 +121,46 @@ public:
 	[[nodiscard]] const std::vector<std::pair<uint64_t, uint64_t>>& CpuDirtyRanges() const noexcept {
 		return m_dirty_ranges;
 	}
+	// A whole-image CPU-dirty state as the one dirty range it amounts to (a refresh of part of it completes that part:
+	// TextureCache::RefreshTextureLevels).
+	void NarrowCpuDirty() {
+		if (!m_cpu_dirty || m_partial_dirty || m_maybe_cpu_dirty) {
+			EXIT("image cannot narrow its dirty state\n");
+		}
+		m_partial_dirty = true;
+		m_dirty_ranges.assign(1, {info.data.address, info.data.End()});
+	}
 	// The whole image must be uploaded again (the image stopped watching all of its pages).
 	void DropPartialDirty() noexcept {
+		if (m_partial_dirty) {
+			s_cpu_dirty_epoch.fetch_add(1, std::memory_order_relaxed);
+		}
 		m_partial_dirty = false;
 		m_dirty_ranges.clear();
+	}
+	// A refresh of [begin, end) only (the levels one view covers): the other ranges stay dirty.
+	void RefreshRangeComplete(uint64_t begin, uint64_t end) {
+		if (!IsPartiallyCpuDirty() || m_maybe_cpu_dirty || begin >= end) {
+			EXIT("image cannot complete a partial refresh\n");
+		}
+		SubtractRange(m_dirty_ranges, begin, end);
+		if (m_dirty_ranges.empty()) {
+			RefreshComplete();
+		}
+	}
+	// Removes [begin, end) from sorted, disjoint ranges.
+	static void SubtractRange(std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t begin, uint64_t end) {
+		std::vector<std::pair<uint64_t, uint64_t>> kept;
+		kept.reserve(ranges.size() + 1);
+		for (const auto& [range_begin, range_end]: ranges) {
+			if (range_end <= begin || range_begin >= end) {
+				kept.emplace_back(range_begin, range_end);
+				continue;
+			}
+			if (range_begin < begin) kept.emplace_back(range_begin, begin);
+			if (end < range_end) kept.emplace_back(end, range_end);
+		}
+		ranges = std::move(kept);
 	}
 	// Sorted, disjoint [begin, end) ranges; merges adjacent and overlapping ones.
 	static void AddRange(std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t begin, uint64_t end) {
