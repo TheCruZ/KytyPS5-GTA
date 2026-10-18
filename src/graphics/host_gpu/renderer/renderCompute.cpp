@@ -935,6 +935,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	ResetBindings();
 }
 
+#include "graphics/host_gpu/renderer/tableUse.inc"
 #include "graphics/host_gpu/renderer/tableDispatch.inc"
 
 } // namespace Libs::Graphics

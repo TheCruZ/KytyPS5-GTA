@@ -10,6 +10,10 @@
 // compiled in table mode for that draw's specializations. A draw whose descriptors select others compiles a variant
 // (a few per frame) or takes the normal path. Native XPR records leave the pairs table draws serve to them.
 //
+// The resolve thread evaluates the blocks and selects the programs ahead of the draw (TableDrawAhead) instead of the
+// normal resolution, reading guest memory through the resolution's log; the execution thread then only gives the
+// buffers their device addresses.
+//
 // Included by renderDraw.cpp.
 
 namespace {
@@ -20,13 +24,6 @@ bool TableXprEnabled() {
 		return value != nullptr && value[0] == '1';
 	}();
 	return enabled;
-}
-
-bool TableXprReadWord(uint64_t address, uint32_t& word) {
-	if ((address & 3u) != 0 || !GuestRange {address, 4}.Valid()) return false;
-	if (Libs::LibKernel::Memory::MayFaultOnGpuRead(address, 4))
-		return Libs::LibKernel::Memory::TryReadAroundGpuWrites(address, &word, 4);
-	return Libs::LibKernel::Memory::TryReadBacking(address, &word, 4);
 }
 
 } // namespace
@@ -45,9 +42,11 @@ struct RenderExecutor::TableDrawCache {
 		     refused_specializations;
 		bool refused = false;
 	};
+	// The execution thread changes pairs and served under the lock; the resolve thread reads them under it.
 	std::unordered_map<uint64_t, Pair> pairs;
 	// Shader address pairs (NativeXprPairOfShaders) some table pair serves: native XPR records leave them.
 	std::unordered_set<uint64_t> served;
+	std::atomic_flag             lock;
 	static constexpr uint32_t    CompileBudget = 4;
 	uint64_t                     budget_frame  = UINT64_MAX;
 	uint32_t                     compiles      = 0;
@@ -55,6 +54,7 @@ struct RenderExecutor::TableDrawCache {
 	std::array<ShaderRecompiler::IR::ResourceSnapshot, 2>       snapshots;
 	std::array<ShaderRecompiler::IR::ResourceSpecialization, 2> specializations;
 	std::vector<uint32_t>                                       key;
+	std::vector<uint32_t>                                       ahead_key; // the resolve thread's
 	std::vector<uint32_t>                                       block;
 
 	bool TakeBudget(uint64_t frame) {
@@ -67,14 +67,14 @@ struct RenderExecutor::TableDrawCache {
 };
 
 RenderExecutor::TableDrawCache& RenderExecutor::TableDrawState() {
-	if (!m_table_draw) {
+	std::call_once(m_table_draw_once, [this] {
 		m_table_draw = {new TableDrawCache {}, [](TableDrawCache* cache) { delete cache; }};
-	}
+	});
 	return *m_table_draw;
 }
 
 bool RenderExecutor::TableDrawServes(const HW::Shader& shaders) {
-	return TableXprEnabled() && m_table_draw && m_table_draw->served.contains(NativeXprPairOfShaders(shaders));
+	return TableXprEnabled() && TableDrawState().served.contains(NativeXprPairOfShaders(shaders));
 }
 
 // The pair's key: both stages' code and static input, and whether the pixel stage runs.
@@ -122,16 +122,27 @@ void RenderExecutor::TableDrawLearn(CommandBuffer& buffer, const DrawRenderState
 	                                     TableDrawExportMapping(ctx, DrawColorOutputMask(ctx)), state.ps_active,
 	                                     vertex_info, pixel_info, vertex_params, pixel_params))
 		return;
-	auto& pair = cache.pairs[TableDrawKey(cache.key, vertex_params, vertex_info, state.ps_active ? &pixel_params : nullptr,
-	                                      pixel_info)];
-	if (pair.refused || !pair.variants.empty() || !cache.TakeBudget(m_context.FrameNumber())) return;
+	const auto key =
+	    TableDrawKey(cache.key, vertex_params, vertex_info, state.ps_active ? &pixel_params : nullptr, pixel_info);
+	auto found = cache.pairs.find(key);
+	if (found != cache.pairs.end() && (found->second.refused || !found->second.variants.empty())) return;
+	if (found == cache.pairs.end()) {
+		const TableLockGuard lock(cache.lock);
+		found = cache.pairs.emplace(key, TableDrawCache::Pair {}).first;
+	}
+	auto&      pair   = found->second;
+	const auto refuse = [&] {
+		const TableLockGuard lock(cache.lock);
+		pair.refused = true;
+	};
+	if (!cache.TakeBudget(m_context.FrameNumber())) return;
 	const auto [vertex_plan, vertex_specialization] = pipelines.ProgramPlanOf(state.programs.vertex[0]);
 	const auto [pixel_plan, pixel_specialization] =
 	    state.ps_active ? pipelines.ProgramPlanOf(state.programs.pixel)
 	                    : std::pair<const ShaderRecompiler::IR::ResourcePlan*,
 	                                const ShaderRecompiler::IR::ResourceSpecialization*> {nullptr, nullptr};
 	if (vertex_plan == nullptr || (state.ps_active && pixel_plan == nullptr)) {
-		pair.refused = true;
+		refuse();
 		return;
 	}
 	TableDrawCache::Variant variant;
@@ -141,7 +152,7 @@ void RenderExecutor::TableDrawLearn(CommandBuffer& buffer, const DrawRenderState
 		variant.pixel = pipelines.CompileTableGraphics(pixel_params, nullptr, &pixel_info, *pixel_specialization, cursor,
 		                                               refusal);
 		if (variant.pixel == nullptr || !variant.pixel->program.bindings.UsesPushData()) {
-			pair.refused = true;
+			refuse();
 			return;
 		}
 		variant.pixel->program.bindings.AdvancePushData(cursor);
@@ -149,159 +160,123 @@ void RenderExecutor::TableDrawLearn(CommandBuffer& buffer, const DrawRenderState
 	variant.vertex = pipelines.CompileTableGraphics(vertex_params, &vertex_info, nullptr, *vertex_specialization, cursor,
 	                                                refusal);
 	if (variant.vertex == nullptr || !variant.vertex->program.bindings.UsesPushData()) {
-		pair.refused = true;
+		refuse();
 		return;
 	}
+	const TableLockGuard lock(cache.lock);
 	pair.vertex_plan = vertex_plan;
 	pair.pixel_plan  = pixel_plan;
 	pair.variants.push_back(variant);
 	cache.served.insert(NativeXprPairOfShaders(sh));
 }
 
-// Evaluates a table program's slots and descriptors for a use, into `snapshot`.
-static bool TableEvaluateStage(const ShaderRecompiler::IR::CompiledShaderInfo& reference,
-                               std::span<const uint32_t>                       user_data,
-                               ShaderRecompiler::IR::ResourceSnapshot&          snapshot) {
-	using Kind        = ShaderRecompiler::IR::TablePlan::Operand::Kind;
-	const auto& plan  = reference.table_plan;
-	auto&       slots = snapshot.flattened_srt;
-	slots.assign(plan.slots.size(), 0);
-	const auto value_of = [&](const ShaderRecompiler::IR::TablePlan::Operand& operand, uint32_t& value) {
-		switch (operand.kind) {
-			case Kind::Immediate: value = operand.value; return true;
-			case Kind::UserData:
-				if (operand.value < reference.user_data_base ||
-				    operand.value - reference.user_data_base >= user_data.size())
-					return false;
-				value = user_data[operand.value - reference.user_data_base];
-				return true;
-			case Kind::Slot:
-				if (operand.value >= slots.size()) return false;
-				value = slots[operand.value];
-				return true;
-			default: return false;
-		}
-	};
-	for (size_t index = 0; index < plan.slots.size(); ++index) {
-		if (plan.cpu[index] == 0) continue;
-		const auto& slot = plan.slots[index];
-		uint32_t    low = 0, high = 0, offset = 0, records = 0;
-		if (!value_of(slot.low, low) || !value_of(slot.high, high)) return false;
-		uint64_t address = 0;
-		if (slot.bounded) {
-			if (!value_of(slot.records, records)) return false;
-			const uint64_t stride = (high >> 16u) & 0x3fffu;
-			const uint64_t range  = stride == 0 ? records : stride * records;
-			if (static_cast<uint64_t>(slot.immediate) + 4u > range) return false;
-			address = (uint64_t {low} | uint64_t {high & 0xffffu} << 32u) + static_cast<uint64_t>(slot.immediate);
-		} else {
-			if (!value_of(slot.offset, offset)) return false;
-			address = ((uint64_t {low} | uint64_t {high} << 32u) & 0xffff'ffff'ffffull) + (offset & ~3u) +
-			          static_cast<int64_t>(slot.immediate);
-		}
-		if (!TableXprReadWord(address, slots[index])) return false;
-	}
-	const auto evaluate = [&](const ShaderRecompiler::IR::TablePlan::Operand* words, uint32_t count,
-	                          ShaderRecompiler::IR::DescriptorValue& value) {
-		value             = {};
-		value.dword_count = count;
-		for (uint32_t word = 0; word < count; ++word)
-			if (!value_of(words[word], value.dwords[word])) return false;
-		return true;
-	};
-	snapshot.buffers.resize(plan.buffers.size());
-	for (size_t i = 0; i < plan.buffers.size(); ++i)
-		if (!evaluate(plan.buffers[i].data(), 4, snapshot.buffers[i])) return false;
-	snapshot.images.resize(plan.images.size());
-	for (size_t i = 0; i < plan.images.size(); ++i)
-		if (!evaluate(plan.images[i].words.data(), plan.images[i].count, snapshot.images[i])) return false;
-	snapshot.samplers.resize(plan.samplers.size());
-	for (size_t i = 0; i < plan.samplers.size(); ++i)
-		if (!evaluate(plan.samplers[i].words.data(), plan.samplers[i].count, snapshot.samplers[i])) return false;
-	snapshot.user_data.assign(user_data.begin(), user_data.end());
-	snapshot.specialization_reads.clear();
-	snapshot.specialization_read_slots.clear();
-	snapshot.image_tables.clear();
-	snapshot.uniform_fill = {};
-	return true;
-}
-
-bool RenderExecutor::TableDrawPrograms(CommandBuffer& buffer, uint32_t color_output_mask, DrawRenderState& state) {
-	m_table_draw_active = false;
-	if (!TableXprEnabled() || !m_table_draw) return false;
-	auto&       cache = *m_table_draw;
-	const auto& ctx   = buffer.GetRegisters();
-	const auto& sh    = buffer.GetShaders();
+// The draw's programs from its table pair, and their resources into `snapshots`; false when the normal path takes it.
+// Ahead of execution (`ahead`) guest memory is read through the resolution's log and no program is compiled.
+bool RenderExecutor::TableDrawSelect(const HW::Context& ctx, const HW::UserConfig& user_config, const HW::Shader& sh,
+                                     uint32_t color_output_mask, DrawRenderState& state,
+                                     ShaderRecompiler::IR::ResourceSnapshot*       snapshots,
+                                     ShaderRecompiler::IR::ResourceSpecialization* specs, ProgramResolution* ahead) {
+	auto&                         cache = TableDrawState();
+	std::optional<TableLockGuard> lock;
+	if (ahead != nullptr) lock.emplace(cache.lock);
 	if (!cache.served.contains(NativeXprPairOfShaders(sh))) return false;
+	lock.reset();
 	ShaderVertexInputInfo vertex_info {};
 	ShaderPixelInputInfo  pixel_info {};
 	ShaderParams          vertex_params, pixel_params;
 	auto&                 pipelines = m_context.GetPipelineCache();
-	if (!pipelines.PrepareGraphicsStages(sh.GetVs(), sh.GetPs(), ctx.GetShaderRegisters(), ctx, buffer.GetUserConfig(),
+	if (!pipelines.PrepareGraphicsStages(sh.GetVs(), sh.GetPs(), ctx.GetShaderRegisters(), ctx, user_config,
 	                                     TableDrawExportMapping(ctx, color_output_mask), state.ps_active, vertex_info,
-	                                     pixel_info, vertex_params, pixel_params))
+	                                     pixel_info, vertex_params, pixel_params, ahead))
 		return false;
-	const auto found = cache.pairs.find(
-	    TableDrawKey(cache.key, vertex_params, vertex_info, state.ps_active ? &pixel_params : nullptr, pixel_info));
-	if (found == cache.pairs.end() || found->second.refused || found->second.variants.empty()) return false;
-	auto&      pair      = found->second;
-	const auto reference = pair.variants.front();
-	auto&       snapshots = cache.snapshots;
-	auto&       specs     = cache.specializations;
-	if (!TableEvaluateStage(reference.vertex->program,
-	                        std::span(vertex_params.user_data).first(vertex_params.user_data_count), snapshots[0]) ||
-	    !pipelines.SpecializeDirectResources(*pair.vertex_plan, snapshots[0], specs[0]))
+	const auto key = TableDrawKey(ahead != nullptr ? cache.ahead_key : cache.key, vertex_params, vertex_info,
+	                              state.ps_active ? &pixel_params : nullptr, pixel_info);
+	const ShaderRecompiler::IR::ResourcePlan* plans[2] {};
+	TableDrawCache::Variant                   reference;
+	if (ahead != nullptr) lock.emplace(cache.lock);
+	{
+		const auto found = cache.pairs.find(key);
+		if (found == cache.pairs.end() || found->second.refused || found->second.variants.empty()) return false;
+		plans[0]  = found->second.vertex_plan;
+		plans[1]  = found->second.pixel_plan;
+		reference = found->second.variants.front();
+	}
+	lock.reset();
+	GuestReadLog* reads = ahead != nullptr ? &ahead->reads : nullptr;
+	if (!TableEvaluate(reference.vertex->program,
+	                   std::span(vertex_params.user_data).first(vertex_params.user_data_count), snapshots[0], reads) ||
+	    !pipelines.SpecializeDirectResources(*plans[0], snapshots[0], specs[0]))
 		return false;
 	if (state.ps_active &&
-	    (!TableEvaluateStage(reference.pixel->program, std::span(pixel_params.user_data).first(pixel_params.user_data_count),
-	                         snapshots[1]) ||
-	     !pipelines.SpecializeDirectResources(*pair.pixel_plan, snapshots[1], specs[1])))
+	    (!TableEvaluate(reference.pixel->program, std::span(pixel_params.user_data).first(pixel_params.user_data_count),
+	                    snapshots[1], reads) ||
+	     !pipelines.SpecializeDirectResources(*plans[1], snapshots[1], specs[1])))
 		return false;
-	const TableDrawCache::Variant* variant = nullptr;
-	for (const auto& candidate: pair.variants) {
-		if (candidate.vertex->specialization == specs[0] &&
-		    (!state.ps_active || candidate.pixel->specialization == specs[1])) {
-			variant = &candidate;
-			break;
-		}
-	}
-	if (variant == nullptr) {
-		const auto refused = std::pair {specs[0], state.ps_active ? specs[1] : ShaderRecompiler::IR::ResourceSpecialization {}};
-		if (std::ranges::find(pair.refused_specializations, refused) != pair.refused_specializations.end() ||
+	const auto matches = [&](const TableDrawCache::Variant& candidate) {
+		return candidate.vertex->specialization == specs[0] &&
+		       (!state.ps_active || candidate.pixel->specialization == specs[1]);
+	};
+	TableDrawCache::Variant variant;
+	if (ahead != nullptr) lock.emplace(cache.lock);
+	auto& pair = cache.pairs.find(key)->second;
+	if (const auto it = std::ranges::find_if(pair.variants, matches); it != pair.variants.end()) variant = *it;
+	lock.reset();
+	if (variant.vertex == nullptr) {
+		const auto refused =
+		    std::pair {specs[0], state.ps_active ? specs[1] : ShaderRecompiler::IR::ResourceSpecialization {}};
+		if (ahead != nullptr ||
+		    std::ranges::find(pair.refused_specializations, refused) != pair.refused_specializations.end() ||
 		    !cache.TakeBudget(m_context.FrameNumber()))
 			return false;
-		TableDrawCache::Variant compiled;
-		std::string             refusal;
-		uint32_t                cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(false, false);
+		std::string refusal;
+		uint32_t    cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(false, false);
 		if (state.ps_active) {
-			compiled.pixel = pipelines.CompileTableGraphics(pixel_params, nullptr, &pixel_info, specs[1], cursor, refusal);
-			if (compiled.pixel != nullptr) compiled.pixel->program.bindings.AdvancePushData(cursor);
+			variant.pixel = pipelines.CompileTableGraphics(pixel_params, nullptr, &pixel_info, specs[1], cursor, refusal);
+			if (variant.pixel != nullptr) variant.pixel->program.bindings.AdvancePushData(cursor);
 		}
-		compiled.vertex = pipelines.CompileTableGraphics(vertex_params, &vertex_info, nullptr, specs[0], cursor, refusal);
-		if (compiled.vertex == nullptr || (state.ps_active && compiled.pixel == nullptr) ||
-		    !compiled.vertex->program.bindings.UsesPushData() ||
-		    !(compiled.vertex->program.table_plan == reference.vertex->program.table_plan) ||
-		    (state.ps_active && (!compiled.pixel->program.bindings.UsesPushData() ||
-		                         !(compiled.pixel->program.table_plan == reference.pixel->program.table_plan)))) {
+		variant.vertex = pipelines.CompileTableGraphics(vertex_params, &vertex_info, nullptr, specs[0], cursor, refusal);
+		const TableLockGuard guard(cache.lock);
+		if (variant.vertex == nullptr || (state.ps_active && variant.pixel == nullptr) ||
+		    !variant.vertex->program.bindings.UsesPushData() ||
+		    !(variant.vertex->program.table_plan == reference.vertex->program.table_plan) ||
+		    (state.ps_active && (!variant.pixel->program.bindings.UsesPushData() ||
+		                         !(variant.pixel->program.table_plan == reference.pixel->program.table_plan)))) {
 			pair.refused_specializations.push_back(refused);
 			return false;
 		}
-		pair.variants.push_back(compiled);
-		variant = &pair.variants.back();
+		pair.variants.push_back(variant);
 	}
-	state.programs           = {};
-	state.programs.vertex[0] = variant->vertex->handle;
-	state.vertex_info        = {};
+	state.programs             = {};
+	state.programs.vertex[0]   = variant.vertex->handle;
+	state.vertex_info          = {};
 	state.vertex_info[0]       = vertex_info;
-	state.vertex_info[0].stage = {.program = &variant->vertex->program, .resources = &snapshots[0]};
+	state.vertex_info[0].stage = {.program = &variant.vertex->program, .resources = &snapshots[0]};
 	state.ps_input_info        = {};
 	if (state.ps_active) {
-		state.programs.pixel      = variant->pixel->handle;
+		state.programs.pixel      = variant.pixel->handle;
 		state.ps_input_info       = pixel_info;
-		state.ps_input_info.stage = {.program = &variant->pixel->program, .resources = &snapshots[1]};
+		state.ps_input_info.stage = {.program = &variant.pixel->program, .resources = &snapshots[1]};
 	}
-	m_table_draw_active = true;
+	state.table = true;
 	return true;
+}
+
+bool RenderExecutor::TableDrawAhead(const HW::Context& context, const HW::UserConfig& user_config,
+                                    const HW::Shader& shaders, uint32_t color_output_mask, DrawRenderState& state,
+                                    ProgramResolution& ahead) {
+	return TableXprEnabled() && user_config.GetPrimType() != Prospero::PrimitiveType::kPatch &&
+	       TableDrawSelect(context, user_config, shaders, color_output_mask, state, ahead.resources.data(),
+	                       ahead.specializations.data(), &ahead);
+}
+
+bool RenderExecutor::TableDrawPrograms(CommandBuffer& buffer, uint32_t color_output_mask, DrawRenderState& state) {
+	m_table_draw_active = false;
+	if (!TableXprEnabled()) return false;
+	auto& cache         = TableDrawState();
+	m_table_draw_active = TableDrawSelect(buffer.GetRegisters(), buffer.GetUserConfig(), buffer.GetShaders(),
+	                                      color_output_mask, state, cache.snapshots.data(),
+	                                      cache.specializations.data(), nullptr);
+	return m_table_draw_active;
 }
 
 // After the stages' bindings (PrepareGraphicsBindings()): each table stage's block, its buffers resolved to device

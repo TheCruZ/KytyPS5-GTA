@@ -14,6 +14,7 @@
 #include <array>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <unordered_map>
@@ -650,10 +651,22 @@ private:
 	// their SRT slots and buffers from a block written for each dispatch, instead of the normal path's resolution.
 	struct TableDispatchCache;
 	std::unique_ptr<TableDispatchCache, void (*)(TableDispatchCache*)> m_table_dispatch {nullptr, nullptr};
+	std::once_flag      m_table_dispatch_once;
 	TableDispatchCache& TableDispatchState();
+	const PipelineCache::TableProgram* TableDispatchSelect(const HW::ComputeShaderInfo& cs,
+	                                                       const HW::ShaderRegisters* sh, bool async_compute,
+	                                                       ShaderRecompiler::IR::ResourceSnapshot&       snapshot,
+	                                                       ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                                                       GuestReadLog*                                 reads);
+	// Resolve thread: the table program of a dispatch and its resources, into `ahead`; null when it has none.
+	const PipelineCache::TableProgram* TableDispatchAhead(const HW::ComputeShaderInfo& cs, bool async_compute,
+	                                                      ProgramResolution& ahead);
+	// Execution thread: the table program and resources a dispatch resolved ahead, when its reads still hold.
+	bool TakeResolvedTable(const PipelineCache::TableProgram*& table, ShaderRecompiler::IR::ResourceSnapshot*& snapshot);
 	// Table draws (tableDraw.inc, KYTY_TABLE_XPR).
 	struct TableDrawCache;
 	std::unique_ptr<TableDrawCache, void (*)(TableDrawCache*)> m_table_draw {nullptr, nullptr};
+	std::once_flag                                             m_table_draw_once;
 	bool m_table_draw_active = false; // the executing draw takes its programs from a table pair
 	TableDrawCache& TableDrawState();
 	// Whether a table pair serves draws of these shaders (native XPR records leave them).
@@ -662,6 +675,13 @@ private:
 	void TableDrawLearn(CommandBuffer& buffer, const DrawRenderState& state);
 	// The draw's programs from its table pair, when there is one: then true.
 	bool TableDrawPrograms(CommandBuffer& buffer, uint32_t color_output_mask, DrawRenderState& state);
+	bool TableDrawSelect(const HW::Context& ctx, const HW::UserConfig& user_config, const HW::Shader& sh,
+	                     uint32_t color_output_mask, DrawRenderState& state,
+	                     ShaderRecompiler::IR::ResourceSnapshot*       snapshots,
+	                     ShaderRecompiler::IR::ResourceSpecialization* specs, ProgramResolution* ahead);
+	// Resolve thread: the draw's programs from its table pair, their resources in `ahead`.
+	bool TableDrawAhead(const HW::Context& context, const HW::UserConfig& user_config, const HW::Shader& shaders,
+	                    uint32_t color_output_mask, DrawRenderState& state, ProgramResolution& ahead);
 	// The table stages' blocks, after their bindings.
 	bool TableDrawBlocks(std::span<PreparedBindings* const> stages);
 	// True when the dispatch was recorded from a table program.

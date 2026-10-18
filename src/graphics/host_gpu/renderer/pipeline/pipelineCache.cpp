@@ -2085,16 +2085,18 @@ bool PipelineCache::PrepareGraphicsStages(const HW::VertexShaderInfo& vertex_reg
                                           std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
                                           bool pixel_active, ShaderVertexInputInfo& vertex_info,
                                           ShaderPixelInputInfo& pixel_info, ShaderParams& vertex_params,
-                                          ShaderParams& pixel_params) {
+                                          ShaderParams& pixel_params, ProgramResolution* ahead) {
 	if (user_config.GetPrimType() == Prospero::PrimitiveType::kPatch || context.HasObjectPrimitiveIdOutput()) {
 		return false;
 	}
+	const ShaderGuestReaderScope reader(ahead != nullptr ? ReadAheadShaderState : nullptr,
+	                                    ahead != nullptr ? &ahead->reads : nullptr);
 	std::array<ShaderVertexInputInfo, 3> vertex_infos {};
 	std::array<ShaderParams, 3>          params {};
 	bool                                 failed = false;
 	PrepareGraphicsStagesImpl(vertex_regs, pixel_regs, sh, context, user_config, target_export_mapping, pixel_active,
-	                          vertex_infos, pixel_info, nullptr, params, pixel_params, failed);
-	if (failed || vertex_infos[0].logical_stage == ShaderType::Mesh) {
+	                          vertex_infos, pixel_info, ahead, params, pixel_params, failed);
+	if (failed || vertex_infos[0].logical_stage == ShaderType::Mesh || (ahead != nullptr && ahead->reads.Failed())) {
 		return false;
 	}
 	vertex_info   = vertex_infos[0];

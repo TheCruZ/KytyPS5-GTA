@@ -256,7 +256,8 @@ public:
 	                           const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
 	                           std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
 	                           bool pixel_active, ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info,
-	                           ShaderParams& vertex_params, ShaderParams& pixel_params);
+	                           ShaderParams& vertex_params, ShaderParams& pixel_params,
+	                           ProgramResolution* ahead = nullptr);
 	// Table draws: a vertex or pixel program in table mode (as CompileTableCompute()), its push data from
 	// `push_data_start_dword`.
 	const TableProgram* CompileTableGraphics(const ShaderParams& params, ShaderVertexInputInfo* vertex_info,
