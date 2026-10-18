@@ -42,6 +42,10 @@ constexpr uint64_t REGION_COUNT = ADDRESS_SIZE / REGION_SIZE;
 
 constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 
+// PageManager::SetUnmappingRange: the range this thread is releasing, [begin, end); empty: none.
+thread_local uint64_t g_unmapping_begin = 0;
+thread_local uint64_t g_unmapping_end   = 0;
+
 [[noreturn]] void FailFast(const char* reason = nullptr) noexcept {
 	std::fputs("PageManager fail-fast: ", stderr);
 	std::fputs(reason != nullptr ? reason : "invalid page state", stderr);
@@ -203,6 +207,18 @@ struct PageManager::Impl {
 	}
 
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
+		const auto end = vaddr + size;
+		if (mode == Common::VirtualMemory::Mode::ReadWrite && g_unmapping_end > g_unmapping_begin &&
+		    vaddr < g_unmapping_end && end > g_unmapping_begin) {
+			// Releases inside the range being unmapped are left to the unmap (SetUnmappingRange).
+			if (vaddr < g_unmapping_begin) ProtectHost(vaddr, g_unmapping_begin - vaddr, mode);
+			if (end > g_unmapping_end) ProtectHost(g_unmapping_end, end - g_unmapping_end, mode);
+			return;
+		}
+		ProtectHost(vaddr, size, mode);
+	}
+
+	void ProtectHost(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
 			      static_cast<uint32_t>(mode));
@@ -327,6 +343,24 @@ void PageManager::SetDeferredProtectionSink(std::vector<std::pair<uint64_t, uint
 
 void PageManager::ReapplyProtection(uint64_t vaddr, uint64_t size) {
 	m_impl->ReapplyProtection(vaddr, size);
+}
+
+void PageManager::SetUnmappingRange(uint64_t begin, uint64_t end) noexcept {
+	g_unmapping_begin = end == 0 ? 0 : begin;
+	g_unmapping_end   = end;
+}
+
+bool PageManager::RestoreIfUnwatched(uint64_t vaddr) noexcept {
+	// A region that does not exist yet never held a watcher: the protection is not ours.
+	auto* region = m_impl->FindRegion(vaddr);
+	if (region == nullptr) {
+		return false;
+	}
+	SpinGuard lock(region->lock);
+	if (region->pages[(vaddr % REGION_SIZE) / PAGE_SIZE].Perms() != Common::VirtualMemory::Mode::ReadWrite) {
+		return false;
+	}
+	return Libs::LibKernel::Memory::RestoreGuestWritable(Common::AlignDown(vaddr, PAGE_SIZE), PAGE_SIZE);
 }
 
 uint64_t PageManager::GetPageSize() const {

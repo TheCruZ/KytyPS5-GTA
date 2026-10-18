@@ -248,6 +248,50 @@ void TestWatchAndUnwatch(uint64_t base = 0x0000000200010000ull) {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+void TestUnmappingRange() {
+  PageManager manager;
+  const auto page_size = manager.GetPageSize();
+  auto *memory = Allocate(page_size * 4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  manager.UpdatePageWatchers<true>(address, page_size * 4);
+  // The unmap's unwatching leaves the host protection of the pages inside the
+  // range; the pages outside get theirs back.
+  PageManager::SetUnmappingRange(address + page_size, address + page_size * 3);
+  manager.UpdatePageWatchers<false>(address, page_size * 4);
+  PageManager::SetUnmappingRange(0, 0);
+  Check(IsWritable(memory) && IsWritable(memory + page_size * 3),
+        "unwatching outside the unmapping range left a protection");
+  Check(!IsWritable(memory + page_size) && !IsWritable(memory + page_size * 2),
+        "unwatching inside the unmapping range changed the host protection");
+  // The unmap failed: the range gets its watchers' protection back.
+  manager.ReapplyProtection(address + page_size, page_size * 2);
+  Check(IsWritable(memory + page_size) && IsWritable(memory + page_size * 2),
+        "ReapplyProtection did not restore the unmapping range");
+
+  // A protection (not the release of one) inside the range is still applied.
+  PageManager::SetUnmappingRange(address, address + page_size * 4);
+  manager.UpdatePageWatchers<true>(address, page_size);
+  PageManager::SetUnmappingRange(0, 0);
+  Check(!IsWritable(memory), "an unmapping range skipped a protection");
+  manager.UpdatePageWatchers<false>(address, page_size);
+  Check(IsWritable(memory), "unwatching after the unmapping range failed");
+
+  // A page nothing watches that kept a protection is repaired; a watched one is not.
+  manager.UpdatePageWatchers<true>(address, page_size * 2);
+  PageManager::SetUnmappingRange(address, address + page_size);
+  manager.UpdatePageWatchers<false>(address, page_size);
+  PageManager::SetUnmappingRange(0, 0);
+  Check(!IsWritable(memory), "the skipped release made the page writable");
+  Check(manager.RestoreIfUnwatched(address) && IsWritable(memory),
+        "RestoreIfUnwatched did not repair an unwatched page");
+  Check(!manager.RestoreIfUnwatched(address + page_size) &&
+            !IsWritable(memory + page_size),
+        "RestoreIfUnwatched repaired a watched page");
+  manager.UpdatePageWatchers<false>(address + page_size, page_size);
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestSharedWatcherCounts() {
   PageManager manager;
   const auto page_size = manager.GetPageSize();
@@ -690,6 +734,10 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
   return ProtectAddressSpace(vaddr, size, mode);
 }
 
+bool RestoreGuestWritable(uint64_t vaddr, uint64_t size) {
+  return ProtectAddressSpace(vaddr, size, Common::VirtualMemory::Mode::ReadWrite);
+}
+
 } // namespace Libs::LibKernel::Memory
 
 int main(int argc, char **argv) {
@@ -698,6 +746,7 @@ int main(int argc, char **argv) {
   }
   TestWatchAndUnwatch();
   TestWatchAndUnwatch(Libs::LibKernel::Memory::kExtendedMemoryBase);
+  TestUnmappingRange();
   TestSharedWatcherCounts();
   TestCrossRegionRange();
   TestBatchedWatcherRanges();

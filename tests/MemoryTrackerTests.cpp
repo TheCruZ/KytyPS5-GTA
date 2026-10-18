@@ -1366,6 +1366,10 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
   return ProtectAddressSpace(vaddr, size, mode);
 }
 
+bool RestoreGuestWritable(uint64_t vaddr, uint64_t size) {
+  return ProtectAddressSpace(vaddr, size, Common::VirtualMemory::Mode::ReadWrite);
+}
+
 } // namespace Libs::LibKernel::Memory
 
 int main(int argc, char **argv) {

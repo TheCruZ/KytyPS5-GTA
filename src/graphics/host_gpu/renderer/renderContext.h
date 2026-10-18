@@ -84,7 +84,11 @@ public:
 	// when the log of unmaps no longer reaches back that far).
 	[[nodiscard]] bool UnmappedSince(uint64_t version, uint64_t vaddr, uint64_t size) const;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
-	void               UnmapMemory(uint64_t vaddr, uint64_t size);
+	// releasing: the range is unmapped or decommitted right after (the trackers' unwatching leaves its host protection to
+	// the unmap, KYTY_UNMAP_PROTECT_SKIP).
+	void               UnmapMemory(uint64_t vaddr, uint64_t size, bool releasing = false);
+	// A releasing UnmapMemory whose unmap failed: the range's pages get their trackers' protection back.
+	void               ReapplyProtection(uint64_t vaddr, uint64_t size) { m_page_manager.ReapplyProtection(vaddr, size); }
 	void               CacheDmaBases(const ShaderStageRuntime& runtime);
 	// Uploads the CPU writes of the guest memory that the device-address reads of the stages can
 	// reach (see ShaderInfo::dma_windows); false when a stage's reach is not known, and nothing

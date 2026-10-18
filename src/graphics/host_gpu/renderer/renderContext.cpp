@@ -9,9 +9,24 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <optional>
 
 namespace Libs::Graphics {
+
+namespace {
+
+// chenxiao07's KYTY_UNMAP_PROTECT_SKIP (default on; 0 restores the protection of every released watcher).
+bool UnmapProtectSkipEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_UNMAP_PROTECT_SKIP");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+} // namespace
 
 RenderContext::RenderContext(GraphicContext& graphics)
     : m_graphics(graphics), m_render_executor(*this),
@@ -69,6 +84,13 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		if (!GuestRange {fault_vaddr, fault_size}.Valid() || !m_page_manager.IsWatched(fault_vaddr)) {
 			return false;
 		}
+	}
+	// No watcher holds the page, so no cache expects this fault: the protection outlived its watchers (a release the
+	// unmap left to the host, KYTY_UNMAP_PROTECT_SKIP, whose unmap did not complete) and would fault forever. It gets
+	// the guest's own protection back.
+	if (access == PageFaultAccess::Write && UnmapProtectSkipEnabled() &&
+	    m_page_manager.RestoreIfUnwatched(fault_vaddr)) {
+		return true;
 	}
 	if (access == PageFaultAccess::Write && GuestGpu::IsGpuThread()) {
 		// A write of the command stream: device-address readers after it must see it.
@@ -178,13 +200,23 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	m_bda_mapped_since_sync.emplace_back(vaddr, size);
 }
 
-void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
+void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size, bool releasing) {
 	if (CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported memory unmap from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	const auto unmap = [this, vaddr, size] {
+	const auto unmap = [this, vaddr, size, releasing] {
+		// Released memory loses its host protection with the mapping: the watchers removed below need not restore it
+		// page run by page run first.
+		struct UnmappingRange {
+			explicit UnmappingRange(uint64_t begin, uint64_t end) { PageManager::SetUnmappingRange(begin, end); }
+			~UnmappingRange() { PageManager::SetUnmappingRange(0, 0); }
+		};
+		std::optional<UnmappingRange> unmapping;
+		if (releasing && UnmapProtectSkipEnabled()) {
+			unmapping.emplace(vaddr, vaddr + size);
+		}
 		// Finishing the GPU protects GPU writes to the range and completions that may write guest
 		// memory there (downloads, write scans). Queued GPU work only reads cached copies and
 		// host-only completions (cache bookkeeping, flips, interrupts) never touch the range, so

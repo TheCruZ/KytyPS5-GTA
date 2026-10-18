@@ -34,6 +34,15 @@ public:
 	static void SetDeferredProtectionSink(std::vector<std::pair<uint64_t, uint64_t>>* sink) noexcept;
 	// Any thread: protects the pages of the range as their watchers say now.
 	void ReapplyProtection(uint64_t vaddr, uint64_t size);
+	// While set on this thread, watchers released inside [begin, end) update the page state without making the pages
+	// writable on the host: the range is about to be unmapped, which drops its protection anyway (a texture pool made
+	// of 64 KiB mappings cost one VirtualProtect per mapping for each image the unmap deleted). Protections are still
+	// applied: a skipped one would leave a watched page writable and writes to it unseen. If the unmap fails, the
+	// caller reapplies the range (ReapplyProtection). end == 0 clears it.
+	static void SetUnmappingRange(uint64_t begin, uint64_t end) noexcept;
+	// A write fault on a page nothing watches: the protection outlived its watchers and would fault forever. The page
+	// gets the guest's own protection back; false when it is not such a page.
+	[[nodiscard]] bool RestoreIfUnwatched(uint64_t vaddr) noexcept;
 
 private:
 	struct Impl;

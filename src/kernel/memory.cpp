@@ -104,14 +104,24 @@ static void MapGpuRange(uint64_t vaddr, uint64_t size) {
 	GetGpuResources().MapMemory(vaddr, size);
 }
 
-static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
+// `releasing`: the range is unmapped or decommitted right after (RenderContext::UnmapMemory).
+static void UnmapGpuRange(uint64_t vaddr, uint64_t size, bool releasing = false) {
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 	if (g_test_gpu_range != nullptr) g_test_gpu_range(false, vaddr, size);
 #endif
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return;
 	}
-	GetGpuResources().UnmapMemory(vaddr, size);
+	GetGpuResources().UnmapMemory(vaddr, size, releasing);
+}
+
+// A releasing UnmapGpuRange left the pages' host protection to the unmap; when the unmap fails
+// they stay mapped, so they get their trackers' protection back.
+static void RestoreGpuRangeProtection(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return;
+	}
+	GetGpuResources().ReapplyProtection(vaddr, size);
 }
 
 static bool DecodeMemoryProtection(int prot, VirtualMemory::Mode* mode, GpuAccessMode* gpu_mode) {
@@ -2873,9 +2883,12 @@ static int UnmapMemoryOwner(const VirtualRanges::Range& range, uint64_t vaddr, s
 }
 
 static int UnmapMemoryRange(const VirtualRanges::Range& range, uint64_t vaddr, size_t len) {
-	UnmapGpuRange(vaddr, len);
+	UnmapGpuRange(vaddr, len, true);
 	const int result = UnmapMemoryOwner(range, vaddr, len);
-	if (result != OK && IsCommittedRangeType(range.type)) MapGpuRange(vaddr, len);
+	if (result != OK) {
+		RestoreGpuRangeProtection(vaddr, len);
+		if (IsCommittedRangeType(range.type)) MapGpuRange(vaddr, len);
+	}
 	return result;
 }
 
@@ -4196,6 +4209,18 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode m
 	       g_guest_address_space->ProtectTransient(vaddr, size, mode);
 }
 
+bool RestoreGuestWritable(uint64_t vaddr, uint64_t size) {
+	VirtualRanges::Range range {};
+	if (g_virtual_ranges == nullptr || g_guest_address_space == nullptr ||
+	    !g_virtual_ranges->Query(vaddr, 0, &range) || (range.protection & PROT_CPU_WRITE) == 0 ||
+	    range.start > vaddr || vaddr + size > range.start + range.size) {
+		return false;
+	}
+	const auto mode = (range.protection & PROT_CPU_EXEC) != 0 ? VirtualMemory::Mode::ExecuteReadWrite
+	                                                          : VirtualMemory::Mode::ReadWrite;
+	return g_guest_address_space->ProtectTransient(vaddr, size, mode);
+}
+
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
@@ -4205,8 +4230,12 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 	}
 	const auto mapped_size = (size + GuestPageSize - 1u) & ~(GuestPageSize - 1u);
 	(void)RequireGuestRuntimeMemory(vaddr, mapped_size);
-	UnmapGpuRange(vaddr, mapped_size);
-	return FreeGuestMemoryOwner(vaddr, mapped_size);
+	UnmapGpuRange(vaddr, mapped_size, true);
+	const bool freed = FreeGuestMemoryOwner(vaddr, mapped_size);
+	if (!freed) {
+		RestoreGpuRangeProtection(vaddr, mapped_size);
+	}
+	return freed;
 }
 
 // The ABI entry points and batch operations hold g_memory_operation_mutex.
@@ -4631,8 +4660,12 @@ int KYTY_SYSV_ABI KernelMemoryPoolDecommit(void* addr, size_t len, int flags) {
 		scan = next;
 	}
 
-	UnmapGpuRange(vaddr, len);
-	return DecommitMemoryPoolRange(vaddr, len);
+	UnmapGpuRange(vaddr, len, true);
+	const int result = DecommitMemoryPoolRange(vaddr, len);
+	if (result != OK) {
+		RestoreGpuRangeProtection(vaddr, len);
+	}
+	return result;
 }
 
 int KYTY_SYSV_ABI KernelMemoryPoolBatch(const KernelMemoryPoolBatchEntry* entries, int num_entries,
