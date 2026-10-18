@@ -35,6 +35,13 @@ public:
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
 	void           FlushAndWait();
+	// A flush nothing waits on: deferred while the GPU has KYTY_FLUSH_DEFER submissions to run.
+	void           DeferrableFlush();
+	// The deferred flush, if one is pending (before the command processor goes idle).
+	void           FlushDeferred();
+	// Execution thread, with a flush deferred: asked every 16 units of `weight` (a draw 1, a dispatch 4), submits the open
+	// buffer once the GPU is down to its last submission (true).
+	[[nodiscard]] bool FlushedDeferred(uint32_t weight);
 	void           Finish();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
@@ -139,6 +146,8 @@ private:
 	};
 
 	void BeginNext();
+	// The submissions the GPU has still to finish (the recording thread's not handed yet included).
+	[[nodiscard]] uint64_t Backlog();
 	void RecordingThread();
 	void SubmitRecorded(vk::CommandBuffer& buffer, size_t buffer_index,
 	                    const RecordedSubmit& recorded);
@@ -178,6 +187,9 @@ private:
 	std::mutex                   m_guest_writes_mutex;
 	std::vector<GuestWrite>      m_guest_writes;
 	uint64_t                     m_next_guest_write     = 0;
+	// DeferrableFlush left the open buffer open (the execution thread's).
+	bool                         m_flush_deferred       = false;
+	uint32_t                     m_deferred_checks      = 0;
 	OperationState               m_operation_state      = OperationState::Open;
 	std::unique_ptr<HostCopyQueue> m_host_copies;
 	SubmitHook                     m_submit_hook      = nullptr;

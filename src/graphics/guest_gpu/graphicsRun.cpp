@@ -46,6 +46,9 @@ static thread_local bool              g_gpu_thread        = false;
 // The command processor thread of a pipelined GPU.
 static thread_local bool              g_cp_thread         = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
+// The command processor thread emitted a flush the scheduler may defer (KYTY_FLUSH_DEFER): it emits the deferred flush
+// before it goes idle.
+static thread_local bool              g_flush_deferrable  = false;
 
 // Operations a pipelined command processor may queue ahead of their execution.
 constexpr size_t OperationQueueSize = 4096;
@@ -713,7 +716,18 @@ void CommandProcessor::BufferFlush() {
 	EmitCallback([this] { GetScheduler().Flush(); });
 }
 
-void CommandProcessor::NoteRecordedWork() {
+void CommandProcessor::BufferFlushDeferrable() {
+	g_flush_deferrable = true;
+	EmitCallback([this] { GetScheduler().DeferrableFlush(); });
+}
+
+void CommandProcessor::BufferFlushDeferred() {
+	EmitCallback([this] { GetScheduler().FlushDeferred(); });
+}
+
+void CommandProcessor::NoteRecordedWork(uint32_t weight) {
+	// A flush deferred while the GPU was busy goes once the GPU is down to its last submission.
+	(void)GetScheduler().FlushedDeferred(weight);
 	const auto tick = GetScheduler().CurrentTick();
 	if (tick != m_batch_tick) {
 		m_batch_tick = tick;
@@ -741,10 +755,11 @@ void CommandProcessor::BufferFlushIfBatchReady() {
 	// Label writes reach guest memory when the packet is executed, and resources are captured
 	// when a draw is recorded, so submitting here only starts the GPU earlier. A submission per
 	// label costs a queue submit and a new command buffer, so wait for a batch of work.
+	g_flush_deferrable = true;
 	EmitCallback([this] {
 		constexpr uint32_t MinBatchWork = 64;
 		if (GetScheduler().CurrentTick() == m_batch_tick && m_batch_work >= MinBatchWork) {
-			GetScheduler().Flush();
+			GetScheduler().DeferrableFlush();
 		}
 	});
 }
@@ -1010,6 +1025,22 @@ void GuestGpu::ThreadRun(void* data) {
 		Common::UniqueFunction<void> command;
 		bool                         has_submission = false;
 		bool                         should_stop    = false;
+		// A flush the scheduler deferred (KYTY_FLUSH_DEFER) goes before the command processor waits for work or for
+		// a blocked queue: nothing else would submit it.
+		if (g_flush_deferrable) {
+			bool runnable = false;
+			{
+				Common::LockGuard lock(gpu->m_queue_mutex);
+				runnable = !gpu->m_commands.empty();
+				for (const auto& queue: gpu->m_queues) {
+					runnable |= !queue.empty() && !queue.front().blocked;
+				}
+			}
+			if (!runnable) {
+				g_flush_deferrable = false;
+				gpu->m_gfx_cp->BufferFlushDeferred();
+			}
+		}
 		if (spin_blocked) {
 			spin_blocked      = false;
 			const auto epoch  = gpu->m_work_epoch.load(std::memory_order_acquire);
@@ -1194,7 +1225,12 @@ bool GuestGpu::Process(Submission& submission) {
 				}
 			}
 			if (progressed) {
-				cp.BufferFlush();
+				// (A slice stopped at a wait goes to the GPU at once: what it waits for may need it.)
+				if (complete) {
+					cp.BufferFlushDeferrable();
+				} else {
+					cp.BufferFlush();
+				}
 			}
 			break;
 		}
@@ -1215,7 +1251,11 @@ bool GuestGpu::Process(Submission& submission) {
 			complete = cp.Process(submission.command_execution, submission.commands) ==
 			           Pm4ProcessResult::Complete;
 			if (submission.command_execution.MadeProgress()) {
-				cp.BufferFlush();
+				if (complete) {
+					cp.BufferFlushDeferrable();
+				} else {
+					cp.BufferFlush();
+				}
 			}
 			break;
 		}
@@ -1863,7 +1903,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 void CommandProcessor::ExecuteDispatchDirect(const GpuOperation& operation, uint32_t thread_group_x,
                                              uint32_t thread_group_y, uint32_t thread_group_z,
                                              uint32_t mode) {
-	NoteRecordedWork();
+	NoteRecordedWork(4);
 
 	if (GraphicsRunDebugDumpEnabled()) {
 		static std::atomic<uint32_t> log_count {0};
@@ -1899,7 +1939,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 
 void CommandProcessor::ExecuteDispatchIndirect(const GpuOperation& operation) {
 	const auto& dispatch = operation.dispatch;
-	NoteRecordedWork();
+	NoteRecordedWork(4);
 	if ((dispatch.mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
 		// Earlier GPU work writes the thread counts: reading them here would wait for it.
 		m_renderer.GetRenderExecutor().DispatchIndirectThreads(operation.submit_id, CurrentBuffer(),

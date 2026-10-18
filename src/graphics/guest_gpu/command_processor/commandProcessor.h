@@ -71,6 +71,10 @@ public:
 
 	void BufferInit();
 	void BufferFlush();
+	// A flush nothing waits on (the end of a slice): the scheduler defers it while the GPU is busy (KYTY_FLUSH_DEFER).
+	void BufferFlushDeferrable();
+	// The deferred flush, if the scheduler left one open.
+	void BufferFlushDeferred();
 	void BufferFlushIfBatchReady();
 	void BufferWait();
 	// Register writes go through these; queued operations keep snapshots of the old values.
@@ -200,7 +204,8 @@ private:
 
 	// Execution side, in operation order. Only these touch the renderer.
 	void BindState(const GpuRegisterState& state);
-	void NoteRecordedWork();
+	// weight: a draw 1, a dispatch 4 (CommandScheduler::FlushedDeferred).
+	void NoteRecordedWork(uint32_t weight = 1);
 	[[nodiscard]] uint32_t ResolveNumInstances(const GpuOperation& operation) const;
 	void ExecuteDrawIndex(const GpuOperation& operation, DrawIndexArgs args);
 	void ExecuteDrawAuto(const GpuOperation& operation, DrawAutoArgs args);

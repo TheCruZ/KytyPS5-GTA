@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <tuple>
@@ -30,6 +31,19 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 	            what, vk::to_string(result).c_str(), static_cast<int>(result), tick, debug_op,
 	            debug_submit, arg0, arg1, arg2, arg3, arg4);
 	std::fflush(stdout);
+}
+
+// chenxiao07's KYTY_FLUSH_DEFER (default 2, 0 flushes at once): the submissions the GPU has still to run for a flush
+// nothing waits on to be deferred.
+uint32_t FlushDeferBacklog() {
+	static const uint32_t backlog = [] {
+		const char* value = std::getenv("KYTY_FLUSH_DEFER");
+		if (value == nullptr) {
+			return 2u;
+		}
+		return static_cast<uint32_t>(std::min<unsigned long>(std::strtoul(value, nullptr, 10), 64ul));
+	}();
+	return backlog;
 }
 
 } // namespace
@@ -214,6 +228,51 @@ void CommandScheduler::FlushAndWait() {
 	const auto tick = Submit();
 	m_master.Wait(tick);
 	BeginNext();
+}
+
+// A flush point nothing waits on (a label without an interrupt, the end of a queue's slice: CommandProcessor::
+// BufferFlushDeferrable) while the GPU has FlushDeferBacklog() (or more) submissions still to run: the buffer stays open,
+// and goes with the next flush, or once the GPU is down to its last submission (FlushedDeferred: asked every 16 draws or
+// 4 dispatches, so it never runs dry waiting for this one), or before the command processor goes idle (FlushDeferred).
+// Each submission costs the GPU a drain between back-to-back command buffers (~8 us) and the recording thread a
+// submission. (The render pass ends as a submission ends it, so the commands after it are recorded as they would be into
+// the next buffer.)
+void CommandScheduler::DeferrableFlush() {
+	if (const auto backlog = FlushDeferBacklog();
+	    backlog != 0 && Active() && !m_command.IsInvalid() && Backlog() >= backlog) {
+		EndRendering();
+		m_flush_deferred = true;
+		return;
+	}
+	Flush();
+}
+
+void CommandScheduler::FlushDeferred() {
+	if (m_flush_deferred) {
+		Flush();
+	}
+}
+
+bool CommandScheduler::FlushedDeferred(uint32_t weight) {
+	if (!m_flush_deferred) {
+		return false;
+	}
+	if ((m_deferred_checks += weight) < 16) {
+		return false;
+	}
+	m_deferred_checks = 0;
+	if (Backlog() > 1) {
+		return false;
+	}
+	Flush();
+	return true;
+}
+
+uint64_t CommandScheduler::Backlog() {
+	m_master.Refresh();
+	const auto submitted = m_master.CurrentTick() - 1;
+	const auto done      = m_master.KnownGpuTick();
+	return submitted > done ? submitted - done : 0;
 }
 
 void CommandScheduler::Finish() {
@@ -477,6 +536,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
+	m_flush_deferred = false;
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 	if (m_submit_hook != nullptr) {
