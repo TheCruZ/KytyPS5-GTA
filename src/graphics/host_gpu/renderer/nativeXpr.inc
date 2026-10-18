@@ -307,20 +307,34 @@ struct RenderExecutor::NativeXprCache {
 
 namespace {
 
-// The shader addresses and the user-data counts.
+// The pair of shader addresses, mixed (a hash of two words is taken several times per draw).
+uint64_t NativeXprPairHash(uint64_t vs, uint64_t ps) {
+	uint64_t h = vs * 0x9e3779b97f4a7c15ull ^ (ps + 0x632be59bd9b4e019ull) * 0xc2b2ae3d27d4eb4full;
+	h ^= h >> 29u;
+	h *= 0xbf58476d1ce4e5b9ull;
+	return h ^ (h >> 32u);
+}
+
+// The shader addresses of a key (its first four words).
 uint64_t NativeXprPairKey(const std::vector<uint32_t>& key) {
-	return key.size() < 4 ? 0 : XXH3_64bits(key.data(), 4 * sizeof(uint32_t));
+	return key.size() < 4 ? 0
+	                      : NativeXprPairHash(key[0] | uint64_t {key[1]} << 32u, key[2] | uint64_t {key[3]} << 32u);
 }
 
 // The pair of shader addresses, as NativeXprPairKey() hashes them.
+uint64_t NativeXprPairOfShaders(const HW::Shader& sh) {
+	const auto es = sh.GetVs().es_regs.data_addr;
+	const auto vs = es != 0 ? es : sh.GetVs().gs_regs.data_addr;
+	return NativeXprPairHash(vs, sh.GetPs().ps_regs.data_addr);
+}
+
 uint64_t NativeXprPairOf(const CommandBuffer& buffer) {
-	const auto& sh = buffer.GetShaders();
-	const auto  es = sh.GetVs().es_regs.data_addr;
-	const auto  vs = es != 0 ? es : sh.GetVs().gs_regs.data_addr;
-	const auto  ps = sh.GetPs().ps_regs.data_addr;
-	const std::array<uint32_t, 4> words {static_cast<uint32_t>(vs), static_cast<uint32_t>(vs >> 32u),
-	                                     static_cast<uint32_t>(ps), static_cast<uint32_t>(ps >> 32u)};
-	return XXH3_64bits(words.data(), sizeof(words));
+	return NativeXprPairOfShaders(buffer.GetShaders());
+}
+
+bool NativeXprResolveSkipEnabled() {
+	static const bool enabled = NativeXprSwitch("KYTY_XPR_RESOLVE_SKIP");
+	return enabled;
 }
 
 // Object identity: both shader addresses and every user-data SGPR (the SRT chains start there).
@@ -1626,9 +1640,24 @@ bool RenderExecutor::NativeXprTryDirect(CommandBuffer& buffer, const DrawIndexAr
 }
 
 // An indexed indirect draw of one object, its arguments read by the host GPU.
+bool RenderExecutor::NativeXprLikely(const HW::Shader& shaders) const noexcept {
+	return NativeXprEnabled() && NativeXprResolveSkipEnabled() &&
+	       m_native_xpr_drawn[NativeXprPairOfShaders(shaders) & (m_native_xpr_drawn.size() - 1)].load(
+	           std::memory_order_relaxed) != 0;
+}
+
 bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, uint64_t args_addr, uint64_t index_base,
                                   uint64_t index_bytes, vk::IndexType index_type) {
-	if (!NativeXprEnabled() || buffer.IsInvalid() || index_base == 0 || index_bytes == 0) return false;
+	if (!NativeXprEnabled() || buffer.IsInvalid()) return false;
+	// The resolve thread skips the resolution ahead of draws of pairs whose last try drew.
+	const auto pair  = NativeXprPairOf(buffer);
+	bool       drawn = false;
+	struct DrawnHint {
+		std::atomic<uint8_t>& slot;
+		const bool&           drawn;
+		~DrawnHint() { slot.store(drawn ? 1 : 0, std::memory_order_relaxed); }
+	} hint {m_native_xpr_drawn[pair & (m_native_xpr_drawn.size() - 1)], drawn};
+	if (index_base == 0 || index_bytes == 0) return false;
 	auto& cache = NativeXprState();
 	m_context.GetCommandScheduler().PopPendingOperations();
 	Common::LockGuard lock(m_context.GetMutex());
@@ -1642,7 +1671,6 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, uint64_t args_addr, uin
 	    ctx.GetColorControl().mode > 1u || (ucfg.GetPrimitiveResetControl() & 0x1u) != 0)
 		return false;
 	const auto frame = m_context.FrameNumber();
-	const auto pair  = NativeXprPairOf(buffer);
 	auto&      use   = cache.pairs[pair];
 	if (use.resting_until > frame || cache.unstorable.contains(pair)) return false;
 	if (++use.tries > NativeXprCache::PairTriesWithoutRecord && use.stored == 0) {
@@ -1739,5 +1767,6 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, uint64_t args_addr, uin
 		return false;
 	}
 	++cache.counters.hits;
+	drawn = true;
 	return true;
 }

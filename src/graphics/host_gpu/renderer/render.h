@@ -280,6 +280,9 @@ public:
 	[[nodiscard]] bool NativeXprTryDirect(CommandBuffer& buffer, const DrawIndexArgs& args);
 	// The draw a try offered is done (drawn or skipped by the normal path).
 	void NativeXprEndDraw() noexcept { m_native_xpr_store = false; }
+	// Resolve thread: whether the last native XPR try of the draw's shader pair drew it. Its
+	// resolution ahead is then likely wasted (KYTY_XPR_RESOLVE_SKIP=0 resolves them all the same).
+	[[nodiscard]] bool NativeXprLikely(const HW::Shader& shaders) const noexcept;
 
 private:
 	struct NativeXprCache;
@@ -646,6 +649,8 @@ private:
 	const DrawIndexArgs* m_native_xpr_direct = nullptr; // the direct draw a try is for
 	// The try of the executing draw asked the normal path to store a record.
 	bool m_native_xpr_store = false;
+	// Per hashed shader pair: its last native XPR try drew (NativeXprLikely()).
+	std::array<std::atomic<uint8_t>, 4096> m_native_xpr_drawn {};
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

@@ -424,9 +424,14 @@ void GuestGpu::ResolveThread() {
 				break;
 			}
 		}
-		if (operation->kind == GpuOperationKind::DrawIndex ||
-		    operation->kind == GpuOperationKind::DrawAuto ||
-		    operation->kind == GpuOperationKind::DrawIndirect) {
+		if ((operation->kind == GpuOperationKind::DrawIndex ||
+		     operation->kind == GpuOperationKind::DrawIndirect) &&
+		    executor.NativeXprLikely(*operation->state.shaders)) {
+			// A native XPR record draws it, most likely: its resolution would go unused, and the
+			// resolutions of the other operations wait behind it.
+		} else if (operation->kind == GpuOperationKind::DrawIndex ||
+		           operation->kind == GpuOperationKind::DrawAuto ||
+		           operation->kind == GpuOperationKind::DrawIndirect) {
 			// The register snapshots stay valid until the operation executed.
 			operation->resolved =
 			    executor.ResolveDrawAhead(*operation->state.context, *operation->state.user_config,
