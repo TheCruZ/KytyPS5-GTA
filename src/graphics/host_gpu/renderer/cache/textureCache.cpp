@@ -266,6 +266,7 @@ void TextureCache::RegisterImage(ImageId id) {
 		m_image_page_table[page].push_back(id);
 	});
 	image.registered = true;
+	++image.registrations;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	image.lru_tick   = m_gc_tick;
 	const auto epoch = ++m_image_set_epoch;

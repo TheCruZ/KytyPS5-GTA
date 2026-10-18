@@ -71,6 +71,13 @@ bool NativeXprVertexBuffersEnabled() {
 	return enabled;
 }
 
+// KYTY_NATIVE_IMAGE_PROOF=0: a record's sampled images are checked again whenever any image was registered or
+// unregistered, instead of only those whose own registration changed.
+bool NativeXprImageProofEnabled() {
+	static const bool enabled = NativeXprSwitch("KYTY_NATIVE_IMAGE_PROOF");
+	return enabled;
+}
+
 bool NativeXprStatsEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_NATIVE_XPR_STATS");
@@ -153,6 +160,7 @@ struct RenderExecutor::NativeXprRecord {
 	struct ImageDep {
 		ImageId                 id;
 		uint64_t                serial = 0;
+		uint32_t                registration = 0; // Image::registrations when the record was proven
 		vk::ImageLayout         layout = vk::ImageLayout::eUndefined;
 		ImageSubresourceRange   range;
 		TextureCache::ImageDesc desc;
@@ -748,7 +756,7 @@ const char* RenderExecutor::NativeXprBindResources(NativeXprRecord& record,
 				return "image_binding";
 			if (!textures.IsSampledImageCurrent(image.image_id, image.desc)) return "image_not_current";
 			const auto& view = image.desc.view_info;
-			image_deps.push_back({image.image_id, owner->serial, image.layout,
+			image_deps.push_back({image.image_id, owner->serial, owner->registrations, image.layout,
 			                      {view.base_level, view.level_count, view.base_layer, view.layer_count},
 			                      image.desc});
 		}
@@ -1194,7 +1202,13 @@ bool RenderExecutor::NativeXprValidateResources(NativeXprRecord& record, uint64_
 			image = textures.m_slot_images.try_get(dep.id);
 			if (image == nullptr || image->serial != dep.serial || TextureCache::RefreshPending(*image)) return false;
 		}
-		if (images_moved && !textures.IsSampledImageCurrent(dep.id, dep.desc)) return false;
+		// An image still in the registration the proof saw keeps the backing and resources it checked (chenxiao07's
+		// KYTY_NATIVE_IMAGE_PROOF): only images registered since are checked again, under the cache's lock.
+		if (images_moved &&
+		    !(NativeXprImageProofEnabled() && image->registered && image->registrations == dep.registration &&
+		      !image->depth_id && !image->binding.needs_rebind) &&
+		    !textures.IsSampledImageCurrent(dep.id, dep.desc))
+			return false;
 		(void)textures.GetImage(dep.id); // LRU, as FindTexture does
 	}
 	record.image_set_epoch   = textures.ImageSetEpoch();

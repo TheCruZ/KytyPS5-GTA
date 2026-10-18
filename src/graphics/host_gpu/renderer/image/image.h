@@ -139,6 +139,8 @@ public:
 
 	// Unique per image object (an ImageId slot can hold another image later).
 	uint64_t         serial = s_next_serial.fetch_add(1, std::memory_order_relaxed) + 1;
+	// Times the image was registered (TextureCache::RegisterImage()).
+	uint32_t         registrations = 0;
 	ImageInfo        info;
 	VulkanImage      backing;
 	std::vector<CachedImageView> views;
