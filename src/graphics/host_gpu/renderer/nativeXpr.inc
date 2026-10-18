@@ -44,11 +44,24 @@ bool NativeXprEnabled() {
 	return enabled;
 }
 
-// KYTY_NATIVE_XPR_RELOCATE=1: relocated records (see the top of this file). Off by default: in
-// GTA V nearly every use rebinds moved buffers (a new set) and its normal path is cheaper.
+// KYTY_NATIVE_XPR_RELOCATE=0: no relocated records (see the top of this file). On by default, as chenxiao07's
+// Demon's Souls launcher sets it (native XPR draws are Demon's Souls' only; in GTA V nearly every use rebinds moved
+// buffers, a new set, and its normal path is cheaper).
 bool NativeXprRelocateEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_NATIVE_XPR_RELOCATE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// chenxiao07's KYTY_NATIVE_XPR_INSTANCES (=1; off by default here): the instances of a mesh (the same programs and
+// descriptor shape, other buffers) keep a relocated record each whatever order a frame draws them in, instead of
+// rebinding one record's buffers (a new set) for each. With it Demon's Souls crashed in the driver on entering the
+// game (2 of 2 runs; an access violation at a bad address): not understood yet.
+bool NativeXprInstancesEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_NATIVE_XPR_INSTANCES");
 		return value != nullptr && value[0] == '1';
 	}();
 	return enabled;
@@ -365,7 +378,7 @@ struct RenderExecutor::NativeXprCache {
 		uint64_t target_object = 0, target_lookup = 0, rebinds = 0;
 		uint64_t relocated_hits = 0, relocated_rebinds = 0, relocated_unresolved = 0, relocated_miss = 0,
 		         relocated_stored = 0, relocated_broken = 0;
-		uint64_t budget_denied = 0, pipeline_pending = 0;
+		uint64_t budget_denied = 0, pipeline_pending = 0, relocated_instances = 0;
 	} counters;
 	std::unordered_map<std::string_view, uint64_t> refuse_reasons;
 	~NativeXprCache() {
@@ -1646,6 +1659,12 @@ RenderExecutor::NativeXprRecord* RenderExecutor::NativeXprRelocated(uint64_t fra
 		++cache.counters.relocated_miss;
 		// (By shape: buffer bases that move every frame are rebound.)
 		if (NativeXprCache::SeenAgainIn(cache.relocated_seen, shape, frame)) ask_store();
+		return nullptr;
+	}
+	// The record of the shape already drew another instance this frame: this one gets a record of its own.
+	if (moved && record->used_frame == frame && NativeXprInstancesEnabled()) {
+		++cache.counters.relocated_instances;
+		ask_store();
 		return nullptr;
 	}
 	// The resolution's constants: the flattened SRT and the user data part of the shader data (the
