@@ -6,13 +6,88 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include <condition_variable>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <numeric>
+#include <thread>
+#include <vector>
 #include <vk_mem_alloc.h>
 
 namespace Libs::Graphics {
 
 namespace {
+
+// chenxiao07's KYTY_BUFFER_RECLAIM (default on; 0 destroys them where they are released): a retired buffer's memory
+// is freed on a worker thread. Freeing a dedicated allocation is a kernel call (~0.1 ms on Windows) the render thread
+// paid for every such buffer the cache retired while the game streams. VMA synchronizes internally, and a buffer is
+// destroyed only after the GPU is done with it.
+class BufferReclaimer {
+public:
+	~BufferReclaimer() {
+		{
+			std::lock_guard lock(m_mutex);
+			m_stop = true;
+		}
+		m_wake.notify_one();
+		if (m_thread.joinable()) m_thread.join();
+	}
+	void Push(VmaAllocator allocator, VkBuffer buffer, VmaAllocation allocation) {
+		{
+			std::lock_guard lock(m_mutex);
+			if (!m_thread.joinable()) m_thread = std::thread([this] { Run(); });
+			m_pending.push_back({allocator, buffer, allocation});
+		}
+		m_wake.notify_one();
+	}
+	// Returns once every pushed buffer is destroyed (before the allocator goes away).
+	void Flush() {
+		std::unique_lock lock(m_mutex);
+		m_idle.wait(lock, [this] { return m_pending.empty() && !m_busy; });
+	}
+
+private:
+	struct Item {
+		VmaAllocator  allocator;
+		VkBuffer      buffer;
+		VmaAllocation allocation;
+	};
+	void Run() {
+		std::vector<Item> batch;
+		std::unique_lock  lock(m_mutex);
+		for (;;) {
+			m_wake.wait(lock, [this] { return m_stop || !m_pending.empty(); });
+			if (m_pending.empty() && m_stop) return;
+			batch.swap(m_pending);
+			m_busy = true;
+			lock.unlock();
+			for (const auto& item: batch) vmaDestroyBuffer(item.allocator, item.buffer, item.allocation);
+			batch.clear();
+			lock.lock();
+			m_busy = false;
+			m_idle.notify_all();
+		}
+	}
+	std::mutex              m_mutex;
+	std::condition_variable m_wake, m_idle;
+	std::vector<Item>       m_pending;
+	bool                    m_busy = false, m_stop = false;
+	std::thread             m_thread;
+};
+
+BufferReclaimer& Reclaimer() {
+	static BufferReclaimer reclaimer;
+	return reclaimer;
+}
+
+bool BufferReclaimEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BUFFER_RECLAIM");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
 
 constexpr size_t WATCHES_INITIAL_RESERVE = 0x4000;
 constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
@@ -111,8 +186,16 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 Buffer::~Buffer() {
 	if (m_buffer != nullptr) {
-		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
+		if (BufferReclaimEnabled()) {
+			Reclaimer().Push(m_graphics->allocator, m_buffer, m_allocation);
+		} else {
+			vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
+		}
 	}
+}
+
+void FlushBufferReclaimer() {
+	Reclaimer().Flush();
 }
 
 vk::DeviceAddress Buffer::BufferDeviceAddress() const noexcept {

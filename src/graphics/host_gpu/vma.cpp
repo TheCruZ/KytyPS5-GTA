@@ -80,6 +80,8 @@ void DestroyRecycledImages(VmaAllocator allocator) {
 
 } // namespace
 
+void FlushBufferReclaimer(); // streamBuffer.cpp (KYTY_BUFFER_RECLAIM)
+
 bool GraphicContext::CreateAllocator() {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(instance == nullptr || physical_device == nullptr || device == nullptr ||
@@ -112,6 +114,7 @@ void GraphicContext::DestroyAllocator() {
 	if (allocator == nullptr) {
 		return;
 	}
+	FlushBufferReclaimer();
 	DestroyRecycledImages(allocator);
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
