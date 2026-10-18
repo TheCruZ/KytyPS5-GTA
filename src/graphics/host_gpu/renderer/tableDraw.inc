@@ -1201,10 +1201,32 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, uint
 	return TableDraw(buffer, pair, *variant, draw_state, args_addr, index_base, index_bytes, index_type, direct);
 }
 
+// KYTY_TABLE_XPR=2: a clean draw (no register but user data and index state changed since the draw before:
+// GpuOperation::clean) right after a table draw whose emission is the last one in the command buffer has that draw's
+// pair, variant and draw state, with its pipeline and dynamic state still bound: no pair, state key or variant lookup.
+bool RenderExecutor::TableContinue(CommandBuffer& buffer, uint64_t args_addr, uint64_t index_base,
+                                   uint64_t index_bytes, vk::IndexType index_type, const DrawIndexArgs* direct) {
+	if (!m_table_xpr || !m_native_xpr) return false;
+	auto& table = *m_table_xpr;
+	auto* pair  = table.last_pair;
+	if (pair == nullptr || table.last_state == nullptr || table.last_variant >= pair->variants.size() ||
+	    pair->generation != ShaderMapGeneration())
+		return false;
+	const auto& sh = buffer.GetShaders();
+	if (sh.GetVs().es_regs.data_addr != pair->vs || sh.GetPs().ps_regs.data_addr != pair->ps) return false;
+	auto&       variant = pair->variants[table.last_variant];
+	const auto& emit    = m_native_xpr->emit;
+	if (emit.generation != m_context.GetCommandScheduler().GetDynamicState().Generation() ||
+	    emit.state != table.last_state || emit.pipeline != variant.pipeline || variant.pipeline == nullptr)
+		return false;
+	if (!NativeXprTargetsCurrent(*table.last_state)) return false;
+	return TableDraw(buffer, *pair, variant, *table.last_state, args_addr, index_base, index_bytes, index_type,
+	                 direct) == TableResult::Drawn;
+}
+
 bool RenderExecutor::TableXprTry(CommandBuffer& buffer, uint64_t args_addr, uint64_t index_base,
                                  uint64_t index_bytes, vk::IndexType index_type, const DrawIndexArgs* direct,
                                  bool clean) {
-	(void)clean;
 	m_table_store   = false;
 	m_table_claimed = false;
 	if (TableXprMode() == 0 || buffer.IsInvalid()) return false;
@@ -1222,7 +1244,10 @@ bool RenderExecutor::TableXprTry(CommandBuffer& buffer, uint64_t args_addr, uint
 	m_context.GetCommandScheduler().PopPendingOperations();
 	Common::LockGuard lock(m_context.GetMutex());
 	NativeXprCollect();
-	const auto result = TableTry(buffer, args_addr, index_base, index_bytes, index_type, direct);
+	const auto result =
+	    TableXprMode() >= 2 && clean && TableContinue(buffer, args_addr, index_base, index_bytes, index_type, direct)
+	        ? TableResult::Drawn
+	        : TableTry(buffer, args_addr, index_base, index_bytes, index_type, direct);
 	// (The resolve thread skips the resolution ahead of draws of pairs whose last try drew: NativeXprLikely.)
 	m_native_xpr_drawn[NativeXprPairOfShaders(buffer.GetShaders()) & (m_native_xpr_drawn.size() - 1)].store(
 	    result == TableResult::Drawn ? 1 : 0, std::memory_order_relaxed);

@@ -97,6 +97,9 @@ struct GpuOperation {
 	// The guest ordered the operation after the earlier work of its queue (ACQUIRE_MEM or
 	// WAIT_REG_MEM since the operation before).
 	bool guest_sync = true;
+	// An indexed draw no graphics register but user data changed for since the indexed draw before it
+	// (DrawStateObserver; KYTY_TABLE_XPR=2): RenderExecutor::TableXprTry continues the last table draw's run.
+	bool clean = false;
 	union {
 		DrawIndexArgs       draw_index;
 		DrawAutoArgs        draw_auto;

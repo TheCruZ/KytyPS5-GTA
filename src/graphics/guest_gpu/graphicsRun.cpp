@@ -98,6 +98,15 @@ static void CopyFromGuest(void* destination, const volatile void* source, size_t
 	}
 }
 
+// KYTY_TABLE_XPR=2: table draws continue runs of clean draws (DrawStateObserver, RenderExecutor::TableXprTry).
+static bool TableContinueEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TABLE_XPR");
+		return value != nullptr && value[0] == '2';
+	}();
+	return enabled;
+}
+
 static bool GraphicsRunDebugDumpEnabled() {
 	return Config::GraphicsDebugDumpEnabled() &&
 	       Config::GetPrintfDirection() != Config::LogDirection::Silent;
@@ -489,6 +498,10 @@ void CommandProcessor::Reset() {
 	m_user_data_marker                 = HW::UserSgprType::Unknown;
 	m_draw_indirect_args_base_addr     = 0;
 	m_dispatch_indirect_args_base_addr = 0;
+	if (TableContinueEnabled()) {
+		if (m_draw_observer == nullptr) m_draw_observer = std::make_unique<DrawStateObserver>();
+		m_draw_observer->Invalidate();
+	}
 
 	std::memset(m_const_ram, 0, sizeof(m_const_ram));
 }
@@ -526,6 +539,9 @@ GpuOperation CommandProcessor::MakeOperation(GpuOperationKind kind) {
 	operation.num_instances = m_num_instances;
 	operation.after_wait    = std::exchange(m_wait_since_operation, false);
 	operation.guest_sync    = std::exchange(m_acquire_since_operation, false) || operation.after_wait;
+	operation.clean         = m_draw_observer != nullptr &&
+	                          (kind == GpuOperationKind::DrawIndex || kind == GpuOperationKind::DrawIndirect) &&
+	                          m_draw_observer->LastClean();
 	if (m_pipeline == nullptr) {
 		operation.state = {&m_ctx, &m_ucfg, &m_sh_ctx};
 	} else if (kind == GpuOperationKind::Callback) {
@@ -1381,6 +1397,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
 			auto packet_dw = KYTY_PM4_LEN(packet_header);
 			EXIT_NOT_IMPLEMENTED(packet_dw == 0 || packet_dw > remaining_dw);
+			if (m_draw_observer != nullptr) m_draw_observer->ObservePacket(opcode, packet, packet_dw, true);
 			static std::atomic<uint32_t> skip_log_count {0};
 			if (skip_log_count.fetch_add(1) < 2048) {
 				LOGF("\t predicated skip: op=0x%02" PRIx32 ", r=0x%02" PRIx32 ", len=%" PRIu32
@@ -1406,6 +1423,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		auto handler = g_cp_op_func[opcode];
+		if (m_draw_observer != nullptr) {
+			m_draw_observer->ObservePacket(opcode, packet, std::min(KYTY_PM4_LEN(packet_header), remaining_dw), false);
+		}
 
 		if (handler == nullptr) {
 			const auto offset = total_dw - remaining_dw;
@@ -1582,7 +1602,7 @@ void CommandProcessor::ExecuteDrawIndex(const GpuOperation& operation, DrawIndex
 	// A direct draw of an object may come from its native XPR record (nativeXpr.inc); indirect
 	// ones were offered in TryExecuteDrawIndirectOnGpu().
 	if (args.gpu_indirect == nullptr &&
-	    (executor.TableXprTry(CurrentBuffer(), 0, 0, 0, vk::IndexType::eUint16, &args, false) ||
+	    (executor.TableXprTry(CurrentBuffer(), 0, 0, 0, vk::IndexType::eUint16, &args, operation.clean) ||
 	     executor.NativeXprTryDirect(CurrentBuffer(), args))) {
 		return;
 	}
@@ -1782,7 +1802,7 @@ bool CommandProcessor::TryExecuteDrawIndirectOnGpu(const GpuOperation& operation
 		const auto index_type = indirect.index_type == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
 		if (indirect.count_addr == nullptr && indirect.max_count == 1 &&
 		    (executor.TableXprTry(CurrentBuffer(), args_addr, indirect.index_base, index_bytes, index_type, nullptr,
-		                          false) ||
+		                          operation.clean) ||
 		     executor.NativeXprTry(CurrentBuffer(), args_addr, indirect.index_base, index_bytes, index_type))) {
 			NoteRecordedWork();
 			return true;

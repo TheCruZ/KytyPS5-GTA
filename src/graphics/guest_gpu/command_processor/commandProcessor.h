@@ -2,6 +2,7 @@
 #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_COMMAND_PROCESSOR_H
 
 #include "common/assert.h"
+#include "graphics/guest_gpu/command_processor/drawStateObserver.h"
 #include "graphics/guest_gpu/command_processor/gpuOperation.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -267,6 +268,9 @@ private:
 	uint64_t         m_dispatch_indirect_args_base_addr = 0;
 	// Persistent draw state: indirect draws update it for subsequent draws when they execute.
 	GpuNumInstances m_num_instances;
+	// Whether the graphics registers changed between indexed draws (table draws' runs, KYTY_TABLE_XPR=2); null when
+	// table draws do not continue runs.
+	std::unique_ptr<DrawStateObserver> m_draw_observer;
 
 	uint32_t m_de_count    = 0;
 	uint32_t m_ce_count    = 0;
