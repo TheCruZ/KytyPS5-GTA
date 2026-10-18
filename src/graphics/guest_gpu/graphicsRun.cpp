@@ -2170,8 +2170,24 @@ void CommandProcessor::EmitGlobalBarrier() {
 	EmitCallback([this] { ExecuteGlobalBarrier(); });
 }
 
+// A global barrier orders all the work recorded before it: a second one with nothing recorded in between orders
+// nothing more (chenxiao07's KYTY_GLOBAL_BARRIER_DEDUPE; any command counts, state binds included).
+static bool GlobalBarrierDedupeEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GLOBAL_BARRIER_DEDUPE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 void CommandProcessor::ExecuteGlobalBarrier() {
 	Common::LockGuard lock(m_renderer.GetMutex());
+	const auto        recorder = CurrentBuffer().Handle();
+	const auto*       stream   = recorder.Stream();
+	if (GlobalBarrierDedupeEnabled() && stream != nullptr && stream == m_barrier_stream &&
+	    stream->CommandCount() == m_barrier_commands) {
+		return;
+	}
 
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
@@ -2184,6 +2200,8 @@ void CommandProcessor::ExecuteGlobalBarrier() {
 	dependency.pMemoryBarriers    = &barrier;
 	GetScheduler().EndRendering();
 	CurrentBuffer().Handle().pipelineBarrier2(dependency);
+	m_barrier_stream   = CurrentBuffer().Handle().Stream();
+	m_barrier_commands = m_barrier_stream != nullptr ? m_barrier_stream->CommandCount() : 0;
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {

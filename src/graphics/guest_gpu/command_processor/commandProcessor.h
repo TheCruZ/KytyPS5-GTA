@@ -296,6 +296,9 @@ private:
 	// Draws and dispatches recorded into the command buffer of m_batch_tick.
 	uint64_t m_batch_tick = 0;
 	uint32_t m_batch_work = 0;
+	// The stream and its command count after the last global barrier (KYTY_GLOBAL_BARRIER_DEDUPE).
+	const CommandStream* m_barrier_stream   = nullptr;
+	uint64_t             m_barrier_commands = 0;
 	// The instance count of the last executed indirect draw, and the NUM_INSTANCES sequence it
 	// followed.
 	uint32_t m_indirect_instances         = 0;

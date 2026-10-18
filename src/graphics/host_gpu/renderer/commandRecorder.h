@@ -212,6 +212,8 @@ public:
 	explicit CommandRecorder(CommandStream* stream) noexcept: m_stream(stream) {}
 
 	[[nodiscard]] bool IsDirect() const noexcept { return m_stream == nullptr; }
+	// The stream a deferred recorder appends to (null for a direct one).
+	[[nodiscard]] const CommandStream* Stream() const noexcept { return m_stream; }
 	[[nodiscard]] bool operator==(std::nullptr_t) const noexcept {
 		return m_stream == nullptr && m_direct == nullptr;
 	}
