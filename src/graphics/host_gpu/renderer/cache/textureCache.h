@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <array>
+#include <atomic>
 #include <bitset>
 #include <map>
 #include <memory>
@@ -140,6 +141,24 @@ private:
 	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 44, 14>;
 	static_assert(ImagePageTable::kPageBits == ImagePageBits);
 
+	// Registered images per page of the image page table. Written under m_lock, read without it.
+	class RegisteredPageCounts final {
+	public:
+		RegisteredPageCounts() = default;
+		~RegisteredPageCounts();
+		KYTY_CLASS_NO_COPY(RegisteredPageCounts);
+
+		void               Add(size_t page, int32_t delta);
+		[[nodiscard]] bool Any(size_t first, size_t last_exclusive) const noexcept;
+
+	private:
+		static constexpr size_t kLeafBits = 10;
+		static constexpr size_t kLeafSize = size_t {1} << kLeafBits;
+		using Leaf                        = std::array<std::atomic<uint32_t>, kLeafSize>;
+
+		std::array<std::atomic<Leaf*>, ImagePageTable::kPageCount / kLeafSize> m_leaves {};
+	};
+
 	// Callers have validated the nonempty 44-bit range with TryGetPageRange.
 	template <typename Func>
 	static void ForEachPage(uint64_t address, size_t size, Func&& func) {
@@ -233,6 +252,7 @@ private:
 	MultiLevelPageTable<uint64_t, ImagePageTable::kPageBits, ImagePageTable::kAddressSpaceBits,
 	                    ImagePageTable::kFirstLevelBits>
 	    m_image_page_epochs;
+	RegisteredPageCounts                              m_registered_pages;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	// Depth image -> its depth feedback copy (see CopyDepthForFeedback).
