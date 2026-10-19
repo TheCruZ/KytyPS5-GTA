@@ -711,8 +711,10 @@ private:
 	                bool storable);
 	// Table dispatches (tableDispatch.inc, KYTY_TABLE_DISPATCH): true when the dispatch was recorded from its pair's
 	// table program and image set.
+	// (`indirect_args`: an indirect dispatch's arguments' address, x, y and z unused; `thread_dimensions`: x, y and z
+	// count threads.)
 	bool TableDispatch(CommandBuffer& buffer, const HW::ComputeShaderInfo& cs, uint32_t x, uint32_t y, uint32_t z,
-	                   bool async_compute);
+	                   bool async_compute, uint64_t indirect_args = 0, bool thread_dimensions = false);
 	// After the normal path's lookup of a dispatch's program (`special`: a special path of the normal path takes the
 	// shader): its pair's table program, compiled for its specialization when table mode can serve the program.
 	void TableDispatchLearn(const HW::ComputeShaderInfo& cs, const HW::ShaderRegisters& sh,

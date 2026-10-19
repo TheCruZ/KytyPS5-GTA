@@ -2257,10 +2257,11 @@ bool PipelineCache::EnumerateTableIndirect(const ShaderRecompiler::IR::ResourceP
 
 std::shared_ptr<PipelineCache::TableTicket> PipelineCache::CompileTableComputeAsync(
     const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh, bool async_compute,
-    const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+    const ShaderRecompiler::IR::ResourceSpecialization& specialization, bool thread_dimensions) {
 	auto                   ticket = std::make_shared<TableTicket>();
 	ShaderComputeInputInfo input_info {};
 	input_info.async_compute      = async_compute;
+	input_info.dispatch_thread_dimensions = thread_dimensions;
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto params             = PrepareProgram(regs, sh, input_info);
 	input_info.lds_storage        = input_info.lds_size_dwords * 4u >

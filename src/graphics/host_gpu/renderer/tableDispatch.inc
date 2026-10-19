@@ -21,8 +21,22 @@ bool TableDispatchEnabled() {
 	return enabled;
 }
 
-uint64_t TableDispatchKey(const HW::ComputeShaderInfo& cs, bool async_compute) {
-	return XXH3_64bits_withSeed(&cs.cs_regs, sizeof(cs.cs_regs), async_compute ? 1u : 0u);
+uint64_t TableDispatchKey(const HW::ComputeShaderInfo& cs, bool async_compute, bool thread_dimensions) {
+	return XXH3_64bits_withSeed(&cs.cs_regs, sizeof(cs.cs_regs), (async_compute ? 1u : 0u) | (thread_dimensions ? 2u : 0u));
+}
+
+// chenxiao07's table dispatches also take indirect dispatches (vkCmdDispatchIndirect, the arguments read by the GPU,
+// as the normal path's DispatchIndirect) and dispatches of thread counts (their groups, the counts in the program's
+// shader data): KYTY_TABLE_DISPATCH_INDIRECT and KYTY_TABLE_DISPATCH_THREADS (default 1; 0 leaves them to the normal
+// path as before).
+bool TableDispatchIndirectEnabled() {
+	static const bool enabled = NativeXprSwitch("KYTY_TABLE_DISPATCH_INDIRECT");
+	return enabled;
+}
+
+bool TableDispatchThreadsEnabled() {
+	static const bool enabled = NativeXprSwitch("KYTY_TABLE_DISPATCH_THREADS");
+	return enabled;
 }
 
 // chenxiao07's table dispatches write storage images (the async culling chain's, the downsampling passes'): the set
@@ -35,14 +49,15 @@ bool TableDispatchStorageEnabled() {
 
 // What table dispatches serve: a table program whose shader data fits the push constants and whose set holds only
 // images, samplers and the page table (TableResolveSet). Null, or why not.
-const char* TableDispatchRefusal(const PipelineCache::TableProgram* table) {
+const char* TableDispatchRefusal(const PipelineCache::TableProgram* table, bool thread_dimensions) {
 	if (table == nullptr) return "no table mode program";
 	const auto& program = table->program;
 	using Kind          = ShaderRecompiler::IR::DescriptorBindingKind;
 	if (!program.table_mode) return "no table mode program";
 	if (!program.bindings.UsesPushData()) return "shader data that does not fit the push constants";
 	if (program.info.uses_gds) return "GDS";
-	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) return "thread counts";
+	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart && !thread_dimensions)
+		return "thread counts";
 	if (table->input_info.lds_storage || program.bindings.descriptor_counts[static_cast<size_t>(Kind::SharedMemory)] != 0)
 		return "LDS storage";
 	for (const auto& image: program.info.images) {
@@ -59,11 +74,17 @@ const char* TableDispatchRefusal(const PipelineCache::TableProgram* table) {
 void RenderExecutor::TableDispatchLearn(const HW::ComputeShaderInfo& cs, const HW::ShaderRegisters& sh,
                                         const ShaderComputeInputInfo& input_info, const ShaderProgram& compute_program,
                                         bool async_compute, bool special) {
-	if (!TableDispatchEnabled() || input_info.dispatch_thread_dimensions || input_info.stage.program == nullptr) return;
+	const bool thread_dimensions = input_info.dispatch_thread_dimensions;
+	if (!TableDispatchEnabled() || (thread_dimensions && !TableDispatchThreadsEnabled()) ||
+	    input_info.dispatch_indirect_threads || input_info.stage.program == nullptr)
+		return;
 	auto& table           = OwnTable();
-	auto [found, fresh]   = table.dispatches.try_emplace(TableDispatchKey(cs, async_compute));
+	auto [found, fresh]   = table.dispatches.try_emplace(TableDispatchKey(cs, async_compute, thread_dimensions));
 	auto& pair            = found->second;
-	if (fresh) pair.vs = cs.cs_regs.data_addr;
+	if (fresh) {
+		pair.vs                = cs.cs_regs.data_addr;
+		pair.thread_dimensions = thread_dimensions;
+	}
 	pair.used_frame = m_context.FrameNumber();
 	if (pair.refused || pair.programs[0] != nullptr || pair.pending != nullptr || pair.vs != cs.cs_regs.data_addr)
 		return;
@@ -75,19 +96,21 @@ void RenderExecutor::TableDispatchLearn(const HW::ComputeShaderInfo& cs, const H
 	const bool fill = input_info.stage.resources != nullptr &&
 	                  input_info.stage.resources->uniform_fill.kind != ShaderRecompiler::IR::UniformFillKind::None;
 	if (special || fill || plan == nullptr || specialization == nullptr || program.info.uses_gds ||
-	    program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
+	    (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart && !thread_dimensions)) {
 		pair.refused = true;
 		return;
 	}
 	pair.plans       = {plan, nullptr};
 	pair.code_hashes = {ShaderHashAt(pair.vs), 0};
 	pair.generation  = ShaderMapGeneration();
-	pair.pending     = pipelines.CompileTableComputeAsync(cs, sh, async_compute, *specialization);
+	pair.pending     = pipelines.CompileTableComputeAsync(cs, sh, async_compute, *specialization, thread_dimensions);
 }
 
 bool RenderExecutor::TableDispatch(CommandBuffer& buffer, const HW::ComputeShaderInfo& cs, uint32_t x, uint32_t y,
-                                   uint32_t z, bool async_compute) {
-	if (!TableDispatchEnabled()) return false;
+                                   uint32_t z, bool async_compute, uint64_t indirect_args, bool thread_dimensions) {
+	if (!TableDispatchEnabled() || (indirect_args != 0 && (!TableDispatchIndirectEnabled() || thread_dimensions)) ||
+	    (thread_dimensions && !TableDispatchThreadsEnabled()))
+		return false;
 	auto&      table = OwnTable();
 	const auto frame = m_context.FrameNumber();
 	// The dispatches' pairs no dispatch used for PairKeepFrames leave, as the draws' (TableTry).
@@ -109,7 +132,7 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, const HW::ComputeShade
 		}
 	}
 	// (The pair found last again without its lookup: runs of dispatches keep their program.)
-	const auto key   = TableDispatchKey(cs, async_compute);
+	const auto key   = TableDispatchKey(cs, async_compute, thread_dimensions);
 	auto*      known = table.found_dispatch != nullptr && table.found_dispatch_key == key ? table.found_dispatch : nullptr;
 	if (known == nullptr) {
 		const auto found = table.dispatches.find(key);
@@ -136,7 +159,7 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, const HW::ComputeShade
 		// The table program, once compiled.
 		if (pair.pending == nullptr || !pair.pending->done.load(std::memory_order_acquire)) return false;
 		const auto* program = pair.pending->programs[0];
-		if (const char* refusal = TableDispatchRefusal(program); refusal != nullptr) {
+		if (const char* refusal = TableDispatchRefusal(program, pair.thread_dimensions); refusal != nullptr) {
 			static std::atomic<uint32_t> reports {0};
 			if (reports.fetch_add(1, std::memory_order_relaxed) < 64)
 				std::printf("Table: CS 0x%llx refused: %s\n", static_cast<unsigned long long>(pair.vs),
@@ -184,9 +207,14 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, const HW::ComputeShade
 	auto&                            buffer_cache = m_context.GetBufferCache();
 	TablePrepareBda(pair, user_data); // (as TableDraw's: before the blocks)
 	const auto registration = buffer_cache.BufferSetEpoch();
-	if (!TableBlocks(pair, user_data, blocks, writes, selected) || buffer_cache.BufferSetEpoch() != registration ||
-	    buffer.IsInvalid())
-		return false;
+	if (!TableBlocks(pair, user_data, blocks, writes, selected)) return false;
+	// An indirect dispatch's arguments, read by the GPU (as DispatchIndirect's: their owner made current).
+	std::pair<Buffer*, uint64_t> arguments {};
+	if (indirect_args != 0) {
+		arguments = buffer_cache.ObtainBuffer(indirect_args, sizeof(vk::DispatchIndirectCommand), false);
+		if (arguments.first == nullptr || (arguments.second & 3u) != 0) return false;
+	}
+	if (buffer_cache.BufferSetEpoch() != registration || buffer.IsInvalid()) return false;
 	// Emission, as DispatchDirect's.
 	buffer.EndRendering();
 	auto vk_buffer = buffer.Handle();
@@ -210,6 +238,20 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, const HW::ComputeShade
 	}
 	push_data.dwords[start + bindings.TableBlockDword()]      = static_cast<uint32_t>(blocks[0]);
 	push_data.dwords[start + bindings.TableBlockDword() + 1u] = static_cast<uint32_t>(blocks[0] >> 32u);
+	// A dispatch of thread counts: the counts where its program reads them, its groups the counts' cover (as
+	// DispatchDirect's).
+	const auto& r      = cs.cs_regs;
+	const auto  groups = [](uint32_t threads, uint32_t size) { return (threads + std::max(size, 1u) - 1u) / std::max(size, 1u); };
+	if (thread_dimensions) {
+		if (bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
+			push_data.dwords[start + bindings.dispatch_thread_dword]      = x;
+			push_data.dwords[start + bindings.dispatch_thread_dword + 1u] = y;
+			push_data.dwords[start + bindings.dispatch_thread_dword + 2u] = z;
+		}
+		x = groups(x, r.num_thread_x);
+		y = groups(y, r.num_thread_y);
+		z = groups(z, r.num_thread_z);
+	}
 	vk_buffer.pushConstants(pipeline.pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
 	                        (start + bindings.ShaderDataDwords()) * sizeof(uint32_t), push_data.dwords.data());
 	// As DispatchDirect(): storage image writes order as buffer writes; a dispatch the guest did not order after the
@@ -219,8 +261,18 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, const HW::ComputeShade
 	         });
 	const bool chained = std::exchange(m_dispatch_chained, false) && m_deferred_barrier;
 	if (writes && !chained) ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (indirect_args != 0 && !chained) {
+		// (As DispatchIndirect's: the arguments earlier work wrote, read as indirect commands.)
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics | vk::PipelineStageFlagBits::eComputeShader |
+		                              vk::PipelineStageFlagBits::eTransfer,
+		                          vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatch(x, y, z);
+	if (indirect_args != 0) vk_buffer.dispatchIndirect(arguments.first->Handle(), arguments.second);
+	else vk_buffer.dispatch(x, y, z);
 	m_deferred_barrier       = true;
 	m_deferred_barrier_queue = m_guest_queue;
 	return true;

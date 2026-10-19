@@ -349,7 +349,8 @@ struct RenderExecutor::TablePair {
 	uint32_t                         variant_hint = 0; // the variant TableTry found last (KYTY_TABLE_MRU bit 2)
 	// The table programs' compilation (on a worker): until it is done the pair's draws take the normal path.
 	std::shared_ptr<PipelineCache::TableTicket> pending;
-	// A dispatch's (tableDispatch.inc): its program's input and native pipeline.
+	// A dispatch's (tableDispatch.inc): of thread counts or of groups, its program's input and native pipeline.
+	bool                           thread_dimensions = false;
 	ShaderComputeInputInfo         compute_info;
 	const PipelineCache::Pipeline* pipeline = nullptr;
 	// The pair's programs for other buffer specializations (KYTY_TABLE_BUFFER_VARIANTS: V#s of other formats, or of
@@ -480,7 +481,7 @@ void RenderExecutor::TableReset(TablePair& pair) {
 	if (table.store == &pair) table.store = nullptr;
 	if (table.last_pair == &pair) table.last_pair = nullptr;
 	if (table.gathered == &pair) table.gathered = nullptr;
-	pair = {.vs = pair.vs, .ps = pair.ps, .generation = pair.generation};
+	pair = {.vs = pair.vs, .ps = pair.ps, .generation = pair.generation, .thread_dimensions = pair.thread_dimensions};
 }
 
 // The pair's runs (TablePair::Run): the slots its stages evaluate, in reads of consecutive slots, by level.
@@ -1600,7 +1601,7 @@ uint32_t RenderExecutor::TableSelectBuffers(CommandBuffer& buffer, TablePair& pa
 	const auto& ctx       = buffer.GetRegisters();
 	if (dispatch) {
 		variant.pending = pipelines.CompileTableComputeAsync(sh.GetCs(), ctx.GetShaderRegisters(), async_compute,
-		                                                     variant.specializations[0]);
+		                                                     variant.specializations[0], pair.thread_dimensions);
 	} else {
 		ShaderVertexInputInfo vertex_info {};
 		ShaderPixelInputInfo  pixel_info {};

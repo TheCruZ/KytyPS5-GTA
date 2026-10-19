@@ -437,8 +437,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
-	if (!use_thread_dimensions && TableDispatch(buffer, cs_regs, thread_group_x, thread_group_y, thread_group_z,
-	                                            async_compute)) {
+	if (TableDispatch(buffer, cs_regs, thread_group_x, thread_group_y, thread_group_z, async_compute, 0,
+	                  use_thread_dimensions)) {
 		return;
 	}
 	ShaderComputeInputInfo input_info {};
@@ -463,7 +463,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (!compute_program) {
 		return;
 	}
-	if (!use_thread_dimensions) {
+	{
 		TableDispatchLearn(cs_regs, sh_regs, input_info, compute_program, async_compute,
 		                   input_info.stage.program != nullptr &&
 		                       std::ranges::find(DemonsSoulsCopy::Shaders, input_info.stage.program->shader_hash) !=
@@ -874,6 +874,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (cs_regs.cs_regs.data_addr == 0) {
 		return;
 	}
+	if (TableDispatch(buffer, cs_regs, 0, 0, 0, async_compute, args_addr)) {
+		return;
+	}
 	ShaderComputeInputInfo input_info {};
 	ShaderProgram          compute_program;
 	if (!TakeResolvedDispatch(input_info, compute_program)) {
@@ -885,6 +888,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (!compute_program) {
 		return;
 	}
+	TableDispatchLearn(cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info, compute_program,
+	                   async_compute,
+	                   input_info.stage.program != nullptr &&
+	                       std::ranges::find(DemonsSoulsCopy::Shaders, input_info.stage.program->shader_hash) !=
+	                           DemonsSoulsCopy::Shaders.end());
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;

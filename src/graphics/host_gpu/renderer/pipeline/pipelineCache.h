@@ -276,9 +276,11 @@ public:
 		std::string                        refusal;
 	};
 	// A compute program in table mode for a specialization.
+	// (`thread_dimensions`: for dispatches of thread counts, ShaderComputeInputInfo::dispatch_thread_dimensions.)
 	std::shared_ptr<TableTicket> CompileTableComputeAsync(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
 	                                                      bool async_compute,
-	                                                      const ShaderRecompiler::IR::ResourceSpecialization& specialization);
+	                                                      const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                                                      bool thread_dimensions = false);
 	// A draw's vertex and (with pixel_params) pixel programs in table mode, the pixel stage's push data first.
 	std::shared_ptr<TableTicket> CompileTableGraphicsAsync(
 	    const ShaderParams& vertex_params, const ShaderVertexInputInfo& vertex_info, const ShaderParams* pixel_params,
