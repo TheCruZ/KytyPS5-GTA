@@ -1,6 +1,7 @@
 #include "loader/runtimeLinker.h"
 
 #include "common/assert.h"
+#include "common/hackNotice.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
@@ -706,6 +707,12 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}
 		if (const auto length =
 		        Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address)) {
+			// Guest memory starts at 0x40000: a walker load below it goes through a null table
+			// pointer, which the walk follows when it cannot decide a branch.
+			if (info->access_violation_vaddr < 0x40000u) {
+				Common::HackNotice::Report("null SRT table read as zero", "SRT walker load", 0,
+				                           info->access_violation_vaddr);
+			}
 			Loader::X64InstructionEmulator::SkipLoad(info->native_context, length);
 			return true;
 		}
