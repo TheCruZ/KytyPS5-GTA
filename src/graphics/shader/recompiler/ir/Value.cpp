@@ -52,36 +52,6 @@ VectorReg Value::VectorRegister() const {
 	return vector_reg;
 }
 
-bool Value::U1() const {
-	EXIT_IF(type != Type::U1);
-	return imm_u1;
-}
-
-uint8_t Value::U8() const {
-	EXIT_IF(type != Type::U8);
-	return imm_u8;
-}
-
-uint16_t Value::U16() const {
-	EXIT_IF(type != Type::U16);
-	return imm_u16;
-}
-
-uint64_t Value::U64() const {
-	EXIT_IF(type != Type::U64);
-	return imm_u64;
-}
-
-uint16_t Value::F16Bits() const {
-	EXIT_IF(type != Type::F16);
-	return imm_u16;
-}
-
-float Value::F32Value() const {
-	EXIT_IF(type != Type::F32);
-	return std::bit_cast<float>(imm_u32);
-}
-
 uint64_t Value::ImmediateBits() const {
 	switch (type) {
 		case Type::Void: return 0;
@@ -116,26 +86,6 @@ bool Value::FromImmediateBits(Type type, uint64_t bits, Value& result) {
 		case Type::U32: result = Value(static_cast<uint32_t>(bits)); return fits(UINT32_MAX);
 		case Type::F32: result = Value(Type::F32, bits); return fits(UINT32_MAX);
 		case Type::U64: result = Value(bits); return true;
-		default: return false;
-	}
-}
-
-bool Value::operator==(const Value& other) const {
-	if (type != other.type) {
-		return false;
-	}
-	switch (type) {
-		case Type::Void: return true;
-		case Type::Opaque: return inst == other.inst;
-		case Type::ScalarReg: return scalar_reg == other.scalar_reg;
-		case Type::VectorReg: return vector_reg == other.vector_reg;
-		case Type::U1: return imm_u1 == other.imm_u1;
-		case Type::U8: return imm_u8 == other.imm_u8;
-		case Type::U16:
-		case Type::F16: return imm_u16 == other.imm_u16;
-		case Type::U32:
-		case Type::F32: return imm_u32 == other.imm_u32;
-		case Type::U64: return imm_u64 == other.imm_u64;
 		default: return false;
 	}
 }
@@ -180,20 +130,8 @@ size_t Inst::UseCount() const {
 	return uses.size();
 }
 
-size_t Inst::NumArgs() const {
-	return num_args == PhiArity ? phi_args.size() : num_args;
-}
-
 size_t Inst::NumPhiBlocks() const {
 	return num_args == PhiArity ? phi_args.size() : 0;
-}
-
-Value Inst::Arg(size_t index) const {
-	EXIT_IF(index >= NumArgs());
-	if (num_args <= InlineArity) {
-		return fixed_args[index];
-	}
-	return num_args == PhiArity ? phi_args[index].second : large_args[index];
 }
 
 Block* Inst::PhiBlock(size_t index) const {
