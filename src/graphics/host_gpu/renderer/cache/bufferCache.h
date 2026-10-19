@@ -367,10 +367,12 @@ private:
 	void                                         FinishAsyncReadback(AsyncReadback& request);
 	static bool WaitAsyncReadback(AsyncReadback& request);
 	bool        CopyAsyncReadback(AsyncReadback& request);
+	void        SubmitAsyncReadback(AsyncReadback& request);
 	void        CompleteAsyncReadback(AsyncReadback& request);
 	void        DrainAsyncReadbacks(uint64_t vaddr, uint64_t size, vk::Buffer source = nullptr);
 	void        SettleAsyncReadbacks(uint64_t vaddr, uint64_t size);
 	struct AsyncReadbackSlot {
+		vk::CommandPool                pool    = nullptr; // the slot's own: its copy is recorded by the submitting thread
 		vk::CommandBuffer              command = nullptr;
 		vk::Fence                      fence   = nullptr;
 		vk::Semaphore                  timeline = nullptr; // KYTY_READBACK_SLEEP_WAIT: signalled to timeline_value by the copy
@@ -383,7 +385,7 @@ private:
 	// 32, as chenxiao07's KYTY_READBACK_SLOTS: a burst of guest reads did not wait for a free one.
 	static constexpr size_t                         AsyncReadbackSlots = 32;
 	std::array<AsyncReadbackSlot, AsyncReadbackSlots> m_async_readbacks;
-	vk::CommandPool                                 m_async_readback_pool = nullptr;
+	std::mutex                                      m_readback_queue_mutex; // submissions to the readback queue
 	uint64_t                                        m_async_readback_rewritten = 0;
 	// The mirror: each line holds a copy of its bytes in a cached buffer, recorded at the end of
 	// the command buffer `tick` (0: none since the line's last write) into `slot` of a

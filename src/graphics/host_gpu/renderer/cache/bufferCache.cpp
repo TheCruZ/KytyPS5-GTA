@@ -576,6 +576,9 @@ BufferCache::~BufferCache() {
 		if (slot.timeline) {
 			m_graphics.device.destroySemaphore(slot.timeline);
 		}
+		if (slot.pool) {
+			m_graphics.device.destroyCommandPool(slot.pool);
+		}
 	}
 	if (m_readback.pool) {
 		m_graphics.device.destroyFence(m_readback.fence);
@@ -724,7 +727,25 @@ struct BufferCache::AsyncReadback {
 	// is Detached and never written back.
 	enum State : uint32_t { Pending, Copying, Copied, Detached };
 	std::atomic<uint32_t> state {Pending};
+	// The recorded copy, submitted by the first thread to claim it (KYTY_READBACK_GUEST_SUBMIT): Recorded -> Submitted,
+	// or Cancelled by a GPU write that settles it first (never submitted).
+	enum SubmitState : uint32_t { Recorded, Submitted, Cancelled };
+	std::atomic<uint32_t> submit_state {Submitted};
+	vk::CommandBuffer     command = nullptr;
+	vk::Semaphore         master  = nullptr; // waited for at `needed`
 };
+
+// KYTY_READBACK_GUEST_SUBMIT (default on; 0: the execution thread submits): the guest thread that waits for an
+// asynchronous readback submits its recorded copy, once the submission it waits for was submitted. The execution
+// thread waited for that submission and paid the queue submission (1.4 ms of it a frame in Demon's Souls), as
+// chenxiao07's recording worker does it instead of his GPU thread.
+static bool ReadbackGuestSubmitEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READBACK_GUEST_SUBMIT");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
 
 // chenxiao07's guest-thread copies (KYTY_READBACK_GUEST_COPY, default on; 0: the execution thread writes every copy
 // back): the guest thread that waited for a readback's copy writes its bytes back itself; the execution thread only
@@ -850,18 +871,18 @@ std::shared_ptr<BufferCache::AsyncReadback> BufferCache::BeginAsyncReadback(uint
 	if (free_slot == AsyncReadbackSlots) {
 		return nullptr;
 	}
-	if (!m_async_readback_pool) {
+	auto& slot = m_async_readbacks[free_slot];
+	if (!slot.pool) {
 		vk::CommandPoolCreateInfo pool_info {};
 		pool_info.flags            = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
 		pool_info.queueFamilyIndex = m_graphics.readback_family;
-		if (device.createCommandPool(&pool_info, nullptr, &m_async_readback_pool) != vk::Result::eSuccess) {
+		if (device.createCommandPool(&pool_info, nullptr, &slot.pool) != vk::Result::eSuccess) {
 			EXIT("BufferCache: could not create the asynchronous readback pool\n");
 		}
 	}
-	auto& slot = m_async_readbacks[free_slot];
 	if (!slot.command) {
 		vk::CommandBufferAllocateInfo allocate {};
-		allocate.commandPool        = m_async_readback_pool;
+		allocate.commandPool        = slot.pool;
 		allocate.level              = vk::CommandBufferLevel::ePrimary;
 		allocate.commandBufferCount = 1;
 		const vk::FenceCreateInfo fence_info {};
@@ -886,53 +907,20 @@ std::shared_ptr<BufferCache::AsyncReadback> BufferCache::BeginAsyncReadback(uint
 		                                        std::max<uint64_t>(Common::AlignUp(total_size, 64 * 1024), 256 * 1024));
 	}
 	// The copy waits for the needed submission on the GPU, but must not be submitted before it
-	// (see DownloadOnReadbackQueue()).
-	while (m_scheduler.SubmittedTick() < needed) {
-		Common::SpinPause();
+	// (see DownloadOnReadbackQueue()): by its guest thread (SubmitAsyncReadback), or here.
+	const bool guest_submit = ReadbackGuestSubmitEnabled();
+	if (!guest_submit) {
+		while (m_scheduler.SubmittedTick() < needed) {
+			Common::SpinPause();
+		}
 	}
 	const auto command = slot.command;
-	(void)command.reset({});
-	vk::CommandBufferBeginInfo begin_info {};
-	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
-	(void)command.begin(&begin_info);
-	command.copyBuffer(buffer.Handle(), slot.staging->Handle(), static_cast<uint32_t>(copies.size()), copies.data());
-	vk::BufferMemoryBarrier after {};
-	after.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
-	after.dstAccessMask       = vk::AccessFlagBits::eHostRead;
-	after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	after.buffer              = slot.staging->Handle();
-	after.offset              = 0;
-	after.size                = total_size;
-	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1,
-	                        &after, 0, nullptr);
-	(void)command.end();
-	const auto                      semaphore  = m_scheduler.GetMasterSemaphore().Handle();
-	const vk::PipelineStageFlags    wait_stage = vk::PipelineStageFlagBits::eTransfer;
-	vk::TimelineSemaphoreSubmitInfo timeline {};
-	timeline.waitSemaphoreValueCount = 1;
-	timeline.pWaitSemaphoreValues    = &needed;
+	const auto     semaphore    = m_scheduler.GetMasterSemaphore().Handle();
 	// (The copy also signals the slot's timeline semaphore, which a sleeping guest thread waits on.)
 	const uint64_t signal_value = slot.timeline_value + 1;
-	if (slot.timeline) {
-		timeline.signalSemaphoreValueCount = 1;
-		timeline.pSignalSemaphoreValues    = &signal_value;
-	}
-	vk::SubmitInfo submit {};
-	submit.pNext              = &timeline;
-	submit.waitSemaphoreCount = 1;
-	submit.pWaitSemaphores    = &semaphore;
-	submit.pWaitDstStageMask  = &wait_stage;
-	submit.commandBufferCount = 1;
-	submit.pCommandBuffers    = &command;
-	if (slot.timeline) {
-		submit.signalSemaphoreCount = 1;
-		submit.pSignalSemaphores    = &slot.timeline;
-	}
-	if (m_graphics.readback_queue.submit(1, &submit, slot.fence) != vk::Result::eSuccess) {
-		EXIT("BufferCache: readback queue submission failed\n");
-	}
 	auto request            = std::make_shared<AsyncReadback>();
+	request->command        = command;
+	request->master         = semaphore;
 	request->vaddr          = vaddr;
 	request->size           = size;
 	request->needed         = needed;
@@ -957,11 +945,68 @@ std::shared_ptr<BufferCache::AsyncReadback> BufferCache::BeginAsyncReadback(uint
 		request->timeline_value = signal_value;
 	}
 	request->staging        = slot.staging.get();
+	request->submit_state.store(AsyncReadback::Recorded, std::memory_order_relaxed);
+	if (!guest_submit) {
+		SubmitAsyncReadback(*request);
+	}
 	slot.request            = request;
 	return request;
 }
 
 // Any thread: waits for the copy on the GPU. False when the request was finished meanwhile.
+// Any thread: submits the request's recorded copy once (after the submission it waits for), unless it was cancelled.
+void BufferCache::SubmitAsyncReadback(AsyncReadback& request) {
+	auto recorded = static_cast<uint32_t>(AsyncReadback::Recorded);
+	if (!request.submit_state.compare_exchange_strong(recorded, AsyncReadback::Submitted, std::memory_order_acq_rel)) {
+		return;
+	}
+	// (Its slot's command buffer, recorded here: by the submitting thread, the slot's pool its alone.)
+	const auto command = request.command;
+	(void)command.reset({});
+	vk::CommandBufferBeginInfo begin_info {};
+	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	(void)command.begin(&begin_info);
+	command.copyBuffer(request.source, request.staging->Handle(), static_cast<uint32_t>(request.copies.size()),
+	                   request.copies.data());
+	vk::BufferMemoryBarrier after {};
+	after.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+	after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after.buffer              = request.staging->Handle();
+	after.offset              = 0;
+	after.size                = VK_WHOLE_SIZE;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1,
+	                        &after, 0, nullptr);
+	(void)command.end();
+	while (m_scheduler.SubmittedTick() < request.needed) {
+		Common::SpinPause();
+	}
+	const vk::PipelineStageFlags    wait_stage = vk::PipelineStageFlagBits::eTransfer;
+	vk::TimelineSemaphoreSubmitInfo timeline {};
+	timeline.waitSemaphoreValueCount = 1;
+	timeline.pWaitSemaphoreValues    = &request.needed;
+	if (request.timeline) {
+		timeline.signalSemaphoreValueCount = 1;
+		timeline.pSignalSemaphoreValues    = &request.timeline_value;
+	}
+	vk::SubmitInfo submit {};
+	submit.pNext              = &timeline;
+	submit.waitSemaphoreCount = 1;
+	submit.pWaitSemaphores    = &request.master;
+	submit.pWaitDstStageMask  = &wait_stage;
+	submit.commandBufferCount = 1;
+	submit.pCommandBuffers    = &request.command;
+	if (request.timeline) {
+		submit.signalSemaphoreCount = 1;
+		submit.pSignalSemaphores    = &request.timeline;
+	}
+	std::lock_guard lock(m_readback_queue_mutex);
+	if (m_graphics.readback_queue.submit(1, &submit, request.fence) != vk::Result::eSuccess) {
+		EXIT("BufferCache: readback queue submission failed\n");
+	}
+}
+
 bool BufferCache::WaitAsyncReadback(AsyncReadback& request) {
 	if (request.timeline) {
 		// Asleep in slices: a request dropped meanwhile (KYTY_READBACK_DETACH) is noticed within a slice and not only
@@ -1031,6 +1076,7 @@ bool BufferCache::CopyAsyncReadback(AsyncReadback& request) {
 
 // Execution thread: the copy's bytes go to guest memory and the request is finished.
 void BufferCache::CompleteAsyncReadback(AsyncReadback& request) {
+	SubmitAsyncReadback(request);
 	if (!WaitAsyncReadback(request) || !CopyAsyncReadback(request)) {
 		return;
 	}
@@ -1128,6 +1174,15 @@ void BufferCache::SettleAsyncReadbacks(uint64_t vaddr, uint64_t size) {
 		    std::ranges::none_of(request->pages, [&](const auto& page) {
 			    return vaddr < page.second && page.first < vaddr + size;
 		    })) {
+			continue;
+		}
+		// Not submitted yet: dropped with no copy in flight.
+		if (auto recorded = static_cast<uint32_t>(AsyncReadback::Recorded);
+		    request->submit_state.compare_exchange_strong(recorded, AsyncReadback::Cancelled,
+		                                                  std::memory_order_acq_rel)) {
+			request->state.store(AsyncReadback::Detached, std::memory_order_release);
+			request->finished.store(true, std::memory_order_release);
+			slot.request.reset();
 			continue;
 		}
 		auto pending = static_cast<uint32_t>(AsyncReadback::Pending);
@@ -1240,6 +1295,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		// written back by an urgent command, as the synchronous path writes them. A write then
 		// makes the range CPU-modified (synchronous() finds nothing left to read back).
 		if (request) {
+			SubmitAsyncReadback(*request);
 			const bool guest_copy = ReadbackGuestCopyEnabled();
 			const bool copied     = WaitAsyncReadback(*request) && (!guest_copy || CopyAsyncReadback(*request));
 			if (copied || is_write) {
@@ -2288,8 +2344,11 @@ bool BufferCache::DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::Bu
 	submit.pWaitDstStageMask  = &wait_stage;
 	submit.commandBufferCount = 1;
 	submit.pCommandBuffers    = &command;
-	if (m_graphics.readback_queue.submit(1, &submit, m_readback.fence) != vk::Result::eSuccess) {
-		EXIT("BufferCache: readback queue submission failed\n");
+	{
+		std::lock_guard lock(m_readback_queue_mutex);
+		if (m_graphics.readback_queue.submit(1, &submit, m_readback.fence) != vk::Result::eSuccess) {
+			EXIT("BufferCache: readback queue submission failed\n");
+		}
 	}
 	for (;;) {
 		const auto status = device.getFenceStatus(m_readback.fence);
