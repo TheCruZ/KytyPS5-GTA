@@ -1594,6 +1594,30 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 
+	// Wolverine's ray-tracing compute 0xe6d76d24f59f8015 expands to ~13.6 MB of SPIR-V, which runs the
+	// NVIDIA driver out of memory: its dispatches are skipped, as Frank did (it gave up on it).
+	// KYTY_EXPAND_HUGE_SHADERS=1 expands it anyway.
+	static bool SkipHugeExpansion(uint64_t hash) {
+		static const bool allow = [] {
+			const char* value = std::getenv("KYTY_EXPAND_HUGE_SHADERS");
+			return value != nullptr && value[0] == '1';
+		}();
+		return !allow && hash == 0xe6d76d24f59f8015ull;
+	}
+
+	static void ReportCallExpansionFailure(const ShaderParams& params,
+	                                       const ShaderRecompiler::ShaderSource& source) {
+		Common::HackNotice::Report("dispatch skipped: the call tables of its shader do not expand",
+		                           "ProgramCache::ReportCallExpansionFailure", params.hash, 0,
+		                           source.refresh_failure);
+		static std::atomic_uint reports {0};
+		if (reports.fetch_add(1) < 16u) {
+			PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} reason=call "
+			                 "expansion failed: {}; rendering is incomplete",
+			                 params.hash, source.refresh_failure);
+		}
+	}
+
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor) {
@@ -1666,6 +1690,12 @@ struct PipelineCache::ProgramCache {
 			}
 			if (entry->second.call_source) {
 				source_changed = entry->second.RefreshCallSource(runtime);
+				if (entry->second.call_source->refresh_failed) {
+					// The call tables do not expand now (not mapped yet, or a target that is not
+					// a function): skip this dispatch.
+					ReportCallExpansionFailure(params, *entry->second.call_source);
+					return ShaderProgram {};
+				}
 			}
 		}
 		if (entry != nullptr && !source_changed) {
@@ -1977,13 +2007,15 @@ struct PipelineCache::ProgramCache {
 		if (entry == nullptr && finished_job == translating.end()) {
 			source = ShaderRecompiler::PrepareShaderSource(params.code, options);
 		}
-		if (source.unsupported_call_pc != UINT32_MAX) {
+		if (source.unsupported_call_pc != UINT32_MAX &&
+		    (!source.expand_calls || SkipHugeExpansion(params.hash))) {
 			PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} pc=0x{:08x} "
 			                 "reason=unsupported GPU-selected callable target; rendering is incomplete",
 			                 params.hash, source.unsupported_call_pc);
-			Common::HackNotice::Report("dispatch skipped: GPU-selected callable target",
+			Common::HackNotice::Report(source.expand_calls ? "dispatch skipped: huge shader expansion refused"
+			                                               : "dispatch skipped: GPU-selected callable target",
 			                           "ProgramCache::Get", params.hash, source.unsupported_call_pc,
-			                           "rendering is incomplete");
+			                           "rendering is incomplete; KYTY_EXPAND_HUGE_SHADERS=1 expands a huge shader");
 			{
 				std::unique_lock programs_lock(programs_mutex);
 				programs.try_emplace(lookup_key, ShaderRecompiler::IR::ResourcePlan {}, nullptr)
@@ -1991,7 +2023,7 @@ struct PipelineCache::ProgramCache {
 			}
 			return ShaderProgram {};
 		}
-		const bool new_calls = !source.calls.empty();
+		const bool new_calls = source.HasCalls();
 		if (new_calls) {
 			disk_ok = false;
 		}
@@ -2034,9 +2066,13 @@ struct PipelineCache::ProgramCache {
 			                           "ProgramCache::Get", params.hash, static_cast<uint64_t>(stage));
 			return ShaderProgram {};
 		} else if (current != nullptr) {
-			if (!current->calls.empty()) {
+			if (current->HasCalls()) {
 				if (entry == nullptr) {
 					ShaderRecompiler::RefreshShaderSource(*current, runtime);
+					if (current->refresh_failed) {
+						ReportCallExpansionFailure(params, *current);
+						return ShaderProgram {};
+					}
 				}
 				translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
 				translated.program.source_reads = current->reads;

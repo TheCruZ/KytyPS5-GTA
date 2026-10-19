@@ -616,12 +616,16 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 			const auto value = Register(site.instruction, call.src0.reg + i);
 			if (ambiguous) {
 				source.unsupported_call_pc = call.pc;
+				source.expand_calls        = true;
+				source.wave_size           = options.wave_size;
 				source.calls.clear();
 				return;
 			}
 			if (!ValidateRuntimeValue(query, value, RuntimeValueType::Integer)) {
 				EXIT_IF(value.Instruction()->GetOpcode() != ValueOpcode::ReadConstBuffer);
 				source.unsupported_call_pc = call.pc;
+				source.expand_calls        = true;
+				source.wave_size           = options.wave_size;
 				source.calls.clear();
 				return;
 			}
@@ -670,11 +674,42 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 }
 
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime) {
-	EXIT_IF(source.unsupported_call_pc != UINT32_MAX);
+	EXIT_IF(source.unsupported_call_pc != UINT32_MAX && !source.expand_calls);
 	auto& reads = source.reads;
 	reads.clear();
 	IR::SrtReadCapture capture(runtime, reads);
 	const auto clean = IR::CleanRuntime(capture.ObservedRuntime());
+	if (source.expand_calls) {
+		// The call targets are GPU data: read the call tables and inline the functions (the
+		// reads are captured with the others).
+		const Decoder::ShaderCodeReader reader = [&](uint64_t address, std::span<uint32_t> words) {
+			return clean.read_memory(clean.userdata, address, words);
+		};
+		if (!source.expander) source.expander = std::make_shared<Decoder::ShaderFunctionExpander>();
+		std::vector<uint32_t> expanded;
+		source.refresh_failure.clear();
+		source.refresh_failed = !source.expander->Expand(source.code, runtime.shader_base, runtime.user_data,
+		                                                 reader, expanded, source.refresh_failure,
+		                                                 source.wave_size) ||
+		                        expanded.empty();
+		if (source.refresh_failed) {
+			if (source.refresh_failure.empty()) source.refresh_failure = "shader call expansion is empty";
+			return source.decoded;
+		}
+		if (source.linked &&
+		    std::ranges::equal(std::span(source.linked->code).subspan(source.code.size()), expanded)) {
+			return source.linked->decoded;
+		}
+		ShaderSource::Linked linked;
+		linked.code = source.code;
+		linked.code.insert(linked.code.end(), expanded.begin(), expanded.end());
+		const auto expanded_code = std::span<const uint32_t>(linked.code).subspan(source.code.size());
+		Decoder::DecodeProgram(expanded_code, linked.decoded);
+		linked.decoded.code = expanded_code;
+		source.linked = std::move(linked);
+		++source.revision;
+		return source.linked->decoded;
+	}
 	IR::SrtWalker walker(source.call_targets, clean);
 	for (auto& site: source.calls) {
 		uint32_t low = 0, high = 0;

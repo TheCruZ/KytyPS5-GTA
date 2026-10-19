@@ -11296,6 +11296,74 @@ void TestMemoryFedScalarLeafCall() {
 #endif
 }
 
+// A call through a table of function pointers inside a loop: a write to a register the target
+// depends on (the table's V#) is harmless when no path leads from it back to the call (the shader
+// reloads that register for its own later use after the loop), and still refused when one does.
+void TestCallTableDependencyWrites() {
+  using namespace ShaderRecompiler;
+  constexpr uint64_t base     = 0xfe0040000ull;
+  constexpr uint64_t table    = base + 0x100;
+  constexpr uint64_t function = base + 0x200;
+  struct Memory {
+    std::array<uint32_t, 0x100> words{};
+  } memory;
+  for (uint32_t slot = 0; slot < 8; slot++) {
+    memory.words[(table - base) / 4 + slot * 4] = static_cast<uint32_t>(function);
+    memory.words[(table - base) / 4 + slot * 4 + 1] = static_cast<uint32_t>(function >> 32u);
+  }
+  memory.words[(function - base) / 4]     = 0xbe830381u; // s_mov_b32 s3, 1
+  memory.words[(function - base) / 4 + 1] = 0xbe80200eu; // s_setpc_b64 s[14:15]
+  const auto read = [](void* data, uint64_t address, std::span<uint32_t> out) {
+    const auto& m = *static_cast<Memory*>(data);
+    if (address < base || address + out.size_bytes() > base + sizeof(m.words)) return false;
+    std::memcpy(out.data(), reinterpret_cast<const uint8_t*>(m.words.data()) + address - base,
+                out.size_bytes());
+    return true;
+  };
+  std::array<uint32_t, 64> user_data{};
+  user_data[8]  = static_cast<uint32_t>(table);
+  user_data[9]  = static_cast<uint32_t>(table >> 32u) | (16u << 16u);
+  user_data[10] = 8;
+  user_data[11] = 0x5204;
+  auto options      = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  IR::SrtRuntime runtime{.user_data = user_data, .read_memory = read, .userdata = &memory,
+                         .read_specialization_memory = read};
+  // v_readfirstlane_b32 s20, v1; s_lshl_b32 s20, s20, 4 (a target that depends on the lanes);
+  // s_buffer_load_dwordx2 s[14:15], s[8:11], s20; s_waitcnt; the call.
+  const std::vector<uint32_t> head = {0x7e280501u, 0x8f148414u, 0xf4240384u, 0x28000000u,
+                                      0xbf8cc07fu, 0xbe8e210eu};
+  const uint32_t add = 0x80158115u, compare = 0xbf0a8415u, mov_s8 = 0xbe880380u,
+                 end = 0xbf810000u;
+  auto make = [&](bool write_in_loop) {
+    auto shader = head;
+    if (write_in_loop) shader.push_back(mov_s8);
+    shader.insert(shader.end(), {add, compare});
+    shader.push_back(write_in_loop ? 0xbf85fff6u : 0xbf85fff7u); // back to the first instruction
+    if (!write_in_loop) shader.push_back(mov_s8);
+    shader.push_back(end);
+    return shader;
+  };
+  {
+    const auto shader = make(false);
+    auto source = PrepareShaderSource(shader, options);
+    Check(source.expand_calls, "a call through a table did not take the expansion path");
+    (void)RefreshShaderSource(source, runtime);
+    if (source.refresh_failed) std::fprintf(stderr, "%s\n", source.refresh_failure.c_str());
+    Check(!source.refresh_failed,
+          "a write to the table descriptor after the loop refused the call expansion");
+  }
+  {
+    const auto shader = make(true);
+    auto source = PrepareShaderSource(shader, options);
+    Check(source.expand_calls, "a call through a table did not take the expansion path");
+    (void)RefreshShaderSource(source, runtime);
+    Check(source.refresh_failed &&
+              source.refresh_failure.find("may overwrite a call-target dependency") != std::string::npos,
+          "a write to the table descriptor inside the loop was accepted");
+  }
+}
+
 void TestNewShaderRecompilerSetpcBranch() {
   const uint32_t shader[] = {
       EncodeSop1(0x1f, 4, 0),      // s_getpc_b64 s[4:5]
@@ -17265,6 +17333,7 @@ int main() {
   TestNewShaderRecompilerSetpcBranch();
   TestGraphicsComputeGetreg();
   TestMemoryFedScalarLeafCall();
+  TestCallTableDependencyWrites();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMeshPassesAcrossBarrier();
