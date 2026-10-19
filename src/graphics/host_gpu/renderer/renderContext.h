@@ -147,6 +147,7 @@ public:
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	// Advances whenever a range is mapped or unmapped.
 	[[nodiscard]] uint64_t MappedRangesVersion() const noexcept;
+	[[nodiscard]] const PageManager& GetPageManager() const noexcept { return m_page_manager; }
 	// Execution thread: the guest frames (suspend points) executed so far.
 	[[nodiscard]] uint64_t FrameNumber() const noexcept { return m_frame_number; }
 	// Whether part of the range was unmapped after MappedRangesVersion() was `version` (true

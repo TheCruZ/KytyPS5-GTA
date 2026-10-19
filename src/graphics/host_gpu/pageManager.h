@@ -23,6 +23,9 @@ public:
 	[[nodiscard]] uint64_t GetPageSize() const;
 	// Whether cache tracking currently restricts access to the page holding vaddr.
 	[[nodiscard]] bool IsWatched(uint64_t vaddr) const;
+	// Any thread, without locks: whether a page of the range may have read watchers (reading it may fault). False is
+	// exact while no watcher is added meanwhile (chenxiao07's read granules: a bit per 64 KiB, then a byte per page).
+	[[nodiscard]] bool HasReadWatchers(uint64_t vaddr, uint64_t size) const noexcept;
 
 	// From the first to the end of the last page of [vaddr, vaddr + size) a watcher holds (its host protection is the
 	// trackers'), by the pages' state: no system call. False when no page of the range has one.

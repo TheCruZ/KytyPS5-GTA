@@ -172,7 +172,43 @@ struct PageManager::Impl {
 	struct Region {
 		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
 		std::array<PageState, REGION_PAGES> pages;
+		// Nonzero while a page has read watchers (HasReadWatchers).
+		std::array<std::atomic<uint8_t>, REGION_PAGES> read_hint {};
 	};
+
+	// A bit per 64 KiB granule: some page there may have read watchers. Set before a page's read_hint, cleared after
+	// the granule's last one (both under the region's lock). HasReadWatchers asks it first.
+	static constexpr uint64_t READ_GRANULE_SIZE  = 64 * 1024;
+	static constexpr uint64_t READ_GRANULE_PAGES = READ_GRANULE_SIZE / PAGE_SIZE;
+	std::unique_ptr<std::atomic<uint64_t>[]> read_granules =
+	    std::make_unique<std::atomic<uint64_t>[]>(ADDRESS_SIZE / READ_GRANULE_SIZE / 64);
+
+	void MarkReadGranule(uint64_t address) noexcept {
+		const auto granule = address / READ_GRANULE_SIZE;
+		read_granules[granule / 64].fetch_or(uint64_t {1} << (granule % 64), std::memory_order_release);
+	}
+
+	void SyncReadGranules(const Region& region, uint64_t base_addr, size_t first, size_t last) noexcept {
+		if (first >= last) return;
+		for (size_t g = first / READ_GRANULE_PAGES; g <= (last - 1) / READ_GRANULE_PAGES; ++g) {
+			bool any = false;
+			for (size_t p = g * READ_GRANULE_PAGES; p < (g + 1) * READ_GRANULE_PAGES; ++p)
+				any |= region.read_hint[p].load(std::memory_order_relaxed) != 0;
+			const auto granule = base_addr / READ_GRANULE_SIZE + g;
+			const auto bit     = uint64_t {1} << (granule % 64);
+			if (any)
+				read_granules[granule / 64].fetch_or(bit, std::memory_order_release);
+			else if ((read_granules[granule / 64].load(std::memory_order_relaxed) & bit) != 0)
+				read_granules[granule / 64].fetch_and(~bit, std::memory_order_release);
+		}
+	}
+
+	[[nodiscard]] bool MayHaveReadWatchers(uint64_t vaddr, uint64_t last_byte) const noexcept {
+		if (last_byte >= ADDRESS_SIZE) return true;
+		for (auto g = vaddr / READ_GRANULE_SIZE; g <= last_byte / READ_GRANULE_SIZE; ++g)
+			if (((read_granules[g / 64].load(std::memory_order_acquire) >> (g % 64)) & 1u) != 0) return true;
+		return false;
+	}
 
 	Impl() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -281,6 +317,10 @@ struct PageManager::Impl {
 			const auto new_count = update ? page.AddDelta<track ? 1 : -1, is_read>(address)
 			                              : page.AddDelta<0, is_read>(address);
 			const auto new_perms = page.Perms();
+			if constexpr (is_read) {
+				if (new_count != 0) MarkReadGranule(address); // (before the page's hint: the bits stay a superset)
+				region.read_hint[page_index].store(new_count != 0 ? 1u : 0u, std::memory_order_release);
+			}
 
 			if (new_perms != perms) [[unlikely]] {
 				release_pending();
@@ -304,6 +344,7 @@ struct PageManager::Impl {
 		}
 
 		release_pending();
+		if constexpr (is_read) SyncReadGranules(region, base_addr, first, last);
 	}
 
 	// `watched_only`: the pages the watchers leave writable are skipped, and the others are protected at once (even
@@ -432,6 +473,18 @@ bool PageManager::RestoreIfUnwatched(uint64_t vaddr) noexcept {
 		return false;
 	}
 	return Libs::LibKernel::Memory::RestoreGuestWritable(Common::AlignDown(vaddr, PAGE_SIZE), PAGE_SIZE);
+}
+
+bool PageManager::HasReadWatchers(uint64_t vaddr, uint64_t size) const noexcept {
+	if (size == 0 || vaddr >= ADDRESS_SIZE || size > ADDRESS_SIZE - vaddr) return true;
+	if (!m_impl->MayHaveReadWatchers(vaddr, vaddr + size - 1)) return false;
+	const auto last = Common::AlignDown(vaddr + size - 1, PAGE_SIZE);
+	for (auto page = Common::AlignDown(vaddr, PAGE_SIZE);; page += PAGE_SIZE) {
+		if (const auto* region = m_impl->FindRegion(page);
+		    region != nullptr && region->read_hint[(page % REGION_SIZE) / PAGE_SIZE].load(std::memory_order_acquire))
+			return true;
+		if (page == last) return false;
+	}
 }
 
 uint64_t PageManager::GetPageSize() const {

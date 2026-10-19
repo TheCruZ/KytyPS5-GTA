@@ -133,6 +133,43 @@ bool TableReadRun(uint64_t address, uint32_t count, uint32_t* out) {
 	return Libs::LibKernel::Memory::TryReadBacking(address, out, bytes);
 }
 
+// chenxiao07's direct table reads (KYTY_TABLE_DIRECT_READS, default on; 0: every run through TableReadRun): a run
+// within a page no read watcher protects, of GPU-mapped memory, is read in place, without the backing view's lookup
+// (the page's mapping proven once per 16 KiB until mappings change).
+bool TableDirectReadsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TABLE_DIRECT_READS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+struct TableReader {
+	RenderContext&            context;
+	std::array<uint64_t, 256>& mapped; // 16 KiB pages proven GPU-mapped, by page & 255
+	uint64_t                  page   = UINT64_MAX;
+	bool                      direct = false;
+	bool Read(uint64_t address, uint32_t count, uint32_t* out) {
+		const uint64_t bytes = uint64_t {count} * 4u;
+		const uint64_t first = address >> 12u;
+		if ((address & 3u) == 0 && bytes != 0 && first == (address + bytes - 1u) >> 12u && TableDirectReadsEnabled()) {
+			if (first != page) {
+				page          = first;
+				auto&      seen  = mapped[(address >> 14u) & 255u];
+				const bool known = seen == (address >> 14u) ||
+				                   (context.IsMapped((address >> 14u) << 14u, 16384) && (seen = address >> 14u, true));
+				direct = known && !context.GetPageManager().HasReadWatchers(first << 12u, 4096);
+			}
+			if (direct) {
+				const auto* from = reinterpret_cast<const volatile uint32_t*>(address);
+				for (uint32_t i = 0; i < count; ++i) out[i] = from[i];
+				return true;
+			}
+		}
+		return TableReadRun(address, count, out);
+	}
+};
+
 // An operand of a stage's plan: an immediate, a slot of its block, a user data register, or a word of the stage's
 // code address (a V# of constants the code embeds).
 uint32_t TableOperandValue(const ShaderRecompiler::IR::TablePlan::Operand& operand,
@@ -369,6 +406,9 @@ struct RenderExecutor::TablePair {
 };
 
 struct RenderExecutor::TableXpr {
+	// 16 KiB pages proven GPU-mapped under mapped_version (TableReader).
+	std::array<uint64_t, 256> mapped {};
+	uint64_t                  mapped_version = UINT64_MAX;
 	std::unordered_map<uint64_t, TablePair, NativeXprKeyHash> pairs; // by NativeXprPairHash
 	// Table dispatches' pairs, by the compute stage's registers (TableDispatchKey), and the one found last.
 	std::unordered_map<uint64_t, TablePair, NativeXprKeyHash> dispatches;
@@ -634,6 +674,11 @@ void RenderExecutor::TablePack(TablePair& pair, const std::array<TableFlatStage,
 // slots, and the T#/S# words they make (TableXpr::words, the set's key). False: something the normal path must read.
 bool RenderExecutor::TableEvaluateDraw(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data) {
 	auto&      table  = OwnTable();
+	if (const auto version = m_context.MappedRangesVersion(); version != table.mapped_version) {
+		table.mapped.fill(UINT64_MAX);
+		table.mapped_version = version;
+	}
+	TableReader reader {m_context, table.mapped};
 	const auto stages = pair.programs[1] != nullptr ? 2u : 1u;
 	auto&      words  = table.words;
 	words.clear();
@@ -682,7 +727,7 @@ bool RenderExecutor::TableEvaluateDraw(TablePair& pair, std::array<std::span<con
 					address = ((uint64_t {get(run.address[0])} | uint64_t {get(run.address[1])} << 32u) & 0x0000fffffffffffcull) +
 					          (get(run.address[2]) & ~3u) + static_cast<uint64_t>(int64_t {run.immediate});
 				}
-				if (!TableReadRun(address, run.count, slots.data() + run.first)) return false;
+				if (!reader.Read(address, run.count, slots.data() + run.first)) return false;
 			}
 			size_t at = 0;
 			for (const auto count: form.image_counts) {
@@ -713,7 +758,7 @@ bool RenderExecutor::TableEvaluateDraw(TablePair& pair, std::array<std::span<con
 				address = ((uint64_t {value(read.low)} | uint64_t {value(read.high)} << 32u) & 0x0000fffffffffffcull) +
 				          (value(read.offset) & ~3u) + static_cast<uint64_t>(int64_t {read.immediate});
 			}
-			if (!TableReadRun(address, run.count, slots.data() + run.first)) return false;
+			if (!reader.Read(address, run.count, slots.data() + run.first)) return false;
 		}
 		for (const auto& descriptor: plan.images)
 			for (uint32_t w = 0; w < descriptor.count; ++w) words.push_back(value(descriptor.words[w]) & ~NativeXprLodStatsMask[w]);
