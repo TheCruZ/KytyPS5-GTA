@@ -231,15 +231,16 @@ static bool UrgentSpinEnabled() {
 	return enabled;
 }
 
-void GuestGpu::SendUrgentCommandSync(Common::UniqueFunction<void>&& command) {
+void GuestGpu::SendUrgentCommandSync(Common::UniqueFunction<void>&& command, bool drains_copies) {
 	EXIT_IF(!command);
 	if (!m_pipelined || IsGpuThread() || g_cp_thread) {
 		SendCommandSync(std::move(command));
 		return;
 	}
-	const auto queue = [this](Common::UniqueFunction<void>&& wrapped) {
+	const auto queue = [this, drains_copies](Common::UniqueFunction<void>&& wrapped) {
 		std::lock_guard lock(m_urgent_mutex);
 		m_urgent_commands.push_back(std::move(wrapped));
+		m_urgent_drain = m_urgent_drain || drains_copies;
 		m_urgent_pending.fetch_add(1, std::memory_order_release);
 	};
 	// A busy execution thread runs the command before its next operation; an idle one is woken
@@ -273,21 +274,39 @@ void GuestGpu::SendUrgentCommandSync(Common::UniqueFunction<void>&& command) {
 	done.acquire();
 }
 
+// chenxiao07's guest commands drain nothing but the deferred protection (KYTY_URGENT_NO_DRAIN, default on; 0 drains the
+// host copy queue before every batch). The copy thread reads guest memory that the guest may free or overwrite once an
+// urgent command returns: unmaps, write faults and invalidations wait for it, readbacks of GPU-written pages do not (the
+// pages they write back are GPU-modified, not copy sources, and the copies of a submission are awaited before it).
+static bool UrgentNoDrainEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_URGENT_NO_DRAIN");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 void GuestGpu::RunUrgentCommands() {
 	if (m_urgent_pending.load(std::memory_order_acquire) == 0) {
 		return;
 	}
-	m_renderer.GetRenderExecutor().InvalidateRenderTargetMemo();
-	m_renderer.GetRenderExecutor().FlushDeferredDispatchBarrier();
-	// Unmaps free memory that copies of executed draws may still read.
-	if (auto* copies = m_renderer.GetCommandScheduler().HostCopies(); copies != nullptr) {
-		copies->Drain();
-	}
+	// (Taken first: a command queued after this batch was taken has its own turn and its own drain.)
 	std::vector<Common::UniqueFunction<void>> commands;
+	bool                                      drain = true;
 	{
 		std::lock_guard lock(m_urgent_mutex);
 		commands.swap(m_urgent_commands);
+		drain          = m_urgent_drain;
+		m_urgent_drain = false;
 		m_urgent_pending.store(0, std::memory_order_relaxed);
+	}
+	m_renderer.GetRenderExecutor().InvalidateRenderTargetMemo();
+	m_renderer.GetRenderExecutor().FlushDeferredDispatchBarrier();
+	// Unmaps free memory that copies of executed draws may still read.
+	if (drain || !UrgentNoDrainEnabled()) {
+		if (auto* copies = m_renderer.GetCommandScheduler().HostCopies(); copies != nullptr) {
+			copies->Drain();
+		}
 	}
 	for (auto& command: commands) {
 		command();

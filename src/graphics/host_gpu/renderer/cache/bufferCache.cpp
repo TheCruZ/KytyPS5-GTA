@@ -1158,12 +1158,14 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	// KYTY_GUEST_READBACK_ASYNC=1, and KYTY_GUEST_WRITE_READBACK_ASYNC=1 for writes too.
 	if ((!is_write || AsyncWriteReadbacksEnabled()) && !GuestGpu::IsGpuThread() && AsyncReadbacksEnabled()) {
 		std::shared_ptr<AsyncReadback> request;
-		gpu.SendUrgentCommandSync([&] {
-			request = BeginAsyncReadback(vaddr, size);
-			if (!request) {
-				synchronous();
-			}
-		});
+		gpu.SendUrgentCommandSync(
+		    [&] {
+			    request = BeginAsyncReadback(vaddr, size);
+			    if (!request) {
+				    synchronous();
+			    }
+		    },
+		    is_write);
 		// The copy completes on the GPU while the execution thread goes on; its bytes are
 		// written back by an urgent command, as the synchronous path writes them. A write then
 		// makes the range CPU-modified (synchronous() finds nothing left to read back).
@@ -1171,16 +1173,18 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			const bool guest_copy = ReadbackGuestCopyEnabled();
 			const bool copied     = WaitAsyncReadback(*request) && (!guest_copy || CopyAsyncReadback(*request));
 			if (copied || is_write) {
-				gpu.SendUrgentCommandSync([&] {
-					if (copied && guest_copy) {
-						FinishAsyncReadback(*request);
-					} else if (copied) {
-						CompleteAsyncReadback(*request);
-					}
-					if (is_write) {
-						synchronous();
-					}
-				});
+				gpu.SendUrgentCommandSync(
+				    [&] {
+					    if (copied && guest_copy) {
+						    FinishAsyncReadback(*request);
+					    } else if (copied) {
+						    CompleteAsyncReadback(*request);
+					    }
+					    if (is_write) {
+						    synchronous();
+					    }
+				    },
+				    is_write);
 			}
 		}
 		return;
@@ -1189,7 +1193,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	// writes once the work before it executed: the operations queued since cannot be what the
 	// access needs, so the readback runs before them instead of after the whole backlog (a
 	// frame of draws, 100-200 ms while an area streams in).
-	m_scheduler.Context().GetGpu().SendUrgentCommandSync(synchronous);
+	m_scheduler.Context().GetGpu().SendUrgentCommandSync(synchronous, is_write);
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
