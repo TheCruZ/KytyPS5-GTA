@@ -1616,7 +1616,7 @@ bool RenderExecutor::TableXprTry(CommandBuffer& buffer, uint64_t args_addr, uint
 	}
 	if (index_base == 0 || index_bytes == 0) return false;
 	m_context.GetCommandScheduler().PopPendingOperations();
-	Common::LockGuard lock(m_context.GetMutex());
+	RenderLockGuard lock(m_context.GetMutex());
 	NativeXprCollect();
 	const auto result =
 	    TableXprMode() >= 2 && clean && TableContinue(buffer, args_addr, index_base, index_bytes, index_type, direct)

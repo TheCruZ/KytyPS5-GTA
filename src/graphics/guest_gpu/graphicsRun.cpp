@@ -391,6 +391,8 @@ void GuestGpu::ExecutionThread() {
 	KYTY_PROFILER_THREAD("Thread_GpuExecute");
 	Config::ConfigureGpuStageThread(Config::GpuStageThread::Execution);
 	g_gpu_thread = true;
+	// This thread takes the renderer's lock around every draw and dispatch: its side of the lock is the cheap one.
+	m_renderer.GetMutex().BecomeOwner();
 	// Waking the command processor costs a fence: publish every operation, but only look for a
 	// waiter now and then and before sleeping.
 	constexpr uint32_t NotifyInterval = 16;
@@ -423,6 +425,7 @@ void GuestGpu::ExecutionThread() {
 		}
 	}
 	m_executed.Notify();
+	m_renderer.GetMutex().ResignOwner();
 	g_gpu_thread = false;
 }
 
@@ -1031,6 +1034,10 @@ void GuestGpu::ThreadRun(void* data) {
 	if (gpu->m_pipelined) {
 		Config::ConfigureGpuStageThread(Config::GpuStageThread::CommandProcessor);
 	}
+	if (!gpu->m_pipelined) {
+		// (Pipelined, the execution thread executes the operations and owns the renderer's lock.)
+		gpu->m_renderer.GetMutex().BecomeOwner();
+	}
 
 	// When every queue waits (WAIT_REG_MEM), a pipelined command processor retries without
 	// sleeping until the spin budget is spent.
@@ -1149,6 +1156,8 @@ void GuestGpu::ThreadRun(void* data) {
 			gpu->m_gfx_cp->BufferWait();
 			if (gpu->m_pipelined) {
 				gpu->StopExecution();
+			} else {
+				gpu->m_renderer.GetMutex().ResignOwner();
 			}
 			g_gpu_state  = nullptr;
 			g_gpu_thread = false;
@@ -2252,9 +2261,9 @@ static bool GlobalBarrierDedupeEnabled() {
 }
 
 void CommandProcessor::ExecuteGlobalBarrier() {
-	Common::LockGuard lock(m_renderer.GetMutex());
-	const auto        recorder = CurrentBuffer().Handle();
-	const auto*       stream   = recorder.Stream();
+	RenderLockGuard lock(m_renderer.GetMutex());
+	const auto      recorder = CurrentBuffer().Handle();
+	const auto*     stream   = recorder.Stream();
 	if (GlobalBarrierDedupeEnabled() && stream != nullptr && stream == m_barrier_stream &&
 	    stream->CommandCount() == m_barrier_commands) {
 		return;

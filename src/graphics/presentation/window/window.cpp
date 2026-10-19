@@ -846,7 +846,7 @@ void WindowRun() {
 	EXIT_IF(g_window == nullptr);
 
 	g_window->Run();
-	Common::LockGuard lock(g_window->render_context->GetMutex());
+	RenderLockGuard lock(g_window->render_context->GetMutex());
 	g_window->render_context->GetPipelineCache().Save();
 }
 

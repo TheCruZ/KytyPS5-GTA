@@ -1814,7 +1814,7 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, uint64_t args_addr, uin
 	if (index_base == 0 || index_bytes == 0) return false;
 	auto& cache = NativeXprState();
 	m_context.GetCommandScheduler().PopPendingOperations();
-	Common::LockGuard lock(m_context.GetMutex());
+	RenderLockGuard lock(m_context.GetMutex());
 	NativeXprCollect();
 	const auto& ucfg = buffer.GetUserConfig();
 	const auto& ctx  = buffer.GetRegisters();

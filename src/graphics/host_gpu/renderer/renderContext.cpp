@@ -13,6 +13,17 @@
 #include <cstdlib>
 #include <cstring>
 #include <optional>
+#include <thread>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#undef min
+#undef max
+#undef MemoryBarrier
+#endif
 
 namespace Libs::Graphics {
 
@@ -45,7 +56,80 @@ uint64_t WindowClockNow() {
 	                                 .count());
 }
 
+// KYTY_RENDER_MUTEX=0: the renderer's lock is the plain mutex for every thread, the draw thread included.
+bool RenderMutexEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_RENDER_MUTEX");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// Makes the stores of every thread of the process visible to all processors (false: the host cannot).
+bool FlushProcessWriteBuffers() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	::FlushProcessWriteBuffers();
+	return true;
+#else
+	return false;
+#endif
+}
+
 } // namespace
+
+void RenderMutex::BecomeOwner() {
+	if (!RenderMutexEnabled()) {
+		return;
+	}
+	EXIT_IF(t_owner);
+	m_mutex.Lock(); // (no requester inside: a later one finds the owner)
+	m_owner_exists = true;
+	m_asymmetric   = FlushProcessWriteBuffers();
+	m_owner_depth  = 0;
+	m_owner_locked = false;
+	t_owner        = true;
+	m_mutex.Unlock();
+}
+
+void RenderMutex::ResignOwner() {
+	if (!t_owner) {
+		return;
+	}
+	EXIT_IF(m_owner_depth != 0);
+	m_mutex.Lock();
+	t_owner        = false;
+	m_owner_exists = false;
+	m_mutex.Unlock();
+}
+
+void RenderMutex::OwnerLockSlow() {
+	// A requester holds the mutex or is about to: out, and in after it (or the host has no flush: the mutex always).
+	m_busy.store(0, std::memory_order_release);
+	m_mutex.Lock();
+	m_owner_locked = true;
+}
+
+void RenderMutex::OwnerUnlockSlow() {
+	m_owner_locked = false;
+	m_mutex.Unlock();
+}
+
+void RenderMutex::RequesterLock() {
+	if (t_requester_depth++ != 0) return;
+	m_mutex.Lock();
+	if (!m_owner_exists || !m_asymmetric) return;
+	m_requested.store(1, std::memory_order_relaxed);
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+	// The owner's `busy` store is visible now if it made it, and its next acquisition sees the request.
+	(void)FlushProcessWriteBuffers();
+	while (m_busy.load(std::memory_order_acquire) != 0) std::this_thread::yield();
+}
+
+void RenderMutex::RequesterUnlock() {
+	if (--t_requester_depth != 0) return;
+	m_requested.store(0, std::memory_order_release);
+	m_mutex.Unlock();
+}
 
 // Any guest thread, at a write fault: true when the fault's write window was released (no image, no GPU-written page
 // and all mapped in it).

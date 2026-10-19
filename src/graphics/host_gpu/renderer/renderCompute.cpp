@@ -395,7 +395,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	Common::LockGuard lock(m_context.GetMutex());
+	RenderLockGuard lock(m_context.GetMutex());
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
 		     "groups=%ux%ux%u mode=%u\n",
@@ -710,7 +710,7 @@ void RenderExecutor::DispatchIndirectThreads(uint64_t submit_id, CommandBuffer& 
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
 	                    1, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
-	Common::LockGuard lock(m_context.GetMutex());
+	RenderLockGuard lock(m_context.GetMutex());
 	// Its passes record their own barriers: it ends a chain of dispatches.
 	FlushDeferredDispatchBarrier();
 	const auto& cs_regs = buffer.GetShaders().GetCs();
@@ -857,7 +857,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
-	Common::LockGuard lock(m_context.GetMutex());
+	RenderLockGuard lock(m_context.GetMutex());
 	vk::DispatchIndirectCommand args {};
 	if (!m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
 	    LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args)) &&

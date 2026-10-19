@@ -18,6 +18,7 @@
 #include "kernel/eventQueue.h"
 
 #include <array>
+#include <atomic>
 #include <memory>
 #include <shared_mutex>
 #include <span>
@@ -33,6 +34,69 @@ namespace Libs::Graphics {
 
 class GuestGpu;
 
+// The renderer's lock (recursive, as Common::Mutex). The GPU thread that executes the draws and dispatches takes it
+// around each of them (thousands a frame), other threads (presentation, a capture) a few times a frame: an interlocked
+// acquisition and release per draw stalled that thread on its store buffer. So its acquisition is a store and a load
+// (chenxiao07's asymmetric Dekker lock): another thread takes the mutex, raises `requested`, makes the owner's stores
+// visible and its later loads see the request (FlushProcessWriteBuffers) and waits until the owner is outside (`busy`
+// clear); the owner that finds a request takes the mutex. KYTY_RENDER_MUTEX=0: nobody becomes the owner, every thread
+// takes the mutex.
+class RenderMutex {
+public:
+	RenderMutex()  = default;
+	~RenderMutex() = default;
+	KYTY_CLASS_NO_COPY(RenderMutex);
+
+	// The calling thread (the one that executes the GPU operations) takes the owner's side from now on, until it
+	// resigns (outside any lock).
+	void BecomeOwner();
+	void ResignOwner();
+
+	void Lock() {
+		if (!t_owner) return RequesterLock();
+		if (m_owner_depth++ != 0) return;
+		m_busy.store(1, std::memory_order_relaxed);
+		// (The store before the load in program order: the requester's flush is what orders them on the CPU.)
+		std::atomic_signal_fence(std::memory_order_seq_cst);
+		if (!m_asymmetric || m_requested.load(std::memory_order_acquire) != 0) OwnerLockSlow();
+	}
+	void Unlock() {
+		if (!t_owner) return RequesterUnlock();
+		if (--m_owner_depth != 0) return;
+		if (m_owner_locked) return OwnerUnlockSlow();
+		m_busy.store(0, std::memory_order_release);
+	}
+
+private:
+	void OwnerLockSlow();
+	void OwnerUnlockSlow();
+	void RequesterLock();
+	void RequesterUnlock();
+
+	Common::Mutex m_mutex;
+	// The owner's (written at each of its acquisitions): it is inside, and its depth.
+	alignas(64) std::atomic<uint32_t> m_busy {0};
+	uint32_t                          m_owner_depth  = 0;
+	bool                              m_owner_locked = false; // (its outermost acquisition took the mutex)
+	// The requesters' (written under the mutex): one holds the mutex and waits for the owner to leave; an owner exists.
+	alignas(64) std::atomic<uint32_t> m_requested {0};
+	bool                              m_owner_exists = false;
+	bool                              m_asymmetric   = false; // (the host can flush other processors' stores)
+	inline static thread_local bool     t_owner           = false;
+	inline static thread_local uint32_t t_requester_depth = 0;
+};
+
+class RenderLockGuard {
+public:
+	// NOLINTNEXTLINE(google-runtime-references)
+	explicit RenderLockGuard(RenderMutex& mutex): m_mutex(mutex) { m_mutex.Lock(); }
+	~RenderLockGuard() { m_mutex.Unlock(); }
+	KYTY_CLASS_NO_COPY(RenderLockGuard);
+
+private:
+	RenderMutex& m_mutex;
+};
+
 class RenderContext {
 public:
 	explicit RenderContext(GraphicContext& graphics);
@@ -45,7 +109,7 @@ public:
 	[[nodiscard]] GuestGpu&                 GetGpu() const;
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
 
-	Common::Mutex&      GetMutex() { return m_mutex; }
+	RenderMutex&        GetMutex() { return m_mutex; }
 	CommandScheduler&   GetCommandScheduler() { return m_command_scheduler; }
 	PipelineCache&      GetPipelineCache() { return m_pipeline_cache; }
 	DescriptorHeap&     GetDescriptorHeap() { return m_descriptor_heap; }
@@ -112,7 +176,7 @@ private:
 	};
 
 	GraphicContext&           m_graphics;
-	Common::Mutex             m_mutex;
+	RenderMutex               m_mutex;
 	RenderExecutor            m_render_executor;
 	CommandScheduler          m_command_scheduler;
 	DescriptorHeap            m_descriptor_heap;
