@@ -93,6 +93,18 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	return ptr;
 }
 
+void MemoryTracker::QueueBdaSync(uint64_t vaddr, uint64_t size) {
+	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	std::lock_guard lock(m_bda_sync_mutex);
+	m_bda_sync.Add(begin, end - begin);
+}
+
+RangeSet MemoryTracker::TakeBdaSync() {
+	std::lock_guard lock(m_bda_sync_mutex);
+	return std::exchange(m_bda_sync, RangeSet {});
+}
+
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	if (g_tracker_skip_clean && g_tracker_bitmap && IsRangeCpuCleanHint(vaddr, size)) {
@@ -124,6 +136,7 @@ void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
+	QueueBdaSync(vaddr, size);
 }
 
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
@@ -196,6 +209,8 @@ void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
+	locks.clear();
+	QueueBdaSync(vaddr, size);
 }
 
 } // namespace Libs::Graphics

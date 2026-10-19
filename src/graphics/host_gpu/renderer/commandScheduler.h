@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "common/uniqueFunction.h"
+#include "graphics/host_gpu/renderer/dynamicState.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
@@ -18,7 +19,6 @@
 #include <type_traits>
 
 #include <queue>
-
 #include <thread>
 #include <vector>
 
@@ -68,12 +68,14 @@ public:
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
+	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	// As DeferOperation, also between guest command buffers (no active command buffer): runs
 	// once the GPU has finished the current tick, so work submitted earlier, still running, can
 	// keep using what the operation releases.
 	void                      DeferRelease(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
+	[[nodiscard]] bool        HasPendingPriorityOperations();
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 	// Hands later submissions to a dedicated queue thread, which submits them in tick order, so
 	// vkQueueSubmit (and the queue lock that present also takes) leaves the recording thread.
@@ -129,6 +131,7 @@ public:
 	// Waits at most timeout_ns for the GPU to reach a submitted tick; true when it has.
 	bool                           WaitFor(uint64_t tick, uint64_t timeout_ns);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
+	[[nodiscard]] DynamicState&    GetDynamicState() noexcept { return m_dynamic_state; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
 
@@ -207,6 +210,7 @@ private:
 	void SubmitThread(std::stop_token stop);
 	void StopSubmitThread();
 	void PriorityOperationsThread(std::stop_token stop);
+	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 
 	// KYTY_GPU_TIME (see commandScheduler.cpp).
@@ -222,6 +226,7 @@ private:
 	uint32_t                     m_recorded_release_mem_writes     = 0;
 	uint32_t                     m_recorded_release_mem_interrupts = 0;
 	uint32_t                     m_recorded_draws                  = 0;
+	DynamicState                 m_dynamic_state;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;

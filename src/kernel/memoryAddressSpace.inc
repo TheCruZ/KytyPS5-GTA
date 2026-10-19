@@ -40,6 +40,35 @@ static void ResyncRemappedViews() {
 	t_resync_ns += CostNowNs() - begin;
 }
 
+template <typename Regions, typename Source, typename Gap>
+static void CopySparseRange(const Regions& regions, uint64_t vaddr, void* data, uint64_t size,
+                            Source&& source, Gap&& gap) {
+	const auto end     = vaddr + size;
+	auto       mapping = regions.lower_bound(vaddr);
+	if (mapping != regions.begin()) {
+		auto previous = std::prev(mapping);
+		if (previous->second.vaddr + previous->second.size > vaddr) {
+			mapping = previous;
+		}
+	}
+
+	auto* destination = static_cast<uint8_t*>(data);
+	auto  cursor      = vaddr;
+	for (; mapping != regions.end() && mapping->second.vaddr < end; ++mapping) {
+		const auto& entry = mapping->second;
+		const auto  start = std::max(vaddr, entry.vaddr);
+		const auto  bytes = std::min(end, entry.vaddr + entry.size) - start;
+		if (cursor < start) {
+			gap(cursor, destination + (cursor - vaddr), start - cursor);
+		}
+		std::memcpy(destination + (start - vaddr), source(entry, start), bytes);
+		cursor = start + bytes;
+	}
+	if (cursor < end) {
+		gap(cursor, destination + (cursor - vaddr), end - cursor);
+	}
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 	return size != 0 && VirtualFree(reinterpret_cast<void*>(vaddr), size,
@@ -194,6 +223,7 @@ public:
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			return false;
 		}
+		DiagLockGuard map_lock(m_mutex, __func__);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (m_lazy_commit) {
 			// Pages not committed yet are zero when they are; touching them would fault.
@@ -229,6 +259,11 @@ public:
 		if (data == nullptr) {
 			return false;
 		}
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+		if (g_test_backing_read != nullptr && IsAvailable() && size != 0) {
+			g_test_backing_read(vaddr, size);
+		}
+#endif
 		auto* destination = static_cast<uint8_t*>(data);
 		return TryTransferBacking(
 		    vaddr, size, [destination](uint8_t* backing, uint64_t data_offset, size_t bytes) {
@@ -282,18 +317,20 @@ public:
 		return RangeOk(offset, size) ? m_backing_base + offset : nullptr;
 	}
 
-	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
+	// Gaps (bytes no mapping holds) are handed to `gap(address, destination, bytes)`.
+	// The copy runs outside the lock: the GPU thread reads whole buffers this way (64 ms with
+	// the lock held, the game's map, unmap and protect calls waiting, cutscene, 2026-10-18).
+	// The backing base view stays mapped and a mapped range's backing stays committed, so the
+	// copy is safe if the mapping changes meanwhile; it sees the bytes as they are then.
+	template <typename Gap>
+	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size, Gap&& gap) {
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
 
-		// The copy runs outside the lock: the GPU thread reads whole buffers this way (64 ms with
-		// the lock held, the game's map, unmap and protect calls waiting, cutscene, 2026-10-18).
-		// The backing base view stays mapped and a mapped range's backing stays committed, so the
-		// copy is safe if the mapping changes meanwhile; it sees the bytes as they are then.
 		struct Segment {
-			uint64_t       start;
-			uint64_t       bytes;
+			uint64_t       vaddr;
+			uint64_t       size;
 			const uint8_t* source;
 		};
 		thread_local std::vector<Segment> segments;
@@ -301,7 +338,12 @@ public:
 		const auto end = vaddr + size;
 		{
 			DiagLockGuard lock(m_mutex, __func__);
-			auto          first = m_maps.lower_bound(vaddr);
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+			if (g_test_backing_read != nullptr) {
+				g_test_backing_read(vaddr, size);
+			}
+#endif
+			auto first = m_maps.lower_bound(vaddr);
 			if (first != m_maps.begin()) {
 				auto previous = std::prev(first);
 				if (previous->second.vaddr + previous->second.size > vaddr) {
@@ -324,16 +366,23 @@ public:
 		auto* destination = static_cast<uint8_t*>(data);
 		auto  cursor      = vaddr;
 		for (const auto& segment: segments) {
-			if (cursor < segment.start) {
-				std::memset(destination + (cursor - vaddr), 0, segment.start - cursor);
+			if (cursor < segment.vaddr) {
+				gap(cursor, destination + (cursor - vaddr), segment.vaddr - cursor);
 			}
-			std::memcpy(destination + (segment.start - vaddr), segment.source, segment.bytes);
-			cursor = segment.start + segment.bytes;
+			std::memcpy(destination + (segment.vaddr - vaddr), segment.source, segment.size);
+			cursor = segment.vaddr + segment.size;
 		}
 		if (cursor < end) {
-			std::memset(destination + (cursor - vaddr), 0, end - cursor);
+			gap(cursor, destination + (cursor - vaddr), end - cursor);
 		}
 		return true;
+	}
+
+	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
+		return TryReadSparseBacking(vaddr, data, size,
+		                            [](uint64_t, uint8_t* destination, uint64_t bytes) {
+			                            std::memset(destination, 0, bytes);
+		                            });
 	}
 
 	bool MapFixed(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
@@ -790,7 +839,9 @@ private:
 		}
 
 		const auto protect_begin = CostNowNs();
-		const bool protected_ok  = ApplyProtection(ptr, size, mode);
+		// The view was created with the access of `mode`; only a no-access view needs it applied.
+		const bool protected_ok =
+		    mode != VirtualMemory::Mode::NoAccess || ApplyProtection(ptr, size, mode);
 		t_view_protect_ns += CostNowNs() - protect_begin;
 		if (!protected_ok) {
 			UnmapViewOfFile2(GetCurrentProcess(), ptr, MEM_PRESERVE_PLACEHOLDER);
@@ -959,24 +1010,49 @@ public:
 	}
 
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
-		if (!Owns(vaddr, size)) {
+		return CopySparseMemory<false>(vaddr, data, size);
+	}
+
+	// copy_private: gaps of the backing may be private mappings, read in place; otherwise a
+	// private mapping in the range fails the copy and gaps read as zero.
+	template <bool copy_private>
+	bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {
+		if (data == nullptr || !Owns(vaddr, size)) {
 			return false;
 		}
-		{
-			DiagLockGuard lock(m_mutex, __func__);
-			auto          mapping = m_mapped.upper_bound(vaddr);
-			if (mapping != m_mapped.begin()) {
-				--mapping;
-			}
-			for (; mapping != m_mapped.end() && mapping->second.vaddr < vaddr + size; ++mapping) {
-				const auto& region = mapping->second;
-				if (region.type == MappingType::Private && region.vaddr + region.size > vaddr) {
-					return false;
+		if constexpr (!copy_private) {
+			{
+				DiagLockGuard lock(m_mutex, __func__);
+				auto          mapping = m_mapped.upper_bound(vaddr);
+				if (mapping != m_mapped.begin()) {
+					--mapping;
+				}
+				for (; mapping != m_mapped.end() && mapping->second.vaddr < vaddr + size;
+				     ++mapping) {
+					const auto& region = mapping->second;
+					if (region.type == MappingType::Private && region.vaddr + region.size > vaddr) {
+						return false;
+					}
 				}
 			}
+			// Outside this lock too: the backing store copies without holding its own.
+			return m_backing->TryReadSparseBacking(vaddr, data, size);
+		} else {
+			DiagLockGuard lock(m_mutex, __func__);
+			return m_backing->TryReadSparseBacking(
+			    vaddr, data, size, [&](uint64_t start, uint8_t* destination, uint64_t bytes) {
+				    const auto zero = [](uint64_t, uint8_t* output, uint64_t length) {
+					    std::memset(output, 0, length);
+				    };
+				    // Backing gaps can contain private mappings or reservations only.
+				    CopySparseRange(m_mapped, start, destination, bytes,
+				                    [](const auto& region, uint64_t address) {
+					                    EXIT_IF(region.type != MappingType::Private);
+					                    return reinterpret_cast<const void*>(address);
+				                    },
+				                    zero);
+			    });
 		}
-		// Outside this lock too: the backing store copies without holding its own.
-		return m_backing->TryReadSparseBacking(vaddr, data, size);
 	}
 
 	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }

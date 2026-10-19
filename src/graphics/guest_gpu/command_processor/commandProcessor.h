@@ -24,6 +24,15 @@ enum class ContextStateOperation : uint32_t {
 	PushClear = 3,
 };
 
+struct IndirectDrawRegisters {
+	uint32_t vertex_offset;
+	uint32_t instance_offset;
+	uint32_t index_offset;
+	// DRAW_INDIRECT_MULTI: the SH register that receives the draw's index within the packet
+	// (starts at zero for each packet); Pm4::SH_NOP for none.
+	uint32_t draw_index;
+};
+
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
@@ -105,13 +114,11 @@ public:
 	void DrawIndex(DrawIndexArgs args);
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count);
 	void DrawIndexAuto(DrawAutoArgs args);
-	// DRAW_INDIRECT(_MULTI) START_INST_LOC: the SH register the CP writes each draw's start
-	// instance into (0: none). Set by the PM4 handler before the draw.
-	void SetIndirectStartInstanceRegister(uint32_t reg) { m_start_instance_register = reg; }
-	void DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed);
+	void DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
+	                  uint32_t draw_initiator, bool indexed);
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
 	                       const volatile uint32_t* count_addr, uint32_t stride_in_bytes,
-	                       uint32_t draw_initiator, bool indexed, uint32_t draw_index_register);
+	                       IndirectDrawRegisters registers, uint32_t draw_initiator, bool indexed);
 	void WriteAtEndOfPipe32(uint32_t cache_policy, uint32_t event_write_dest,
 	                        uint32_t eop_event_type, uint32_t cache_action, uint32_t event_index,
 	                        uint32_t event_write_source, void* dst_gpu_addr, uint32_t value,
@@ -208,8 +215,6 @@ private:
 	// The DrawIndirectArgs whose instance count NUM_INSTANCES holds after a GPU-read indirect draw;
 	// read on the CPU only if a later draw takes its instance count from there.
 	uint64_t m_num_instances_args = 0;
-	uint32_t m_start_instance_register = 0;
-	void     WriteIndirectStartInstance(uint32_t start_instance);
 	[[nodiscard]] uint32_t NumInstances();
 
 	uint32_t m_de_count    = 0;

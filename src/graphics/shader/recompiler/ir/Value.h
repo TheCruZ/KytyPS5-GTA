@@ -23,6 +23,7 @@ class Value {
 public:
 	Value() = default;
 	explicit Value(Inst* value);
+	explicit Value(const Inst* value) = delete;
 	explicit Value(ScalarReg value);
 	explicit Value(VectorReg value);
 	explicit Value(bool value);
@@ -141,6 +142,12 @@ public:
 		}
 		return evaluation_index;
 	}
+	// Backend definitions belong to one emission. Wave64 emulation needs one per half.
+	[[nodiscard]] uint32_t Definition(uint32_t half) const { return definitions[half]; }
+	void SetDefinition(uint32_t half, uint32_t definition) const {
+		definitions[half] = definition;
+	}
+	void ResetDefinitions() const { definitions = {}; }
 
 	void SetParent(Block* block);
 	void SetArg(size_t index, Value value);
@@ -192,6 +199,7 @@ private:
 	uint8_t             num_args;
 	bool                live = false;
 	mutable uint32_t    evaluation_index = UINT32_MAX;
+	mutable std::array<uint32_t, 2> definitions {};
 	uint64_t            flags;
 	Block*              parent = nullptr;
 	union {
@@ -202,7 +210,7 @@ private:
 	std::vector<Use>    uses;
 };
 
-static_assert(sizeof(Inst) <= 112, "Inst operand storage unintentionally increased");
+static_assert(sizeof(Inst) <= 120, "Inst operand and backend storage unintentionally increased");
 
 // The accessors the IR passes and the resource walker call for every operand, inline: out of
 // line they were a fifth of the GPU thread's resource walk (calls, no LTO).

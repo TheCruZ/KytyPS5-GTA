@@ -6,7 +6,6 @@
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
-#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include <algorithm>
@@ -58,57 +57,52 @@ constexpr std::array<ImageDimensionInfo, 7> ImageDimensions {{
 
 const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 
-struct SpirvRequirements {
-	bool bvh                          = false;
-	bool subgroup_ballot              = false;
-	bool subgroup_barrier             = false;
-	bool subgroup_shuffle             = false;
-	bool subgroup_local_invocation_id = false;
-	bool subgroup_arithmetic          = false;
-	bool compute_derivatives          = false;
-	bool image_gather_extended        = false;
-	bool function_lds                 = false;
-	// Dwords the function-scope LDS array needs, from bounds on every LDS address; 0 when some
-	// address is unbounded.
-	uint32_t function_lds_dwords      = 0;
-	bool function_scratch             = false;
-	bool pixel_valid_mask             = false;
-	bool buffer_int64_atomics         = false;
-	bool buffer_u8                    = false;
-	bool buffer_u16                   = false;
-	bool shared_int64_atomics         = false;
-	bool coherent_buffers             = false;
-	bool float64                      = false;
-	bool shader_clock                 = false;
+struct BufferDefinition {
+	uint32_t variable             = 0;
+	uint32_t type                 = 0;
+	uint32_t element_type         = 0;
+	uint32_t pointer_type         = 0;
+	uint32_t element_pointer_type = 0;
 };
 
-SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
+struct ImageDefinition {
+	uint32_t variable     = 0;
+	uint32_t type         = 0;
+	uint32_t pointer_type = 0;
+	uint32_t sampled_type = 0;
+};
 
 // KYTY_NO_FLOAT_CONTROLS: shaders built without SignedZeroInfNanPreserve (spirvEmitterModule.cpp).
 bool FloatControlsDisabled(uint64_t shader_hash);
 
+// Bindless images or samplers and buffers bound with a GPU-sized record count read the flattened
+// SRT even when no other resource does (spirvEmitterModule.cpp).
+bool BindlessOrGpuSizedSrt(const IR::Program& program);
+
 struct ValueEmitContext;
 
 struct EmitterState {
-	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
+	EmitterState(IR::Program& program_, ShaderStageInputInfo input_info_, bool maintenance8_enabled_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
-	      program(program_), input_info(input_info_),
-	      requirements(AnalyzeProgramRequirements(program_)) {
+	      program(program_), input_info(input_info_), maintenance8_enabled(maintenance8_enabled_) {
 		if (ShaderWorkgroupInput(program.stage, input_info) != nullptr) {
 			lds_storage_class = spv::StorageClassWorkgroup;
 		}
-		if (IR::FindBinding(program.bindings, IR::DescriptorBindingKind::SharedMemory) != nullptr) {
+		if (program.info.uses_lds && program.stage == ShaderType::Compute &&
+		    input_info.compute != nullptr && input_info.compute->lds_storage) {
 			lds_storage_class = spv::StorageClassStorageBuffer;
 		}
 	}
 
 	Builder                                          builder;
-	const IR::Program&                               program;
+	IR::Program&                                     program;
 	ShaderStageInputInfo                             input_info;
+	bool                                            maintenance8_enabled;
+	uint32_t                                        debug_source = 0;
 	uint32_t                                        void_type = 0;
 	uint32_t                                        bool_type = 0;
 	uint32_t                                        u32_type = 0;
-	uint32_t                                        native_u64_type = 0;
+	uint32_t                                        u64_type = 0;
 	uint32_t                                        i32_type = 0;
 	uint32_t                                        f32_type = 0;
 	uint32_t                                        f64_type = 0;
@@ -123,26 +117,27 @@ struct EmitterState {
 	uint32_t                                         tess_inner_variable = 0;
 	uint32_t                                         tess_patch_base     = 0;
 
-	const SpirvRequirements                          requirements;
 	// SignedZeroInfNanPreserve for 32-bit floats: NaN-aware GLSL.std.450 operations (NMin, NMax,
 	// OpIsNan) then have the defined results the guest's IEEE instructions need.
 	const bool float_controls = !FloatControlsDisabled(program.shader_hash);
+	// OpReadClockKHR (S_MEMREALTIME) is used: needs the shader clock capability.
+	bool                                             shader_clock            = false;
+	// Dwords the function-scope LDS array of a non-compute stage needs, from bounds on every
+	// LDS address; 0 when some address is unbounded (the default size is then used).
+	uint32_t                                         function_lds_dwords     = 0;
 	uint32_t                                         lane_count              = 1;
 	// Execution scope of the barriers that keep one guest wave's LDS accesses in order across
 	// host invocations (WaveLdsScope in SpirvEmitter.cpp); 0 when none are emitted.
 	uint32_t                                         wave_lds_scope          = 0;
 	uint32_t                                         lane_half               = 0;
-	uint32_t                                         storage_buffer_variable = 0;
-	uint32_t                                         storage_buffer_u8_variable = 0;
-	uint32_t                                         storage_buffer_u16_variable = 0;
-	uint32_t                                         storage_buffer_u64_variable = 0;
-	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
-	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_dword_lengths {};
-	// Write bitmap (BindingLayout::write_tracking): the bitmap's device address, each memory
+	std::array<BufferDefinition, 4>                  storage_buffers {};
+	std::vector<uint32_t>                           memory_byte_offsets;
+	std::vector<uint32_t>                            memory_dword_lengths;
+	// Write bitmap (Bindings::write_tracking): the bitmap's device address, each memory
 	// binding's guest base (u64 ids; a base of 0 is not tracked in that draw), and whether the
 	// instruction being emitted writes memory.
 	uint32_t                                         write_bitmap_address    = 0;
-	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> write_track_bases {};
+	std::vector<uint32_t>                            write_track_bases;
 	bool                                             emitting_write          = false;
 	// The instruction EmitDirectInstruction is emitting, and its lane (gpu_records_ssa bounds).
 	const IR::Inst*                                  emitting_inst           = nullptr;
@@ -150,6 +145,9 @@ struct EmitterState {
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
+	uint32_t                                         indirect_format_function = 0;
+	uint32_t                                         indirect_format_geometry_function = 0;
+	std::map<std::array<uint32_t, 3>, uint32_t>        indirect_buffer_load_functions;
 	uint32_t                                         bvh_intersect_function  = 0;
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
@@ -161,7 +159,7 @@ struct EmitterState {
 	uint32_t                                         lds_variable            = 0;
 	uint32_t                                         lds_u64_variable        = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};
-	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
+	std::array<ImageDefinition, IR::ImageBindingCount> images {};
 	// Bindless images: set-1 runtime arrays by image type, the key -> slot translation buffer,
 	// and the slot EmitImage computed for the instruction being emitted (0 when none).
 	std::map<uint32_t, uint32_t>                     bindless_image_variables;
@@ -178,6 +176,8 @@ struct EmitterState {
 	uint32_t                                         bindless_sampler_variable     = 0;
 	uint32_t                                         bindless_sampler_slot         = 0;
 	uint32_t                   sampler_variable                      = 0;
+	uint32_t                   sampler_type                          = 0;
+	uint32_t                   sampler_pointer_type                  = 0;
 	uint32_t                   main_func                             = 0;
 	uint32_t                   mesh_guest_func                       = 0;
 	uint32_t                   mesh_allocation                       = 0;
@@ -200,7 +200,7 @@ struct EmitterState {
 	// loop exit is taken, so a loop whose trip count comes from bad data ends instead of hanging
 	// the GPU (structured loops; the dispatcher has its own bound).
 	uint32_t                   loop_guard_variable                   = 0;
-	std::vector<uint32_t>      loop_guard_merges;
+	std::vector<const IR::Block*> loop_guard_merges;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
@@ -210,11 +210,11 @@ struct EmitterState {
 	uint32_t                   layer_variable                        = 0;
 	uint32_t                   viewport_index_variable               = 0;
 	uint32_t                   depth_variable                        = 0;
+	uint32_t                   object_primitive_id_variable          = 0;
 	uint32_t                   sample_mask_variable                  = 0;
 	std::vector<InputBinding>  inputs;
 	std::vector<OutputBinding> outputs;
 	std::vector<uint32_t>      interface_variables;
-	std::unordered_map<const IR::Block*, uint32_t> labels;
 };
 
 uint32_t TypeVoid(EmitterState& state);
@@ -222,7 +222,6 @@ uint32_t TypeBool(EmitterState& state);
 uint32_t TypeBoolVector(EmitterState& state, uint32_t components);
 uint32_t TypeU32(EmitterState& state);
 uint32_t TypeU64(EmitterState& state);
-uint32_t TypeScalarU64(EmitterState& state);
 uint32_t TypeU32Pair(EmitterState& state);
 uint32_t TypeI32(EmitterState& state);
 uint32_t TypeI32Pair(EmitterState& state);
@@ -235,8 +234,6 @@ uint32_t TypeI32Vector(EmitterState& state, uint32_t components);
 uint32_t TypeF32Vector(EmitterState& state, uint32_t components);
 uint32_t TypePointer(EmitterState& state, spv::StorageClass storage_class, uint32_t pointee);
 uint32_t TypeFunction(EmitterState& state);
-uint32_t TypeStorageBufferElement(EmitterState& state, uint32_t bits);
-uint32_t TypeStorageBufferPointer(EmitterState& state, uint32_t bits = 32);
 uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits = 32);
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
@@ -269,6 +266,11 @@ inline const IR::ImageResource& ImageResourceAt(const EmitterState& state, uint3
 inline void EmitLabel(EmitterState& state, uint32_t label) {
 	state.current_label = label;
 	state.builder.AddFunction(spv::OpLabel, label);
+	if (state.debug_source != 0 && state.current_block != nullptr) {
+		// Source lines encode the containing native block's byte offset plus one.
+		state.builder.AddFunction(spv::OpLine, state.debug_source,
+		                          state.current_block->start_pc + 1u, 0u);
+	}
 }
 
 uint32_t TypeId(EmitterState& state, IR::Type type);
@@ -296,6 +298,12 @@ inline uint32_t Unary(EmitterState& state, spv::Op opcode, uint32_t type, uint32
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(opcode, type, result, value);
 	return result;
+}
+
+inline uint32_t PackU64(EmitterState& state, uint32_t low, uint32_t high) {
+	const auto pair = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 2), pair, low, high);
+	return Unary(state, spv::OpBitcast, TypeU64(state), pair);
 }
 
 inline uint32_t Binary(EmitterState& state, spv::Op opcode, uint32_t type, uint32_t lhs,
@@ -327,12 +335,10 @@ struct ValueEmitContext {
 	const IR::Inst*       ImageAddress(IR::Value value);
 	const IR::MemoryInfo& Memory(const IR::Inst& inst) const;
 	const IR::ExportInfo& Export(const IR::Inst& inst) const;
-	uint32_t              Label(const IR::Block* block) const;
 	[[noreturn]] void     Fail(const char* reason) const;
 	[[noreturn]] void     Fail(const IR::Inst& inst, const char* reason) const;
 
 	EmitterState&                                                      state;
-	std::unordered_map<const IR::Inst*, uint32_t>                      definitions;
 	const std::unordered_map<const IR::Inst*, uint32_t>*               dispatcher_spills = nullptr;
 	std::unordered_map<const IR::Inst*, std::pair<uint32_t, uint32_t>> dispatcher_block_loads;
 	uint32_t                                                           scratch_u32_variable = 0;
@@ -389,9 +395,6 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
                                                IR::DescriptorBindingKind kind, uint32_t resource,
                                                const char* reason);
 
-uint32_t ResourceForDescriptor(const EmitterState& state, IR::DescriptorBindingKind kind,
-                               uint32_t resource);
-
 uint32_t DescriptorElementPointer(EmitterState& state, uint32_t result_ptr_type,
                                   uint32_t variable_id, uint32_t array_index,
                                   IR::DescriptorBindingKind kind, uint32_t resource,
@@ -412,13 +415,14 @@ uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t
 uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip = 0,
                              uint32_t array_index = 0);
 
-uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler);
+uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler, uint32_t array_index = 0);
 
 uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler_id,
-                          uint32_t mip = 0, uint32_t array_index = 0);
+                          uint32_t mip = 0, uint32_t array_index = 0,
+                          bool sampler_dynamic = false);
 
 void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,
-                           uint32_t texel);
+                           uint32_t texel, uint32_t array_index);
 
 spv::ExecutionModel ExecutionModelForStage(ShaderType stage);
 
@@ -483,6 +487,7 @@ inline constexpr auto EmitAddU32 = EmitNative<spv::OpIAdd, IR::Type::U32, uint32
 uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32_t rhs);
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
+uint32_t EmitPushDataLoad(EmitterState& state, uint32_t index);
 
 // A thread-dimension compute dispatch whose counts the shader reads from GPU memory.
 [[nodiscard]] bool DispatchDimensionsIndirect(const EmitterState& state);
@@ -492,7 +497,8 @@ uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem);
 
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
-uint32_t StorageBufferElementBits(const IR::Program& program, const IR::MemoryInfo& mem);
+
+uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resource);
 
 void EmitMemoryOffsets(EmitterState& state);
 void EmitSrtVerify(EmitterState& state);
@@ -503,9 +509,11 @@ void EnsureLdsStorage(EmitterState& state);
 struct MemoryResourceAccess {
 	IR::ResourceKind      kind             = IR::ResourceKind::None;
 	uint32_t              object_pointer   = 0;
+	uint32_t              descriptor_index = 0;
 	uint32_t              length           = 0;
 	uint32_t              byte_offset      = 0;
 	uint32_t              element_bits     = 32;
+	bool                  non_uniform      = false;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
 	// Write-tracked binding, while a writing instruction is emitted: its guest base (u64 id).
 	uint32_t              write_base       = 0;
@@ -513,11 +521,13 @@ struct MemoryResourceAccess {
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                    uint32_t search_iterations, uint32_t default_resource);
-MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem);
+MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem,
+                                                 uint32_t array_index = 0u);
 
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         state,
                                                         const IR::MemoryInfo& mem,
-                                                        uint32_t variable, uint32_t pointer_type,
+                                                        BufferDefinition& buffer,
+                                                        uint32_t array_index = 0,
                                                         uint32_t element_bits = 32);
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
@@ -541,6 +551,16 @@ uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits);
 uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
                                   uint32_t component, uint32_t raw);
 
+enum class UnormRounding { RoundEven, HalfUp, Truncate };
+
+uint32_t EncodeFormattedStoreComponent(EmitterState& state, const Format::BufferFormatInfo& info,
+                                       uint32_t component, uint32_t data, uint32_t data_bits,
+                                       UnormRounding rounding = UnormRounding::RoundEven);
+
+uint32_t EncodePackedColorComponent(EmitterState& state, const Format::BufferFormatInfo& info,
+                                    uint32_t component, uint32_t data, uint32_t data_bits,
+                                    UnormRounding rounding = UnormRounding::RoundEven);
+
 spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode);
 
 uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t pointer,
@@ -561,20 +581,10 @@ inline constexpr auto EmitSelectValueU32 =
 
 uint32_t EmitAndConstant(EmitterState& state, uint32_t value, uint32_t mask);
 
-uint32_t EmitShiftRightConstant(EmitterState& state, uint32_t value, uint32_t shift);
-
 inline constexpr auto EmitOrU32 = EmitNative<spv::OpBitwiseOr, IR::Type::U32, uint32_t, uint32_t>;
 
 uint32_t EmitCompareU32Constant(EmitterState& state, spv::Op opcode, uint32_t value,
                                 uint32_t constant);
-
-uint32_t EmitSubConstantMinusU32(EmitterState& state, uint32_t constant, uint32_t value);
-
-uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t f32);
-
-uint32_t EmitMinMaxU32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value);
-
-uint32_t EmitMinMaxI32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value);
 
 inline constexpr auto EmitBitcastF32ToU32 = EmitNative<spv::OpBitcast, IR::Type::U32, uint32_t>;
 
@@ -598,6 +608,7 @@ uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
                                uint32_t class_match);
 
 uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask);
+uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask);
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value);
 
@@ -623,10 +634,10 @@ uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits);
 void EmitProgram(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
+void DefineIndirectBufferFormats(ValueEmitContext& ctx);
+void DefineIndirectBufferLoads(ValueEmitContext& ctx);
 void DefineBvhIntersect(EmitterState& state);
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
-uint32_t ConstantDeviceAddress(EmitterState& state, uint64_t value);
-uint32_t DeviceAddressFromWords(EmitterState& state, uint32_t low, uint32_t high);
 
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>

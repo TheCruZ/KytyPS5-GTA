@@ -1,31 +1,38 @@
-#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include <algorithm>
 #include <bit>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
-uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
-	if (state.program.bindings.UsesPushData()) {
-		dword_index += state.program.bindings.push_data_start_dword;
-		const auto pointer = state.builder.AllocateId();
-		const auto value   = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state),
-		                          pointer, state.push_constant_variable, ConstantU32(state, 0),
-		                          ConstantU32(state, dword_index));
-		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
-		return value;
-	}
+uint32_t EmitPushDataLoad(EmitterState& state, uint32_t index) {
+	const auto pointer = state.builder.AllocateId();
+	const auto value   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state),
+	                          pointer, state.push_constant_variable, ConstantU32(state, 0), index);
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+	return value;
+}
+
+static uint32_t EmitShaderDataDwordLoadAt(EmitterState& state, uint32_t dword_index) {
+	if (state.program.bindings.UsesPushData()) return EmitPushDataLoad(state, dword_index);
 	if (state.shader_data_storage_variable != 0) {
 		const auto pointer = state.builder.AllocateId();
 		const auto value   = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
 		                          pointer, state.shader_data_storage_variable,
-		                          ConstantU32(state, 0), ConstantU32(state, dword_index));
+		                          ConstantU32(state, 0), dword_index);
 		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
 		return value;
 	}
 	return ConstantU32(state, 0);
+}
+
+uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
+	if (state.program.bindings.UsesPushData()) {
+		dword_index += state.program.bindings.push_data_start_dword;
+	}
+	return EmitShaderDataDwordLoadAt(state, ConstantU32(state, dword_index));
 }
 
 uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32_t rhs) {
@@ -47,6 +54,16 @@ uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t m
 	};
 	const auto mapping = ConstantU32(state, mapping_offset);
 	const auto count = LoadMapping(mapping);
+	if (search_iterations == 0u) {
+		const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), key,
+		                          ConstantU32(state, 2u));
+		const auto valid = Binary(state, spv::OpULessThan, TypeBool(state), index, count);
+		const auto safe = Select(state, TypeU32(state), valid, index, ConstantU32(state, 0u));
+		const auto entry = Binary(state, spv::OpIAdd, TypeU32(state), safe,
+		                          ConstantU32(state, mapping_offset + 1u));
+		return Select(state, TypeU32(state), valid, LoadMapping(entry),
+		              ConstantU32(state, default_resource));
+	}
 	const auto entry_at = [&](uint32_t index) {
 		return Binary(state, spv::OpIAdd, TypeU32(state), mapping,
 		              Binary(state, spv::OpIAdd, TypeU32(state),
@@ -95,47 +112,72 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 	return state.program.info.buffers[mem.resource].descriptor_format;
 }
 
-uint32_t StorageBufferElementBits(const IR::Program& program, const IR::MemoryInfo& mem) {
-	if (!mem.formatted) return mem.data_bits;
-	const auto format = mem.typed ? Format::DecodeTBufferFormat(mem.data_format, mem.number_format)
-	                              : program.info.buffers[mem.resource].descriptor_format;
-	const auto info = Format::GetFormatInfo(format);
-	return info.type == Format::ComponentType::Unknown || info.packed_bitfield
-	           ? 32u : info.component_bits[0];
+uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resource) {
+	const auto& buffers = state.program.info.buffers;
+	const auto& root = buffers[resource];
+	if (root.indirect_root != resource || root.descriptor_index == UINT32_MAX ||
+	    root.indirect_resources.size() < 2u) {
+		return UINT32_MAX;
+	}
+	const auto first = root.packed_stride == 0u ? 1u : 0u;
+	const auto representative = root.indirect_resources[first];
+	const auto& shared = buffers[representative];
+	if (shared.packed_stride == 0u) return UINT32_MAX;
+	uint32_t next_child_slot = UINT32_MAX;
+	for (uint32_t ordinal = first; ordinal < root.indirect_resources.size(); ++ordinal) {
+		const auto& candidate = buffers[root.indirect_resources[ordinal]];
+		if (candidate.packed_stride != shared.packed_stride ||
+		    candidate.descriptor_format != shared.descriptor_format ||
+		    candidate.descriptor_swizzle != shared.descriptor_swizzle ||
+		    candidate.descriptor_index == UINT32_MAX ||
+		    (ordinal > 1u && candidate.descriptor_index != next_child_slot)) return UINT32_MAX;
+		if (ordinal != 0u) next_child_slot = candidate.descriptor_index + 1u;
+	}
+	return representative;
 }
 
 void EmitMemoryOffsets(EmitterState& state) {
-	for (uint32_t i = 0; i < state.program.bindings.memory_offset_count; i++) {
+	const auto count = state.program.bindings.descriptor_counts[static_cast<size_t>(IR::DescriptorBindingKind::Buffers)];
+	state.memory_byte_offsets.resize(count);
+	state.memory_dword_lengths.resize(count);
+	std::vector<bool> dynamic_offsets(count);
+	for (uint32_t resource = 0; resource < state.program.info.buffers.size(); ++resource) {
+		if (SharedIndirectBufferResource(state, resource) == UINT32_MAX) continue;
+		for (const auto candidate: state.program.info.buffers[resource].indirect_resources) {
+			dynamic_offsets[state.program.info.buffers[candidate].descriptor_index] = true;
+		}
+	}
+	for (uint32_t i = 0; i < count; i += 4u) {
+		const auto lanes = std::min(4u, count - i);
+		if (std::all_of(dynamic_offsets.begin() + i, dynamic_offsets.begin() + i + lanes,
+		                [](bool dynamic) { return dynamic; })) continue;
 		const auto word =
 		    EmitShaderDataDwordLoad(state, state.program.bindings.memory_offset_dword + i / 4u);
-		const auto shift             = ConstantU32(state, (i % 4u) * 8u);
-		state.memory_byte_offsets[i] = EmitBinaryU32(
-		    state, spv::OpBitwiseAnd, EmitBinaryU32(state, spv::OpShiftRightLogical, word, shift),
-		    ConstantU32(state, 0xffu));
-		state.memory_dword_lengths[i] =
-		    EmitShaderDataDwordLoad(state, state.program.bindings.BufferLengthDword() + i);
+		for (uint32_t lane = 0; lane < lanes; ++lane) {
+			if (dynamic_offsets[i + lane]) continue;
+			state.memory_byte_offsets[i + lane] = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
+			    state, word, ConstantU32(state, lane * 8u), ConstantU32(state, 8u));
+			// The bound range's length in dwords (OpArrayLength is zero for ranges over 2 GiB on
+			// some NVIDIA drivers), from the shader data.
+			state.memory_dword_lengths[i + lane] = EmitShaderDataDwordLoad(
+			    state, state.program.bindings.BufferLengthDword() + i + lane);
+		}
 	}
 	// A buffer bound with a conservative record count (KYTY_GPU_SIZED_DYNAMIC): its length is the
 	// smaller of the bound range and the exact count's, read from the flattened SRT dword the GPU
 	// filled before the dispatch (BufferResource::gpu_records_flat). Lengths count dwords from the
 	// aligned binding start, so the byte offset of the guest base is added first; sums saturate.
-	if (const auto* group =
-	        IR::FindBinding(state.program.bindings, IR::DescriptorBindingKind::Buffers);
-	    group != nullptr && state.flattened_srt_variable != 0) {
+	if (state.flattened_srt_variable != 0) {
 		const auto bool_type = TypeBool(state);
 		const auto u32       = TypeU32(state);
 		const auto max_u32   = ConstantU32(state, UINT32_MAX);
-		const auto count     = std::min<size_t>(group->resources.size(),
-		                                        state.program.bindings.memory_offset_count);
-		for (uint32_t i = 0; i < count; i++) {
-			const auto resource = group->resources[i];
-			if (resource >= state.program.info.buffers.size()) {
+		for (const auto& buffer: state.program.info.buffers) {
+			if (!buffer.live || buffer.descriptor_index >= count ||
+			    dynamic_offsets[buffer.descriptor_index] ||
+			    buffer.gpu_records_flat == IR::BufferResource::NoGpuRecords) {
 				continue;
 			}
-			const auto& buffer = state.program.info.buffers[resource];
-			if (buffer.gpu_records_flat == IR::BufferResource::NoGpuRecords) {
-				continue;
-			}
+			const auto i       = buffer.descriptor_index;
 			const auto pointer = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
 			                          pointer, state.flattened_srt_variable, ConstantU32(state, 0),
@@ -179,17 +221,18 @@ void EmitMemoryOffsets(EmitterState& state) {
 	}
 	if (state.program.bindings.write_tracking) {
 		const auto load64 = [&](uint32_t dword) {
-			const auto u64 = TypeScalarU64(state);
+			const auto u64 = TypeU64(state);
 			const auto lo  = Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoad(state, dword));
 			const auto hi = Unary(state, spv::OpUConvert, u64,
 			                      EmitShaderDataDwordLoad(state, dword + 1u));
 			return Binary(state, spv::OpBitwiseOr, u64, lo,
 			              Binary(state, spv::OpShiftLeftLogical, u64, hi,
-			                     ConstantDeviceAddress(state, 32)));
+			                     ConstantU64(state, 32)));
 		};
 		const auto start           = state.program.bindings.WriteTrackDword();
 		state.write_bitmap_address = load64(start);
-		for (uint32_t i = 0; i < state.program.bindings.memory_offset_count; i++) {
+		state.write_track_bases.resize(count);
+		for (uint32_t i = 0; i < count; i++) {
 			state.write_track_bases[i] = load64(start + 2u + 2u * i);
 		}
 	}
@@ -267,18 +310,18 @@ void EmitSrtVerify(EmitterState& state) {
 	state.builder.AddFunction(spv::OpBranchConditional, miss, report_label, after_label);
 	EmitLabel(state, report_label);
 	{
-		const auto u64     = TypeScalarU64(state);
+		const auto u64     = TypeU64(state);
 		const auto lo      = Unary(state, spv::OpUConvert, u64,
 		                           EmitShaderDataDwordLoad(state, first + 2u));
 		const auto hi      = Unary(state, spv::OpUConvert, u64,
 		                           EmitShaderDataDwordLoad(state, first + 3u));
 		const auto address = Binary(state, spv::OpBitwiseOr, u64, lo,
 		                            Binary(state, spv::OpShiftLeftLogical, u64, hi,
-		                                   ConstantDeviceAddress(state, 32)));
+		                                   ConstantU64(state, 32)));
 		const auto word    = [&](uint32_t dword) {
 			const auto at_address = dword == 0u ? address
 			                                    : Binary(state, spv::OpIAdd, u64, address,
-			                                             ConstantDeviceAddress(state, dword * 4u));
+			                                             ConstantU64(state, dword * 4u));
 			return Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), at_address);
 		};
 		const auto hash  = state.program.shader_hash;
@@ -306,27 +349,27 @@ void EmitSrtVerify(EmitterState& state) {
 // its guest page (4 KiB) in the GPU write bitmap; the host then downloads only pages that were
 // written. A binding the host does not track in this draw has a base of 0 and skips it.
 void EmitWriteBitmapMark(EmitterState& state, const MemoryResourceAccess& access, uint32_t index) {
-	const auto u64     = TypeScalarU64(state);
+	const auto u64     = TypeU64(state);
 	const auto tracked = Binary(state, spv::OpINotEqual, TypeBool(state), access.write_base,
-	                            ConstantDeviceAddress(state, 0));
+	                            ConstantU64(state, 0));
 	(void)EmitValueOrZeroIfCondition(state, tracked, [&]() {
 		const auto element = Unary(state, spv::OpUConvert, u64, index);
 		const auto shift   = std::countr_zero(std::max(access.element_bits / 8u, 1u));
 		const auto offset  = shift == 0 ? element
 		                                : Binary(state, spv::OpShiftLeftLogical, u64, element,
-		                                         ConstantDeviceAddress(state, shift));
+		                                         ConstantU64(state, shift));
 		const auto address = Binary(state, spv::OpIAdd, u64, access.write_base, offset);
 		const auto page    = Binary(state, spv::OpShiftRightLogical, u64, address,
-		                            ConstantDeviceAddress(state, 12));
+		                            ConstantU64(state, 12));
 		const auto word    = Binary(state, spv::OpShiftRightLogical, u64, page,
-		                            ConstantDeviceAddress(state, 5));
+		                            ConstantU64(state, 5));
 		const auto bit     = Binary(
 		    state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
 		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), Unary(state, spv::OpUConvert, TypeU32(state), page),
 		           ConstantU32(state, 31)));
 		const auto word_address =
 		    Binary(state, spv::OpIAdd, u64, state.write_bitmap_address,
-		           Binary(state, spv::OpShiftLeftLogical, u64, word, ConstantDeviceAddress(state, 2)));
+		           Binary(state, spv::OpShiftLeftLogical, u64, word, ConstantU64(state, 2)));
 		const auto pointer = Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state),
 		                           word_address);
 		const auto value   = state.builder.AllocateId();
@@ -341,7 +384,7 @@ uint32_t LdsDwordCount(const EmitterState& state) {
 	if (workgroup != nullptr) {
 		return workgroup->lds_size_dwords;
 	}
-	return state.requirements.function_lds_dwords != 0 ? state.requirements.function_lds_dwords
+	return state.function_lds_dwords != 0 ? state.function_lds_dwords
 	                                                   : 8192u;
 }
 
@@ -400,9 +443,9 @@ void EnsureLdsStorage(EmitterState& state) {
 		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationAliased);
 		return variable;
 	};
-	if (state.requirements.shared_int64_atomics) {
+	if (state.program.info.shared_int64_atomics) {
 		state.lds_variable = define(TypeU32(state), 4u);
-		state.lds_u64_variable = define(TypeScalarU64(state), 8u);
+		state.lds_u64_variable = define(TypeU64(state), 8u);
 		state.builder.AddName(state.lds_u64_variable, "lds_qwords");
 	} else {
 		state.lds_variable = state.builder.DefineGlobalVariable(
@@ -414,34 +457,75 @@ void EnsureLdsStorage(EmitterState& state) {
 
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
                                                          const IR::MemoryInfo& mem,
-                                                         uint32_t variable,
-                                                         uint32_t pointer_type,
+                                                         BufferDefinition& buffer,
+                                                         uint32_t array_index,
                                                          uint32_t element_bits) {
-	if (variable == 0) {
+	if (buffer.variable == 0) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
 		                             "storage buffer descriptor array was not emitted");
 	}
-	const auto array_index =
-	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
-	MemoryResourceAccess access {
-	    .kind          = mem.kind,
-	    .element_bits  = element_bits,
-	    .memory_access = mem.coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone};
-	access.object_pointer = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain, pointer_type, access.object_pointer, variable,
-	                          ConstantU32(state, array_index));
-	access.byte_offset = state.memory_byte_offsets[array_index];
-	if (state.emitting_write && mem.kind == IR::ResourceKind::Buffer &&
-	    state.program.bindings.write_tracking && mem.resource < state.program.info.buffers.size() &&
-	    state.program.info.buffers[mem.resource].write_tracked) {
-		access.write_base = state.write_track_bases[array_index];
+	if (buffer.pointer_type == 0) {
+		buffer.pointer_type = TypePointer(state, spv::StorageClassStorageBuffer, buffer.type);
 	}
-	// Some NVIDIA drivers return zero from OpArrayLength for ranges over 2 GiB.
-	// Use the actual bound range, including alignment, without truncating guest memory.
+	const bool non_uniform = array_index != 0u;
+	const auto static_index = state.program.info.buffers.at(mem.resource).descriptor_index;
+	if (!non_uniform) array_index = ConstantU32(state, static_index);
+	MemoryResourceAccess access {.kind             = mem.kind,
+	                             .descriptor_index = array_index,
+	                             .element_bits     = element_bits,
+	                             .non_uniform      = non_uniform,
+	                             .memory_access    = mem.coherent ? spv::MemoryAccessVolatileMask
+	                                                              : spv::MemoryAccessMaskNone};
+	access.object_pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, buffer.pointer_type, access.object_pointer,
+	                          buffer.variable, array_index);
+	const bool write_tracked = state.emitting_write && mem.kind == IR::ResourceKind::Buffer &&
+	                           state.program.bindings.write_tracking &&
+	                           state.program.info.buffers[mem.resource].write_tracked;
+	uint32_t dwords = 0;
+	if (non_uniform) {
+		state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
+		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
+		state.builder.RequireCapability(spv::CapabilityStorageBufferArrayNonUniformIndexing);
+		state.builder.AddAnnotation(spv::OpDecorate, access.object_pointer, spv::DecorationNonUniform);
+		const auto& bindings = state.program.bindings;
+		const auto push_start = bindings.UsesPushData() ? bindings.push_data_start_dword : 0u;
+		const auto offsets_start = bindings.memory_offset_dword + push_start;
+		const auto word = EmitShaderDataDwordLoadAt(state, EmitAddU32(
+		    state, ConstantU32(state, offsets_start),
+		    Binary(state, spv::OpShiftRightLogical, TypeU32(state), array_index, ConstantU32(state, 2))));
+		const auto shift = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), array_index, ConstantU32(state, 3)),
+		    ConstantU32(state, 3));
+		access.byte_offset = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
+		    state, word, shift, ConstantU32(state, 8));
+		dwords = EmitShaderDataDwordLoadAt(state, EmitAddU32(
+		    state, ConstantU32(state, bindings.BufferLengthDword() + push_start), array_index));
+		if (write_tracked) {
+			// The guest base of this binding (2 dwords) in the write-tracking table.
+			const auto at = EmitAddU32(
+			    state, ConstantU32(state, bindings.WriteTrackDword() + push_start + 2u),
+			    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), array_index,
+			           ConstantU32(state, 1)));
+			const auto u64 = TypeU64(state);
+			const auto lo  = Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoadAt(state, at));
+			const auto hi  = Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoadAt(
+			    state, EmitAddU32(state, at, ConstantU32(state, 1))));
+			access.write_base = Binary(state, spv::OpBitwiseOr, u64, lo,
+			    Binary(state, spv::OpShiftLeftLogical, u64, hi, ConstantU64(state, 32)));
+		}
+	} else {
+		access.byte_offset = state.memory_byte_offsets[static_index];
+		dwords             = state.memory_dword_lengths[static_index];
+		if (write_tracked) {
+			access.write_base = state.write_track_bases[static_index];
+		}
+	}
+	// Some NVIDIA drivers return zero from OpArrayLength for ranges over 2 GiB: the length is
+	// the actual bound range, including alignment, without truncating guest memory.
 	// The length is in dwords; the bounds checks index elements of the access's own width (narrow
 	// storage indexes bytes or halfwords, 64-bit atomics qwords). A dword length compared with a
 	// byte index dropped every access past the first quarter of the buffer.
-	auto dwords = state.memory_dword_lengths[array_index];
 	// gpu_records_ssa: also within the count of the descriptor this access names (the handle's
 	// dword 2, which the shader computes), from the guest base; sums saturate.
 	if ((mem.kind == IR::ResourceKind::Buffer || mem.kind == IR::ResourceKind::ScalarBuffer) &&
@@ -495,7 +579,8 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	return access;
 }
 
-MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem) {
+MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem,
+                                                 uint32_t array_index) {
 	MemoryResourceAccess access {.kind = mem.kind};
 	switch (mem.kind) {
 		case IR::ResourceKind::Lds:
@@ -528,12 +613,14 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 		case IR::ResourceKind::ScalarBuffer:
 		case IR::ResourceKind::Buffer: {
 			const auto bits = mem.kind == IR::ResourceKind::Buffer
-			                      ? StorageBufferElementBits(state.program, mem) : 32u;
-			const auto variable = bits == 8u ? state.storage_buffer_u8_variable
-			                      : bits == 16u ? state.storage_buffer_u16_variable
-			                                    : state.storage_buffer_variable;
-			access = PrepareStorageBufferResourceAccess(
-			    state, mem, variable, TypeStorageBufferPointer(state, bits), bits);
+			                      ? IR::StorageBufferElementBits(state.program, mem) : 32u;
+			auto* buffer = &state.storage_buffers[2];
+			if (bits == 8u) {
+				buffer = &state.storage_buffers[0];
+			} else if (bits == 16u) {
+				buffer = &state.storage_buffers[1];
+			}
+			access = PrepareStorageBufferResourceAccess(state, mem, *buffer, array_index, bits);
 			access.element_bits = bits;
 			return access;
 		}
@@ -559,7 +646,7 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 			    TypeStorageBufferElementPointer(state, 32));
 		}
 		const auto pointer = state.builder.AllocateId();
-		if (access.kind == IR::ResourceKind::Lds && state.requirements.shared_int64_atomics) {
+		if (access.kind == IR::ResourceKind::Lds && state.program.info.shared_int64_atomics) {
 			state.builder.AddFunction(spv::OpAccessChain, TypeU32ElementPointer(state, storage_class),
 			                          pointer, access.object_pointer, ConstantU32(state, 0), index);
 			return pointer;
@@ -581,6 +668,9 @@ uint32_t EmitStorageBufferElementPointer(EmitterState& state,
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer, access.object_pointer,
 	                          ConstantU32(state, 0), index);
+	if (access.non_uniform) {
+		state.builder.AddAnnotation(spv::OpDecorate, pointer, spv::DecorationNonUniform);
+	}
 	return pointer;
 }
 
@@ -683,8 +773,83 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
 	}
 }
 
+uint32_t EncodeFormattedStoreComponent(EmitterState& state, const Format::BufferFormatInfo& info,
+                                       uint32_t component, uint32_t data, uint32_t data_bits,
+                                       UnormRounding rounding) {
+	EXIT_IF(rounding != UnormRounding::RoundEven && info.type != Format::ComponentType::Unorm);
+	const auto bits = info.component_bits[component];
+	if (data_bits == 16u) {
+		if (info.type == Format::ComponentType::Uint) {
+			data = EmitBitFieldUExtract(state, data, ConstantU32(state, 0), ConstantU32(state, 16));
+		} else if (info.type == Format::ComponentType::Sint) {
+			data = EmitBitFieldSExtract(state, data, ConstantU32(state, 0), ConstantU32(state, 16));
+		} else {
+			data = EmitBitCastU32F32(state, EmitF16BitsToF32(state, data));
+		}
+	}
+	if (info.type == Format::ComponentType::Sint && bits < 32u) {
+		const auto maximum = (1u << (bits - 1u)) - 1u;
+		data = EmitSMax32(state, data, ConstantU32(state, ~maximum));
+		data = EmitSMin32(state, data, ConstantU32(state, maximum));
+		return Binary(state, spv::OpBitwiseAnd, TypeU32(state), data,
+		              ConstantU32(state, (1u << bits) - 1u));
+	}
+	const bool normalized = info.type == Format::ComponentType::Unorm ||
+	                        info.type == Format::ComponentType::Snorm;
+	const bool scaled = info.type == Format::ComponentType::Uscaled ||
+	                    info.type == Format::ComponentType::Sscaled;
+	if (normalized || scaled) {
+		// Two-bit packed channels are unsigned even in signed formats.
+		const bool is_signed = bits != 2u && (info.type == Format::ComponentType::Snorm ||
+		                                      info.type == Format::ComponentType::Sscaled);
+		const auto max_value = static_cast<float>((1u << (bits - (is_signed ? 1u : 0u))) - 1u);
+		const auto lower = normalized ? (is_signed ? -1.0f : 0.0f)
+		                              : (is_signed ? -max_value - 1.0f : 0.0f);
+		const auto upper = normalized ? 1.0f : max_value;
+		auto value = Select(state, TypeF32(state), EmitClassifyF32Bits(state, data).nan,
+		                    ConstantF32Value(state, 0.0f), EmitBitCastF32U32(state, data));
+		value = EmitGlsl<GLSLstd450FClamp, IR::Type::F32>(
+		    state, value, ConstantF32Value(state, lower), ConstantF32Value(state, upper));
+		if (normalized) {
+			value = EmitFPMul32(state, value, ConstantF32Value(state, max_value));
+			if (rounding == UnormRounding::RoundEven) {
+				value = EmitFPRoundEven32(state, value);
+			} else if (rounding == UnormRounding::HalfUp) {
+				value = EmitFPAdd32(state, value, ConstantF32Value(state, 0.5f));
+			}
+		}
+		// Float-to-integer conversion truncates scaled values toward zero.
+		value = Unary(state, is_signed ? spv::OpConvertFToS : spv::OpConvertFToU,
+		              is_signed ? TypeI32(state) : TypeU32(state), value);
+		return is_signed ? Unary(state, spv::OpBitcast, TypeU32(state), value) : value;
+	}
+	if (bits == 16u && info.type == Format::ComponentType::Float) {
+		const auto pair = EmitCompositeConstructF32x2(
+		    state, EmitBitCastF32U32(state, data), ConstantF32Value(state, 0.0f));
+		return EmitPackHalf2x16(state, pair);
+	}
+	return data;
+}
+
+uint32_t EncodePackedColorComponent(EmitterState& state, const Format::BufferFormatInfo& info,
+                                    uint32_t component, uint32_t data, uint32_t data_bits,
+                                    UnormRounding rounding) {
+	auto value = EncodeFormattedStoreComponent(state, info, component, data, data_bits, rounding);
+	if (info.type == Format::ComponentType::Uint) {
+		value = EmitUMin32(state, value,
+		                  ConstantU32(state, (1u << info.component_bits[component]) - 1u));
+	}
+	if (info.component_bit_offset[component] != 0u) {
+		value = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), value,
+		               ConstantU32(state, info.component_bit_offset[component]));
+	}
+	return value;
+}
+
 spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 	switch (opcode) {
+		case IR::ValueOpcode::SharedAtomicCmpSwap32:
+		case IR::ValueOpcode::SharedAtomicCmpSwap64:
 		case IR::ValueOpcode::ImageAtomicCompareSwap32:
 		case IR::ValueOpcode::BufferAtomicCmpSwap32: return spv::OpAtomicCompareExchange;
 		case IR::ValueOpcode::ImageAtomicSwap32:
@@ -696,6 +861,7 @@ spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::ImageAtomicIAdd64:
 		case IR::ValueOpcode::BufferAtomicIAdd32:
 		case IR::ValueOpcode::SharedAtomicIAdd64:
+		case IR::ValueOpcode::BufferAtomicIAdd64:
 		case IR::ValueOpcode::SharedAtomicIAdd32: return spv::OpAtomicIAdd;
 		case IR::ValueOpcode::BufferAtomicISub32:
 		case IR::ValueOpcode::SharedAtomicISub32: return spv::OpAtomicISub;
@@ -712,7 +878,8 @@ spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::ImageAtomicUMax32:
 		case IR::ValueOpcode::ImageAtomicUMax64:
 		case IR::ValueOpcode::BufferAtomicUMax32:
-		case IR::ValueOpcode::SharedAtomicUMax32: return spv::OpAtomicUMax;
+		case IR::ValueOpcode::SharedAtomicUMax32:
+		case IR::ValueOpcode::SharedAtomicUMax64: return spv::OpAtomicUMax;
 		case IR::ValueOpcode::ImageAtomicAnd32:
 		case IR::ValueOpcode::ImageAtomicAnd64:
 		case IR::ValueOpcode::BufferAtomicAnd32:
@@ -737,22 +904,25 @@ uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32
 	const auto opcode = SpirvAtomicOpcode(inst.GetOpcode());
 	const auto old    = ctx.state.builder.AllocateId();
 	const bool wide   = inst.GetType() == IR::Type::U64;
-	const auto type   = wide ? TypeScalarU64(ctx.state) : TypeU32(ctx.state);
+	const auto type   = wide ? TypeU64(ctx.state) : TypeU32(ctx.state);
 	if (opcode == spv::OpAtomicCompareExchange) {
-		const auto desired    = ctx.Arg(inst, inst.NumArgs() - 3);
-		const auto comparator = ctx.Arg(inst, inst.NumArgs() - 2);
+		auto desired    = ctx.Arg(inst, inst.NumArgs() - 3);
+		auto comparator = ctx.Arg(inst, inst.NumArgs() - 2);
+		if (inst.GetOpcode() == IR::ValueOpcode::SharedAtomicCmpSwap32) {
+			// RDNA2 DS compares DATA and stores DATA2, opposite to BUFFER atomics.
+			std::swap(desired, comparator);
+		}
 		ctx.state.builder.AddFunction(
 		    spv::OpAtomicCompareExchange, TypeU32(ctx.state), old, pointer,
 		    ConstantU32(ctx.state, scope), ConstantU32(ctx.state, spv::MemorySemanticsMaskNone),
 		    ConstantU32(ctx.state, spv::MemorySemanticsMaskNone), desired, comparator);
 	} else {
-		auto value = ctx.Arg(inst, inst.NumArgs() - 2);
-		if (wide) value = Unary(ctx.state, spv::OpBitcast, type, value);
+		const auto value = ctx.Arg(inst, inst.NumArgs() - 2);
 		ctx.state.builder.AddFunction(opcode, type, old, pointer,
 		                              ConstantU32(ctx.state, scope),
 		                              ConstantU32(ctx.state, spv::MemorySemanticsMaskNone), value);
 	}
-	return wide ? Unary(ctx.state, spv::OpBitcast, TypeU64(ctx.state), old) : old;
+	return old;
 }
 
 void EmitAtomicMemoryBarrier(EmitterState& state, IR::ResourceKind kind) {

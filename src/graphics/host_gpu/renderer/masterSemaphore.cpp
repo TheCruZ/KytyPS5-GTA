@@ -9,6 +9,7 @@
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "common/debugCounters.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 namespace Libs::Graphics {
@@ -94,6 +95,8 @@ void MasterSemaphore::Wait(uint64_t tick) {
 
 	Common::Timer timer;
 	timer.Start();
+	Common::DebugCounters::ScopedTimer wait_counters(Common::DebugCounters::Counter::GpuWaits,
+	                                                 Common::DebugCounters::Counter::GpuWaitNs);
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	const double waited = timer.GetTimeS();
 	RecordSemaphoreWait(waited, tick, m_gpu_tick.load(std::memory_order_acquire));

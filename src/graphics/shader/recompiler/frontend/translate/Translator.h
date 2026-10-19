@@ -24,14 +24,15 @@ constexpr uint32_t ProbeVgpr = 253; // 253..255
 class Translator {
 public:
 	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit,
-	           bool flush_f32_inputs)
+	           bool flush_f32_inputs, bool graphics_compute)
 	    : program(program), ir(block), current_vector_limit(vector_limit),
-	      flush_f32_inputs(flush_f32_inputs) {}
+	      flush_f32_inputs(flush_f32_inputs), graphics_compute(graphics_compute) {}
 
 	void TranslateInstruction(const Decoder::Instruction& inst);
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
 	                            uint32_t component_count, const ShaderBufferResource& resource);
-	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source, IR::BlockInfo& info);
+	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
+	                        IR::Block& info);
 	// Diagnostics (KYTY_FORCE_PC): overwrites the first destination dwords of an instruction
 	// with constants after it is translated.
 	void ForceDestination(const Decoder::Instruction& inst, const std::vector<uint32_t>& values);
@@ -60,10 +61,9 @@ private:
 	IR::U32                ReadU32(const Decoder::Operand& operand);
 	std::array<IR::U32, 2> ReadU32Pair(const Decoder::Operand& operand);
 	IR::U64                ReadU64(const Decoder::Operand& operand);
-	IR::F32 ReadF16LaneAsF32(const Decoder::Operand& operand, bool high_lane, bool packed = false);
+	IR::F32 ReadF16LaneAsF32(const Decoder::Operand& operand, bool high_lane);
 	IR::F32 ReadF16AsF32(const Decoder::Operand& operand);
 	IR::F32 ReadMixF32(const Decoder::Operand& operand);
-	IR::U32 ReadU16LaneRaw(const Decoder::Operand& operand, bool high_lane);
 	IR::U32 ReadU16LaneAsU32(const Decoder::Operand& operand, bool high_lane, bool sign_extend);
 	IR::U32 ReadU16AsU32(const Decoder::Operand& operand, bool sign_extend);
 	IR::U32 Read16LaneBits(const Decoder::Operand& operand, bool high_lane);
@@ -133,6 +133,7 @@ private:
 	void DS_ADDTID(const Decoder::Instruction& inst, bool write);
 	void DS_SWIZZLE_B32(const Decoder::Instruction& inst);
 	void DS_PERMUTE(const Decoder::Instruction& inst, bool backward);
+	void DS_ORDERED_COUNT(const Decoder::Instruction& inst);
 
 	IR::F32 SelectF32(IR::U1 condition, IR::F32 true_value, IR::F32 false_value);
 	IR::U32 ConvertF32ToU32Saturated(IR::F32 value, float upper_bound, float safe_upper,
@@ -144,19 +145,14 @@ private:
 	void EmitCompareResult(const Decoder::Instruction& inst, IR::U1 value, bool scalar, bool cmpx);
 	void EmitCompareConstant(const Decoder::Instruction& inst, bool value, bool scalar, bool cmpx);
 	void EmitIntegerCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, IR::Type type,
-	                        bool scalar, bool cmpx);
-	// A 64-bit compare the IR has no opcode for, as another one with swapped operands and/or a
-	// negated result (a >= b is !(a < b); a <= b is !(b < a) or !(a > b)).
-	void EmitInteger64CompareVia(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
-	                             bool swap, bool negate, bool cmpx);
+	                        bool scalar, bool cmpx, bool swap_operands = false);
 	void EmitInteger16Compare(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                          bool signed_value, bool cmpx);
 	void EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool half,
 	                      bool cmpx);
-	void EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool cmpx);
-	void EmitFloat64Compare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool cmpx);
-	void EmitFloat64Equal(const Decoder::Instruction& inst);
-	void EmitFloatClassCompare(const Decoder::Instruction& inst, bool cmpx);
+	void EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool cmpx,
+	                             bool is64 = false);
+	void EmitFloatClassCompare(const Decoder::Instruction& inst, bool cmpx, bool half = false);
 	void V_CVT_F32_UBYTE(const Decoder::Instruction& inst, uint32_t byte_index);
 	void V_CVT_F32_U32(const Decoder::Instruction& inst);
 	void V_CVT_F32_I32(const Decoder::Instruction& inst);
@@ -195,8 +191,8 @@ private:
 	void FloatCube(const Decoder::Instruction& inst, uint32_t result_kind);
 	void Integer16Shift(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool arithmetic);
 	void Integer16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool sign);
+	void Integer16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool sign);
 	void V_MAD_I16(const Decoder::Instruction& inst);
-	void V_MED3_I16(const Decoder::Instruction& inst);
 	void PackedInteger16Shift(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                          bool arithmetic);
 	void PackedInteger16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
@@ -214,7 +210,7 @@ private:
 	void V_AND_OR_B32(const Decoder::Instruction& inst);
 	void V_OR3_B32(const Decoder::Instruction& inst);
 	void V_XOR3_B32(const Decoder::Instruction& inst);
-	void S_FF1_I32_B64(const Decoder::Instruction& inst);
+	void S_FF_I32_B64(const Decoder::Instruction& inst, bool find_zero);
 	void V_FFBH_32(const Decoder::Instruction& inst, bool sign);
 	void S_FLBIT_I32_B64(const Decoder::Instruction& inst);
 	void Integer24(const Decoder::Instruction& inst, bool sign, bool addend);
@@ -292,6 +288,7 @@ private:
 	uint32_t        current_pc           = 0;
 	uint32_t        current_vector_limit = 1;
 	bool            flush_f32_inputs;
+	bool            graphics_compute;
 };
 
 inline bool& TranslationNonFatalFlag() {

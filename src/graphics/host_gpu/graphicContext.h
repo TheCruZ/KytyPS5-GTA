@@ -9,6 +9,7 @@
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <span>
 #include <tuple>
 #include <vector>
 #include <vk_mem_alloc.h>
@@ -67,7 +68,7 @@ struct GraphicContext {
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
-	bool                               depth_color_copy_enabled               = false;
+	bool                               maintenance8_enabled                  = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
 	// Descriptor indexing for bindless images: runtime arrays indexed non-uniformly, partially
@@ -182,6 +183,14 @@ struct GraphicContext {
 		const auto budget = GetTotalMemoryBudget();
 		return budget != 0 && GetDeviceMemoryUsage() / 100 >= budget / 100 * percent / 100;
 	}
+
+	struct HeapUsage {
+		uint64_t usage        = 0; // Whole process, as reported by VK_EXT_memory_budget.
+		uint64_t budget       = 0;
+		uint32_t allocations  = 0;
+		bool     device_local = false;
+	};
+	[[nodiscard]] uint32_t GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> heaps) const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
 

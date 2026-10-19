@@ -166,6 +166,7 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	m_buffer_cache.QueueBdaSync(vaddr, size);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -190,7 +191,12 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		}
 	}
 	const auto unmap = [this, vaddr, size] {
-		if (m_command_scheduler.Active()) {
+		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
+		// access a range with no cached data, so they must finish before it is unmapped.
+		if (m_command_scheduler.Active() &&
+		    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
+		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
+		     m_command_scheduler.HasPendingPriorityOperations())) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			(KYTY_SUBMIT_REASON(), m_command_scheduler.Finish());
 			m_command_scheduler.WaitPriorityOperations(tick);
@@ -279,31 +285,8 @@ void RenderContext::PrepareBda() {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
-	// Every cached buffer is synchronized so a global-memory shader sees the CPU's writes.
-	// That walk touched every buffer per dispatch (a quarter of the GPU thread in the
-	// world); it only has to repeat once something became CPU-dirty or a buffer appeared.
-	// The walk runs at most once per guest submission: what the game wrote before submitting is
-	// visible to all its commands, as on the console, and the GPU thread runs behind the game
-	// anyway. Per draw, the walk and the re-protection it triggers took ~38 % of the GPU thread
-	// on the title menu (21 -> 32 fps).
-	const auto epoch = g_cpu_dirty_epoch.load(std::memory_order_acquire);
-	if (epoch != m_bda_synced_epoch) {
-		const auto submission = g_guest_submission_seq.load(std::memory_order_relaxed);
-		if (submission == m_bda_synced_submission) {
-			m_fault_process_pending = true;
-			return;
-		}
-		m_bda_synced_submission = submission;
-	}
-	if (epoch != m_bda_synced_epoch) {
-		// The guest writes somewhere nearly all the time, so the epoch moves between most
-		// dispatches; walk only the regions holding CPU-dirty pages, not every buffer.
-		std::shared_lock lock(m_mapped_ranges_mutex);
-		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-			m_buffer_cache.SynchronizeCpuDirtyBuffersInRange(start, end - start);
-		});
-		m_bda_synced_epoch = epoch;
-	}
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	m_buffer_cache.SynchronizeBda(m_mapped_ranges);
 	m_fault_process_pending = true;
 }
 

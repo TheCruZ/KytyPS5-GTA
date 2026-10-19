@@ -3,12 +3,14 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/cpuAffinity.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
@@ -22,12 +24,9 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
-#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
-#include "graphics/shader/recompiler/ir/passes/SrtNative.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
-#include "kytyGitVersion.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
@@ -37,6 +36,7 @@
 #include <condition_variable>
 #include <deque>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -66,6 +66,8 @@ bool ShaderFailureNonFatal() {
 }
 
 namespace {
+
+constexpr auto DriverCacheSaveInterval = std::chrono::minutes {5};
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -106,12 +108,9 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	// No emulator revision: the driver keys every pipeline by its whole create info, SPIR-V
-	// included, so a new build reuses the pipelines whose shaders did not change. Keying on the
-	// revision threw the whole cache away at every rebuild and release, and the first start then
-	// compiled everything behind a black screen.
-	return fmt::format("KytyPC2:{:08x}:{:08x}:{:08x}:{}\n", properties.vendorID,
-	                   properties.deviceID, properties.driverVersion, uuid);
+	// Driver cache entries already distinguish shader code and pipeline state across builds.
+	return fmt::format("KytyPC2:{:08x}:{:08x}:{:08x}:{}\n",
+	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
 }
 
 std::string PipelineCacheTitleId() {
@@ -835,7 +834,7 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 }
 
 bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
-                         const std::vector<uint32_t>& spirv) {
+                         const std::vector<uint32_t>& spirv, bool maintenance8_enabled) {
 	if (!Config::ShaderValidationEnabled()) {
 		return true;
 	}
@@ -847,7 +846,9 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 		                        static_cast<int>(position.column), static_cast<int>(position.index),
 		                        message);
 	});
-	if (tools.Validate(spirv)) {
+	spvtools::ValidatorOptions validator_options;
+	validator_options.SetAllowOffsetTextureOperand(maintenance8_enabled);
+	if (tools.Validate(spirv.data(), spirv.size(), validator_options)) {
 		return true;
 	}
 	spvtools::SpirvTools disassembler(SPV_ENV_VULKAN_1_2);
@@ -1288,25 +1289,56 @@ struct PipelineCache::ProgramCache {
 		uint32_t              user_data_count = 0;
 		uint32_t              code_size       = 0;
 		std::vector<uint32_t> static_state;
-		// Exact expanded code includes callees and their original return-PC constants.
-		// A different target/body must not reuse a program compiled for an earlier call.
-		std::vector<uint32_t> function_code;
 
 		bool operator==(const ProgramKey&) const = default;
 	};
 
 	struct Permutation {
+		std::vector<uint32_t>                       function_code;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
 	};
 
 	struct SourceEntry {
-		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
-		    : resource_plan(std::move(plan)) {
+		SourceEntry(ShaderRecompiler::IR::ResourcePlan plan,
+		            std::unique_ptr<ShaderRecompiler::ShaderSource> call_source)
+		    : call_source(std::move(call_source)), resource_plan(std::move(plan)) {
 			permutations.reserve(8);
 		}
 
+		std::span<const uint32_t> FunctionCode() const {
+			return call_source
+			    ? std::span<const uint32_t>(call_source->linked->code).subspan(call_source->code.size())
+			    : std::span<const uint32_t>{};
+		}
+
+		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime) {
+			const auto revision = call_source->revision;
+			ShaderRecompiler::RefreshShaderSource(*call_source, runtime);
+			resource_plan.source_reads = call_source->reads;
+			return revision != call_source->revision;
+		}
+
+		// The permutation compiled for the specialization the last materialization produced, this
+		// push-data position and (for a source with calls) the code the calls resolve to now.
+		Permutation* FindPermutation(uint32_t push_data_cursor) {
+			for (auto& candidate: permutations) {
+				const auto& layout = candidate.program.bindings;
+				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
+				        push_data_cursor, layout.ShaderDataDwords()) ||
+				    candidate.specialization != specialization) {
+					continue;
+				}
+				if (call_source && !std::ranges::equal(candidate.function_code, FunctionCode())) {
+					continue;
+				}
+				return &candidate;
+			}
+			return nullptr;
+		}
+
+		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
@@ -1317,6 +1349,7 @@ struct PipelineCache::ProgramCache {
 		// Draw prep: the serial of the prepared result whose refresh `resources` holds now (0 after a
 		// walk here), so a later draw of the same packet can use it again.
 		uint64_t prepared_serial = 0;
+		bool                                       skip_dispatch = false;
 	};
 
 	struct ProgramKeyHash {
@@ -1329,7 +1362,6 @@ struct PipelineCache::ProgramCache {
 			PipelineKeyHash::Mix(hash, key.user_data_count);
 			PipelineKeyHash::Mix(hash, key.code_size);
 			PipelineKeyHash::Mix(hash, key.static_state.size());
-			PipelineKeyHash::Mix(hash, key.function_code.size());
 			// Bucket same-shape static variants by source. ProgramKey equality performs the one
 			// exact state comparison needed on a stable hit without hashing the full state first.
 			return hash;
@@ -1347,6 +1379,9 @@ struct PipelineCache::ProgramCache {
 	                           ShaderRecompiler::TranslateResult                   translated,
 	                           const ShaderRecompiler::IR::ResourceSpecialization& specialization,
 	                           uint32_t push_data_start_dword) {
+		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
+		                                         Common::DebugCounters::Counter::ShaderCompileNs,
+		                                         Common::DebugCounters::Peak::ShaderCompileNs);
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		last_spirv_words = result.spirv.size();
@@ -1355,16 +1390,19 @@ struct PipelineCache::ProgramCache {
 	}
 
 	// A compiled (or cached) permutation of the source: its module, bound for this stage.
+	// function_code: the code of the callees the source's calls resolved to (empty without calls).
 	template <typename InputInfo>
 	ShaderProgram AddPermutation(SourceEntry& source, const char* stage_name,
 	                             const ShaderRecompiler::CompileOptions&  options,
 	                             const std::vector<uint32_t>&             spirv,
 	                             ShaderRecompiler::IR::CompiledShaderInfo program,
-	                             InputInfo& input_info, uint32_t& push_data_cursor) {
+	                             InputInfo& input_info, uint32_t& push_data_cursor,
+	                             std::span<const uint32_t> function_code) {
 		Profiler::Phases phases;
 		phases.SetText("%s 0x%016" PRIx64, stage_name, options.shader_hash);
 		KYTY_PROFILER_PHASE(phases, "Shader: SPIR-V validate", profiler::colors::Blue300);
-		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, spirv)) {
+		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, spirv,
+		                         options.maintenance8_enabled)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
 			     options.shader_hash);
@@ -1372,7 +1410,7 @@ struct PipelineCache::ProgramCache {
 		DumpShaderSpirv(stage_name, options.shader_hash, spirv);
 
 		KYTY_PROFILER_PHASE(phases, "Shader: module create", profiler::colors::Blue300);
-		const auto module = CompileSPV(spirv, device);
+		const auto module = CompileSPV(spirv, graphics.device);
 		EXIT_IF(module == nullptr);
 		phases.End();
 		if (options.dump_ir) {
@@ -1380,6 +1418,7 @@ struct PipelineCache::ProgramCache {
 			     static_cast<uint64_t>(spirv.size()), options.wave_size);
 		}
 		source.permutations.push_back({
+		    .function_code  = {function_code.begin(), function_code.end()},
 		    .specialization = source.specialization,
 		    .program        = std::move(program),
 		    .handle         = {.id          = ++next_shader_id,
@@ -1573,81 +1612,7 @@ struct PipelineCache::ProgramCache {
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
-		lookup_key.function_code.clear();
-		// A compute shader that gave up is dispatched again every frame, and expanding its
-		// functions to find it in `unsupported` cost ~3 ms a dispatch (three such dispatches a
-		// frame in the jungle). Remember the refusal by shader, code address, static state and
-		// user data, and skip before expanding. KYTY_GAVE_UP_FAST=0 turns this off.
-		uint64_t gave_up_key = 0;
-		uint64_t                 fast_key = 0;
-		ProgramsMap::value_type* fast_hit = nullptr;
-		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
-			static const bool fast = [] {
-				const char* value = std::getenv("KYTY_GAVE_UP_FAST");
-				return value == nullptr || value[0] != '0';
-			}();
-			if (fast) {
-				gave_up_key = XXH3_64bits_withSeed(user_data.data(), user_data.size_bytes(),
-				                                   params.hash ^ params.Base());
-				gave_up_key = XXH3_64bits_withSeed(
-				    lookup_key.static_state.data(),
-				    lookup_key.static_state.size() * sizeof(uint32_t), gave_up_key);
-				if (gave_up_fast.contains(gave_up_key)) {
-					Profiler::Add(Profiler::Counter::SkippedGaveUp);
-					Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": shader gave up",
-					                                StageLabel(stage), params.hash);
-					return ShaderProgram {};
-				}
-			}
-			// The same dispatch (shader, code address, static state, user data) as within the last
-			// 50 ms finds its program without expanding the functions or hashing the expanded code
-			// (~12 us a dispatch, 3 s in 20 s of the command thread in the jungle, 2026-10-16).
-			// Entries are never erased, so the pointer stays valid. KYTY_FAST_PROGRAM=0 turns it off.
-			static const bool fast_program = [] {
-				const char* value = std::getenv("KYTY_FAST_PROGRAM");
-				return value == nullptr || value[0] != '0';
-			}();
-			// The program depends on the user data only through the expanded functions
-			// (ExpansionInputsHash), and on the static state.
-			const auto make_fast_key = [&] {
-				const uint64_t inputs = ExpansionInputsHash(
-				    params, user_data, input_info.wave_size,
-				    params.hash ^ params.Base() ^
-				        (static_cast<uint64_t>(input_info.wave_size) << 56u) ^
-				        (static_cast<uint64_t>(params.code.size()) << 32u));
-				return XXH3_64bits_withSeed(lookup_key.static_state.data(),
-				                            lookup_key.static_state.size() * sizeof(uint32_t),
-				                            inputs) |
-				       1u;
-			};
-			if (fast_program) {
-				fast_key = make_fast_key();
-				// A dispatch comes back once a frame (~100 ms at our frame rates), so the window is
-				// longer than the expansion reuse's 50 ms. KYTY_FAST_PROGRAM_MS sets it.
-				static const auto window = std::chrono::milliseconds([] {
-					const char* value = std::getenv("KYTY_FAST_PROGRAM_MS");
-					return value != nullptr ? std::strtoul(value, nullptr, 10) : 1000ul;
-				}());
-				if (const auto it = fast_entries.find(fast_key);
-				    it != fast_entries.end() &&
-				    std::chrono::steady_clock::now() - it->second.validated < window) {
-					fast_hit = it->second.entry;
-				}
-			}
-			if (fast_hit == nullptr) {
-				KYTY_PROFILER_BLOCK("ProgramCache::ExpandFunctions");
-				ExpandShaderFunctions(params, user_data, input_info.wave_size,
-				                      lookup_key.function_code);
-				if (fast_key != 0) {
-					// Kept under the registers this expansion consulted.
-					fast_key = make_fast_key();
-				}
-			}
-		}
-		if (fast_hit == nullptr && unsupported.contains(lookup_key)) {
-			if (gave_up_key != 0) {
-				gave_up_fast.insert(gave_up_key);
-			}
+		if (unsupported.contains(lookup_key)) {
 			Profiler::Add(Profiler::Counter::SkippedGaveUp);
 			Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": shader gave up",
 			                                StageLabel(stage), params.hash);
@@ -1655,24 +1620,8 @@ struct PipelineCache::ProgramCache {
 		}
 		KYTY_PROFILER_BLOCK("ProgramCache::Get");
 		ProgramsMap::value_type* entry = nullptr;
-		if (fast_hit) {
-			entry = fast_hit;
-		} else if (const auto found = programs.find(lookup_key); found != programs.end()) {
+		if (const auto found = programs.find(lookup_key); found != programs.end()) {
 			entry = &*found;
-			if (fast_key != 0) {
-				// The title's async chains alone dispatch ~2,800 programs a frame, each with its own
-				// user data: at 4,096 entries the map was cleared every frame or two and most
-				// dispatches expanded their functions again. KYTY_FAST_PROGRAM_ENTRIES sets the cap.
-				static const size_t fast_cap = [] {
-					const char* value = std::getenv("KYTY_FAST_PROGRAM_ENTRIES");
-					return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 10))
-					                        : size_t {65536};
-				}();
-				if (fast_entries.size() > fast_cap) {
-					fast_entries.clear();
-				}
-				fast_entries[fast_key] = {entry, std::chrono::steady_clock::now()};
-			}
 		}
 		// Scoped to this call only: see GuestPageReadCache.
 		GuestPageReadCache                           clean_read_cache;
@@ -1695,8 +1644,20 @@ struct PipelineCache::ProgramCache {
 			for (uint32_t axis = 0; axis < 3u; axis++) {
 				runtime.workgroup_size[axis] = input_info.threads_num[axis];
 			}
+			runtime.indirect_args_address = input_info.indirect_args_address;
 		}
+		// A source with calls (GPU-selected callables): its call targets are read again at every
+		// dispatch; a changed target set means a new plan and a new permutation.
+		bool source_changed = false;
 		if (entry != nullptr) {
+			if (entry->second.skip_dispatch) {
+				return ShaderProgram {};
+			}
+			if (entry->second.call_source) {
+				source_changed = entry->second.RefreshCallSource(runtime);
+			}
+		}
+		if (entry != nullptr && !source_changed) {
 			{
 				// One zone per refresh, named by the program (kept with KYTY_PROFILE_ZONES=0).
 				Profiler::Phases refresh_zone;
@@ -1786,13 +1747,6 @@ struct PipelineCache::ProgramCache {
 				t_srt_shader_hash = 0;
 				runtime.gpu_written = nullptr;
 				runtime.gpu_fills   = nullptr;
-				if (ShaderRecompiler::IR::SrtNativeStats stats;
-				    ShaderRecompiler::IR::TakeSrtNativeReport(stats)) {
-					LOGF("SRT native: %u plans compiled, %u failed, %" PRIu64 " KB of code, %" PRIu64
-					     " instructions, %" PRIu64 " through the interpreter\n",
-					     stats.plans, stats.failed, stats.bytes / 1024u, stats.instructions,
-					     stats.interpreted);
-				}
 				if (t_srt_defer_tick != 0) {
 					// KYTY_SRT_DEFER: bytes this refresh reads are downloading; the dispatch is
 					// suspended and refreshed again once they land (SrtDeferRead).
@@ -1838,15 +1792,7 @@ struct PipelineCache::ProgramCache {
 					return ShaderProgram {};
 				}
 			}
-			if (const auto permutation = std::ranges::find_if(
-			        entry->second.permutations, [&](const Permutation& candidate) {
-				        const auto& layout = candidate.program.bindings;
-				        return layout.push_data_start_dword ==
-				                   ShaderRecompiler::IR::PushData::StartFor(
-				                       push_data_cursor, layout.ShaderDataDwords()) &&
-				               candidate.specialization == entry->second.specialization;
-			        });
-			    permutation != entry->second.permutations.end()) {
+			if (const auto* permutation = entry->second.FindPermutation(push_data_cursor)) {
 				input_info.stage = {.program   = &permutation->program,
 				                    .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
@@ -1854,13 +1800,6 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
-		if (fast_hit != nullptr) {
-			// No permutation fits: the compile below needs the expanded code.
-			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
-				ExpandShaderFunctions(params, user_data, input_info.wave_size,
-				                      lookup_key.function_code);
-			}
-		}
 		// A translation on the workers (TranslationWorkers): the draw waits for it by being skipped.
 		if (!translating.empty()) {
 			if (const auto job = translating.find(lookup_key);
@@ -1894,11 +1833,13 @@ struct PipelineCache::ProgramCache {
 		}
 		ShaderRecompiler::CompileOptions options;
 		options.stage       = stage;
+		options.maintenance8_enabled = graphics.maintenance8_enabled;
 		options.shader_hash = params.hash;
 		options.user_data   = user_data;
 		options.back_code      = params.back_code;
 		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 		options.early_dump  = options.dump_ir;
+		options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
 		options.dump_label  = label;
 		options.input_info  = stage_input;
 
@@ -1915,9 +1856,10 @@ struct PipelineCache::ProgramCache {
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		options.non_fatal = ShaderFailureNonFatal();
 		options.bindless_images = bindless_images;
-		const auto compile_code = lookup_key.function_code.empty()
-		                              ? params.code
-		                              : std::span<const uint32_t>(lookup_key.function_code);
+		// Sources with calls (GPU-selected callables) are not cached on disk: their translation
+		// depends on the code the calls resolve to, which the key does not hold.
+		bool disk_ok = disk != nullptr && !source_changed &&
+		               (entry == nullptr || !entry->second.call_source);
 		// The shader disk cache (shaderDiskCache.h): a source entry stands in for the translation
 		// of a source new to this session, a permutation entry for the compile. In verify mode
 		// both are only compared with a fresh translation. A hit is not a compile: it is not
@@ -1926,11 +1868,11 @@ struct PipelineCache::ProgramCache {
 		std::vector<uint8_t> cached_source;
 		std::vector<uint8_t> permutation_key;
 		std::vector<uint8_t> cached_permutation;
-		if (disk != nullptr) {
+		if (disk_ok) {
 			Profiler::Phases disk_zone;
 			disk_zone.SetText("%s 0x%016" PRIx64, stage_name, params.hash);
 			KYTY_PROFILER_PHASE(disk_zone, "Shader disk cache", profiler::colors::CyanA700);
-			BuildSourceKey(source_key, compile_code, params, options, input_info);
+			BuildSourceKey(source_key, params.code, params, options, input_info);
 			if (entry == nullptr) {
 				CountDiskLookup();
 				std::vector<uint8_t>          payload;
@@ -1966,7 +1908,7 @@ struct PipelineCache::ProgramCache {
 					}
 					{
 						std::unique_lock programs_lock(programs_mutex);
-						entry = &*programs.try_emplace(lookup_key, std::move(record.plan)).first;
+						entry = &*programs.try_emplace(lookup_key, std::move(record.plan), nullptr).first;
 					}
 					if (!MaterializeFirstUse(entry->second, runtime, stage, stage_name, params.hash)) {
 						return ShaderProgram {};
@@ -1992,7 +1934,7 @@ struct PipelineCache::ProgramCache {
 					                  "Shader from the disk cache: %s 0x%016" PRIx64 ", %zu SPIR-V words",
 					                  stage_name, params.hash, record.spirv.size());
 					return AddPermutation(entry->second, stage_name, options, record.spirv,
-					                      std::move(record.program), input_info, push_data_cursor);
+					                      std::move(record.program), input_info, push_data_cursor, {});
 				}
 			}
 		}
@@ -2003,21 +1945,45 @@ struct PipelineCache::ProgramCache {
 		KYTY_PROFILER_PHASE(compile_zone, "Shader compile", profiler::colors::DeepOrangeA200);
 		const auto compile_begin = std::chrono::steady_clock::now();
 		ShaderRecompiler::TranslateResult translated;
-		if (const auto job = translating.find(lookup_key); job != translating.end()) {
+		// A source new to this session is decoded once; one with calls is kept in its entry and
+		// translated again whenever the code its calls resolve to changes.
+		ShaderRecompiler::ShaderSource source;
+		const auto                     finished_job = translating.find(lookup_key);
+		if (entry == nullptr && finished_job == translating.end()) {
+			source = ShaderRecompiler::PrepareShaderSource(params.code, options);
+		}
+		if (source.unsupported_call_pc != UINT32_MAX) {
+			PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} pc=0x{:08x} "
+			                 "reason=unsupported GPU-selected callable target; rendering is incomplete",
+			                 params.hash, source.unsupported_call_pc);
+			{
+				std::unique_lock programs_lock(programs_mutex);
+				programs.try_emplace(lookup_key, ShaderRecompiler::IR::ResourcePlan {}, nullptr)
+				    .first->second.skip_dispatch = true;
+			}
+			return ShaderProgram {};
+		}
+		const bool new_calls = !source.calls.empty();
+		if (new_calls) {
+			disk_ok = false;
+		}
+		auto* current = entry == nullptr ? &source : entry->second.call_source.get();
+		if (finished_job != translating.end()) {
 			// Done (the check above returned while it was not): take the worker's translation.
 			const auto waited = std::chrono::duration<double, std::milli>(
-			                        std::chrono::steady_clock::now() - job->second->queued)
+			                        std::chrono::steady_clock::now() - finished_job->second->queued)
 			                        .count();
 			if (translations_done++ < 32) {
 				LOGF("ShaderTranslator: %s 0x%016" PRIx64 " ready after %.0f ms, %" PRIu64
 				     " draws skipped so far while translating\n",
 				     stage_name, params.hash, waited, translation_skips);
 			}
-			translated = std::move(job->second->result);
-			translating.erase(job);
-		} else if (defer_translation && stage != ShaderType::Compute && translators != nullptr) {
+			translated = std::move(finished_job->second->result);
+			translating.erase(finished_job);
+		} else if (defer_translation && stage != ShaderType::Compute && translators != nullptr &&
+		           !new_calls && (entry == nullptr || !entry->second.call_source)) {
 			auto job = std::make_shared<TranslationJob>();
-			job->code.assign(compile_code.begin(), compile_code.end());
+			job->code.assign(params.code.begin(), params.code.end());
 			job->back_code.assign(params.back_code.begin(), params.back_code.end());
 			job->user_data.assign(user_data.begin(), user_data.end());
 			job->options           = options;
@@ -2037,13 +2003,23 @@ struct PipelineCache::ProgramCache {
 			Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": translating",
 			                                StageLabel(stage), params.hash);
 			return ShaderProgram {};
+		} else if (current != nullptr) {
+			if (!current->calls.empty()) {
+				if (entry == nullptr) {
+					ShaderRecompiler::RefreshShaderSource(*current, runtime);
+				}
+				translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
+				translated.program.source_reads = current->reads;
+			} else {
+				translated = ShaderRecompiler::TranslateProgram(current->decoded, options);
+			}
 		} else {
-			translated = ShaderRecompiler::TranslateProgram(compile_code, options);
+			translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		}
 		if (translated.unsupported) {
 			// Remember the refusal: a skipped shader is dispatched again every frame, and
 			// re-deriving the same answer costs as much as a compile each time.
-			if (disk != nullptr && entry == nullptr) {
+			if (disk_ok && entry == nullptr) {
 				std::vector<uint8_t> payload;
 				if (ShaderDiskCache::EncodeSourceRecord(true, false, nullptr, payload)) {
 					StoreEntry(true, params.hash, source_key, cached_source, payload);
@@ -2056,7 +2032,7 @@ struct PipelineCache::ProgramCache {
 		std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
 		if (entry == nullptr) {
 			plan.emplace(ShaderRecompiler::IR::ExtractResourcePlan(translated.program));
-			if (disk != nullptr) {
+			if (disk_ok) {
 				std::vector<uint8_t> payload;
 				if (ShaderDiskCache::EncodeSourceRecord(false, uses_clock, &*plan, payload)) {
 					StoreEntry(true, params.hash, source_key, cached_source, payload);
@@ -2074,13 +2050,16 @@ struct PipelineCache::ProgramCache {
 		}
 		if (entry == nullptr) {
 			{
+				auto retained = new_calls
+				                    ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source))
+				                    : nullptr;
 				std::unique_lock programs_lock(programs_mutex);
-				entry = &*programs.try_emplace(lookup_key, std::move(*plan)).first;
+				entry = &*programs.try_emplace(lookup_key, std::move(*plan), std::move(retained)).first;
 			}
 			if (!MaterializeFirstUse(entry->second, runtime, stage, stage_name, params.hash)) {
 				return ShaderProgram {};
 			}
-			if (disk != nullptr) {
+			if (disk_ok) {
 				BuildPermutationKey(permutation_key, source_key, entry->second.specialization,
 				                    push_data_cursor);
 				if (disk_verify) {
@@ -2090,17 +2069,31 @@ struct PipelineCache::ProgramCache {
 					}
 				}
 			}
+		} else if (source_changed) {
+			// The calls resolve to other code: the plan of the new translation, and a permutation
+			// compiled for that code if there is one.
+			entry->second.resource_plan =
+			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			if (!MaterializeFirstUse(entry->second, runtime, stage, stage_name, params.hash)) {
+				return ShaderProgram {};
+			}
+			if (const auto* permutation = entry->second.FindPermutation(push_data_cursor)) {
+				input_info.stage = {.program   = &permutation->program,
+				                    .resources = &entry->second.resources};
+				permutation->program.bindings.AdvancePushData(push_data_cursor);
+				return permutation->handle;
+			}
 		}
 		auto compiled = CompileTranslated(options, std::move(translated),
 		                                  entry->second.specialization, push_data_cursor);
 		std::vector<uint8_t> permutation_payload;
-		if (disk != nullptr) {
+		if (disk_ok) {
 			ShaderDiskCache::EncodePermutationRecord(compiled.spirv, compiled.program,
 			                                         permutation_payload);
 		}
 		const auto handle = AddPermutation(entry->second, stage_name, options, compiled.spirv,
 		                                   std::move(compiled.program), input_info,
-		                                   push_data_cursor);
+		                                   push_data_cursor, entry->second.FunctionCode());
 		{
 			const auto us = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 			                                         std::chrono::steady_clock::now() - compile_begin)
@@ -2113,7 +2106,7 @@ struct PipelineCache::ProgramCache {
 			                  last_spirv_words);
 		}
 		compile_zone.End();
-		if (disk != nullptr) {
+		if (disk_ok) {
 			// After AddPermutation: SPIR-V that fails validation is never stored.
 			StoreEntry(false, params.hash, permutation_key, cached_permutation,
 			           permutation_payload);
@@ -2121,10 +2114,11 @@ struct PipelineCache::ProgramCache {
 		return handle;
 	}
 
-	ProgramCache(vk::Device device, bool shader_clock, bool bindless_images,
+	ProgramCache(GraphicContext& graphics, bool shader_clock, bool bindless_images,
 	             ShaderDiskCache::SessionInfo session, std::filesystem::path disk_directory)
-	    : device(device), shader_clock(shader_clock), bindless_images(bindless_images),
-	      disk_session(session), disk_verify(ShaderDiskCache::VerifyEnabled()) {
+	    : graphics(graphics), device(graphics.device), shader_clock(shader_clock),
+	      bindless_images(bindless_images), disk_session(session),
+	      disk_verify(ShaderDiskCache::VerifyEnabled()) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 		if (Config::GraphicsDebugDumpEnabled()) {
 			// The dumps are written while translating: every shader has to be translated.
@@ -2157,174 +2151,19 @@ struct PipelineCache::ProgramCache {
 		for (const auto& [key, entry]: programs) {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {
-				device.destroyShaderModule(permutation.handle.module, nullptr);
-			}
-		}
-	}
-
-	// KYTY_EXPAND_BY_CONSULTED=0: the reuse and fast-program keys hash all of the user data.
-	static bool KeyByConsulted() {
-		static const bool enabled = [] {
-			const char* value = std::getenv("KYTY_EXPAND_BY_CONSULTED");
-			return value == nullptr || value[0] != '0';
-		}();
-		return enabled;
-	}
-
-	// A hash of the user data as far as the expanded code (and so the program) depends on it:
-	// only its size for code without calls, the registers the last complete call resolution
-	// consulted (and their values) for code with calls, all of it otherwise. The title's call
-	// shader c4df2a00067e0666 is dispatched ~16,000 times a second with different user data but
-	// the same call-table registers: hashing all of it missed every reuse and expanded each time
-	// (~3 us, 8 % of the GPU thread in the jungle, 2026-10-18).
-	uint64_t ExpansionInputsHash(const ShaderParams& params, std::span<const uint32_t> user_data,
-	                             uint32_t wave_size, uint64_t seed) {
-		if (KeyByConsulted() && params.hash != 0) {
-			const uint64_t no_call_key =
-			    params.hash ^ (static_cast<uint64_t>(params.code.size()) << 32u) ^
-			    (static_cast<uint64_t>(wave_size) << 56u);
-			const uint64_t count = user_data.size();
-			if (no_call_shaders.contains(no_call_key)) {
-				return XXH3_64bits_withSeed(&count, sizeof(count), seed ^ 0x6e6f2d63616c6c73ull);
-			}
-			if (const auto* regs = function_expander.ConsultedUserData(params.code, params.hash,
-			                                                           wave_size)) {
-				consulted_scratch.clear();
-				consulted_scratch.push_back(static_cast<uint32_t>(count));
-				for (const auto reg: *regs) {
-					consulted_scratch.push_back(reg);
-					consulted_scratch.push_back(reg < user_data.size() ? user_data[reg] : 0u);
-				}
-				return XXH3_64bits_withSeed(consulted_scratch.data(),
-				                            consulted_scratch.size() * sizeof(uint32_t),
-				                            seed ^ 0x636f6e73756c7465ull);
-			}
-		}
-		return XXH3_64bits_withSeed(user_data.data(), user_data.size_bytes(), seed);
-	}
-
-	// Shader function expansion decodes the shader and every callee, and a shader with table
-	// calls can be dispatched hundreds of times a frame; the expander keeps what it can reuse.
-	void ExpandShaderFunctions(const ShaderParams& params, std::span<const uint32_t> user_data,
-	                           uint32_t wave_size, std::vector<uint32_t>& expanded) {
-		// Resolving the call targets and re-reading every callee to validate the kept expansion
-		// was ~7.6 us a dispatch, 13 000 dispatches a second (10 % of the GPU thread in the
-		// jungle, 2026-10-10). The same shader with the same user data reuses the result for
-		// 50 ms before it is validated again. KYTY_EXPAND_REUSE_MS=0 validates every time.
-		static const auto reuse = std::chrono::milliseconds([] {
-			const char* value = std::getenv("KYTY_EXPAND_REUSE_MS");
-			return value != nullptr ? std::strtoul(value, nullptr, 10) : 50ul;
-		}());
-		// Code without calls expands to nothing whatever the user data: once the expander has
-		// found none in this code (named by its content hash and size), skip the user-data hash,
-		// the reuse map and the expander (most of the title's ~25,000 dispatches a second).
-		const uint64_t no_call_key =
-		    params.hash ^ (static_cast<uint64_t>(params.code.size()) << 32u) ^
-		    (static_cast<uint64_t>(wave_size) << 56u);
-		if (params.hash != 0 && no_call_shaders.contains(no_call_key)) {
-			expanded.clear();
-			return;
-		}
-		const auto now = std::chrono::steady_clock::now();
-		uint64_t   reuse_key = 0;
-		const uint64_t reuse_seed = params.hash ^ params.Base() ^
-		                            (static_cast<uint64_t>(wave_size) << 56u) ^
-		                            (static_cast<uint64_t>(params.code.size()) << 32u);
-		if (reuse.count() != 0) {
-			reuse_key = ExpansionInputsHash(params, user_data, wave_size, reuse_seed);
-			if (const auto it = expand_reuse.find(reuse_key);
-			    it != expand_reuse.end() && now - it->second.validated < reuse) {
-				expanded = it->second.code;
-				return;
-			}
-		}
-		struct Remember {
-			std::unordered_map<uint64_t, ExpandReused>& map;
-			uint64_t                               key;
-			std::chrono::steady_clock::time_point  now;
-			const std::vector<uint32_t>&           result;
-			~Remember() {
-				if (key == 0) {
-					return;
-				}
-				if (map.size() > 4096) {
-					map.clear();
-				}
-				auto& entry     = map[key];
-				entry.code      = result;
-				entry.validated = now;
-			}
-		} remember {expand_reuse, reuse_key, now, expanded};
-		std::string reason;
-		const bool  expanded_ok = function_expander.Expand(
-		     params.code, params.Base(), user_data,
-		     [](uint64_t address, std::span<uint32_t> words) {
-			     return ReadShaderGuestMemoryRaw(nullptr, address, words);
-		     },
-		     expanded, reason, wave_size, params.hash);
-		if (reuse_key != 0) {
-			// Kept under the registers this resolution consulted.
-			remember.key = ExpansionInputsHash(params, user_data, wave_size, reuse_seed);
-		}
-		if (expanded_ok && expanded.empty() && reason.empty() && params.hash != 0 &&
-		    !function_expander.HasCalls(params.code)) {
-			no_call_shaders.insert(no_call_key);
-		}
-		// The draw-prep scanner cannot run the expander (GPU-thread state), and a program key
-		// without the expanded functions never finds the entry of a shader with calls (the
-		// title's 0xc4df2a00067e0666, ~16 000 dispatches a second, all refreshed on the GPU
-		// thread). Keep the last expansion by shader and code address for it; the GPU thread
-		// checks that the scanner's entry is the one it finds itself (TakeScanned).
-		if (expanded_ok && !expanded.empty()) {
-			const uint64_t   scan_key = ScanExpandKey(params, wave_size);
-			std::lock_guard  lock(scan_expand_mutex);
-			auto&            kept = scan_expansions[scan_key];
-			if (kept != expanded) {
-				if (scan_expansions.size() > 4096) {
-					scan_expansions.clear();
-					scan_expansions[scan_key] = expanded;
-				} else {
-					kept = expanded;
-				}
-			}
-		}
-		if (!expanded_ok) {
-			static std::atomic<uint32_t> reports {0};
-			if (reports.fetch_add(1) < 16) {
-				::printf("Shader function expansion hash=%016" PRIx64 ": %s\n", params.hash,
-				         reason.c_str());
+				graphics.device.destroyShaderModule(permutation.handle.module, nullptr);
 			}
 		}
 	}
 
 	using ProgramsMap = std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash>;
 	ProgramsMap                                                    programs;
-	struct FastEntry {
-		ProgramsMap::value_type*              entry = nullptr;
-		std::chrono::steady_clock::time_point validated;
-	};
-	std::unordered_map<uint64_t, FastEntry>                        fast_entries;
 	// Taken exclusively by the GPU thread when it inserts into programs (entries are never
 	// erased, so pointers to them stay valid), shared by the draw-prep scanner's lookups.
 	std::shared_mutex                                              programs_mutex;
 	std::unordered_set<ProgramKey, ProgramKeyHash>                 unsupported;
-	std::unordered_set<uint64_t>                                   gave_up_fast;
-	struct ExpandReused {
-		std::vector<uint32_t>                 code;
-		std::chrono::steady_clock::time_point validated;
-	};
-	std::unordered_map<uint64_t, ExpandReused>                     expand_reuse;
-	std::unordered_set<uint64_t>                                   no_call_shaders;
-	std::vector<uint32_t>                                          consulted_scratch;
-	// The last function expansion by shader and code address, for the draw-prep scanner.
-	std::mutex                                                     scan_expand_mutex;
-	std::unordered_map<uint64_t, std::vector<uint32_t>>            scan_expansions;
-	static uint64_t ScanExpandKey(const ShaderParams& params, uint32_t wave_size) {
-		return params.hash ^ params.Base() ^ (static_cast<uint64_t>(wave_size) << 56u) ^
-		       (static_cast<uint64_t>(params.code.size()) << 32u);
-	}
-	ShaderRecompiler::Decoder::ShaderFunctionExpander             function_expander;
 	ProgramKey                                                     lookup_key;
+	GraphicContext&                                                graphics;
 	vk::Device                                                  device;
 	bool                                                        shader_clock = false;
 	bool                                                        bindless_images = false;
@@ -2368,9 +2207,11 @@ struct PipelineCache::ProgramCache {
 		prep_key.user_data_count = params.user_data_count;
 		prep_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, prep_key.static_state);
-		prep_key.function_code.clear();
 		const auto entry = programs.find(prep_key);
-		return entry != programs.end() ? &entry->second : nullptr;
+		// A source with calls reads its call targets before every refresh: not prepared ahead.
+		return entry != programs.end() && !entry->second.call_source && !entry->second.skip_dispatch
+		           ? &entry->second
+		           : nullptr;
 	}
 
 	// The SRT refresh of Get with the probe reader (ReadShaderGuestMemoryProbe).
@@ -2495,14 +2336,6 @@ struct PipelineCache::ProgramCache {
 		key.user_data_count = params.user_data_count;
 		key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, key.static_state);
-		key.function_code.clear();
-		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
-			std::lock_guard lock(scan_expand_mutex);
-			if (const auto it = scan_expansions.find(ScanExpandKey(params, input_info.wave_size));
-			    it != scan_expansions.end()) {
-				key.function_code = it->second;
-			}
-		}
 		std::shared_lock programs_lock(programs_mutex);
 		const auto       entry = programs.find(key);
 		// KYTY_FPS_LOG: why a scanned program has no entry (first miss of each shader): the
@@ -2519,7 +2352,6 @@ struct PipelineCache::ProgramCache {
 						std::string diff;
 						if (other.user_data_count != key.user_data_count) diff += fmt::format(" ud {}!={}", other.user_data_count, key.user_data_count);
 						if (other.code_size != key.code_size) diff += fmt::format(" size {}!={}", other.code_size, key.code_size);
-						if (!other.function_code.empty()) diff += fmt::format(" function_code {} dwords", other.function_code.size());
 						for (size_t i = 0; i < std::max(other.static_state.size(), key.static_state.size()); i++) {
 							const uint32_t a = i < other.static_state.size() ? other.static_state[i] : 0xdeadu;
 							const uint32_t b = i < key.static_state.size() ? key.static_state[i] : 0xdeadu;
@@ -2531,7 +2363,9 @@ struct PipelineCache::ProgramCache {
 				}
 			}
 		}
-		return entry != programs.end() ? &entry->second : nullptr;
+		return entry != programs.end() && !entry->second.call_source && !entry->second.skip_dispatch
+		           ? &entry->second
+		           : nullptr;
 	}
 
 	// KYTY_FPS_LOG: the shaders the scanner could not prepare most often (no entry / walk failed),
@@ -2819,14 +2653,15 @@ struct PipelineCache::ProgramCache {
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics),
       m_program_cache(std::make_unique<ProgramCache>(
-          graphics.device, graphics.shader_device_clock_enabled,
+          graphics, graphics.shader_device_clock_enabled,
           graphics.bindless_enabled && Config::BindlessImagesEnabled(),
           ShaderDiskCache::SessionInfo {
               .vendor_id           = graphics.GetPhysicalDeviceProperties().vendorID,
               .device_id           = graphics.GetPhysicalDeviceProperties().deviceID,
               .bindless_images     = graphics.bindless_enabled && Config::BindlessImagesEnabled(),
               .float_image_atomics = Config::FloatImageAtomicsEnabled()},
-          ShaderDiskCacheDirectory())) {
+          ShaderDiskCacheDirectory())),
+      m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 	if (g_async_pipelines) {
@@ -2838,6 +2673,12 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 }
 
 PipelineCache::~PipelineCache() {
+	m_program_cache->FlushDisk();
+	// No worker may use the driver cache once it is destroyed below; later pipelines are
+	// compiled on the GPU thread (FinishPending).
+	if (m_compiler != nullptr) {
+		m_compiler->Stop();
+	}
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -2866,7 +2707,6 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
 		return;
 	}
-
 	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
@@ -2900,7 +2740,7 @@ void PipelineCache::InitializeDriverCache() {
 			    XXH3_64bits(initial_data.data(), initial_data.size()) != payload_hash) {
 				initial_data.clear();
 				PipelineCacheLog(
-				    "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)",
+				    "Vulkan pipeline cache: invalidating {} (driver or data mismatch)",
 				    path);
 			}
 		} else {
@@ -2927,23 +2767,28 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 	if (!initial_data.empty()) {
-		PipelineCacheLog("Vulkan pipeline cache: loaded {} bytes from {}", initial_data.size(),
-		                 path);
+		PipelineCacheLog("Vulkan pipeline cache: loaded {:.2f} MB from {}",
+		                 static_cast<double>(initial_data.size()) / 1'000'000.0, path);
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
 }
 
-void PipelineCache::Save() {
-	m_program_cache->FlushDisk();
-	// No worker may use the driver cache once it is destroyed below; later pipelines are
-	// compiled on the GPU thread (FinishPending).
-	if (m_compiler != nullptr) {
-		m_compiler->Stop();
-	}
+void PipelineCache::CheckpointDriverCache() {
 	if (m_driver_cache == nullptr) {
 		return;
 	}
+	m_driver_cache_dirty = true;
+	if (std::chrono::steady_clock::now() >= m_next_driver_cache_save) {
+		Save();
+	}
+}
+
+void PipelineCache::Save() {
+	if (m_driver_cache == nullptr || !m_driver_cache_dirty) {
+		return;
+	}
+	m_next_driver_cache_save = std::chrono::steady_clock::now() + DriverCacheSaveInterval;
 
 	size_t               size = 0;
 	vk::Result           result;
@@ -2963,8 +2808,8 @@ void PipelineCache::Save() {
 	}
 	if (result != vk::Result::eSuccess || size == 0 ||
 	    size > std::numeric_limits<uint32_t>::max()) {
-		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
-		                 vk::to_string(result), size);
+		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {:.2f} MB)",
+		                 vk::to_string(result), static_cast<double>(size) / 1'000'000.0);
 		return;
 	}
 	payload.resize(size);
@@ -2986,16 +2831,20 @@ void PipelineCache::Save() {
 	}
 	const bool flushed = !file.IsInvalid() && file.Flush();
 	file.Close();
-	if (prefix_written != prefix.size() || payload_written != payload.size() || !flushed ||
-	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
+	const bool written = prefix_written == prefix.size() && payload_written == payload.size() && flushed;
+	std::error_code error;
+	if (written) {
+		std::filesystem::rename(temp_path, m_driver_cache_path, error);
+	}
+	if (!written || error) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
 		return;
 	}
-	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
+	PipelineCacheLog("Vulkan pipeline cache: saved {:.2f} MB to {}",
+	                 static_cast<double>(payload.size()) / 1'000'000.0,
 	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
+	m_driver_cache_dirty = false;
 }
 
 // Glyphs, icons and other cached layers are drawn once into small offscreen targets, and a draw
@@ -3044,6 +2893,17 @@ bool PipelineCache::DescribeGraphicsStages(
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
+	const bool object_primitive_id = context.HasObjectPrimitiveIdOutput();
+	if (object_primitive_id) {
+		// CxObjectIdMode: register source plus a 32-bit pipelined primitive-ID addition.
+		EXIT_NOT_IMPLEMENTED(sh.m_paClObjprimIdCntl != 2u || mesh_active || tess_active ||
+		                     !pixel_active || (sh.m_vgtDrawPayloadCntl & 8u) == 0 ||
+		                     user_config.GetPrimType() != Prospero::PrimitiveType::kTriList);
+		const auto& target = context.GetRenderTarget(7);
+		EXIT_NOT_IMPLEMENTED(Prospero::ResolveRenderTargetFormat(target.info.format,
+		                                                       target.info.channel_type)
+		                         .buffer_format != Prospero::BufferFormat::k32UInt);
+	}
 	if (mesh_active) {
 		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
 		auto& mesh              = vertex_info[0].mesh;
@@ -3079,7 +2939,8 @@ bool PipelineCache::DescribeGraphicsStages(
 		}
 	}
 	if (pixel_active) {
-		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		pixel_info.object_primitive_id = object_primitive_id;
 		// SPI_SHADER_COL_FORMAT describes export packing, not the attachment numeric type.
 		// In particular, 32-bit exports can carry raw integer material data.
 		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
@@ -3093,6 +2954,35 @@ bool PipelineCache::DescribeGraphicsStages(
 			} else if (rt.info.channel_type == Prospero::ChannelType::kSInt) {
 				pixel_info.target_sint_mask |= 1u << slot;
 			}
+		}
+		for (uint32_t export_index = 0; export_index < 8u; export_index++) {
+			const auto slot = ShaderPixelExportTarget(pixel_info.target_shader_mask, export_index);
+			if (slot >= 8u || pixel_info.target_output_mode[export_index] == 0u) continue;
+			const auto& rt = context.GetRenderTarget(slot);
+			const auto target_mask = render_target_mask_slot(context.GetRenderTargetMask(), slot);
+			if (rt.base.addr == 0 || target_mask == 0u) continue;
+			const auto format = Prospero::ResolveRenderTargetFormat(rt.info.format, rt.info.channel_type);
+			if (format.buffer_format != Prospero::BufferFormat::k11_11_10UNorm) continue;
+			const auto mapping = pixel_info.target_export_mapping[export_index];
+			const auto shader_mask = render_target_mask_slot(pixel_info.target_shader_mask, slot);
+			const bool blend = context.GetBlendControl(slot).enable && !rt.info.blend_bypass;
+			if (blend || (mapping.ApplyMask(target_mask) & 7u) != 7u ||
+			    (mapping.ApplyMask(shader_mask) & 7u) != 7u ||
+			    pixel_info.target_output_mode[export_index] != 9u) {
+				EXIT("unsupported packed UNorm render-target export: slot=%u export=%u mode=%u "
+				     "target_mask=0x%x shader_mask=0x%x mapping=0x%02x blend=%u\n",
+				     slot, export_index, pixel_info.target_output_mode[export_index], target_mask,
+				     shader_mask, mapping.packed, static_cast<uint32_t>(blend));
+			}
+			pixel_info.target_packed_unorm_mask |= 1u << export_index;
+			pixel_info.target_round_mode |= static_cast<uint8_t>(rt.info.round_mode) << export_index;
+		}
+		if (!mesh_active && !tess_active && Prospero::IsRectList(user_config.GetPrimType())) {
+			pixel_info.parameter_mode = ShaderPixelParameterMode::Rectangle;
+		} else if (context.GetModeControl().provoking_vtx_last) {
+			pixel_info.parameter_mode = ShaderPixelParameterMode::LastVertex;
+		} else {
+			pixel_info.parameter_mode = ShaderPixelParameterMode::FirstVertex;
 		}
 		const auto& blend = context.GetBlendControl(0);
 		pixel_info.dual_source_blending =
@@ -3173,8 +3063,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
-	uint32_t          push_data_cursor =
-	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
+	const bool object_primitive_id = context.HasObjectPrimitiveIdOutput();
+	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
+	    mesh_active, object_primitive_id);
 	GraphicsPrograms  result;
 	// New shaders of 3D draws (depth test on) translate on the workers while the draw is skipped;
 	// UI and layer draws translate at once (TranslationWorkers).
@@ -3338,6 +3229,7 @@ bool PipelineCache::FinishPending(Pipeline& pipeline) {
 	EXIT_NOT_IMPLEMENTED(job.result != vk::Result::eSuccess || job.pipeline == nullptr);
 	pipeline.pipeline = job.pipeline;
 	pipeline.pending.reset();
+	CheckpointDriverCache();
 	return true;
 }
 
@@ -3380,6 +3272,9 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		EXIT_IF(!colors[i].image_id || colors[i].desc.view_info.format == vk::Format::eUndefined);
 		static_params.color_mask[slot] = colors[i].export_mapping.ApplyMask(
 		    render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot));
+		if (colors[i].desc.info.guest_format == Prospero::BufferFormat::k11_11_10UNorm) {
+			static_params.color_mask[slot] = 1u;
+		}
 		rendering.color_formats[slot] = colors[i].desc.view_info.format;
 		if (attachment_samples == 0) {
 			attachment_samples = colors[i].desc.info.samples;
@@ -3479,9 +3374,6 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) {
 		EXIT("Pipeline: sample-rate shading is required but unsupported by the host\n");
 	}
-	static_params.depth_bounds_test_enable = depth.depth_bounds_test_enable;
-	static_params.depth_min_bounds         = depth.depth_min_bounds;
-	static_params.depth_max_bounds         = depth.depth_max_bounds;
 	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
 	static_params.cull_back  = !rect_list && mc.cull_back;
 	static_params.cull_front = !rect_list && mc.cull_front;
@@ -3620,7 +3512,13 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		return &pipeline;
 	}
 	const auto build_begin = std::chrono::steady_clock::now();
-	const auto result = CreateGraphicsPipeline(*build, m_driver_cache, &cached->pipeline);
+	vk::Result result;
+	{
+		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
+		                                         Common::DebugCounters::Counter::PipelineCreateNs,
+		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		result = CreateGraphicsPipeline(*build, m_driver_cache, &cached->pipeline);
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	ReportGraphicsPipelineBuilt(vs_input_info.stage.program->shader_hash,
 	                            ps_active ? ps_input_info->stage.program->shader_hash : 0,
@@ -3631,6 +3529,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
+	CheckpointDriverCache();
 
 	return iter->second.get();
 }
@@ -3658,6 +3557,9 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		zone.SetText("CS 0x%016" PRIx64, hash);
 		KYTY_PROFILER_PHASE(zone, "Compute pipeline build", profiler::colors::RedA100);
 		const auto begin = std::chrono::steady_clock::now();
+		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
+		                                         Common::DebugCounters::Counter::PipelineCreateNs,
+		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
 		ReportPipelineBuilt(Profiler::Counter::ComputePipelinesBuilt, "Compute", hash, 0, begin);
 	}
@@ -3667,6 +3569,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
+	CheckpointDriverCache();
 
 	return *iter->second;
 }

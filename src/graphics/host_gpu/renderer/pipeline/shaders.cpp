@@ -23,6 +23,8 @@
 #include <chrono>
 #include <cinttypes>
 #include <cstdlib>
+#include <array>
+#include <bit>
 #include <limits>
 #include <memory>
 #include <span>
@@ -222,10 +224,12 @@ static vk::BlendOp GetBlendOp(uint32_t op) {
 static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descriptor_bindings,
                               const ShaderRecompiler::IR::CompiledShaderInfo& program,
                               vk::ShaderStageFlagBits              stage) {
-	for (const auto& binding: program.bindings.descriptors) {
+	for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
+		const auto index = std::countr_zero(mask);
+		const auto kind = static_cast<ShaderRecompiler::IR::DescriptorBindingKind>(index);
 		descriptor_bindings.push_back(
-		    {ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind),
-		     NativeDescriptorType(binding.kind), NativeDescriptorCount(binding), stage, nullptr});
+		    {ShaderRecompiler::IR::NativeBinding(program.stage, kind), NativeDescriptorType(kind),
+		     program.bindings.descriptor_counts[index], stage, nullptr});
 	}
 }
 
@@ -250,9 +254,40 @@ static void FillSetLayouts(GraphicContext& graphics, const PipelineCache::Pipeli
 
 static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                    std::span<const vk::DescriptorSetLayoutBinding> bindings) {
-	uint32_t descriptor_count = 0;
+	const auto& limits = graphics.GetPhysicalDeviceProperties().limits;
+	uint64_t descriptor_count = 0;
+	uint64_t storage_buffers = 0;
+	uint64_t samplers = 0;
+	std::array<uint64_t, 32> stage_buffers {}, stage_resources {}, stage_samplers {};
 	for (const auto& binding: bindings) {
 		descriptor_count += binding.descriptorCount;
+		const bool storage = binding.descriptorType == vk::DescriptorType::eStorageBuffer;
+		const bool sampler = binding.descriptorType == vk::DescriptorType::eSampler;
+		if (storage) storage_buffers += binding.descriptorCount;
+		if (sampler) samplers += binding.descriptorCount;
+		for (auto stages = static_cast<uint32_t>(binding.stageFlags); stages != 0; stages &= stages - 1u) {
+			const auto stage = std::countr_zero(stages);
+			if (storage) stage_buffers[stage] += binding.descriptorCount;
+			if (sampler) stage_samplers[stage] += binding.descriptorCount;
+			else
+				stage_resources[stage] += binding.descriptorCount;
+			if (stage_buffers[stage] > limits.maxPerStageDescriptorStorageBuffers ||
+			    stage_resources[stage] > limits.maxPerStageResources ||
+			    stage_samplers[stage] > limits.maxPerStageDescriptorSamplers) {
+				EXIT("native descriptor stage %u exceeds device limits: buffers=%" PRIu64
+				     "/%u resources=%" PRIu64 "/%u samplers=%" PRIu64 "/%u\n", stage, stage_buffers[stage],
+				     limits.maxPerStageDescriptorStorageBuffers, stage_resources[stage], limits.maxPerStageResources,
+				     stage_samplers[stage], limits.maxPerStageDescriptorSamplers);
+			}
+		}
+	}
+	if (storage_buffers > limits.maxDescriptorSetStorageBuffers) {
+		EXIT("native storage-buffer descriptors exceed device limit: %" PRIu64 "/%u\n",
+		     storage_buffers, limits.maxDescriptorSetStorageBuffers);
+	}
+	if (samplers > limits.maxDescriptorSetSamplers) {
+		EXIT("native sampler descriptors exceed device limit: %" PRIu64 "/%u\n",
+		     samplers, limits.maxDescriptorSetSamplers);
 	}
 	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
 
@@ -565,14 +600,6 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
 	auto& depth_stencil_info = build.depth_stencil;
-	depth_stencil_info.depthBoundsTestEnable =
-#if defined(__APPLE__)
-	    VK_FALSE; // MoltenVK lacks the depthBounds feature; depth-bounds testing is disabled
-#else
-	    (static_params.depth_bounds_test_enable ? VK_TRUE : VK_FALSE);
-#endif
-	depth_stencil_info.minDepthBounds    = static_params.depth_min_bounds;
-	depth_stencil_info.maxDepthBounds    = static_params.depth_max_bounds;
 
 	build.dynamic_states = {
 	    vk::DynamicState::eViewportWithCount,
@@ -591,6 +618,8 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 	    vk::DynamicState::eBlendConstants,
 	};
 #if !defined(__APPLE__)
+	build.dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
+	build.dynamic_states.push_back(vk::DynamicState::eDepthBounds);
 	if (rendering.color_count != 0) {
 		build.dynamic_states.push_back(vk::DynamicState::eColorWriteEnableEXT);
 	}
@@ -599,15 +628,11 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 		build.dynamic_states.push_back(vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);
 	}
 	if (PipelineDynamicRasterStateEnabled()) {
-		// Core Vulkan 1.3 (cull mode, front face, depth-bounds test enable) and 1.0 (depth bounds;
-		// the depthBounds feature is required on these hosts). The key holds zeroes for them; the
-		// draw records the values from the same registers (SetGraphicsDynamicParams).
+		// Core Vulkan 1.3. The key holds zeroes for them; the draw records the values from the
+		// same registers (SetGraphicsDynamicParams). The depth-bounds test enable and bounds are
+		// dynamic in every pipeline (DynamicState), whatever this switch says.
 		build.dynamic_states.push_back(vk::DynamicState::eCullMode);
 		build.dynamic_states.push_back(vk::DynamicState::eFrontFace);
-#if !defined(__APPLE__)
-		build.dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
-		build.dynamic_states.push_back(vk::DynamicState::eDepthBounds);
-#endif
 	}
 
 	build.dynamic_state.dynamicStateCount = static_cast<uint32_t>(build.dynamic_states.size());
@@ -750,6 +775,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
 	vk::ComputePipelineCreateInfo info {};
+	if (input_info.stage.program->info.uses_gds) {
+		info.flags = vk::PipelineCreateFlagBits::eDispatchBase;
+	}
 	info.stage             = comp_shader_stage_info;
 	info.layout            = pipeline.pipeline_layout;
 	info.basePipelineIndex = -1;

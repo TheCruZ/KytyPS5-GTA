@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/cpuAffinity.h"
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/timer.h"
@@ -342,7 +343,7 @@ void CommandScheduler::CompleteReleaseMemWrite() {
 
 void CommandScheduler::CompleteReleaseMemInterrupt() {
 	// Deliberately smaller than CompleteReleaseMemWrite's 32: this event has already been queued
-	// for guest delivery once its tick completes (see Sync::TriggerEopEventAtEndOfPipe ->
+	// for guest delivery once its tick completes (see CommandProcessor::TriggerEopEventAtEndOfPipe ->
 	// DeferPriorityOperation), and a guest thread may be blocked waiting on it via an event queue.
 	// Batching still defers only the vkQueueSubmit -- the event fires once that (now slightly
 	// larger) submission's tick completes, same as before, just a handful of RELEASE_MEM events
@@ -498,6 +499,14 @@ void CommandScheduler::PopPendingOperations() {
 }
 
 void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) {
+	QueueOperation(std::move(operation), false);
+}
+
+void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
+	QueueOperation(std::move(operation), true);
+}
+
+void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority) {
 	CheckActive();
 	DeferRelease(std::move(operation));
 }
@@ -506,39 +515,25 @@ void CommandScheduler::DeferRelease(Common::UniqueFunction<void>&& operation) {
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
-		m_pending_operations.push({std::move(operation), CurrentTick()});
-		return;
-	}
-	if (g_deferred_callback_scheduler == this) {
+		auto& queue = priority ? m_priority_operations : m_pending_operations;
+		queue.push({std::move(operation), CurrentTick()});
 		lock.unlock();
-		operation();
+		if (priority) {
+			m_operation_available.notify_one();
+		}
 		return;
 	}
-	m_operation_available.wait(lock,
-	                           [this] { return m_operation_state == OperationState::Closed; });
+	if (g_deferred_callback_scheduler != this) {
+		m_operation_available.wait(lock,
+		                           [this] { return m_operation_state == OperationState::Closed; });
+	}
 	lock.unlock();
 	operation();
 }
 
-void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
-	CheckActive();
-	EXIT_IF(!operation);
-	std::unique_lock lock(m_operation_mutex);
-	if (m_operation_state == OperationState::Open) {
-		m_priority_operations.push({std::move(operation), CurrentTick()});
-		lock.unlock();
-		m_operation_available.notify_one();
-		return;
-	}
-	if (g_deferred_callback_scheduler == this) {
-		lock.unlock();
-		operation();
-		return;
-	}
-	m_operation_available.wait(lock,
-	                           [this] { return m_operation_state == OperationState::Closed; });
-	lock.unlock();
-	operation();
+bool CommandScheduler::HasPendingPriorityOperations() {
+	std::lock_guard lock(m_operation_mutex);
+	return !m_priority_operations.empty() || m_priority_active;
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
@@ -633,11 +628,13 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 			EXIT_NOT_IMPLEMENTED(m_worker_buffer.begin(&begin_info) != vk::Result::eSuccess);
 			m_timer_slot = m_gpu_timer->Begin(m_worker_buffer);
 		});
+		m_dynamic_state.Invalidate();
 		return m_command;
 	}
 	m_command.m_buffer = m_command_pool.Commit(tick);
 	m_command.Begin();
 	m_timer_slot = m_gpu_timer->Begin(m_command.Handle());
+	m_dynamic_state.Invalidate();
 	return m_command;
 }
 
@@ -793,6 +790,7 @@ void CommandScheduler::QueueSubmit(SubmitJob& job) {
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
 	Timeline::Mark("vk-submit", job.tick);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
 	if (result == vk::Result::eErrorDeviceLost) {
 		DumpDeviceLossDiagnostics(graphics);

@@ -93,6 +93,7 @@ static void PrintUsage() {
 	::printf("Options:\n");
 	::printf("  --game <dir|elf|zar>                 Game directory, ELF, or ZArchive to load.\n");
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
+	::printf("  --addcont-dir <dir>                  Add-ons (DLC) folder (default: none).\n");
 	::printf("  --screen-width <num>                 Window width. Default: 1280.\n");
 	::printf("  --screen-height <num>                Window height. Default: 720.\n");
 	::printf(
@@ -103,18 +104,22 @@ static void PrintUsage() {
 	::printf("  --controller-color <#RRGGBB>        Override the controller lightbar color.\n");
 	::printf("  --controller-volume <0-100>         DualSense speaker volume. Default: 50.\n");
 	::printf("  --controller-vibration <0-100>      DualSense vibration intensity. Default: 100.\n");
+	::printf("  --keyboard-player <0-4>             Keyboard player; 0 shares player 1 with the gamepad. Default: 0.\n");
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
 	::printf(
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
+	::printf("  --hdr                                Enable HDR10 output when supported.\n");
 	::printf(
 	    "  --hide-cursor                        Hide the cursor after 2 s idle. Default: off.\n");
+	::printf("  --no-splash                          Disable the startup splash screen.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
+	::printf("  --network-connected <true|false>     Use the host local network (default: false).\n");
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --vulkan-validation-fatal <t|f>      Exit on the first validation error (default\n"
@@ -134,13 +139,21 @@ static void PrintUsage() {
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
 	::printf(
+	    "  --sync-raw-image-buffers <true|false> Synchronize raw reads of GPU images. Default: false.\n");
+	::printf(
 	    "  --trophy-notifications <true|false>   Show trophy unlock toasts and play their sound.\n");
+	::printf(
+	    "  --trophy-duration <seconds>          Trophy toast duration, 5-10. Default: 6.\n");
+	::printf("  --perf-overlay <true|false>           Show the performance panel (F2 or Cmd+P).\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 	::printf("  --bindless                           Sample heap-indexed images through bindless arrays.\n");
 	::printf("  --no-float-image-atomics             Skip shaders that run integer image atomics on R32\n"
 	         "                                       float images (they run by default).\n");
 	::printf("  --skip-shaders <hash,...>            Skip the draws and dispatches of these guest shaders\n"
 	         "                                       (hex hashes, as logged).\n");
+	::printf(
+	    "  --skip-notice-screen <true|false>    Skip startup logos and notices in supported games.\n"
+	    "                                      Default: false.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -263,8 +276,18 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			continue;
 		}
 
+		if (arg == "--hdr") {
+			options.config.hdr_enabled = true;
+			continue;
+		}
+
 		if (arg == "--hide-cursor") {
 			options.config.hide_cursor_enabled = true;
+			continue;
+		}
+
+		if (arg == "--no-splash") {
+			options.config.splash_enabled = false;
 			continue;
 		}
 
@@ -351,6 +374,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				         value.c_str());
 				return false;
 			}
+		} else if (arg == "--guest-exec") {
+			options.elf = Common::PathFromUtf8(Common::FixFilenameSlash(value));
+			options.config.guest_arguments.assign(argv + i + 1, argv + argc);
+			break;
 		} else if (arg == "--game-patch") {
 			if (!options.game_patch.empty()) {
 				::printf("--game-patch can only be specified once\n");
@@ -364,6 +391,12 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.game_patch = path;
+		} else if (arg == "--addcont-dir") {
+			if (!options.addcont_dir.empty()) {
+				::printf("--addcont-dir can only be specified once\n");
+				return false;
+			}
+			options.addcont_dir = Common::PathFromUtf8(Common::FixFilenameSlash(value));
 		} else if (arg == "--screen-width") {
 			if (!ParseUint32(value, options.config.screen_width) ||
 			    options.config.screen_width == 0) {
@@ -409,6 +442,12 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid controller vibration intensity: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--keyboard-player") {
+			if (!ParseUint32(value, options.config.keyboard_player) ||
+			    options.config.keyboard_player > static_cast<uint32_t>(Config::MAX_PLAYERS)) {
+				::printf("invalid keyboard player: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--present-mode") {
 			if (!ParseEnum(value, options.config.present_mode)) {
 				::printf("invalid present mode: %s\n", value.c_str());
@@ -424,9 +463,19 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid vblank frequency: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--trophy-duration") {
+			if (!ParseUint32(value, options.config.trophy_duration_seconds)) {
+				::printf("invalid trophy duration: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--console-language") {
 			if (!ParseConsoleLanguage(value, options.config.console_language)) {
 				::printf("invalid console language: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--network-connected") {
+			if (!ParseBool(value, options.config.network_connected)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
 		} else if (arg == "--vulkan-validation") {
@@ -492,8 +541,23 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--sync-raw-image-buffers") {
+			if (!ParseBool(value, options.config.sync_raw_image_buffers)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--trophy-notifications") {
 			if (!ParseBool(value, options.config.trophy_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--skip-notice-screen") {
+			if (!ParseBool(value, options.config.skip_notice_screen)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--perf-overlay") {
+			if (!ParseBool(value, options.config.perf_overlay_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

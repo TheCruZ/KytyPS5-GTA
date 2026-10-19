@@ -17,6 +17,7 @@ struct ResourceSpecialization {
 		// Written at addresses the host cannot bound: the shader records the pages it writes in
 		// the GPU write bitmap (BufferCache::WriteBitmap, rework.md Phase 2 first step).
 		bool                   write_tracked                   = false;
+		bool                   scalar_empty                    = false;
 		uint32_t               indirect_root                   = BufferResource::NoIndirectBuffer;
 		uint32_t               indirect_mapping_offset         = 0;
 		uint32_t               indirect_search_iterations      = 0;
@@ -44,13 +45,16 @@ struct ResourceSpecialization {
 	};
 
 	struct Sampler {
+		uint32_t indirect_root = SamplerResource::NoIndirectSampler;
+		uint32_t indirect_mapping_offset = 0;
+		uint32_t indirect_search_iterations = 0;
 		bool     bindless                = false;
 		uint32_t bindless_mapping_offset = 0;
-		bool     operator==(const Sampler&) const = default;
+		bool operator==(const Sampler&) const = default;
 	};
 
-	std::vector<Buffer>  buffers;
-	std::vector<Image>   images;
+	std::vector<Buffer> buffers;
+	std::vector<Image>  images;
 	std::vector<Sampler> samplers;
 
 	bool operator==(const ResourceSpecialization&) const = default;

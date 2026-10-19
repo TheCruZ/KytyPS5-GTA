@@ -183,9 +183,6 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 		if (z.htile_data_base_addr == 0 || (z.htile_data_base_addr & 0x7fffu) != 0) {
 			DepthFatal("invalid HTile metadata address");
 		}
-		if (z.depth_view.slice_max >= 32) {
-			DepthFatal("HTile clear tracking supports at most 32 slices");
-		}
 	}
 	if (!z.size.valid) {
 		DepthFatal("missing depth extent");
@@ -245,7 +242,7 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 	desc.info.bytes_per_block = bytes;
 	desc.info.samples         = samples;
 	desc.info.tile_mode       = Prospero::TileMode::kDepth;
-	desc.info.mip_layout[0]   = {0, depth_backing_size, pitch, height};
+	desc.info.UpdateSize();
 	desc.info.metadata.range =
 	    has_htile ? GuestRange {z.htile_data_base_addr, htile_backing_size} : GuestRange {};
 	desc.info.metadata.kind   = has_htile ? ImageMetadataKind::Htile : ImageMetadataKind::None;
@@ -328,9 +325,15 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	     rc.depth_clear_enable || rc.stencil_clear_enable)) {
 		DepthFatal("unsupported depth-to-color copy state");
 	}
+	if (rc.copy_depth_to_color &&
+	    (z.z_info.num_samples != 0 || rc.copy_sample != 0 ||
+	     z.z_info.format != Prospero::DepthFormat::kZ32F ||
+	     dc.z_enable || dc.z_write_enable || dc.depth_bounds_enable || dc.stencil_enable ||
+	     rc.depth_clear_enable || rc.stencil_clear_enable)) {
+		DepthFatal("unsupported depth-to-color copy state");
+	}
 	r.desc = MakeDepthTargetDesc(buffer, z);
 	r.depth_clear_enable      = rc.depth_clear_enable;
-	r.depth_load_clear_enable = r.depth_clear_enable;
 	r.depth_clear_value       = hw.GetDepthClearValue();
 	r.depth_test_enable       = dc.z_enable;
 	r.depth_write_enable      = r.depth_test_enable && dc.z_write_enable &&
@@ -338,8 +341,6 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	r.depth_compare_op        = static_cast<vk::CompareOp>(dc.zfunc);
 
 	r.depth_bounds_test_enable = dc.depth_bounds_enable;
-	r.depth_min_bounds         = hw.GetDepthBoundsMin();
-	r.depth_max_bounds         = hw.GetDepthBoundsMax();
 
 	r.stencil_clear_enable =
 	    has_stencil && rc.stencil_clear_enable && !z.depth_view.stencil_write_disable;
@@ -442,9 +443,9 @@ vk::ImageAspectFlags RenderDepthInfo::AttachmentWriteAspects() const {
 	}
 
 	const auto           available = ImageViewOps::DepthAspectMask(format);
-	vk::ImageAspectFlags writes {};
+	vk::ImageAspectFlags writes = load_clear_aspects & available;
 	if ((available & vk::ImageAspectFlagBits::eDepth) &&
-	    (depth_load_clear_enable || depth_write_enable)) {
+	    depth_write_enable) {
 		writes |= vk::ImageAspectFlagBits::eDepth;
 	}
 	if (!(available & vk::ImageAspectFlagBits::eStencil)) {
@@ -482,8 +483,7 @@ vk::ImageAspectFlags RenderDepthInfo::AttachmentWriteAspects() const {
 		       (can_pass && depth_pass && state.passOp != vk::StencilOp::eKeep) ||
 		       (can_pass && depth_fail && state.depthFailOp != vk::StencilOp::eKeep);
 	};
-	if (stencil_clear_enable ||
-	    (stencil_test_enable && (face_writes(stencil_front) || face_writes(stencil_back)))) {
+	if (stencil_test_enable && (face_writes(stencil_front) || face_writes(stencil_back))) {
 		writes |= vk::ImageAspectFlagBits::eStencil;
 	}
 	return writes;

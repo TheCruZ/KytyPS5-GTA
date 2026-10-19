@@ -45,13 +45,7 @@ enum class CommandBufferDebugOp : uint32_t {
 	DispatchDirect,
 	DrawIndex,
 	DrawIndexAuto,
-	EopWrite,
-	EopInterrupt,
-	EopWriteBack,
-	EopFlip,
-	EopWriteBackFlip,
-	EopOnlyFlip,
-	DispatchIndirect,
+	DispatchIndirect = 9,
 	Unknown,
 };
 
@@ -179,9 +173,9 @@ public:
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
-	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
+	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode, bool async_compute);
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
-	                      uint32_t mode);
+	                      uint32_t mode, bool async_compute);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	// Bindless heaps: register the draw's heaps, patch their regions, and once per frame resolve
@@ -202,7 +196,7 @@ public:
 	// Settles again, within the budget, the keys of a window of each heap whose T# changed since
 	// they were settled; returns how many it resolved.
 	uint32_t RevalidateBindlessKeys(uint32_t budget);
-	void                           FindBuffers(PreparedBindings& bindings);
+	void                           FindBuffers(std::span<PreparedBindings* const> stages);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
@@ -247,14 +241,16 @@ private:
 	                                               std::span<PreparedBindings* const> stages = {});
 	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
 	                                              uint32_t render_target_slice_offset);
+	[[nodiscard]] bool        ConsumeMetadataColorOperation(CommandBuffer& buffer,
+	                                                       uint32_t render_target_slice_offset);
 	void                      BindImage(ImageId id, bool storage);
 	void                      BindRenderTarget(ImageId id);
 	void                      ResetBindings();
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const CommandBuffer&          buffer);
-	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
-	                                              CommandBuffer& command, uint32_t group_x,
-	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
+	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
+	                                        CommandBuffer& command, uint32_t group_x,
+	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
 
 	RenderContext&                        m_context;
 	GraphicsBindings                     m_graphics_bindings;
@@ -285,10 +281,8 @@ private:
 	void UpdateBindlessUsageProbe(uint64_t frame, uint64_t snapshot_frame);
 	std::vector<uint32_t>                 m_bindless_srt;
 	std::vector<uint32_t>                 m_verify_srt; // KYTY_SRT_VERIFY: flat SRT with pairs
-	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
-	std::vector<uint32_t>                 m_image_occurrences;
 	// Created at the first thread-dimension indirect dispatch.
 	std::unique_ptr<IndirectDispatchGroups> m_indirect_groups;
 	// Created at the first indirect fast-launch mesh draw with counts on the GPU.

@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/timer.h"
@@ -44,6 +45,26 @@ namespace {
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 
+std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
+                                        StreamBuffer& staging, uint64_t size, uint64_t alignment,
+                                        vk::BufferUsageFlags usage, const auto& write) {
+	const auto [mapped, offset] = staging.Map(size, alignment);
+	if (mapped != nullptr) {
+		write(mapped, offset);
+		staging.Commit();
+		return {&staging, offset};
+	}
+
+	// Large transfers use the same one-time host allocation as ordinary buffer uploads.
+	auto temporary = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Upload, 0,
+	                                         usage, size);
+	write(temporary->Mapped().data(), 0);
+	temporary->Flush(0, size);
+	auto* buffer = temporary.get();
+	scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
+	return {buffer, 0};
+}
+
 } // namespace
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
@@ -51,9 +72,36 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 	auto* bytes = static_cast<const uint8_t*>(source);
 	while (size != 0) {
 		const auto chunk  = std::min(size, m_staging_buffer.Size());
+		// Copy waits for ring reuse and flushes the fresh host data before submission.
 		const auto offset = m_staging_buffer.Copy(bytes, chunk, 4);
-		buffer.CopyFrom(m_scheduler.Current(), m_staging_buffer, offset, buffer.Offset(address),
-		                chunk, vk::AccessFlagBits::eHostWrite);
+		const auto destination_offset = buffer.Offset(address);
+		EXIT_IF(destination_offset > buffer.Size() || chunk > buffer.Size() - destination_offset);
+		m_scheduler.EndRendering();
+		const auto command = m_scheduler.Current().Handle();
+		vk::BufferMemoryBarrier2 before {};
+		before.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+		before.srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+		before.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		before.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before.buffer        = buffer.Handle();
+		before.offset        = destination_offset;
+		before.size          = chunk;
+		vk::DependencyInfo dependency {};
+		dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
+		dependency.bufferMemoryBarrierCount = 1;
+		dependency.pBufferMemoryBarriers    = &before;
+		command.pipelineBarrier2(dependency);
+		const vk::BufferCopy copy {offset, destination_offset, chunk};
+		command.copyBuffer(m_staging_buffer.Handle(), buffer.Handle(), 1, &copy);
+		auto after          = before;
+		after.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		after.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		after.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+		after.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+		dependency.pBufferMemoryBarriers = &after;
+		command.pipelineBarrier2(dependency);
 		bytes += chunk;
 		address += chunk;
 		size -= chunk;
@@ -97,6 +145,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		}
 		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
 		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
+		m_memory_tracker.QueueBdaSync(buffer.CpuAddress(), buffer.Size());
 	} else {
 		const auto found = m_buffers.find(buffer.CpuAddress());
 		EXIT_IF(found == m_buffers.end() || found->second != id);
@@ -333,6 +382,7 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
                                        uint64_t total_size) {
 	Profiler::Add(Profiler::Counter::Readbacks);
 	Profiler::Add(Profiler::Counter::ReadbackBytes, static_cast<int64_t>(total_size));
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
 	const auto buffer_address = buffer.CpuAddress();
 	auto [mapped, offset]     = m_download_buffer.Map(total_size, 64);
 	std::unique_ptr<Buffer> temporary;
@@ -1570,7 +1620,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 // block it had mapped. Such bytes read as zero, like ObtainBufferForImage's direct path.
 static void ReadGuestForUpload(uint8_t* destination, uint64_t address, uint64_t size) {
 	if (!Libs::LibKernel::Memory::TryReadBacking(address, destination, size) &&
-	    !Libs::LibKernel::Memory::TryReadSparseBacking(address, destination, size)) {
+	    !Libs::LibKernel::Memory::CopySparseMemory(address, destination, size)) {
 		static std::atomic<uint32_t> reported {0};
 		if (reported.fetch_add(1) < 16) {
 			LOGF("BufferCache: upload of unmapped guest memory 0x%016" PRIx64 " size=0x%" PRIx64
@@ -1587,6 +1637,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		return nullptr;
 	}
 	Profiler::Add(Profiler::Counter::UploadBytes, static_cast<int64_t>(total_size));
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {
@@ -1658,7 +1709,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		if (mapped != nullptr) {
-			std::memcpy(mapped, reinterpret_cast<const void*>(vaddr), size);
+			if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
+				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+			}
 			m_stream_buffer.Commit();
 			return {&m_stream_buffer, offset};
 		}
@@ -2720,15 +2773,14 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		return ObtainBuffer(vaddr, size, false, false);
 	}
 
-	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr) {
-		EXIT("BufferCache: staging reservation failed for guest image\n");
-	}
-	if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
-		std::memset(staging, 0, static_cast<size_t>(size));
-	}
-	m_staging_buffer.Commit();
-	return {&m_staging_buffer, stage_offset};
+	return UploadMemory(m_graphics, m_scheduler, m_staging_buffer, size, 16,
+	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eStorageBuffer,
+	    [&](uint8_t* mapped, uint64_t) {
+		// Bytes the guest unmapped under a cached image read as zero, not as a crash.
+		if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, mapped, size)) {
+			std::memset(mapped, 0, static_cast<size_t>(size));
+		}
+	});
 }
 
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
@@ -3203,6 +3255,7 @@ void BufferCache::RunGarbageCollector() {
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 			DeleteBuffer(id);
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferEvictions);
 		}
 		gc_deleted++;
 		return ++retire_count == limit;
@@ -3265,6 +3318,16 @@ void BufferCache::SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t siz
 	    vaddr, size, [this](uint64_t address, uint64_t bytes) {
 		    SynchronizeBuffersInRange(address, bytes);
 	    });
+}
+
+void BufferCache::SynchronizeBda(const RangeSet& mapped) {
+	// Take before walking: writes queued during synchronization remain pending.
+	const auto pending = m_memory_tracker.TakeBdaSync();
+	pending.ForEach([&](uint64_t begin, uint64_t end) {
+		mapped.ForEachInRange(begin, end - begin, [this](uint64_t start, uint64_t finish) {
+			SynchronizeBuffersInRange(start, finish - start);
+		});
+	});
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
@@ -3506,6 +3569,7 @@ uint64_t BufferCache::TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin
 	slot.busy.store(1, std::memory_order_release);
 	Profiler::Add(Profiler::Counter::Readbacks);
 	Profiler::Add(Profiler::Counter::ReadbackBytes, static_cast<int64_t>(total_size));
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
 	if (++m_copy_taken % 2048 == 1) {
 		std::fprintf(stderr,
 		             "[copy-readback] taken=%" PRIu64 " writers_running=%" PRIu64

@@ -83,6 +83,10 @@ public:
 	void dispatch(uint32_t x, uint32_t y, uint32_t z) const {
 		Run([=](vk::CommandBuffer command) { command.dispatch(x, y, z); });
 	}
+	void dispatchBase(uint32_t base_x, uint32_t base_y, uint32_t base_z, uint32_t x, uint32_t y,
+	                  uint32_t z) const {
+		Run([=](vk::CommandBuffer command) { command.dispatchBase(base_x, base_y, base_z, x, y, z); });
+	}
 	void dispatchIndirect(vk::Buffer buffer, vk::DeviceSize offset) const {
 		Run([=](vk::CommandBuffer command) { command.dispatchIndirect(buffer, offset); });
 	}
@@ -453,6 +457,21 @@ public:
 	void setAttachmentFeedbackLoopEnableEXT(vk::ImageAspectFlags aspects) const {
 		Run([=](vk::CommandBuffer command) {
 			command.setAttachmentFeedbackLoopEnableEXT(aspects);
+		});
+	}
+	// DynamicState::Commit (the cache of upstream's dynamic graphics state) through this recorder.
+	// Threaded, the state is copied with its dirty bits, which are cleared in the cache, so the
+	// recording thread commits exactly what changed since the previous draw.
+	void commitDynamicState(DynamicState& state, const GraphicContext& graphics) const {
+		if (!Threaded()) {
+			state.Commit(graphics, m_direct);
+			return;
+		}
+		const auto* context  = &graphics;
+		DynamicState snapshot = state;
+		state.dirty_state    = {};
+		m_scheduler->Record([snapshot, context](vk::CommandBuffer command) mutable {
+			snapshot.Commit(*context, command);
 		});
 	}
 

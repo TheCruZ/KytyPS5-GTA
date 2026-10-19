@@ -48,11 +48,14 @@ struct ControllerSettings {
 	QString color;
 	int     speaker_volume      = 50;
 	int     vibration_intensity = 100;
+	// 0 shares player 1 with the first gamepad; 1..MAX_PLAYERS dedicates that player to the keyboard.
+	int     keyboard_player     = 0;
 
 	void WriteSettings(QSettings* s) const {
 		s->setValue("controller_color", color);
 		s->setValue("controller_speaker_volume", speaker_volume);
 		s->setValue("controller_vibration_intensity", vibration_intensity);
+		s->setValue("controller_keyboard_player", keyboard_player);
 	}
 
 	void ReadSettings(QSettings* s) {
@@ -65,6 +68,8 @@ struct ControllerSettings {
 		};
 		speaker_volume      = read_percent("controller_speaker_volume", 50);
 		vibration_intensity = read_percent("controller_vibration_intensity", 100);
+		keyboard_player = qBound(0, s->value("controller_keyboard_player", 0).toInt(),
+		                         Config::MAX_PLAYERS);
 	}
 };
 
@@ -103,6 +108,7 @@ public:
 	QString    firmwareVer; /* requiredSystemSoftwareVersion from sce_sys/param.json */
 	QString    basedir;     /* Game base directory */
 	QString    game_path;   /* Launcher-unique game path */
+	QString    addons_dir;  /* Global setting; not saved per game. */
 	bool       custom_settings = false;
 	GameStatus game_status     = GameStatus::Unknown;
 	QString    game_comment;
@@ -117,10 +123,16 @@ public:
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
+	bool                   hdr_enabled                 = false;
 	bool                   hide_cursor_enabled         = false;
 	bool                   readback_linear_images      = false;
+	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = false;
 	bool                   trophy_enabled              = true;
+	int                    trophy_duration_seconds     = 6;
+	bool                   perf_overlay_enabled        = false;
+	bool                   skip_notice_screen          = false;
+	bool                   network_connected           = false;
 	bool                   bindless_images_enabled     = false;
 	QString                skip_shader_hashes;
 	int                    vblank_frequency            = 60;
@@ -152,10 +164,16 @@ public:
 		present_mode                = other.present_mode;
 		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;
+		hdr_enabled                 = other.hdr_enabled;
 		hide_cursor_enabled         = other.hide_cursor_enabled;
 		readback_linear_images      = other.readback_linear_images;
+		sync_raw_image_buffers      = other.sync_raw_image_buffers;
 		tessellation_enabled        = other.tessellation_enabled;
 		trophy_enabled              = other.trophy_enabled;
+		trophy_duration_seconds     = other.trophy_duration_seconds;
+		perf_overlay_enabled        = other.perf_overlay_enabled;
+		skip_notice_screen          = other.skip_notice_screen;
+		network_connected           = other.network_connected;
 		bindless_images_enabled     = other.bindless_images_enabled;
 		skip_shader_hashes          = other.skip_shader_hashes;
 		vblank_frequency            = other.vblank_frequency;

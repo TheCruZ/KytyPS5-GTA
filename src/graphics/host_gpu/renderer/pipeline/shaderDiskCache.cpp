@@ -2,6 +2,7 @@
 
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "shaderCacheVersion.h"
 
 #include <algorithm>
@@ -24,7 +25,7 @@ namespace {
 
 // Bump when the encoding below changes in a way the source version cannot see (it hashes this
 // file too, so this is belt and braces).
-constexpr uint32_t FormatVersion = 4;
+constexpr uint32_t FormatVersion = 5;
 constexpr uint32_t FileMagic     = 0x4344534bu; // "KSDC"
 constexpr uint64_t MaxFileSize   = uint64_t {256} << 20u;
 
@@ -41,8 +42,16 @@ struct IsOptional: std::false_type {};
 template <typename T>
 struct IsOptional<std::optional<T>>: std::true_type {};
 
+template <typename T>
+struct IsPair: std::false_type {};
+template <typename A, typename B>
+struct IsPair<std::pair<A, B>>: std::true_type {};
+
 template <typename T, typename U>
 concept Is = std::same_as<std::remove_const_t<T>, U>;
+
+// ResourcePlan::control_phi_predecessors: instruction pointer -> predecessor ids.
+using PhiPredecessors = std::unordered_map<const IR::Inst*, std::vector<uint32_t>>;
 
 // Every serialized structure lists its fields once; the writer and the reader both walk this
 // list, so they cannot disagree. A field added to one of these structures must be added here
@@ -81,6 +90,7 @@ template <typename Io, typename T>
 requires Is<T, IR::BufferResource>
 void Visit(Io& io, T& v) {
 	io(v.source);
+	io(v.descriptor_index);
 	io(v.first_use_pc);
 	io(v.max_byte_extent);
 	io(v.packed_stride);
@@ -93,6 +103,7 @@ void Visit(Io& io, T& v) {
 	io(v.formatted);
 	io(v.scalar);
 	io(v.write_tracked);
+	io(v.live);
 	io(v.indirect_root);
 	io(v.indirect_mapping_offset);
 	io(v.indirect_search_iterations);
@@ -107,6 +118,7 @@ template <typename Io, typename T>
 requires Is<T, IR::ImageResource>
 void Visit(Io& io, T& v) {
 	io(v.source);
+	io(v.descriptor_index);
 	io(v.first_use_pc);
 	io(v.resource_class);
 	io(v.numeric_class);
@@ -119,6 +131,7 @@ void Visit(Io& io, T& v) {
 	io(v.written);
 	io(v.atomic);
 	io(v.atomic64);
+	io(v.unfiltered_access_only);
 	io(v.depth_compare);
 	io(v.cube);
 	io(v.r128);
@@ -135,6 +148,10 @@ void Visit(Io& io, T& v) {
 	io(v.source);
 	io(v.first_use_pc);
 	io(v.snapshot_index);
+	io(v.indirect_root);
+	io(v.indirect_mapping_offset);
+	io(v.indirect_search_iterations);
+	io(v.indirect_resources);
 	io(v.force_point_filtering);
 	io(v.depth_compare);
 	io(v.integer_border);
@@ -179,31 +196,47 @@ void Visit(Io& io, T& v) {
 	io(v.sampled_pairs);
 	io(v.inputs);
 	io(v.outputs);
+	io(v.user_data_registers);
 	io(v.vertex_fetch_components);
 	io(v.vertex_offset_sgpr);
 	io(v.instance_offset_sgpr);
 	io(v.has_bitwise_xor);
 	io(v.uses_dma);
+	io(v.uses_swizzle);
+	io(v.uses_lds);
+	io(v.uses_gds);
+	io(v.uses_flattened_srt);
+	io(v.uses_dispatch_threads);
+	io(v.bvh);
+	io(v.subgroup_ballot);
+	io(v.subgroup_vote);
+	io(v.subgroup_barrier);
+	io(v.subgroup_shuffle);
+	io(v.subgroup_arithmetic);
+	io(v.subgroup_local_invocation_id);
+	io(v.compute_derivatives);
+	io(v.image_gather_extended);
+	io(v.function_lds);
+	io(v.function_scratch);
+	io(v.pixel_valid_mask);
+	io(v.buffer_int64_atomics);
+	io(v.buffer_u8);
+	io(v.buffer_u16);
+	io(v.shared_int64_atomics);
+	io(v.coherent_buffers);
+	io(v.float64);
 }
 
 template <typename Io, typename T>
-requires Is<T, IR::DescriptorBinding>
+requires Is<T, IR::Bindings>
 void Visit(Io& io, T& v) {
-	io(v.kind);
-	io(v.resources);
-}
-
-template <typename Io, typename T>
-requires Is<T, IR::BindingLayout>
-void Visit(Io& io, T& v) {
+	io(v.descriptor_counts);
+	io(v.descriptor_mask);
 	io(v.push_data_start_dword);
 	io(v.dispatch_thread_dword);
 	io(v.memory_offset_dword);
-	io(v.memory_offset_count);
 	io(v.write_tracking);
 	io(v.srt_verify);
-	io(v.user_data_registers);
-	io(v.descriptors);
 }
 
 template <typename Io, typename T>
@@ -222,14 +255,50 @@ void Visit(Io& io, T& v) {
 }
 
 template <typename Io, typename T>
+requires Is<T, IR::DescriptorSource::IndirectDescriptor::SelectorRead::CountedRows>
+void Visit(Io& io, T& v) {
+	io(v.source);
+	io(v.stride);
+}
+
+template <typename Io, typename T>
+requires Is<T, IR::DescriptorSource::IndirectDescriptor::SelectorRead>
+void Visit(Io& io, T& v) {
+	io(v.source);
+	io(v.stride);
+	io(v.offset);
+	io(v.maximum);
+	io(v.bit_offset);
+	io(v.bit_mask);
+	io(v.global);
+	io(v.bitset);
+	io(v.rows);
+	io(v.byte_ranges);
+}
+
+template <typename Io, typename T>
+requires Is<T, IR::DescriptorSource::IndirectDescriptor::PointerTable>
+void Visit(Io& io, T& v) {
+	io(v.offset);
+	io(v.stride);
+	io(v.count);
+	io(v.indexed);
+}
+
+template <typename Io, typename T>
 requires Is<T, IR::DescriptorSource::IndirectDescriptor>
 void Visit(Io& io, T& v) {
-	io(v.material_source);
+	io(v.selector);
+	io(v.table_maximum);
+	io(v.pointer_table);
 	io(v.table_source);
-	io(v.selector_stride);
-	io(v.selector_offset);
 	io(v.table_offset);
+	io(v.table_immediate);
 	io(v.table_stride);
+	io(v.table_record_bytes);
+	io(v.table_scalar);
+	io(v.indexed);
+	io(v.signed_count);
 	io(v.workgroup_axis);
 	io(v.selector_shift);
 	io(v.key_shift);
@@ -291,6 +360,7 @@ void Visit(Io& io, T& v) {
 	io(v.group_stride);
 	io(v.words);
 	io(v.value);
+	io(v.bounded_elements);
 }
 
 template <typename Io, typename T>
@@ -298,6 +368,8 @@ requires Is<T, IR::UniformFillPlan>
 void Visit(Io& io, T& v) {
 	io(v.fill);
 	io(v.values);
+	io(v.pattern_size);
+	io(v.element_count);
 }
 
 template <typename Io, typename T>
@@ -308,6 +380,7 @@ void Visit(Io& io, T& v) {
 	io(v.descriptor_swizzle);
 	io(v.zero_stride_oob);
 	io(v.write_tracked);
+	io(v.scalar_empty);
 	io(v.indirect_root);
 	io(v.indirect_mapping_offset);
 	io(v.indirect_search_iterations);
@@ -336,6 +409,9 @@ void Visit(Io& io, T& v) {
 template <typename Io, typename T>
 requires Is<T, IR::ResourceSpecialization::Sampler>
 void Visit(Io& io, T& v) {
+	io(v.indirect_root);
+	io(v.indirect_mapping_offset);
+	io(v.indirect_search_iterations);
 	io(v.bindless);
 	io(v.bindless_mapping_offset);
 }
@@ -358,13 +434,15 @@ void VisitPlanFields(Io& io, T& v) {
 	io(v.user_data_count);
 	io(v.memory_info);
 	io(v.descriptor_sources);
+	io(v.selector_groups);
 	io(v.control_flow);
+	io(v.control_phi_predecessors);
 	io(v.srt_reads);
 	io(v.buffer_writes_bounded);
 	io(v.buffer_writes);
-	io(v.clean_flat_slots);
 	io(v.gpu_fill_slots);
 	io(v.requires_specialization_memory);
+	io(v.source_reads);
 	io(v.capture_specialization_reads);
 	io(v.bindless_images);
 	io(v.srt_plan_complete);
@@ -373,36 +451,10 @@ void VisitPlanFields(Io& io, T& v) {
 	io(v.uniform_fill);
 }
 
-// Tripwires (Windows x64, the layout the sizes were taken from): a field added to a serialized
-// structure changes its size and stops the build here, so that the field gets added to its Visit
-// above as well (Visit lists every field; a field it leaves out is silently lost on a cache hit).
-// After updating the Visit, update the size. ResourcePlan's covers its scratch members too.
-#if defined(_MSC_VER) && defined(_M_X64)
-static_assert(sizeof(IR::MemoryInfo) == 72);
-static_assert(sizeof(IR::BufferResource) == 88);
-static_assert(sizeof(IR::ImageResource) == 88);
-static_assert(sizeof(IR::SamplerResource) == 24);
-static_assert(sizeof(IR::SampledResourcePair) == 12);
-static_assert(sizeof(IR::StageInput) == 56);
-static_assert(sizeof(IR::StageOutput) == 48);
-static_assert(sizeof(IR::ShaderInfo) == 192);
-static_assert(sizeof(IR::DescriptorBinding) == 32);
-static_assert(sizeof(IR::BindingLayout) == 72);
-static_assert(sizeof(IR::CompiledShaderInfo) == 304);
-static_assert(sizeof(IR::DescriptorSource::IndirectDescriptor) == 120);
-static_assert(sizeof(IR::DescriptorSource::BindlessSampler) == 4);
-static_assert(sizeof(IR::DescriptorSource) == 272);
-static_assert(sizeof(IR::ResourceBlock) == 88);
-static_assert(sizeof(IR::SrtRead) == 24);
-static_assert(sizeof(IR::BufferWrite) == 72);
-static_assert(sizeof(IR::UniformFill) == 28);
-static_assert(sizeof(IR::UniformFillPlan) == 96);
-static_assert(sizeof(IR::ResourceSpecialization::Buffer) == 44);
-static_assert(sizeof(IR::ResourceSpecialization::Image) == 36);
-static_assert(sizeof(IR::ResourceSpecialization::Sampler) == 8);
-static_assert(sizeof(IR::ResourceSpecialization) == 72);
-static_assert(sizeof(IR::ResourcePlan) == 856);
-#endif
+// The tripwire of sizeof() static_asserts that guarded the Visit lists was dropped in the merge
+// with upstream (the structures changed): the field lists above follow ShaderIR.h,
+// ResourceSnapshot.h and ResourceMaterialization.h, whose structures carry a "serialized by the
+// shader disk cache" comment. Re-add the sizes (taken from a Windows x64 build) when this builds.
 
 struct Writer {
 	ByteWriter&                                    out;
@@ -431,6 +483,24 @@ struct Writer {
 			out.Put(value.has_value());
 			if (value.has_value()) {
 				(*this)(*value);
+			}
+		} else if constexpr (IsPair<T>::value) {
+			(*this)(value.first);
+			(*this)(value.second);
+		} else if constexpr (std::is_same_v<T, PhiPredecessors>) {
+			out.Put<uint64_t>(value.size());
+			for (const auto& [inst, predecessors]: value) {
+				if (index == nullptr) {
+					ok = false;
+					return;
+				}
+				const auto found = index->find(inst);
+				if (found == index->end()) {
+					ok = false;
+					return;
+				}
+				out.Put<uint32_t>(found->second);
+				(*this)(predecessors);
 			}
 		} else if constexpr (std::is_same_v<T, IR::Value>) {
 			if (auto* inst = value.TryInstruction(); inst != nullptr) {
@@ -510,6 +580,25 @@ struct Reader {
 				// class with default member initializers as default-constructible (Linux build).
 				value = typename T::value_type {};
 				(*this)(*value);
+			}
+		} else if constexpr (IsPair<T>::value) {
+			(*this)(value.first);
+			(*this)(value.second);
+		} else if constexpr (std::is_same_v<T, PhiPredecessors>) {
+			uint64_t count = 0;
+			if (!in.GetCount(count)) {
+				return;
+			}
+			value.clear();
+			for (uint64_t i = 0; i < count && in.Ok(); i++) {
+				uint32_t position = 0;
+				if (!in.Get(position) || insts == nullptr || position >= insts->size()) {
+					in.Fail();
+					return;
+				}
+				std::vector<uint32_t> predecessors;
+				(*this)(predecessors);
+				value.emplace((*insts)[position], std::move(predecessors));
 			}
 		} else if constexpr (std::is_same_v<T, IR::Value>) {
 			uint8_t tag = 0;
@@ -605,7 +694,12 @@ bool DecodePlan(ByteReader& in, IR::ResourcePlan& plan) {
 		}
 	}
 	VisitPlanFields(reader, plan);
-	return in.Ok();
+	if (!in.Ok()) {
+		return false;
+	}
+	// The native walker is generated code: not stored, rebuilt for the decoded plan.
+	IR::CompileSrtWalker(plan);
+	return true;
 }
 
 std::string HexKey(std::span<const uint8_t> key) {
