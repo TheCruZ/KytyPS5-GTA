@@ -4,6 +4,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/hackNotice.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -124,6 +125,15 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 
 // Execution thread: the ordinary loads of an SRT walk.
 bool ReadGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
+	// Guest memory starts at 0x40000: a read below it goes through a null table pointer, which the
+	// walk follows when it cannot decide a branch. Read zero instead of faulting the host.
+	constexpr uint64_t GUEST_MEMORY_MIN = 0x40000;
+	if (address < GUEST_MEMORY_MIN) {
+		Common::HackNotice::Report("null SRT table read as zero", "execution thread ReadGuestMemory",
+		                           0, address);
+		std::ranges::fill(values, 0u);
+		return true;
+	}
 	if (!Libs::LibKernel::Memory::TryReadAroundGpuWrites(address, values.data(),
 	                                                     values.size_bytes())) {
 		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());

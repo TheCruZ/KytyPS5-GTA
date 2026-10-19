@@ -2,6 +2,7 @@
 
 #include "common/abi.h"
 #include "common/assert.h"
+#include "common/hackNotice.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <xbyak/xbyak.h>
@@ -15,6 +16,15 @@
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
+namespace {
+
+// Guest memory starts at HOST_SYSTEM_MANAGED_MIN (memoryAddressSpace.inc), so a table pointer or an
+// ordinary read below it comes from a null table pointer. The walker reaches such reads when it
+// follows both sides of a branch it cannot decide, so read zero there instead of faulting the host.
+constexpr uint64_t GUEST_MEMORY_MIN = 0x40000;
+
+} // namespace
 
 SrtRuntime SrtReadCapture::ObservedRuntime() {
 	auto runtime = m_source;
@@ -48,11 +58,21 @@ bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<ui
 	auto& capture = *static_cast<SrtReadCapture*>(userdata);
 	if (capture.m_source.read_memory != nullptr) {
 		if (!capture.m_source.read_memory(capture.m_source.userdata, address, values)) return false;
+	} else if (address < GUEST_MEMORY_MIN) {
+		Common::HackNotice::Report("null SRT table read as zero", "SrtReadCapture::ReadOrdinary", 0,
+		                           address);
+		std::ranges::fill(values, 0u);
+		return true;
 	} else {
 		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	}
 	capture.Record(address, values.size_bytes());
 	return true;
+}
+
+bool SrtReadCapture::ReadsHostMemory(const SrtRuntime& runtime) {
+	return runtime.read_memory == ReadOrdinary &&
+	       static_cast<const SrtReadCapture*>(runtime.userdata)->m_source.read_memory == nullptr;
 }
 
 SrtRuntime CleanRuntime(SrtRuntime runtime) {
@@ -469,11 +489,10 @@ void CompileSrtWalker(ResourcePlan& program) {
 		code.and_(code.rdi, code.r9);
 		const auto first = reads.begin()->first;
 		const auto last = reads.rbegin()->first;
-		if (first < 0) {
-			code.mov(code.r10, -static_cast<int64_t>(first));
-			code.cmp(code.rdi, code.r10);
-			code.jb(failed, Xbyak::CodeGenerator::T_NEAR);
-		}
+		// Tables below guest memory and underflowing reads fall back to the interpreted walk.
+		code.mov(code.r10, GUEST_MEMORY_MIN + static_cast<uint64_t>(-std::min<int64_t>(first, 0)));
+		code.cmp(code.rdi, code.r10);
+		code.jb(failed, Xbyak::CodeGenerator::T_NEAR);
 		if (last > 0) {
 			code.mov(code.r10, AddressMask - last);
 			code.cmp(code.rdi, code.r10);
@@ -761,11 +780,26 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	}
 	bool       read   = true;
 	const auto reader = vector ? m_runtime.read_specialization_memory : m_runtime.read_memory;
+	// A host-memory read through a table below guest memory reads zero, whatever its offset.
+	if (!vector && base < GUEST_MEMORY_MIN &&
+	    (reader == nullptr || SrtReadCapture::ReadsHostMemory(m_runtime))) {
+		Common::HackNotice::Report("null SRT table read as zero", "interpreted SRT walker",
+		                           m_program.shader_hash, address);
+		result = 0;
+		return true;
+	}
 	if (reader != nullptr) {
+		// Names the shader for the notices of the memory callbacks.
+		const Common::HackNotice::ScopedShader shader(m_program.shader_hash);
 		read = reader(m_runtime.userdata, address, {&word, 1});
 	} else {
 		if (vector) return false;
-		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		if (address >= GUEST_MEMORY_MIN) {
+			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		} else {
+			Common::HackNotice::Report("null SRT table read as zero", "interpreted SRT walker",
+			                           m_program.shader_hash, address);
+		}
 	}
 	if (m_runtime.read_slot != nullptr) {
 		*m_runtime.read_slot = NoSrtSlot;
@@ -1198,8 +1232,11 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		m_context.values.resize(m_program.evaluation_value_count);
 		using Walker = bool KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*,
 		    ResourcePlan::EvaluationContext::Entry*, uint64_t, size_t);
-		return m_program.srt_code->getCode<Walker>()(m_runtime.user_data.data(), flat.data(),
-		    m_context.values.data(), m_context.generation, m_runtime.user_data.size());
+		if (m_program.srt_code->getCode<Walker>()(m_runtime.user_data.data(), flat.data(),
+		                                          m_context.values.data(), m_context.generation,
+		                                          m_runtime.user_data.size())) {
+			return true;
+		}
 	}
 	const auto refresh = [&](uint32_t slot) {
 		if (slot >= m_program.srt_reads.size()) return false;
@@ -1844,6 +1881,14 @@ bool CompiledSrtWalker::EvaluateRawRead(uint32_t id, uint64_t& result) {
 			return false;
 		}
 	}
+	// As SrtWalker::EvaluateRawRead: a host-memory read through a table below guest memory is zero.
+	if (base < GUEST_MEMORY_MIN &&
+	    (m_runtime.read_memory == nullptr || SrtReadCapture::ReadsHostMemory(m_runtime))) {
+		Common::HackNotice::Report("null SRT table read as zero", "compiled SRT walker",
+		                           m_program.shader_hash, address);
+		result = 0;
+		return true;
+	}
 	return ReadWord(id, address, result);
 }
 
@@ -1868,9 +1913,14 @@ bool CompiledSrtWalker::ReadWord(uint32_t node, uint64_t address, uint64_t& resu
 	}
 	bool read = true;
 	if (m_runtime.read_memory != nullptr) {
+		// Names the shader for the notices of the memory callbacks.
+		const Common::HackNotice::ScopedShader shader(m_program.shader_hash);
 		read = m_runtime.read_memory(m_runtime.userdata, address, {&word, 1});
-	} else {
+	} else if (address >= GUEST_MEMORY_MIN) {
 		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+	} else {
+		Common::HackNotice::Report("null SRT table read as zero", "compiled SRT walker (ReadWord)",
+		                           m_program.shader_hash, address);
 	}
 	if (m_runtime.read_slot != nullptr) {
 		*m_runtime.read_slot = NoSrtSlot;
