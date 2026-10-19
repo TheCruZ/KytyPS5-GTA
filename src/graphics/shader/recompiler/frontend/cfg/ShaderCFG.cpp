@@ -1778,14 +1778,14 @@ uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& grap
 		for (uint32_t i = point.second; i > block->inst_begin;) {
 			const auto& inst = program.instructions[--i];
 			if (inst.opcode == Opcode::S_SWAPPC_B64) {
-				EXIT_NOT_IMPLEMENTED(MayWriteScalarRegister(inst, code, wave_size));
+				if (MayWriteScalarRegister(inst, code, wave_size)) return AmbiguousScalarDefinition;
 				crossed_calls.push_back(i);
 				continue;
 			}
 			if (MayWriteScalarRegister(inst, code, wave_size)) { index = i; break; }
 		}
 		if (index != UINT32_MAX || block->id == graph.entry_block) {
-			EXIT_IF(definition && *definition != index);
+			if (definition && *definition != index) return AmbiguousScalarDefinition;
 			definition = index;
 			continue;
 		}

@@ -114,6 +114,10 @@ struct Graph {
 
 Graph       BuildGraph(const Decoder::Program& program);
 bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code, uint32_t wave_size);
+// FindScalarDefinition returns this when the register has no single reaching definition (two
+// paths write it differently, or a call it crosses may write it): its value is not a static
+// function of the program.
+constexpr uint32_t AmbiguousScalarDefinition = UINT32_MAX - 1u;
 uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
                               uint32_t before, uint32_t code, uint32_t wave_size,
                               std::vector<uint32_t>& crossed_calls);
