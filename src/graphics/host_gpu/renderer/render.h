@@ -698,8 +698,12 @@ private:
 	bool        TableValidateSet(TableImageSet& set);
 	bool        TableTransit(const TableImageSet& set, CommandRecorder vk_buffer, const NativeXprDrawState* draw_state);
 	void        TablePrepareBda(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
+	// (`selected`: TableSelectBuffers' answer.)
 	bool        TableBlocks(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
-	                        std::array<vk::DeviceAddress, 2>& blocks, bool& writes);
+	                        std::array<vk::DeviceAddress, 2>& blocks, bool& writes, uint32_t selected);
+	static constexpr uint32_t TableNoBuffers = UINT32_MAX;
+	uint32_t    TableSelectBuffers(CommandBuffer& buffer, TablePair& pair, bool dispatch, bool async_compute = false);
+	TableResult TableRequestStore(TablePair& pair, uint64_t state_key);
 	// After a normal draw a table try asked to store (`storable`: one a table variant can draw): the pair's table
 	// programs (compiled by a worker) and this draw state's pipeline, and the draw state.
 	void TableStore(CommandBuffer& buffer, const DrawRenderState& state, vk::PrimitiveTopology topology,

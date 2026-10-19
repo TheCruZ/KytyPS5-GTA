@@ -190,6 +190,40 @@ bool TableBufferSpecialized(const ShaderRecompiler::IR::BufferResource&         
 	       (resource.scalar && descriptor.GetSize() == 0u) == specialized.scalar_empty;
 }
 
+// The buffer specialization a V# selects (as SpecializeDirectResources derives it), from `base`'s (the program's) for
+// what the V# does not choose.
+ShaderRecompiler::IR::ResourceSpecialization::Buffer
+TableBufferSpecialization(const ShaderRecompiler::IR::BufferResource&                 resource,
+                          const ShaderRecompiler::IR::ResourceSpecialization::Buffer& base,
+                          const std::array<uint32_t, 4>&                              words4) {
+	ShaderBufferResource descriptor;
+	std::copy_n(words4.begin(), 4, descriptor.fields);
+	if (descriptor.Type() != 0) descriptor = {};
+	auto       packed_stride = descriptor.PackedStride();
+	const auto stride        = packed_stride & 0x3fffu;
+	const bool swizzle       = stride != 0u && ((packed_stride >> 14u) & 1u) != 0u;
+	if (stride == 0u) {
+		packed_stride &= ~((1u << 14u) | (3u << 16u));
+	} else if (!swizzle) {
+		packed_stride &= ~(3u << 16u);
+	}
+	auto buffer               = base;
+	buffer.packed_stride      = packed_stride;
+	buffer.descriptor_format  = resource.formatted ? descriptor.Format() : Prospero::BufferFormat::kInvalid;
+	buffer.descriptor_swizzle = resource.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);
+	buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
+	buffer.scalar_empty       = resource.scalar && descriptor.GetSize() == 0u;
+	return buffer;
+}
+
+// KYTY_TABLE_BUFFER_VARIANTS (e.g. 4; default 0: a V# of another buffer specialization takes the normal path): the
+// programs a pair keeps for other buffer specializations (TablePair::BufferVariant). Off by default: in Demon's Souls
+// the ~480 draws a frame they take were native XPR records before, which cost the same.
+uint32_t TableBufferVariants() {
+	static const uint32_t variants = NativeXprNumberSwitch("KYTY_TABLE_BUFFER_VARIANTS", 0u);
+	return variants;
+}
+
 const ShaderRecompiler::IR::ResourceSnapshot g_table_no_resources {};
 
 } // namespace
@@ -200,6 +234,8 @@ struct RenderExecutor::TableVariant {
 	const PipelineCache::Pipeline* pipeline       = nullptr; // null while a worker creates it
 	bool                           fetch_embedded = false;   // the vertex program fetches (a direct draw's offsets)
 	bool                           refused        = false;   // other static input than the pair's programs
+	// The pipelines of the pair's buffer variants under this state (TablePair::buffer_variants; null: not made yet).
+	std::vector<const PipelineCache::Pipeline*> buffer_pipelines;
 };
 
 // The descriptor set of one choice of images and samplers (the T#/S# words of both stages).
@@ -316,6 +352,18 @@ struct RenderExecutor::TablePair {
 	// A dispatch's (tableDispatch.inc): its program's input and native pipeline.
 	ShaderComputeInputInfo         compute_info;
 	const PipelineCache::Pipeline* pipeline = nullptr;
+	// The pair's programs for other buffer specializations (KYTY_TABLE_BUFFER_VARIANTS: V#s of other formats, or of
+	// other out-of-bounds rules, than the draw that stored the pair): compiled by the table worker when a draw's V#s
+	// first need them, with the same table plans and bindings (else refused), and used from then on (TableSelectBuffers).
+	struct BufferVariant {
+		std::array<ShaderRecompiler::IR::ResourceSpecialization, 2> specializations; // (asked for)
+		std::array<const PipelineCache::TableProgram*, 2>           tables {};
+		std::shared_ptr<PipelineCache::TableTicket>                 pending;
+		ShaderComputeInputInfo                                      compute_info; // a dispatch's,
+		const PipelineCache::Pipeline*                              pipeline = nullptr; // and its pipeline
+		bool                                                        refused  = false;
+	};
+	std::vector<BufferVariant> buffer_variants;
 	uint64_t                                    used_frame = 0;
 };
 
@@ -1085,7 +1133,7 @@ void RenderExecutor::TablePrepareBda(const TablePair& pair, std::array<std::span
 // obtained as written at every use, as the normal path's (the buffer cache tracks the GPU's writes). False: a buffer
 // the shaders cannot take.
 bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
-                                 std::array<vk::DeviceAddress, 2>& blocks, bool& writes) {
+                                 std::array<vk::DeviceAddress, 2>& blocks, bool& writes, uint32_t selected) {
 	auto&      table        = OwnTable();
 	auto&      buffer_cache = m_context.GetBufferCache();
 	auto&      textures     = m_context.GetTextureCache();
@@ -1120,7 +1168,10 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 	for (uint32_t st = 0; st < stages; ++st) {
 		const auto& program = *pair.programs[st];
 		const auto& plan    = program.table_plan;
-		const auto& spec    = pair.tables[st]->specialization;
+		const auto& spec    = (selected != 0 && selected <= pair.buffer_variants.size()
+		                           ? pair.buffer_variants[selected - 1].tables[st]
+		                           : pair.tables[st])
+		                          ->specialization;
 		auto&       block   = table.blocks[st];
 		auto&       entries = table.entries[st];
 		// The buffers it writes first: a range it also reads through another V# is GPU-written by then, as the
@@ -1298,7 +1349,15 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	                              std::min<uint32_t>(sh.GetPs().ps_regs.rsrc2.user_sgpr, HW::UserSgprInfo::SGPRS_MAX))};
 	if (!TableEvaluateDraw(pair, user_data)) return TableResult::Native;
 	TableGather(pair, user_data);
-	auto* set = TableSet(buffer, pair, *variant.pipeline, &draw_state);
+	// The program for the V#s' buffer specialization (the pair's, or one of its buffer variants), and its pipeline under
+	// this state (made by a store).
+	const auto selected = TableSelectBuffers(buffer, pair, false);
+	if (selected == TableNoBuffers) return TableResult::Native;
+	const auto* selected_pipeline = selected == 0 ? variant.pipeline
+	                                : selected <= variant.buffer_pipelines.size() ? variant.buffer_pipelines[selected - 1]
+	                                                                              : nullptr;
+	if (selected_pipeline == nullptr) return TableRequestStore(pair, variant.state);
+	auto* set = TableSet(buffer, pair, *selected_pipeline, &draw_state);
 	if (set == nullptr) return TableResult::Native;
 
 	// Emission, as NativeXprEmit's: indices and arguments are read by the GPU; lookups may restart the scheduler, so
@@ -1338,7 +1397,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	// replaces an earlier one) leaves an earlier address stale, where the normal path binds after all its lookups.
 	// Such a draw takes the normal path; the next one finds the buffers registered.
 	const auto registration = buffer_cache.BufferSetEpoch();
-	if (!TableBlocks(pair, user_data, blocks, writes)) return TableResult::Native;
+	if (!TableBlocks(pair, user_data, blocks, writes, selected)) return TableResult::Native;
 	constexpr uint64_t           stride = sizeof(vk::DrawIndexedIndirectCommand);
 	std::pair<Buffer*, uint64_t> arguments {};
 	if (direct == nullptr) {
@@ -1392,7 +1451,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		dynamic.Assign(draw_state.dynamic);
 		dynamic.Commit(m_context.GetGraphics(), vk_buffer);
 	}
-	const auto& pipeline = *variant.pipeline;
+	const auto& pipeline = *selected_pipeline;
 	if (!same_command || emit.pipeline != &pipeline) vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	if (!same_command || emit.pipeline != &pipeline || table.last_set != set)
 		vk_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline.pipeline_layout, 0, 1, &set->set, 0,
@@ -1457,6 +1516,107 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	table.last_set     = set;
 	table.images_epoch = textures.ImagesEpoch();
 	return TableResult::Drawn;
+}
+
+RenderExecutor::TableResult RenderExecutor::TableRequestStore(TablePair& pair, uint64_t state_key) {
+	auto&      table = OwnTable();
+	const auto frame = m_context.FrameNumber();
+	if (pair.pending != nullptr || (pair.store_frame == frame && pair.store_state == state_key))
+		return TableResult::Deferred;
+	if (table.store_frame != frame) {
+		table.store_frame    = frame;
+		table.store_requests = 0;
+	}
+	if (const auto budget = TableStoreBudget(); budget != 0 && table.store_requests >= budget) return TableResult::Native;
+	++table.store_requests;
+	pair.store_frame  = frame;
+	pair.store_state  = state_key;
+	table.store       = &pair;
+	table.store_state = state_key;
+	return TableResult::Store;
+}
+
+// The pair's program for the buffer specialization of the V#s TableGather gathered: 0 the pair's own, k its buffer
+// variant k - 1 (KYTY_TABLE_BUFFER_VARIANTS), TableNoBuffers none yet (one is asked for, within the cap: the draw or
+// dispatch takes the normal path meanwhile). `dispatch`: a dispatch's pair (its program compiled for the compute
+// stage's registers).
+uint32_t RenderExecutor::TableSelectBuffers(CommandBuffer& buffer, TablePair& pair, bool dispatch, bool async_compute) {
+	auto&      table  = OwnTable();
+	const auto stages = pair.programs[1] != nullptr ? 2u : 1u;
+	const auto fits   = [&](const auto& specialization_of) {
+		for (uint32_t st = 0; st < stages; ++st) {
+			const auto& resources = pair.programs[st]->info.buffers;
+			const auto& buffers   = specialization_of(st).buffers;
+			if (buffers.size() < resources.size() || table.entries[st].size() < resources.size()) return false;
+			for (size_t i = 0; i < resources.size(); ++i)
+				if (!TableBufferSpecialized(resources[i], buffers[i], table.entries[st][i].first)) return false;
+		}
+		return true;
+	};
+	if (fits([&](uint32_t st) -> const auto& { return pair.tables[st]->specialization; })) return 0;
+	if (TableBufferVariants() == 0) return TableNoBuffers;
+	for (uint32_t k = 0; k < pair.buffer_variants.size(); ++k) {
+		auto& variant = pair.buffer_variants[k];
+		if (variant.pending != nullptr && variant.pending->done.load(std::memory_order_acquire)) {
+			// (The same table plans and bindings as the pair's: its evaluation, blocks and image sets serve them.)
+			bool same = true;
+			for (uint32_t st = 0; st < stages; ++st) {
+				const auto* table_program = variant.pending->programs[st];
+				same = same && table_program != nullptr && table_program->program.table_mode &&
+				       table_program->program.table_plan == pair.programs[st]->table_plan &&
+				       table_program->program.bindings == pair.programs[st]->bindings &&
+				       table_program->program.info.images.size() == pair.programs[st]->info.images.size();
+			}
+			if (same) {
+				variant.tables = {variant.pending->programs[0], stages == 2 ? variant.pending->programs[1] : nullptr};
+				if (dispatch) {
+					variant.compute_info       = variant.tables[0]->input_info;
+					variant.compute_info.stage = {.program = &variant.tables[0]->program, .resources = &g_table_no_resources};
+				}
+			} else {
+				variant.refused = true;
+			}
+			variant.pending.reset();
+		}
+		if (variant.tables[0] != nullptr && !variant.refused) {
+			if (fits([&](uint32_t st) -> const auto& { return variant.tables[st]->specialization; })) return k + 1;
+		} else if (fits([&](uint32_t st) -> const auto& { return variant.specializations[st]; })) {
+			return TableNoBuffers; // (on its way, or refused)
+		}
+	}
+	if (pair.buffer_variants.size() >= TableBufferVariants()) return TableNoBuffers;
+	// A variant for these V#s: the pair's specializations with their buffers'.
+	TablePair::BufferVariant variant;
+	for (uint32_t st = 0; st < stages; ++st) {
+		auto&       specialization = variant.specializations[st];
+		const auto& resources      = pair.programs[st]->info.buffers;
+		specialization             = pair.tables[st]->specialization;
+		for (size_t i = 0; i < resources.size(); ++i)
+			specialization.buffers[i] =
+			    TableBufferSpecialization(resources[i], specialization.buffers[i], table.entries[st][i].first);
+	}
+	auto&       pipelines = m_context.GetPipelineCache();
+	const auto& sh        = buffer.GetShaders();
+	const auto& ctx       = buffer.GetRegisters();
+	if (dispatch) {
+		variant.pending = pipelines.CompileTableComputeAsync(sh.GetCs(), ctx.GetShaderRegisters(), async_compute,
+		                                                     variant.specializations[0]);
+	} else {
+		ShaderVertexInputInfo vertex_info {};
+		ShaderPixelInputInfo  pixel_info {};
+		ShaderParams          vertex_params, pixel_params;
+		if (!pipelines.PrepareGraphicsStages(sh.GetVs(), sh.GetPs(), ctx.GetShaderRegisters(), ctx, buffer.GetUserConfig(),
+		                                     TableDrawExportMapping(ctx, DrawColorOutputMask(ctx)), pair.has_pixel,
+		                                     vertex_info, pixel_info, vertex_params, pixel_params) ||
+		    TableDrawKey(table.static_key, vertex_params, vertex_info, pair.has_pixel ? &pixel_params : nullptr,
+		                 pixel_info) != pair.static_key)
+			return TableNoBuffers;
+		variant.pending = pipelines.CompileTableGraphicsAsync(
+		    vertex_params, vertex_info, pair.has_pixel ? &pixel_params : nullptr, pair.has_pixel ? &pixel_info : nullptr,
+		    variant.specializations[0], pair.has_pixel ? &variant.specializations[1] : nullptr);
+	}
+	pair.buffer_variants.push_back(std::move(variant));
+	return TableNoBuffers;
 }
 
 RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, uint64_t args_addr, uint64_t index_base,
@@ -1558,22 +1718,7 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, uint
 	// pair's draws take the normal path (Deferred).
 	// Within the frame's budget (KYTY_TABLE_STORE_BUDGET): past it the others take native records or the normal path
 	// meanwhile, and ask again in a later frame.
-	const auto request_store = [&] {
-		if (pair.pending != nullptr || (pair.store_frame == frame && pair.store_state == state_key))
-			return TableResult::Deferred;
-		if (table.store_frame != frame) {
-			table.store_frame    = frame;
-			table.store_requests = 0;
-		}
-		if (const auto budget = TableStoreBudget(); budget != 0 && table.store_requests >= budget)
-			return TableResult::Native;
-		++table.store_requests;
-		pair.store_frame  = frame;
-		pair.store_state  = state_key;
-		table.store       = &pair;
-		table.store_state = state_key;
-		return TableResult::Store;
-	};
+	const auto request_store = [&] { return TableRequestStore(pair, state_key); };
 	// (The variant found last first: a pair's draws mostly keep their state.)
 	const bool hint    = (TableMru() & 2u) != 0 && pair.variant_hint < pair.variants.size() &&
 	                  pair.variants[pair.variant_hint].state == state_key;
@@ -1725,5 +1870,22 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 	}
 	variant->pipeline       = pipeline; // (null while a worker creates it: a later draw's store takes it)
 	variant->fetch_embedded = state.vertex_info[0].fetch_embedded;
+	// The buffer variants' pipelines under this state (the same stage input with their programs).
+	variant->buffer_pipelines.resize(pair->buffer_variants.size(), nullptr);
+	for (size_t k = 0; k < pair->buffer_variants.size(); ++k) {
+		const auto& buffers = pair->buffer_variants[k];
+		if (buffers.refused || buffers.tables[0] == nullptr || variant->buffer_pipelines[k] != nullptr) continue;
+		table_vertex.stage.program = &buffers.tables[0]->program;
+		if (state.ps_active) table_pixel.stage.program = &buffers.tables[1]->program;
+		PipelineCache::GraphicsPrograms buffer_programs {};
+		buffer_programs.vertex[0] = buffers.tables[0]->handle;
+		if (state.ps_active) buffer_programs.pixel = buffers.tables[1]->handle;
+		const auto* buffer_pipeline = pipelines.GetGraphicsPipeline(
+		    std::span {state.colors, state.color_count}, *state.depth, std::span {&table_vertex, 1}, buffer,
+		    state.ps_active ? &table_pixel : nullptr, topology, primitive_restart_enable, buffer_programs,
+		    NativeXprAsyncPipelines(), true);
+		if (buffer_pipeline != nullptr && buffer_pipeline->native_bindings && !buffer_pipeline->uses_push_descriptors)
+			variant->buffer_pipelines[k] = buffer_pipeline;
+	}
 	NativeXprCaptureState(state, rendering, table.store_state, dynamic_state);
 }

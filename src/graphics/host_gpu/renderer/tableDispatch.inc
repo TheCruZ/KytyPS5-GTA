@@ -168,14 +168,23 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, const HW::ComputeShade
 		std::copy_n(table.entries[0][i].first.begin(), 4, descriptor.fields);
 		if (textures.IsMeta(descriptor.Base48())) return false;
 	}
-	auto* set = TableSet(buffer, pair, *pair.pipeline, nullptr);
+	// The program for the V#s' buffer specialization (the pair's, or a buffer variant's: KYTY_TABLE_BUFFER_VARIANTS).
+	const auto selected = TableSelectBuffers(buffer, pair, true, async_compute);
+	if (selected == TableNoBuffers) return false;
+	if (selected != 0) {
+		auto& variant = pair.buffer_variants[selected - 1];
+		if (variant.pipeline == nullptr)
+			variant.pipeline = &pipelines.GetNativeComputePipeline(variant.compute_info, variant.tables[0]->handle);
+	}
+	const auto& selected_pipeline = selected != 0 ? *pair.buffer_variants[selected - 1].pipeline : *pair.pipeline;
+	auto*       set               = TableSet(buffer, pair, selected_pipeline, nullptr);
 	if (set == nullptr) return false;
 	std::array<vk::DeviceAddress, 2> blocks {};
 	bool                             writes       = false;
 	auto&                            buffer_cache = m_context.GetBufferCache();
 	TablePrepareBda(pair, user_data); // (as TableDraw's: before the blocks)
 	const auto registration = buffer_cache.BufferSetEpoch();
-	if (!TableBlocks(pair, user_data, blocks, writes) || buffer_cache.BufferSetEpoch() != registration ||
+	if (!TableBlocks(pair, user_data, blocks, writes, selected) || buffer_cache.BufferSetEpoch() != registration ||
 	    buffer.IsInvalid())
 		return false;
 	// Emission, as DispatchDirect's.
@@ -188,7 +197,7 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, const HW::ComputeShade
 		set->transit_epoch = textures.ImagesEpoch();
 		set->transit_state = nullptr;
 	}
-	const auto& pipeline = *pair.pipeline;
+	const auto& pipeline = selected_pipeline;
 	const auto& program  = *pair.programs[0];
 	const auto& bindings = program.bindings;
 	vk_buffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline.pipeline_layout, 0, 1, &set->set, 0, nullptr);
