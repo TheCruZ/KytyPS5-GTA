@@ -113,10 +113,13 @@ struct Graph {
 };
 
 Graph       BuildGraph(const Decoder::Program& program);
-bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code, uint32_t wave_size);
+bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code);
+// FindScalarDefinition returns this when the register has no single reaching definition (two
+// paths write it differently, or a call it crosses may write it): its value is not a static
+// function of the program.
+constexpr uint32_t AmbiguousScalarDefinition = UINT32_MAX - 1u;
 uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
-                              uint32_t before, uint32_t code, uint32_t wave_size,
-                              std::vector<uint32_t>& crossed_calls);
+                              uint32_t before, uint32_t code, std::vector<uint32_t>& crossed_calls);
 // Returns structured control flow or failure diagnostics without changing the native graph.
 // On failure, failure_block is an original block ID or UINT32_MAX.
 Graph       Structurize(const Graph& graph);
