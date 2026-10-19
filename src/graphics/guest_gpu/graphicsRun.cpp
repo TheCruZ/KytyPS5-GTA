@@ -290,6 +290,8 @@ void GuestGpu::RunUrgentCommands() {
 	if (m_urgent_pending.load(std::memory_order_acquire) == 0) {
 		return;
 	}
+	// The guest commands (readbacks, write faults, unmaps) see the protections of the draws executed before them.
+	PageManager::FlushDeferredProtection();
 	// (Taken first: a command queued after this batch was taken has its own turn and its own drain.)
 	std::vector<Common::UniqueFunction<void>> commands;
 	bool                                      drain = true;
@@ -438,6 +440,19 @@ void GuestGpu::ExecuteSync(Common::UniqueFunction<void>&& command) {
 	WaitForExecution();
 }
 
+// chenxiao07's deferred read protection (KYTY_READ_PROTECT_DEFER, default on; 0 protects the pages GPU work writes as
+// soon as they get their read watcher): the execution thread joins the no-access protections of consecutive draws and
+// dispatches into one call per run of adjacent pages (~110 VirtualProtect calls a frame in GTA V, Demon's Souls the
+// same), applied before the guest can learn the work ran: before a guest-visible operation, a guest command, a
+// submission and a wait for work (PageManager::DeferReadProtection).
+static bool ReadProtectDeferEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READ_PROTECT_DEFER");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 void GuestGpu::ExecutionThread() {
 	KYTY_PROFILER_THREAD("Thread_GpuExecute");
 	Config::ConfigureGpuStageThread(Config::GpuStageThread::Execution);
@@ -449,12 +464,15 @@ void GuestGpu::ExecutionThread() {
 	constexpr uint32_t NotifyInterval = 16;
 	uint32_t           unnotified     = 0;
 	auto&              operations     = m_resolving ? m_resolved : m_operations;
+	const bool         defer_read_protection = ReadProtectDeferEnabled();
 	for (;;) {
 		if (m_urgent_pending.load(std::memory_order_relaxed) != 0) {
 			RunUrgentCommands();
 		}
 		auto operation = operations.TryPop();
 		if (!operation) {
+			// (Nothing else would apply them while the thread waits.)
+			PageManager::FlushDeferredProtection();
 			m_executed.Notify();
 			unnotified = 0;
 			operation  = operations.Pop();
@@ -465,7 +483,16 @@ void GuestGpu::ExecutionThread() {
 				continue; // interrupted for urgent commands
 			}
 		}
+		if (defer_read_protection) {
+			// Only draws and dispatches defer: every other operation has guest-visible effects (labels, interrupts,
+			// flips, host commands), after which the guest may read what the work before wrote.
+			const bool defers = operation->kind != GpuOperationKind::Callback;
+			if (!defers) PageManager::FlushDeferredProtection();
+			PageManager::DeferReadProtection(defers);
+		}
 		operation->processor->Execute(*operation);
+		// (Outside an operation, what the urgent commands and the callbacks protect applies at once.)
+		if (defer_read_protection) PageManager::DeferReadProtection(false);
 		const auto sequence = operation->sequence;
 		// Destroy the callback before the command processor may reuse what it references.
 		operation.reset();
@@ -475,6 +502,7 @@ void GuestGpu::ExecutionThread() {
 			unnotified = 0;
 		}
 	}
+	PageManager::FlushDeferredProtection();
 	m_executed.Notify();
 	m_renderer.GetMutex().ResignOwner();
 	g_gpu_thread = false;

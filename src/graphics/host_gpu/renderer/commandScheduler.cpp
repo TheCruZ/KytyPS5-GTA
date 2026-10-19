@@ -592,6 +592,8 @@ vk::CommandBuffer CommandScheduler::ClosePrologue() {
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
 	m_flush_deferred = false;
+	// The work may run once submitted: the pages it writes are read-protected first (KYTY_READ_PROTECT_DEFER).
+	PageManager::FlushDeferredProtection();
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 	if (m_submit_hook != nullptr) {

@@ -229,6 +229,10 @@ struct PageManager::Impl {
 	}
 
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
+		if (t_defer_read_protect && mode == Common::VirtualMemory::Mode::NoAccess) {
+			AddReadProtect(this, vaddr, vaddr + size);
+			return;
+		}
 		const auto end = vaddr + size;
 		if (mode == Common::VirtualMemory::Mode::ReadWrite && g_unmapping_end > g_unmapping_begin &&
 		    vaddr < g_unmapping_end && end > g_unmapping_begin) {
@@ -302,7 +306,9 @@ struct PageManager::Impl {
 		release_pending();
 	}
 
-	void ReapplyProtection(uint64_t vaddr, uint64_t size) {
+	// `watched_only`: the pages the watchers leave writable are skipped, and the others are protected at once (even
+	// where this thread defers its no-access protections): the flush of FlushDeferredProtection.
+	void ReapplyProtection(uint64_t vaddr, uint64_t size, bool watched_only = false) {
 		ValidateRange(vaddr, size);
 		const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
 		const auto end   = Common::AlignUp(vaddr + size, PAGE_SIZE);
@@ -319,7 +325,11 @@ struct PageManager::Impl {
 					while (run < last && region->pages[run].Perms() == perms) {
 						run++;
 					}
-					Protect(region_base + page * PAGE_SIZE, (run - page) * PAGE_SIZE, perms);
+					if (!watched_only) {
+						Protect(region_base + page * PAGE_SIZE, (run - page) * PAGE_SIZE, perms);
+					} else if (perms != Common::VirtualMemory::Mode::ReadWrite) {
+						ProtectHost(region_base + page * PAGE_SIZE, (run - page) * PAGE_SIZE, perms);
+					}
 					page = run;
 				}
 			}
@@ -328,6 +338,45 @@ struct PageManager::Impl {
 	}
 
 	inline static thread_local std::vector<std::pair<uint64_t, uint64_t>>* t_deferred_protection = nullptr;
+
+	// PageManager::DeferReadProtection: the calling thread's pending no-access ranges, disjoint and not adjacent (a
+	// range next to one extends it), and the manager they belong to.
+	struct PendingRange {
+		uint64_t begin, end;
+	};
+	inline static thread_local bool                      t_defer_read_protect = false;
+	inline static thread_local std::vector<PendingRange> t_read_protects;
+	inline static thread_local Impl*                     t_read_protect_owner = nullptr;
+
+	// A no-access range joins the pending ones: merged with those it overlaps or touches (one call for all).
+	static void AddReadProtect(Impl* owner, uint64_t begin, uint64_t end) noexcept {
+		if (t_read_protect_owner != owner) {
+			FlushReadProtect(); // (another manager's: tests; the game has one)
+			t_read_protect_owner = owner;
+		}
+		auto& ranges = t_read_protects;
+		for (size_t i = 0; i < ranges.size();) {
+			if (ranges[i].begin <= end && begin <= ranges[i].end) {
+				begin     = std::min(begin, ranges[i].begin);
+				end       = std::max(end, ranges[i].end);
+				ranges[i] = ranges.back();
+				ranges.pop_back();
+			} else {
+				++i;
+			}
+		}
+		ranges.push_back({begin, end});
+	}
+
+	static void FlushReadProtect() noexcept {
+		auto* owner = t_read_protect_owner;
+		// (Taken first: nothing applied below defers again.)
+		std::vector<PendingRange> ranges;
+		ranges.swap(t_read_protects);
+		for (const auto& range: ranges) {
+			owner->ReapplyProtection(range.begin, range.end - range.begin, true);
+		}
+	}
 
 	template <bool track, bool is_read>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
@@ -402,6 +451,14 @@ bool PageManager::IsWatched(uint64_t vaddr) const {
 template <bool track>
 void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 	m_impl->UpdatePageWatchers<track, false>(vaddr, size);
+}
+
+void PageManager::DeferReadProtection(bool on) noexcept {
+	Impl::t_defer_read_protect = on;
+}
+
+void PageManager::FlushDeferredProtection() noexcept {
+	if (!Impl::t_read_protects.empty()) Impl::FlushReadProtect();
 }
 
 template void PageManager::UpdatePageWatchers<true>(uint64_t, uint64_t);

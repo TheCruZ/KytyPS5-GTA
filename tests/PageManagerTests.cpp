@@ -3,6 +3,7 @@
 
 #include <barrier>
 #include <cstdint>
+#include <initializer_list>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -478,6 +479,104 @@ void TestRegionMaskWatcherRanges() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+void TestDeferredReadProtection() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  constexpr auto region_size = TRACKER_REGION_SIZE;
+  auto *memory = Allocate(region_size * 2);
+  const auto allocation_base = reinterpret_cast<uint64_t>(memory);
+  const auto region_base =
+      (allocation_base + region_size - 1) & ~(region_size - 1);
+  Check(region_base + region_size <= allocation_base + region_size * 2,
+        "test allocation does not contain a complete tracking region");
+  const auto at = [&](uint64_t page) {
+    return reinterpret_cast<void *>(region_base + page * page_size);
+  };
+  const auto mask_of = [](std::initializer_list<size_t> pages) {
+    RegionBits mask;
+    for (const auto page : pages) {
+      mask.Set(page);
+    }
+    return mask;
+  };
+
+  // Adjacent no-access ranges join: one call for the run, applied by the flush.
+  auto first = mask_of({1});
+  auto second = mask_of({2});
+  auto distant = mask_of({5});
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  PageManager::DeferReadProtection(true);
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, first);
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, distant);
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, second);
+  PageManager::DeferReadProtection(false);
+  Check(g_protection_calls == 0 && IsWritable(at(1)) && IsWritable(at(2)) &&
+            IsWritable(at(5)),
+        "a deferred read protection reached the host before the flush");
+  PageManager::FlushDeferredProtection();
+  Check(g_protection_calls == 2 && g_protection_ranges.size() == 2 &&
+            Protection(at(1)) == PAGE_NOACCESS &&
+            Protection(at(2)) == PAGE_NOACCESS &&
+            Protection(at(5)) == PAGE_NOACCESS && IsWritable(at(3)),
+        "the flush did not apply the joined ranges");
+  g_protection_calls = 0;
+  PageManager::FlushDeferredProtection();
+  Check(g_protection_calls == 0, "a second flush protected again");
+
+  // Other protections go at once while the thread defers, and a release is not
+  // held back: only the no-access ones wait.
+  PageManager::DeferReadProtection(true);
+  manager.UpdatePageWatchersForRegion<false, true>(region_base, first);
+  Check(IsWritable(at(1)), "a release waited behind the deferral");
+  manager.UpdatePageWatchers<true>(region_base + page_size * 6, page_size);
+  Check(Protection(at(6)) == PAGE_READONLY,
+        "a write protection waited behind the deferral");
+  manager.UpdatePageWatchers<false>(region_base + page_size * 6, page_size);
+  PageManager::DeferReadProtection(false);
+  manager.UpdatePageWatchersForRegion<false, true>(region_base, second);
+  manager.UpdatePageWatchersForRegion<false, true>(region_base, distant);
+
+  // A page released (here by another thread) while its protection waits is
+  // not given the stale one: the flush applies the watchers' state of then.
+  g_protection_calls = 0;
+  PageManager::DeferReadProtection(true);
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, first);
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, second);
+  PageManager::DeferReadProtection(false);
+  std::thread([&] {
+    manager.UpdatePageWatchersForRegion<false, true>(region_base, first);
+  }).join();
+  PageManager::FlushDeferredProtection();
+  Check(IsWritable(at(1)) && Protection(at(2)) == PAGE_NOACCESS,
+        "the flush applied a protection its page no longer had");
+  // (A page that gets a write watcher meanwhile is read-only, not no-access.)
+  manager.UpdatePageWatchers<true>(region_base + page_size * 3, page_size);
+  PageManager::DeferReadProtection(true);
+  auto third = mask_of({3});
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, third);
+  PageManager::DeferReadProtection(false);
+  Check(Protection(at(3)) == PAGE_READONLY,
+        "a deferred page lost its write protection");
+  PageManager::FlushDeferredProtection();
+  Check(Protection(at(3)) == PAGE_NOACCESS,
+        "the flush did not deny access to a write-watched page");
+  manager.UpdatePageWatchersForRegion<false, true>(region_base, third);
+  manager.UpdatePageWatchers<false>(region_base + page_size * 3, page_size);
+  manager.UpdatePageWatchersForRegion<false, true>(region_base, second);
+  Check(IsWritable(at(2)) && IsWritable(at(3)),
+        "releasing the deferred watchers left a protection");
+
+  // Without the deferral the protection is applied at once, as before.
+  g_protection_calls = 0;
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, first);
+  Check(g_protection_calls == 1 && Protection(at(1)) == PAGE_NOACCESS,
+        "an undeferred read protection was not applied at once");
+  manager.UpdatePageWatchersForRegion<false, true>(region_base, first);
+
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestRegionEndpointBatching() {
   PageManager manager;
   constexpr auto page_size = TRACKER_PAGE_SIZE;
@@ -752,6 +851,7 @@ int main(int argc, char **argv) {
   TestBatchedWatcherRanges();
   TestRegionMaskWatcherRanges();
   TestRegionEndpointBatching();
+  TestDeferredReadProtection();
   TestReadWriteWatcherInteractions();
   TestConcurrentSharedWatchers();
   TestFatalPaths();

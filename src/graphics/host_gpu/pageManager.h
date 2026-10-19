@@ -40,6 +40,19 @@ public:
 	// applied: a skipped one would leave a watched page writable and writes to it unseen. If the unmap fails, the
 	// caller reapplies the range (ReapplyProtection). end == 0 clears it.
 	static void SetUnmappingRange(uint64_t begin, uint64_t end) noexcept;
+	// chenxiao07's deferred read protection (KYTY_READ_PROTECT_DEFER, default on; the execution thread sets it): while it
+	// is on for this thread, the no-access protection of the pages GPU work will write is not applied when the pages
+	// get their read watcher: the ranges wait, merged with those next to them (consecutive dispatches writing adjacent
+	// ranges made a VirtualProtect call each), for FlushDeferredProtection. The page state is already the watchers',
+	// so the trackers see the pages as GPU-owned at once; only the host protection waits. Every other protection
+	// change is applied at once. The work runs on the GPU and the guest learns that it ran only through a guest-visible
+	// operation (a label, an interrupt, a flip), a guest command or a submission of the thread: the thread flushes
+	// before each of them (and before it waits for work).
+	static void DeferReadProtection(bool on) noexcept;
+	// Applies this thread's pending protections: each page gets the protection of its watchers' state when this runs
+	// (not what was pending), under its region's lock, so a page another thread released or protected meanwhile is
+	// not given a stale one.
+	static void FlushDeferredProtection() noexcept;
 	// A write fault on a page nothing watches: the protection outlived its watchers and would fault forever. The page
 	// gets the guest's own protection back; false when it is not such a page.
 	[[nodiscard]] bool RestoreIfUnwatched(uint64_t vaddr) noexcept;
