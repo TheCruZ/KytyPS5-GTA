@@ -52,36 +52,6 @@ VectorReg Value::VectorRegister() const {
 	return vector_reg;
 }
 
-bool Value::U1() const {
-	EXIT_IF(type != Type::U1);
-	return imm_u1;
-}
-
-uint8_t Value::U8() const {
-	EXIT_IF(type != Type::U8);
-	return imm_u8;
-}
-
-uint16_t Value::U16() const {
-	EXIT_IF(type != Type::U16);
-	return imm_u16;
-}
-
-uint64_t Value::U64() const {
-	EXIT_IF(type != Type::U64);
-	return imm_u64;
-}
-
-uint16_t Value::F16Bits() const {
-	EXIT_IF(type != Type::F16);
-	return imm_u16;
-}
-
-float Value::F32Value() const {
-	EXIT_IF(type != Type::F32);
-	return std::bit_cast<float>(imm_u32);
-}
-
 uint64_t Value::ImmediateBits() const {
 	switch (type) {
 		case Type::Void: return 0;
@@ -116,26 +86,6 @@ bool Value::FromImmediateBits(Type type, uint64_t bits, Value& result) {
 		case Type::U32: result = Value(static_cast<uint32_t>(bits)); return fits(UINT32_MAX);
 		case Type::F32: result = Value(Type::F32, bits); return fits(UINT32_MAX);
 		case Type::U64: result = Value(bits); return true;
-		default: return false;
-	}
-}
-
-bool Value::operator==(const Value& other) const {
-	if (type != other.type) {
-		return false;
-	}
-	switch (type) {
-		case Type::Void: return true;
-		case Type::Opaque: return inst == other.inst;
-		case Type::ScalarReg: return scalar_reg == other.scalar_reg;
-		case Type::VectorReg: return vector_reg == other.vector_reg;
-		case Type::U1: return imm_u1 == other.imm_u1;
-		case Type::U8: return imm_u8 == other.imm_u8;
-		case Type::U16:
-		case Type::F16: return imm_u16 == other.imm_u16;
-		case Type::U32:
-		case Type::F32: return imm_u32 == other.imm_u32;
-		case Type::U64: return imm_u64 == other.imm_u64;
 		default: return false;
 	}
 }
@@ -189,16 +139,30 @@ Block* Inst::PhiBlock(size_t index) const {
 	return phi_args[index].first;
 }
 
+Block* Inst::Parent() const {
+	return parent;
+}
+
+const std::vector<Use>& Inst::Uses() const {
+	return uses;
+}
+
 void Inst::SetParent(Block* block) {
 	parent = block;
 }
 
 void Inst::SetArg(size_t index, Value value) {
-	auto& arg = ArgSlot(*this, index);
-	if (auto* old_inst = arg.TryInstruction(); old_inst != nullptr) {
+	const auto old = Arg(index);
+	if (auto* old_inst = old.TryInstruction(); old_inst != nullptr) {
 		RemoveUse(old_inst, index);
 	}
-	arg = value;
+	if (num_args <= InlineArity) {
+		fixed_args[index] = value;
+	} else if (num_args == PhiArity) {
+		phi_args[index].second = value;
+	} else {
+		large_args[index] = value;
+	}
 	if (auto* new_inst = value.TryInstruction(); new_inst != nullptr) {
 		AddUse(new_inst, index);
 	}
@@ -235,13 +199,6 @@ void Inst::ReplaceUsesWith(Value replacement, bool preserve) {
 		}
 	}
 	Invalidate();
-	const auto old_uses = std::exchange(uses, {});
-	for (const auto& use: old_uses) {
-		ArgSlot(*use.user, use.operand) = replacement;
-	}
-	if (auto* target = replacement.TryInstruction(); target != nullptr) {
-		target->uses.insert(target->uses.end(), old_uses.begin(), old_uses.end());
-	}
 	if (preserve) {
 		opcode = ValueOpcode::Identity;
 		num_args = 1;
@@ -347,10 +304,6 @@ void Inst::ClearArgs() {
 			RemoveUse(value_inst, index);
 		}
 	}
-	DropArgs();
-}
-
-void Inst::DropArgs() {
 	if (num_args == PhiArity) {
 		std::destroy_at(&phi_args);
 		std::construct_at(&fixed_args);
