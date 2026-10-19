@@ -412,12 +412,24 @@ void RenderContext::CacheDmaBases(const ShaderStageRuntime& runtime) {
 	}
 }
 
+// chenxiao07's BDA read ranges (KYTY_BDA_READ_RANGES, default on; 0: a program whose DMA footprint the tracking pass did
+// not bound synchronizes all cached memory): a program whose footprint it did not bound may still have a read plan.
+static bool BdaReadRangesEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BDA_READ_RANGES");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 bool RenderContext::SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* const> stages) {
 	// Larger V# ranges are no buffers a draw reads (see FindBuffers()).
 	constexpr uint64_t MaxBufferBytes = uint64_t {256} * 1024 * 1024;
 	// An index offset or thread ID added to a V# record stays within a wave of records past it.
 	constexpr uint64_t WaveRecords = 64;
 	m_dma_spans.clear();
+	// (Reused per thread: every operation with an unbounded footprint evaluates its plan.)
+	thread_local std::vector<GuestRange> plan_ranges;
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	const auto add = [&](uint64_t address, uint64_t size) {
 		if (size != 0 && address <= UINT64_MAX - size) {
@@ -432,6 +444,15 @@ bool RenderContext::SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* 
 			continue;
 		}
 		if (!program.info.dma_bounded) {
+			// (chenxiao07's read plan, KYTY_BDA_READ_RANGES: what the shader's address loads can reach, from its user
+			// data and flattened SRT; a plan that does not evaluate leaves the reach unknown.)
+			if (BdaReadRangesEnabled() &&
+			    ShaderRecompiler::IR::EvaluateBdaReadPlan(program.bda_read_plan, *stage->resources, plan_ranges)) {
+				for (const auto& range: plan_ranges) {
+					add(range.address, range.size);
+				}
+				continue;
+			}
 			return false;
 		}
 		const auto& user_data = stage->resources->user_data;

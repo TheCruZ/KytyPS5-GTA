@@ -143,6 +143,7 @@ Program& Program::operator=(Program&& other) noexcept {
 CompiledShaderInfo Program::TakeCompiledInfo() && {
 	std::vector<std::vector<uint32_t>> raw_reads_after_writes;
 	auto srt_reads_after_writes = SrtReadsAfterBufferWrites(*this, &raw_reads_after_writes);
+	auto bda_read_plan          = BuildBdaReadPlan(*this);
 	CompiledShaderInfo result {
 	    .stage           = stage,
 	    .shader_hash     = shader_hash,
@@ -157,6 +158,7 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 	    .bindings        = std::move(bindings),
 	    .srt_reads_after_buffer_writes = std::move(srt_reads_after_writes),
 	    .raw_reads_after_buffer_writes = std::move(raw_reads_after_writes),
+	    .bda_read_plan   = std::move(bda_read_plan),
 	};
 	for (const auto& output: result.info.outputs) {
 		if (output.kind == StageOutputKind::Parameter && output.index < 32) {

@@ -8,6 +8,7 @@
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/Block.h"
+#include "graphics/shader/recompiler/ir/BdaReadPlan.h"
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
 #include "graphics/shader/shader.h"
@@ -797,6 +798,9 @@ struct CompiledShaderInfo {
 	std::vector<std::vector<uint32_t>> srt_reads_after_buffer_writes;
 	// The same for each scalar load the shader issues itself, by memory-info index.
 	std::vector<std::vector<uint32_t>> raw_reads_after_buffer_writes;
+	// The guest memory the shader reads through device addresses, from the dispatch's user data and flattened SRT
+	// (chenxiao07's BdaReadPlan, KYTY_BDA_READ_RANGES): what its BDA synchronization has to make current.
+	BdaReadPlan bda_read_plan;
 };
 
 // Whether a write of the shader to a buffer (an info.buffers index) can be visible to one of
