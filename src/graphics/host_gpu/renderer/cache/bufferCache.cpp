@@ -1597,6 +1597,15 @@ vk::DeviceAddress BufferCache::TableUpload(const void* data, uint64_t size) {
 	return m_table_upload->BufferDeviceAddress() + m_table_upload->Copy(data, size, 16);
 }
 
+// chenxiao07's write memo (KYTY_WRITE_MEMO, default on; 0: every written range is looked up and synchronized).
+static bool WriteMemoEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_WRITE_MEMO");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
@@ -1661,6 +1670,31 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	}
 
+	// A range written again with nothing changed since (chenxiao07's m_write_memo, KYTY_WRITE_MEMO; default on): its
+	// buffer is the one found before, and the GPU-modified set still holds it whole (nothing registered, nothing taken
+	// out of the set), so synchronizing it would return at once (KYTY_BUFFER_RESIDENCY) and the set would not grow.
+	// No lookup, no coverage query, no range Add. (Demon's Souls' compute chains write the same few blocks in every
+	// dispatch; at his Latria scene 57% of the written ranges a frame were repeats, 9.11 -> 8.91 ms.)
+	WriteMemo* write_memo = nullptr;
+	if (is_written) {
+		write_memo = &(*m_write_memo)[((vaddr >> 4u) ^ (size * 0x9e3779b97f4a7c15ull >> 40u)) % WriteMemoSlots];
+		if (write_memo->vaddr == vaddr && write_memo->size == size && write_memo->texel == is_texel_buffer &&
+		    write_memo->buffer_epoch == m_buffer_set_epoch &&
+		    write_memo->removals == m_gpu_modified_ranges.RemovalEpoch() && t_download_depth == 0 &&
+		    WriteMemoEnabled() && BufferResidencyEnabled()) {
+			if (auto* hit = m_slot_buffers.try_get(write_memo->id);
+			    hit != nullptr && !hit->is_deleted && hit->IsInBounds(vaddr, size)) {
+				TouchBuffer(*hit);
+				SettleAsyncReadbacks(vaddr, size);
+				hit->written_serial = m_scheduler.CommandSerial();
+				m_gpu_write_generation++;
+				NoteWrite(vaddr, size);
+				ForgetKnownFills(vaddr, size);
+				return {hit, hit->Offset(vaddr)};
+			}
+		}
+	}
+
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
 		id = FindBuffer(vaddr, size);
 	}
@@ -1682,8 +1716,16 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		buffer.written_serial = m_scheduler.CommandSerial();
 		m_gpu_write_generation++;
 		m_gpu_modified_ranges.Add(vaddr, size);
+		// (Read before NoteWrite: a readback it settles takes its bytes out of the set, the memo would not hold then.)
+		const auto removals = m_gpu_modified_ranges.RemovalEpoch();
 		NoteWrite(vaddr, size);
 		ForgetKnownFills(vaddr, size);
+		*write_memo = {.vaddr        = vaddr,
+		               .size         = size,
+		               .buffer_epoch = m_buffer_set_epoch,
+		               .removals     = removals,
+		               .id           = id,
+		               .texel        = is_texel_buffer};
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }

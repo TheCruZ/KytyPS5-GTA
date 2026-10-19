@@ -457,6 +457,19 @@ private:
 		uint64_t write_generation = 0;
 		uint64_t offset           = 0;
 	};
+	// The buffer a written binding of a range found, while no buffer was registered or unregistered and no byte left
+	// the GPU-modified set since: the range is GPU-owned whole already (see ObtainBuffer(), KYTY_WRITE_MEMO).
+	struct WriteMemo {
+		uint64_t vaddr        = 0;
+		uint64_t size         = 0;
+		uint64_t buffer_epoch = 0;
+		uint64_t removals     = 0;
+		BufferId id;
+		bool     texel = false;
+	};
+	static constexpr size_t                                  WriteMemoSlots = 4096;
+	std::unique_ptr<std::array<WriteMemo, WriteMemoSlots>>   m_write_memo =
+	    std::make_unique<std::array<WriteMemo, WriteMemoSlots>>();
 	static constexpr size_t                                  StreamMemoSlots = 1024;
 	std::unique_ptr<std::array<StreamMemo, StreamMemoSlots>> m_stream_memo =
 	    std::make_unique<std::array<StreamMemo, StreamMemoSlots>>();

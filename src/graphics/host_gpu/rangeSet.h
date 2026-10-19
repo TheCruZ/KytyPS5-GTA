@@ -58,6 +58,7 @@ public:
 			const auto begin = it->first;
 			const auto last  = it->second;
 			it               = m_ranges.erase(it);
+			m_removals++;
 			if (begin < address) {
 				m_ranges.emplace(begin, address);
 			}
@@ -71,7 +72,12 @@ public:
 	void Clear() {
 		m_ranges.clear();
 		m_hint_end = 0;
+		m_removals++;
 	}
+
+	// Advances whenever a Subtract() or Clear() took bytes out of the set: a range it held whole at some value holds
+	// whole until it changes (Add() only grows the ranges).
+	[[nodiscard]] uint64_t RemovalEpoch() const { return m_removals; }
 
 	template <typename Func>
 	void ForEach(Func&& func) const {
@@ -147,6 +153,7 @@ private:
 	}
 
 	std::map<uint64_t, uint64_t> m_ranges;
+	uint64_t                     m_removals = 0;
 	mutable uint64_t             m_hint_begin = 0;
 	mutable uint64_t             m_hint_end   = 0;
 	bool                         m_fast       = false;
