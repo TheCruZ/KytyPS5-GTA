@@ -850,6 +850,7 @@ void EmitTableMode(EmitterState& state) {
 	}
 	state.table_bases.assign(plan.buffers.size(), 0);
 	state.table_lengths.assign(plan.buffers.size(), 0);
+	state.table_strides.assign(plan.buffers.size(), 0);
 	for (size_t i = 0; i < plan.buffers.size(); ++i) {
 		const auto first      = plan.BufferDword(i);
 		const auto base_low   = Unary(state, spv::OpUConvert, u64, load(first));
@@ -857,6 +858,9 @@ void EmitTableMode(EmitterState& state) {
 		state.table_bases[i]  = Binary(state, spv::OpBitwiseOr, u64, base_low,
 		                               Binary(state, spv::OpShiftLeftLogical, u64, base_high, ConstantU32(state, 32)));
 		state.table_lengths[i] = load(first + 2);
+		// (chenxiao07's table strides: an unswizzled buffer is indexed with the V#'s own stride, so V#s of other
+		// strides use the same program.)
+		state.table_strides[i] = load(first + 4);
 	}
 }
 

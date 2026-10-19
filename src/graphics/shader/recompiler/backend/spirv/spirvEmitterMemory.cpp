@@ -91,8 +91,11 @@ uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 		index = Binary(state, spv::OpIAdd, TypeU32(state), index, BufferLane(state));
 	}
 	const bool swizzle = stride != 0u && (packed & (1u << 14u)) != 0u;
+	// Table mode: an unswizzled buffer's stride is the V#'s, from the block (EmitTableMode); 0 ignores the index.
+	const bool table_stride = state.program.table_mode && !swizzle && mem.resource < state.table_strides.size() &&
+	                          state.table_strides[mem.resource] != 0u;
 	return CalculateBufferAddress(state, index, ctx.Arg(inst, 2), ctx.Arg(inst, 3), mem.offset,
-	                              ConstantU32(state, stride),
+	                              table_stride ? state.table_strides[mem.resource] : ConstantU32(state, stride),
 	                              swizzle ? ConstantBool(state, true) : 0u,
 	                              ConstantU32(state, (packed >> 16u) & 3u))
 	    .byte;

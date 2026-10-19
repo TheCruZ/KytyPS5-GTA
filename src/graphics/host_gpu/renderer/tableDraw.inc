@@ -154,6 +154,16 @@ uint32_t TableOperandValue(const ShaderRecompiler::IR::TablePlan::Operand& opera
 
 // Whether a V# selects the buffer specialization a table program was compiled for (as SpecializeDirectResources
 // derives it): another one takes the normal path, which chooses the program for it.
+// chenxiao07's table strides (KYTY_TABLE_STRIDES, default on; 0: a V# of another stride than the table program
+// was compiled for takes the normal path, as ~700 draws and ~135 dispatches a frame in Demon's Souls did).
+bool TableStridesEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TABLE_STRIDES");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 bool TableBufferSpecialized(const ShaderRecompiler::IR::BufferResource&                 resource,
                             const ShaderRecompiler::IR::ResourceSpecialization::Buffer& specialized,
                             const std::array<uint32_t, 4>&                              words4) {
@@ -168,7 +178,12 @@ bool TableBufferSpecialized(const ShaderRecompiler::IR::BufferResource&         
 	} else if (!swizzle) {
 		packed_stride &= ~(3u << 16u);
 	}
-	return packed_stride == specialized.packed_stride &&
+	// (KYTY_TABLE_STRIDES: an unswizzled buffer of another stride, which table programs read from the block.)
+	const bool any_stride = TableStridesEnabled() && !swizzle && (specialized.packed_stride & (1u << 14u)) == 0u &&
+	                        resource.indirect_root == ShaderRecompiler::IR::BufferResource::NoIndirectBuffer &&
+	                        resource.indirect_resources.empty();
+	const auto stride_bits = any_stride ? ~0x3fffu : ~0u;
+	return (packed_stride & stride_bits) == (specialized.packed_stride & stride_bits) &&
 	       (resource.formatted ? descriptor.Format() : Prospero::BufferFormat::kInvalid) == specialized.descriptor_format &&
 	       (resource.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7)) == specialized.descriptor_swizzle &&
 	       (descriptor.OutOfBounds() == 0u && stride == 0u) == specialized.zero_stride_oob &&

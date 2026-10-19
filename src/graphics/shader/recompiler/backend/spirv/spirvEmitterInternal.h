@@ -141,11 +141,12 @@ struct EmitterState {
 	uint32_t                                         shader_data_storage_variable = 0;
 	uint32_t                                         flattened_srt_variable  = 0;
 	// Table mode (IR::Program::table_mode, EmitTableMode): the block's device address, each slot the shader reads (0:
-	// not given), and each buffer's device address and size in dwords.
+	// not given), and each buffer's device address, size in dwords and stride.
 	uint32_t                                         table_block             = 0;
 	std::vector<uint32_t>                            table_slot_values;
 	std::vector<uint32_t>                            table_bases;
 	std::vector<uint32_t>                            table_lengths;
+	std::vector<uint32_t>                            table_strides;
 	uint32_t                                         uniform_buffer_variable = 0;
 	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;
 	uint32_t                                         lds_base_dwords         = 0;
