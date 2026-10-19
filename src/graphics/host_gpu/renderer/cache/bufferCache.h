@@ -97,6 +97,9 @@ public:
 	// command buffer recorded now completed. Created on first use.
 	[[nodiscard]] vk::DeviceAddress TableUpload(const void* data, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	// A uniform fill of guest memory under images, performed on the GPU in the buffer cache's buffer, the images noting
+	// the value (TextureCache::NoteBufferFill, KYTY_FILL_CLEAR). False, with nothing done, when an image cannot take it.
+	[[nodiscard]] bool FillBufferUnderImages(uint64_t vaddr, uint64_t size, uint32_t value);
 	// Fills memory the emulator itself rewrites, such as consumed color metadata, without
 	// invalidating images over it. Memory the GPU owns is filled on the GPU, so the fill never
 	// drains it; other memory gets a backing write.

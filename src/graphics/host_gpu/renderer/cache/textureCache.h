@@ -83,6 +83,12 @@ public:
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
+	// A uniform fill of [address, size) with `value` that the GPU performs (KYTY_FILL_CLEAR): the images over it note the
+	// fill (Image::MarkBufferFilled), and one all of whose buffer writes were such fills is cleared instead of uploaded.
+	// False, with nothing changed, when an image over it cannot take the fill (depth, multisampled or compressed).
+	[[nodiscard]] bool NoteBufferFill(uint64_t address, uint64_t size, uint32_t value);
+	// KYTY_FILL_CLEAR (default on; 0 off).
+	[[nodiscard]] static bool FillClearEnabled();
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 	[[nodiscard]] bool HasImagesInRegion(uint64_t address, uint64_t size);

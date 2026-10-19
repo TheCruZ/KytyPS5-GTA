@@ -315,12 +315,18 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		// discovery without draining the GPU first.
 		// Larger fills stay on the GPU: a CPU fill would also have to be uploaded again.
 		constexpr uint64_t MaxBufferFill = uint64_t {1} << 20u;
-		if (((descriptor.Base48() | size) & 3u) != 0 || size > MaxBufferFill ||
-		    cache.HasImagesInRegion(descriptor.Base48(), size)) {
-			return false;
+		const bool         aligned       = ((descriptor.Base48() | size) & 3u) == 0;
+		const bool         images        = aligned && cache.HasImagesInRegion(descriptor.Base48(), size);
+		if (aligned && size <= MaxBufferFill && !images) {
+			m_context.GetBufferCache().FillBuffer(descriptor.Base48(), size, packed_clear, false);
+			return true;
 		}
-		m_context.GetBufferCache().FillBuffer(descriptor.Base48(), size, packed_clear, false);
-		return true;
+		// A fill over images that its range does not match (the game clears render targets in 4 MiB pieces and in
+		// spans of several): the same fill on the buffer cache's buffer, and the images over it note the value; one
+		// all of whose buffer writes were such fills is cleared instead of uploaded (chenxiao07's fill clear,
+		// TextureCache::InitializeImage, KYTY_FILL_CLEAR).
+		return images && TextureCache::FillClearEnabled() &&
+		       m_context.GetBufferCache().FillBufferUnderImages(descriptor.Base48(), size, packed_clear);
 	}
 	static std::atomic<uint32_t> logged_clears {0};
 	if (logged_clears.fetch_add(1, std::memory_order_relaxed) < 32) {

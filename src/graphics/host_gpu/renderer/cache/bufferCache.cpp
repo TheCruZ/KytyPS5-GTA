@@ -1806,6 +1806,17 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	dst->Fill(dst_offset, size, value);
 }
 
+bool BufferCache::FillBufferUnderImages(uint64_t vaddr, uint64_t size, uint32_t value) {
+	if (vaddr == 0 || (vaddr & 3u) != 0 || size == 0 || (size & 3u) != 0 || size > UINT64_MAX - vaddr ||
+	    !GuestRange {vaddr, size}.Valid() || !m_texture_cache.NoteBufferFill(vaddr, size, value)) {
+		return false;
+	}
+	m_gpu_write_generation++;
+	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
+	dst->Fill(dst_offset, size, value);
+	return true;
+}
+
 // chenxiao07's CopyGuestMemory (KYTY_COPY_GUEST_MEMORY, default on; 0: a plain memcpy to the destination): a linear
 // copy of CPU-side memory writes only the destination pages whose bytes differ, through the backing view.
 static bool CopyGuestMemoryEnabled() {

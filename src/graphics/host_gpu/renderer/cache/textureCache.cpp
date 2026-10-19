@@ -1519,6 +1519,16 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	destination.Upload(copies, linear.buffer, linear.offset, linear.size);
 }
 
+// chenxiao07's fill clear (KYTY_FILL_CLEAR, default on; 0: a compute fill over an image runs as the dispatch it is and the
+// image is uploaded).
+bool TextureCache::FillClearEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FILL_CLEAR");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 void TextureCache::InitializeImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	TrackImage(id);
@@ -1536,6 +1546,27 @@ void TextureCache::InitializeImage(ImageId id) {
 		// CPU writes over known parts of it alone: the subresources over them (GPU buffer writes take the whole upload).
 		bool uploaded = image.IsPartiallyCpuDirty() && !image.IsBufferModified() && !image.IsMaybeCpuDirty() &&
 		                UploadImagePartial(image);
+		// GPU buffer writes that only filled all of it with one 32-bit value since its last upload (compute fills over
+		// it, NoteBufferFill): a clear to that value, as an upload of those bytes would leave it (chenxiao07's fill
+		// clear, KYTY_FILL_CLEAR). The game clears render targets that way in 4 MiB pieces: at his Stonefang every
+		// frame four 720p RGBA16F, a 1440p R32 array of 4 and a 1440p target, 105 MiB of detiles of zeros a frame.
+		if (!uploaded && image.IsBufferModified() && !image.IsCpuDirty() && !image.info.IsDepth() && !image.depth_id &&
+		    !image.info.IsVolume() && image.backing.image != nullptr &&
+		    image.backing.format == image.info.pixel_format && FillClearEnabled()) {
+			vk::ClearValue clear {};
+			if (const auto value = image.BufferFilledWith();
+			    value.has_value() && DecodeFilledColorClear(image.info.pixel_format, *value, clear.color)) {
+				m_scheduler.EndRendering();
+				const auto command = m_scheduler.Current().Handle();
+				image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+				const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, VK_REMAINING_MIP_LEVELS, 0,
+				                                       VK_REMAINING_ARRAY_LAYERS};
+				command.clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal, &clear.color, 1, &range);
+				image.Transit(vk::ImageLayout::eGeneral,
+				              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
+				uploaded = true;
+			}
+		}
 		if (!uploaded) {
 			const auto [source, source_offset] =
 			    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
@@ -2711,6 +2742,36 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		}
 		image.MarkBufferModified();
 	}
+}
+
+bool TextureCache::NoteBufferFill(uint64_t address, uint64_t size, uint32_t value) {
+	if (!GuestRange {address, size}.Valid()) {
+		return false;
+	}
+	std::scoped_lock lock {m_lock};
+	const auto       images = FindImagesInRegion(address, size, true);
+	const auto       takes  = [&](const Image& image) {
+        return !image.depth_id && !image.info.IsDepth() && !image.info.HasStencil() && image.info.samples == 1 &&
+               image.info.metadata.compression == VideoOutCompression::Uncompressed;
+    };
+	for (const auto id: images) {
+		const auto& image = m_slot_images[id];
+		if (image.Overlaps(address, size) && !takes(image)) {
+			return false;
+		}
+	}
+	for (const auto id: images) {
+		auto& image = m_slot_images[id];
+		if (!image.Overlaps(address, size)) {
+			continue;
+		}
+		if (image.IsGpuModified()) {
+			image.ClearGpuModified();
+		}
+		image.MarkBufferFilled(std::max(address, image.info.data.address),
+		                       std::min(address + size, image.info.data.End()), value);
+	}
+	return true;
 }
 
 bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {

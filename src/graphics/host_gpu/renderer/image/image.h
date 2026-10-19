@@ -231,12 +231,41 @@ public:
 			s_cpu_dirty_epoch.fetch_add(1, std::memory_order_relaxed);
 		}
 		m_buffer_modified = true;
+		m_buffer_whole    = true;
+		m_buffer_ranges.clear();
+		m_buffer_fill = BufferFill::Mixed;
+	}
+	// The same from a compute fill of [begin, end) with one 32-bit value (chenxiao07's MarkBufferFilled,
+	// KYTY_FILL_CLEAR): while every buffer write since the last upload was a fill of that value and together they cover
+	// all of the image, BufferFilledWith gives the value (TextureCache::InitializeImage clears the image to it).
+	void MarkBufferFilled(uint64_t begin, uint64_t end, uint32_t value) {
+		if (!m_buffer_modified) {
+			s_cpu_dirty_epoch.fetch_add(1, std::memory_order_relaxed);
+			m_buffer_modified   = true;
+			m_buffer_whole      = false;
+			m_buffer_ranges.clear();
+			m_buffer_fill       = BufferFill::Value;
+			m_buffer_fill_value = value;
+		} else if (m_buffer_fill != BufferFill::Value || m_buffer_fill_value != value) {
+			m_buffer_fill = BufferFill::Mixed;
+		}
+		AddBufferRange(begin, end);
+	}
+	[[nodiscard]] std::optional<uint32_t> BufferFilledWith() const noexcept {
+		if (!m_buffer_modified || m_buffer_fill != BufferFill::Value || m_buffer_whole || m_buffer_ranges.size() != 1 ||
+		    m_buffer_ranges.front().first > info.data.address || m_buffer_ranges.front().second < info.data.End()) {
+			return std::nullopt;
+		}
+		return m_buffer_fill_value;
 	}
 	void ClearBufferModified() noexcept {
 		if (m_buffer_modified) {
 			MoveStateEpoch();
 		}
 		m_buffer_modified = false;
+		m_buffer_whole    = false;
+		m_buffer_ranges.clear();
+		m_buffer_fill = BufferFill::None;
 	}
 	// Advances whenever an image's barrier state (layout, access), its GPU-written or buffer-modified state or a
 	// refresh changes: images found in place (a table draw's targets and image set) stay so while it does not move
@@ -311,6 +340,34 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>> m_dirty_ranges;
 	bool              m_gpu_modified    = false;
 	bool              m_buffer_modified = false;
+	// Where the buffer writes were, merged and sorted (m_buffer_whole: past a few ranges, all of it), and the value they
+	// all filled when they did (MarkBufferFilled).
+	bool              m_buffer_whole = false;
+	std::vector<std::pair<uint64_t, uint64_t>> m_buffer_ranges;
+	enum class BufferFill : uint8_t { None, Value, Mixed };
+	BufferFill        m_buffer_fill       = BufferFill::None;
+	uint32_t          m_buffer_fill_value = 0;
+
+	void AddBufferRange(uint64_t begin, uint64_t end) {
+		if (m_buffer_whole || begin >= end) {
+			return;
+		}
+		auto at = std::lower_bound(m_buffer_ranges.begin(), m_buffer_ranges.end(), begin,
+		                           [](const auto& range, uint64_t value) { return range.second < value; });
+		auto last = at;
+		while (last != m_buffer_ranges.end() && last->first <= end) {
+			begin = std::min(begin, last->first);
+			end   = std::max(end, last->second);
+			++last;
+		}
+		at = m_buffer_ranges.erase(at, last);
+		m_buffer_ranges.insert(at, {begin, end});
+		// (Past a few, all of it: the fills of an image that is not cleared are a whole upload anyway.)
+		if (m_buffer_ranges.size() > 16u) {
+			m_buffer_whole = true;
+			m_buffer_ranges.clear();
+		}
+	}
 
 	inline static std::atomic<uint64_t> s_next_serial {0};
 	inline static std::atomic<uint64_t> s_cpu_dirty_epoch {1};
