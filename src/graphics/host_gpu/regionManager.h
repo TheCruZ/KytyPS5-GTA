@@ -166,10 +166,14 @@ public:
 	KYTY_CLASS_NO_COPY(RegionManager);
 
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
-	template <DirtySource source>
+	// `all`: every page of the range is modified, not any.
+	template <DirtySource source, bool all = false>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
 		const auto& bits        = GetBits<source>();
+		if constexpr (all) {
+			return bits.AllInRange(start, end);
+		}
 		return bits.AnyInRange(start, end);
 	}
 
@@ -200,10 +204,29 @@ public:
 				                   std::memory_order_release);
 			}
 			m_has_cpu_dirty.store(m_cpu_dirty.Any(), std::memory_order_release);
-			UpdateProtection<!enable, false>();
+			UpdateProtection<!enable, false>(start, end);
 		} else {
-			UpdateProtection<enable, true>();
+			UpdateProtection<enable, true>(start, end);
 		}
+	}
+
+	// CPU-dirty with the pages' write protection kept (chenxiao07's MarkCpuDirtyKeepProtection): the emulator writes
+	// them through the backing view, so no fault sees the write. A page still write-watched stays so (UpdateProtection
+	// moves only the pages whose watcher disagrees with their state in the direction of a change): its next upload
+	// finds it protected already, and a guest write before that faults once and drops the watcher as for any dirty
+	// page. Returns false (nothing changed) when the GPU wrote a page.
+	[[nodiscard]] bool MarkCpuDirtyKeepProtection(uint64_t vaddr, uint64_t size) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		if (m_gpu_dirty.AnyInRange(start, end)) {
+			return false;
+		}
+		m_cpu_dirty.SetRange(start, end);
+		m_cpu_written.SetRange(start, end);
+		m_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
+		m_last_dirty.store(s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel) + 1,
+		                   std::memory_order_release);
+		m_has_cpu_dirty.store(true, std::memory_order_release);
+		return true;
 	}
 
 	template <DirtySource source, bool clear, typename Func>
@@ -218,9 +241,9 @@ public:
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
 				m_has_cpu_dirty.store(m_cpu_dirty.Any(), std::memory_order_release);
-				UpdateProtection<true, false>();
+				UpdateProtection<true, false>(start, end);
 			} else {
-				UpdateProtection<false, true>();
+				UpdateProtection<false, true>(start, end);
 			}
 		}
 		for (const auto [first, last]: mask) {
@@ -254,7 +277,7 @@ public:
 		for (const auto [first, last]: mask) {
 			m_gpu_dirty.SetRange(first, last);
 		}
-		UpdateProtection<true, true>();
+		UpdateProtection<true, true>(0, 0);
 		for (const auto [first, last]: mask) {
 			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
 		}
@@ -275,15 +298,29 @@ public:
 	TrackingSpinLock lock;
 
 private:
+	// The pages of [start, end) whose watcher no longer matches their state, in the direction of the change. Write
+	// watchers: clean pages without one get it (track), dirty pages with one lose it; dirty pages that keep their
+	// protection (MarkCpuDirtyKeepProtection) are left alone by a change that only made other pages clean or dirty.
+	// (Every other change leaves the watchers matching the state of the whole region, so this is what comparing the
+	// whole state with the previous one gave.)
 	template <bool track, bool is_read>
-	void UpdateProtection() {
-		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
-		auto&      previous   = is_read ? m_readable : m_writable;
-		auto       mask       = protection ^ previous;
-		if (mask.None()) {
-			return;
+	void UpdateProtection(size_t start, size_t end) {
+		RegionBits mask;
+		if constexpr (is_read) {
+			const auto protection = ~m_gpu_dirty;
+			mask                  = protection ^ m_readable;
+			if (mask.None()) {
+				return;
+			}
+			m_readable = protection;
+		} else {
+			const auto changed = track ? m_writable & ~m_cpu_dirty : m_cpu_dirty & ~m_writable;
+			mask               = RegionBits(changed, start, end);
+			if (mask.None()) {
+				return;
+			}
+			m_writable ^= mask;
 		}
-		previous = protection;
 		if constexpr (is_read) {
 			m_has_gpu_dirty.store(m_gpu_dirty.Any(), std::memory_order_release);
 		}

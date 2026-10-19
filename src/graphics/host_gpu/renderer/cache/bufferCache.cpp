@@ -1764,6 +1764,16 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	dst->Fill(dst_offset, size, value);
 }
 
+// chenxiao07's CopyGuestMemory (KYTY_COPY_GUEST_MEMORY, default on; 0: a plain memcpy to the destination): a linear
+// copy of CPU-side memory writes only the destination pages whose bytes differ, through the backing view.
+static bool CopyGuestMemoryEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_COPY_GUEST_MEMORY");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
                              bool src_gds) {
 	m_gpu_write_generation++;
@@ -1780,6 +1790,10 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	}
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
 	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
+		if (CopyGuestMemoryEnabled()) {
+			CopyGuestMemory(dst_vaddr, src_vaddr, size);
+			return;
+		}
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
 		return;
@@ -1796,6 +1810,51 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	auto [dst, dst_offset] = dst_memory ? ObtainBuffer(dst_vaddr, size, true, true, dst_id)
 	                                    : std::pair {&m_gds_buffer, dst_vaddr};
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
+}
+
+void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size) {
+	// Demon's Souls' compute fills and copies (cs_memset32, more than 700 a frame) mostly rewrite what the
+	// destination already holds (95% of the bytes): only the destination pages whose bytes differ are written, so
+	// the others stay clean (no upload of their bytes to the GPU again). A run of them is marked CPU-dirty with its
+	// protection kept and written through the backing view: no write fault a page on this thread and no protection
+	// change, here or when the pages are uploaded again (the game rewrites them every frame).
+	uint64_t   run = 0, run_end = 0;
+	const auto write = [&] {
+		if (run_end == run) {
+			return;
+		}
+		const auto  address = dst_vaddr + run, bytes = run_end - run;
+		const auto* from    = reinterpret_cast<const void*>(src_vaddr + run);
+		if (!m_memory_tracker.IsRegionFullyCpuModified(address, bytes)) {
+			// (As the write faults would: the images and known fills over the pages first.)
+			m_texture_cache.InvalidateMemory(address, bytes);
+			ForgetKnownFills(address, bytes);
+			// (The pages are not GPU-modified, CopyBuffer checked: no GPU result is written back there.)
+			if (m_memory_tracker.MarkRegionAsCpuDirtyKeepProtection(address, bytes) &&
+			    Libs::LibKernel::Memory::TryWriteBacking(address, from, bytes)) {
+				return;
+			}
+			// (Memory the backing view does not hold: written through the guest's view, unprotected first.)
+			InvalidateMemory(address, bytes);
+		} else if (Libs::LibKernel::Memory::TryWriteBacking(address, from, bytes)) {
+			// (CPU-dirty already: through the backing view too, a page of it may have kept its protection.)
+			return;
+		}
+		std::memcpy(reinterpret_cast<void*>(address), from, bytes);
+	};
+	for (uint64_t at = 0; at < size;) {
+		const auto bytes = std::min(TRACKER_PAGE_SIZE - (dst_vaddr + at) % TRACKER_PAGE_SIZE, size - at);
+		if (std::memcmp(reinterpret_cast<const void*>(dst_vaddr + at), reinterpret_cast<const void*>(src_vaddr + at),
+		                bytes) != 0) {
+			if (at != run_end) {
+				write();
+				run = at;
+			}
+			run_end = at + bytes;
+		}
+		at += bytes;
+	}
+	write();
 }
 
 void BufferCache::WriteTicks::Assign(uint64_t begin, uint64_t end, uint64_t tick) {

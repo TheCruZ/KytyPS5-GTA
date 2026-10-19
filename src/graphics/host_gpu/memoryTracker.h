@@ -25,6 +25,8 @@ public:
 
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// Every page of the range is CPU-dirty (a region never tracked starts so).
+	[[nodiscard]] bool IsRegionFullyCpuModified(uint64_t vaddr, uint64_t size);
 	// Whether a page of the tracking regions the range touches may be GPU dirty, without taking
 	// their locks: false means the range can be read directly.
 	[[nodiscard]] bool MayBeGpuModified(uint64_t vaddr, uint64_t size) const {
@@ -42,6 +44,9 @@ public:
 		return false;
 	}
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
+	// CPU-dirty, the write protection kept (RegionManager::MarkCpuDirtyKeepProtection): for a write through the
+	// backing view. False, with nothing changed, when the GPU wrote a page of the range.
+	[[nodiscard]] bool MarkRegionAsCpuDirtyKeepProtection(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);

@@ -171,6 +171,8 @@ public:
 	void               NoteKnownFill(uint64_t vaddr, uint64_t size, uint32_t value);
 	[[nodiscard]] bool KnownFill(uint64_t vaddr, uint64_t size, uint32_t& value) const;
 	void               ForgetKnownFills(uint64_t vaddr, uint64_t size);
+	// CopyBuffer's linear copy between memory the GPU did not write (KYTY_COPY_GUEST_MEMORY).
+	void CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size);
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	// Uploads the pending CPU writes of the buffers within `ranges`. Visits only the tracking
 	// regions that hold a registered buffer and whose pages became CPU dirty since the previous

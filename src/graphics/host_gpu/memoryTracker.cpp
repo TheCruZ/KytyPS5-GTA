@@ -92,6 +92,27 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+bool MemoryTracker::IsRegionFullyCpuModified(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	// (A region never tracked is all CPU-dirty.)
+	return !Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		return !manager->IsModified<DirtySource::Cpu, true>(offset, bytes);
+	});
+}
+
+bool MemoryTracker::MarkRegionAsCpuDirtyKeepProtection(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	if (IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+	// (A region never tracked is all CPU-dirty; a page the GPU marks meanwhile is the execution thread's, which calls this.)
+	return !Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		return !manager->MarkCpuDirtyKeepProtection(manager->GetCpuAddr() + offset, bytes);
+	});
+}
+
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
