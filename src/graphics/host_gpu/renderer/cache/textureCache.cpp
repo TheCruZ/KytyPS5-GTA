@@ -39,6 +39,15 @@ bool ImageGranulesEnabled() {
 	return value == nullptr || value[0] != '0';
 }
 
+// KYTY_GPU_MODIFIED_NO_LOCK=0: IsRegionGpuModified takes the cache's lock even where no image was ever registered.
+bool GpuModifiedNoLockEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GPU_MODIFIED_NO_LOCK");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 // KYTY_WRITE_WINDOW_HANDOFF=0: every guest write fault takes the cache's lock.
 bool WriteWindowHandoffEnabled() {
 	static const bool enabled = [] {
@@ -2706,6 +2715,11 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 
 bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
+		return false;
+	}
+	// No image over the range: no lock and no page walk (the granule words are atomic and never move). A registration
+	// racing this reader makes an image the GPU has not written yet.
+	if (GpuModifiedNoLockEnabled() && !MayHaveImages(address, size)) {
 		return false;
 	}
 	std::scoped_lock lock {m_lock};
