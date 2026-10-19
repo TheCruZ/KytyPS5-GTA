@@ -24,6 +24,8 @@ struct GpuRegisterState {
 	// Unique per snapshot of the context registers (0: live registers, not a snapshot):
 	// operations with the same id see the same context registers.
 	uint64_t context_id = 0;
+	// The same for the user configuration registers.
+	uint64_t user_config_id = 0;
 };
 
 // NUM_INSTANCES as the command processor last set it. Indirect draws also set the persistent

@@ -117,6 +117,12 @@ struct DrawAutoArgs {
 	const DrawIndirectSource* gpu_indirect      = nullptr;
 };
 
+// The hash of the context and user configuration registers under the snapshot ids it was made for
+// (NativeXprStateKeyOf, KYTY_STATE_KEY_CACHE).
+struct StateKeyCache {
+	uint64_t context_id = 0, user_config_id = 0, hash = 0;
+};
+
 struct SubmitInfo {
 	static constexpr uint32_t MaxSemaphores = 3;
 
@@ -248,7 +254,10 @@ public:
 	static void ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept;
 	// Execution thread: the context register snapshot of the operation about to execute (0 for
 	// live registers); operations with the same id see the same context registers.
-	void UseContextId(uint64_t context_id) noexcept { m_context_id = context_id; }
+	void UseContextId(uint64_t context_id, uint64_t user_config_id = 0) noexcept {
+		m_context_id     = context_id;
+		m_user_config_id = user_config_id;
+	}
 	// Execution thread: an operation of guest queue `queue` is about to execute. The barrier
 	// after a dispatch is deferred to the next operation, unless that is a dispatch of the same
 	// queue the guest did not order after it (see DispatchDirect() and DispatchIndirect()).
@@ -643,6 +652,8 @@ private:
 	                                                                                nullptr};
 	ResolvedDraw*                                                  m_resolved_draw = nullptr;
 	uint64_t                                                       m_context_id    = 0;
+	uint64_t                                                       m_user_config_id = 0;
+	StateKeyCache                                                  m_state_key_cache;
 	// The context snapshot whose registers hw_check() last accepted.
 	uint64_t m_checked_context_id = 0;
 	// The last color-target descriptions per slot; see ResolveRenderColorTarget().

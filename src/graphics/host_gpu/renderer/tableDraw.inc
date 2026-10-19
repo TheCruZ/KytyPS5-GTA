@@ -1713,7 +1713,7 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, uint
 		pair.pending.reset();
 		if (pair.refused) return TableResult::Native;
 	}
-	cache.state_key      = NativeXprStateKeyOf(buffer);
+	cache.state_key      = NativeXprStateKeyOf(buffer, &m_state_key_cache, m_context_id, m_user_config_id);
 	const auto state_key = cache.state_key;
 	// A store at most once a frame per pair and draw state: while its programs or its pipeline are on their way, the
 	// pair's draws take the normal path (Deferred).

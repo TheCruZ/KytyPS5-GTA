@@ -638,7 +638,7 @@ const T* CommandProcessor::Snapshot(SnapshotRing<T>& ring, const T& live, bool& 
 GpuRegisterState CommandProcessor::SnapshotState(uint64_t sequence) {
 	GpuRegisterState state;
 	state.context     = Snapshot(m_ctx_snapshots, m_ctx, m_ctx_dirty, sequence, &state.context_id);
-	state.user_config = Snapshot(m_ucfg_snapshots, m_ucfg, m_ucfg_dirty, sequence);
+	state.user_config = Snapshot(m_ucfg_snapshots, m_ucfg, m_ucfg_dirty, sequence, &state.user_config_id);
 	state.shaders     = Snapshot(m_sh_ctx_snapshots, m_sh_ctx, m_sh_ctx_dirty, sequence);
 	return state;
 }
@@ -685,7 +685,7 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 	BindState(operation.state);
 	m_renderer.NoteOperation(operation.submit_id, operation.after_wait);
 	auto& executor = m_renderer.GetRenderExecutor();
-	executor.UseContextId(operation.state.context_id);
+	executor.UseContextId(operation.state.context_id, operation.state.user_config_id);
 	// KYTY_INDIRECT_CHAIN=0: indirect dispatches end a chain.
 	static const bool indirect_chains = [] {
 		const char* value = std::getenv("KYTY_INDIRECT_CHAIN");

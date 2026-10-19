@@ -457,13 +457,32 @@ void NativeXprKeyOf(const CommandBuffer& buffer, std::vector<uint32_t>& key) {
 // Draw-state identity: the whole graphics context, the user configuration and the graphics shader
 // stage registers with the user-data layout (types and counts) but not the user-data values,
 // which identify the object instead.
-uint64_t NativeXprStateKeyOf(const CommandBuffer& buffer) {
+// chenxiao07's state key cache (KYTY_STATE_KEY_CACHE, default on; 0: hashed at every call): the context and user
+// configuration registers are hashed again only for other snapshots of them (the command processor's ids: the same
+// id, the same registers).
+bool StateKeyCacheEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_STATE_KEY_CACHE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+uint64_t NativeXprStateKeyOf(const CommandBuffer& buffer, StateKeyCache* cache = nullptr,
+                             uint64_t context_id = 0, uint64_t user_config_id = 0) {
 	const auto& ctx = buffer.GetRegisters();
 	const auto& cfg = buffer.GetUserConfig();
 	const auto& vs  = buffer.GetShaders().GetVs();
 	const auto& ps  = buffer.GetShaders().GetPs();
-	auto hash = XXH3_64bits(&ctx, sizeof(ctx));
-	hash      = XXH3_64bits_withSeed(&cfg, sizeof(cfg), hash);
+	uint64_t    hash = 0;
+	if (cache != nullptr && context_id != 0 && user_config_id != 0 && StateKeyCacheEnabled() &&
+	    cache->context_id == context_id && cache->user_config_id == user_config_id) {
+		hash = cache->hash;
+	} else {
+		hash = XXH3_64bits(&ctx, sizeof(ctx));
+		hash = XXH3_64bits_withSeed(&cfg, sizeof(cfg), hash);
+		if (cache != nullptr) *cache = {context_id, user_config_id, hash};
+	}
 	hash      = XXH3_64bits_withSeed(&vs.es_regs, sizeof(vs.es_regs), hash);
 	hash      = XXH3_64bits_withSeed(&vs.ls_regs, sizeof(vs.ls_regs), hash);
 	hash      = XXH3_64bits_withSeed(&vs.hs_regs, sizeof(vs.hs_regs), hash);
@@ -1833,7 +1852,7 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, uint64_t args_addr, uin
 		return false;
 	}
 	++cache.counters.tries;
-	cache.state_key = NativeXprStateKeyOf(buffer);
+	cache.state_key = NativeXprStateKeyOf(buffer, &m_state_key_cache, m_context_id, m_user_config_id);
 	NativeXprKeyOf(buffer, cache.key);
 	const auto hash  = NativeXprHash(cache.key);
 	cache.tried_hash = hash;
