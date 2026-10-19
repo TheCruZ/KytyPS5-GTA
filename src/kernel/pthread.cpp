@@ -512,6 +512,21 @@ static void SchedulerBackoffOnce() {
 #endif
 }
 
+// chenxiao07's short sleeps (KYTY_SHORT_SLEEP_SPIN=1, off by default: see threads.cpp): a guest sleep of at most 1 us
+// gives the CPU to another ready thread instead of a timer wait.
+static bool SleepMicroSchedulerBackoff(uint64_t microseconds) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SHORT_SLEEP_SPIN");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled || microseconds > 1) {
+		return false;
+	}
+
+	SchedulerBackoffOnce();
+	return true;
+}
+
 static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 	if (microseconds == 0) {
 		KernelDispatchPendingSignalForCurrentThread();
@@ -520,7 +535,9 @@ static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 
 	while (microseconds > 0) {
 		const auto step = std::min<uint64_t>(microseconds, SIGNAL_APC_POLL_MICROS);
-		Common::Thread::SleepMicro(step);
+		if (!SleepMicroSchedulerBackoff(step)) {
+			Common::Thread::SleepMicro(step);
+		}
 		microseconds -= step;
 		KernelDispatchPendingSignalForCurrentThread();
 	}

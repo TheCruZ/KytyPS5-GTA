@@ -2,7 +2,9 @@
 
 #include "common/assert.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cerrno>
 #include <chrono>             // IWYU pragma: keep
 #include <condition_variable> // IWYU pragma: keep
@@ -21,15 +23,48 @@
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
 // IWYU pragma: no_include <winbase.h>
-constexpr DWORD KYTY_CS_SPIN_COUNT = 4000;
+constexpr DWORD    KYTY_CS_SPIN_COUNT          = 4000;
+constexpr uint64_t KYTY_SLEEP_SPIN_LIMIT_100NS = 500; // 50 us
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
+// chenxiao07's short sleeps (KYTY_SHORT_SLEEP_SPIN=1): a sleep of up to 50 us spins, where a kernel transition and the
+// timer's resolution (0.5-1 ms in practice) cost more than the delay. Off by default: the spinning guest threads took
+// the CPUs of the GPU threads (Demon's Souls in game 26.3 -> 24.3 fps).
+static bool ShortSleepSpinEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SHORT_SLEEP_SPIN");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 static void SleepHighResolution100ns(uint64_t units_100ns) {
 	if (units_100ns == 0) {
 		return;
+	}
+
+	if (units_100ns <= KYTY_SLEEP_SPIN_LIMIT_100NS && ShortSleepSpinEnabled()) {
+		LARGE_INTEGER frequency {};
+		LARGE_INTEGER start {};
+		if (QueryPerformanceFrequency(&frequency) != 0 && QueryPerformanceCounter(&start) != 0 &&
+		    frequency.QuadPart > 0) {
+			const auto wait_ticks =
+			    static_cast<LONGLONG>((static_cast<long double>(units_100ns) *
+			                           static_cast<long double>(frequency.QuadPart)) /
+			                          10000000.0L);
+			const auto    deadline = start.QuadPart + std::max<LONGLONG>(wait_ticks, 1);
+			LARGE_INTEGER now {};
+			do {
+				if (QueryPerformanceCounter(&now) == 0) {
+					break;
+				}
+				YieldProcessor();
+			} while (now.QuadPart < deadline);
+			return;
+		}
 	}
 
 	thread_local HANDLE timer = CreateWaitableTimerExW(
