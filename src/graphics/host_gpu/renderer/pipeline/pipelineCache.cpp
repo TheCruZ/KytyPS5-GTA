@@ -714,6 +714,16 @@ bool ReadShaderGuestMemoryImpl(void* userdata, uint64_t address, std::span<uint3
 }
 
 bool ReadShaderGuestMemoryRaw(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	// Guest memory starts at 0x40000: an ordinary SRT read below it goes through a null table
+	// pointer on a side of a branch the shader never takes (the SRT walk follows both sides of the
+	// ones it cannot decide: ASTRO BOT's tiled lighting compute reads a shadow descriptor through
+	// a pointer it loads under an exec branch, null on the side it does not take). Nothing is
+	// mapped there, so it reads zero for every thread instead of refusing, which dropped the
+	// whole dispatch and left the lit surfaces black. Strict reads keep failing.
+	if (address < 0x40000u && !values.empty()) {
+		std::ranges::fill(values, 0u);
+		return true;
+	}
 	const SrtQualifyRead qualify(address, values);
 	const bool           ok = ReadShaderGuestMemoryRawImpl(userdata, address, values);
 	qualify.Finish(ok, values);
