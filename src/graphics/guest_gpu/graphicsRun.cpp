@@ -219,25 +219,57 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 	done.acquire();
 }
 
+// chenxiao07's synchronous-command handshake (KYTY_URGENT_SPIN, default on; 0 keeps the semaphore): the guest thread
+// waiting for an urgent command spins a while (~20 us, about what the command waits for its turn and runs) before it
+// sleeps, and the execution thread wakes it with a system call only if it did. With the semaphore, every waiter slept
+// at once and every command paid a wake-up (Demon's Souls: ~130 urgent commands a frame, two per guest readback).
+static bool UrgentSpinEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_URGENT_SPIN");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 void GuestGpu::SendUrgentCommandSync(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!command);
 	if (!m_pipelined || IsGpuThread() || g_cp_thread) {
 		SendCommandSync(std::move(command));
 		return;
 	}
-	std::binary_semaphore done {0};
-	{
+	const auto queue = [this](Common::UniqueFunction<void>&& wrapped) {
 		std::lock_guard lock(m_urgent_mutex);
-		m_urgent_commands.push_back([operation = std::move(command), &done]() mutable {
-			operation();
-			done.release();
-		});
+		m_urgent_commands.push_back(std::move(wrapped));
 		m_urgent_pending.fetch_add(1, std::memory_order_release);
-	}
+	};
 	// A busy execution thread runs the command before its next operation; an idle one is woken
 	// from its wait for operations. (Not through the command processor: it may be waiting for the
 	// execution thread itself, which waits for the operation the faulting resolve thread holds.)
-	(m_resolving ? m_resolved : m_operations).Interrupt();
+	const auto wake = [this] { (m_resolving ? m_resolved : m_operations).Interrupt(); };
+	if (UrgentSpinEnabled()) {
+		// 0 waiting, 1 done, 2 the caller sleeps.
+		constexpr uint32_t    Spins = 500;
+		std::atomic<uint32_t> state {0};
+		queue([operation = std::move(command), &state]() mutable {
+			operation();
+			if (state.exchange(1, std::memory_order_acq_rel) == 2) state.notify_one();
+		});
+		wake();
+		for (uint32_t spin = 0; spin < Spins; ++spin) {
+			if (state.load(std::memory_order_acquire) == 1) return;
+			Common::SpinPause();
+		}
+		uint32_t expected = 0;
+		if (!state.compare_exchange_strong(expected, 2, std::memory_order_acq_rel)) return; // (done meanwhile)
+		while (state.load(std::memory_order_acquire) != 1) state.wait(2, std::memory_order_acquire);
+		return;
+	}
+	std::binary_semaphore done {0};
+	queue([operation = std::move(command), &done]() mutable {
+		operation();
+		done.release();
+	});
+	wake();
 	done.acquire();
 }
 
