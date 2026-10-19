@@ -577,6 +577,35 @@ void TestDeferredReadProtection() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+void TestWatchedSpan() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(page_size * 8);
+  const auto base = reinterpret_cast<uint64_t>(memory);
+  uint64_t first = 0, end = 0;
+
+  g_protection_calls = 0;
+  Check(!manager.WatchedSpan(base, page_size * 8, &first, &end),
+        "an unwatched range had a watched span");
+  manager.UpdatePageWatchers<true>(base + page_size * 2, page_size);
+  manager.UpdatePageWatchers<true>(base + page_size * 5, page_size);
+  const auto calls = g_protection_calls;
+  Check(manager.WatchedSpan(base, page_size * 8, &first, &end) &&
+            first == base + page_size * 2 && end == base + page_size * 6,
+        "the watched span did not run from the first to the last watched page");
+  Check(manager.WatchedSpan(base + 8, page_size, &first, &end) == false,
+        "a span of unwatched pages was watched");
+  Check(manager.WatchedSpan(base + page_size * 5 + 100, 16, &first, &end) &&
+            first == base + page_size * 5 && end == base + page_size * 6,
+        "a range inside a watched page had no span");
+  Check(g_protection_calls == calls, "WatchedSpan made a system call");
+  manager.UpdatePageWatchers<false>(base + page_size * 2, page_size);
+  manager.UpdatePageWatchers<false>(base + page_size * 5, page_size);
+  Check(!manager.WatchedSpan(base, page_size * 8, &first, &end),
+        "released pages stayed in the watched span");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestRegionEndpointBatching() {
   PageManager manager;
   constexpr auto page_size = TRACKER_PAGE_SIZE;
@@ -852,6 +881,7 @@ int main(int argc, char **argv) {
   TestRegionMaskWatcherRanges();
   TestRegionEndpointBatching();
   TestDeferredReadProtection();
+  TestWatchedSpan();
   TestReadWriteWatcherInteractions();
   TestConcurrentSharedWatchers();
   TestFatalPaths();

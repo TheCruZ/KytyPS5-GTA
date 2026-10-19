@@ -17,6 +17,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -30,6 +31,13 @@
 #include <iterator>
 #include <variant>
 #include <vector>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #ifdef min
 #undef min
@@ -1407,6 +1415,90 @@ static bool AdvanceCommandBuffer(uint64_t command_buffer, uint64_t record_size) 
 	return CommitCommandBufferRecord(command_buffer, &state, record_size);
 }
 
+// chenxiao07's kept-open files (KYTY_APR_KEPT_FILES, default on; 0 opens and closes the file for each read, and
+// invalidates the whole destination range): opened per read, a streamed file (audio, read 16 KiB at a time) lost the
+// cache manager's read-ahead at each close, so each chunk was a disk read of its own, and every open paid the
+// metadata and the antivirus's scan. Windows only. The game's files are read-only: the handles are never closed.
+// Positional reads into a buffer of the thread's (the kernel cannot write into write-protected guest pages), then
+// copied. The pages of the destination the trackers protect are made the host's first, once for the whole read
+// (Memory::PrepareHostOverwrite: GPU-written bytes it replaces dropped, writable at once; a page protected again
+// meanwhile faults as before), not the whole range (a range of unwatched pages needs no call at all).
+static bool AprKeptFilesEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_APR_KEPT_FILES");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+static std::mutex                                 g_kept_files_mutex;
+static std::unordered_map<std::wstring, HANDLE>   g_kept_files;
+
+static HANDLE OpenKeptReadFile(const std::filesystem::path& path) {
+	const auto key = path.wstring();
+	{
+		std::lock_guard lock(g_kept_files_mutex);
+		if (const auto found = g_kept_files.find(key); found != g_kept_files.end()) {
+			return found->second;
+		}
+	}
+	// Opened outside the lock: an open can take 100-400 ms under load, and the reads of the files kept open already
+	// must not wait behind it. (Others may read and write it meanwhile: the handle only reads.)
+	HANDLE handle = CreateFileW(key.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+	                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (handle == INVALID_HANDLE_VALUE) {
+		return INVALID_HANDLE_VALUE;
+	}
+	std::lock_guard lock(g_kept_files_mutex);
+	const auto [kept, added] = g_kept_files.try_emplace(key, handle);
+	if (!added) {
+		CloseHandle(handle); // (another thread opened it meanwhile: its handle is the one kept)
+	}
+	return kept->second;
+}
+
+// The read through a kept file; false when the file cannot be kept (the caller reads it the other way: archive members,
+// directories, files that do not open).
+static bool ReadKeptFileToGuest(const std::filesystem::path& host_path, uint64_t file_offset, uint64_t destination,
+                                uint64_t size, uint64_t* bytes_read) {
+	const HANDLE file = OpenKeptReadFile(host_path);
+	if (file == INVALID_HANDLE_VALUE) {
+		return false;
+	}
+	LARGE_INTEGER length {};
+	if (GetFileSizeEx(file, &length) == 0) {
+		return false;
+	}
+	const auto file_size = static_cast<uint64_t>(length.QuadPart); // (asked each time: a file may have grown)
+	if (file_offset >= file_size) {
+		return true;
+	}
+	const auto readable = std::min<uint64_t>(size, file_size - file_offset);
+	LibKernel::Memory::PrepareHostOverwrite(destination, readable);
+	static thread_local std::vector<uint8_t> buffer;
+	const auto buffer_size = static_cast<size_t>(std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable));
+	if (buffer.size() < buffer_size) {
+		buffer.resize(buffer_size);
+	}
+	while (*bytes_read < readable) {
+		const auto request = static_cast<DWORD>(std::min<uint64_t>(buffer.size(), readable - *bytes_read));
+		// A positional read (the handle is synchronous: it returns when done), so threads share the handle.
+		OVERLAPPED at {};
+		const auto offset = file_offset + *bytes_read;
+		at.Offset         = static_cast<DWORD>(offset);
+		at.OffsetHigh     = static_cast<DWORD>(offset >> 32u);
+		DWORD read        = 0;
+		if (ReadFile(file, buffer.data(), request, &read, &at) == 0 || read == 0) {
+			break;
+		}
+		std::memcpy(reinterpret_cast<void*>(destination + *bytes_read), buffer.data(), read);
+		*bytes_read += read;
+	}
+	return true;
+}
+#endif
+
 static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t file_offset,
                                uint64_t destination, uint64_t size, uint64_t* bytes_read) {
 	if (bytes_read == nullptr) {
@@ -1420,6 +1512,11 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 	if (!AprShared::IsValidGuestRange(destination, size, true)) {
 		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (AprKeptFilesEnabled() && ReadKeptFileToGuest(host_path, file_offset, destination, size, bytes_read)) {
+		return OK;
+	}
+#endif
 
 	Common::File file;
 	if (!file.Open(host_path, Common::File::Mode::Read)) {

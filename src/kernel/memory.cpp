@@ -1151,6 +1151,25 @@ bool InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size) {
 	return g_gpu_resources->InvalidateMemoryForWrite(vaddr, size);
 }
 
+void PrepareHostOverwrite(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || UINT64_MAX - vaddr < size || g_gpu_resources == nullptr) {
+		return;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// From the first page a store would fault on to the end of the last one, of those the trackers protect: by the
+	// pages' state. (A VirtualQuery walk cost more than the reads at start-up: the kernel scans a region's page table to
+	// its end.)
+	uint64_t first = 0, end = 0;
+	if (g_gpu_resources->WatchedSpan(vaddr, size, &first, &end)) {
+		first = std::max(first, vaddr);
+		end   = std::min(end, vaddr + size);
+		(void)g_gpu_resources->InvalidateMemoryForWrite(first, end - first);
+	}
+#else
+	(void)g_gpu_resources->InvalidateMemoryForWrite(vaddr, size);
+#endif
+}
+
 bool InvalidateImages(uint64_t vaddr, uint64_t size) {
 	if (size == 0 || g_gpu_resources == nullptr) {
 		return false;

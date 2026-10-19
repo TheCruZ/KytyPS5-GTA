@@ -153,6 +153,11 @@ void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 // InvalidateMemory, but GPU-written bytes the write replaces whole are dropped instead of read back.
 // False when the range is not GPU memory (writes fault as before).
 bool                   InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
+// Before a host write of all of [vaddr, vaddr + size) (KYTY_APR_KEPT_FILES: a file read): as InvalidateMemoryForWrite, but
+// only for the pages the trackers protect (from the first to the last of them, by their state: no system call), the
+// only ones the write would fault on. A page the guest itself protects faults as before. Windows only; elsewhere the
+// whole range.
+void                   PrepareHostOverwrite(uint64_t vaddr, uint64_t size);
 // The images over the range only, as InvalidateMemory makes them (CPU-written).
 bool                   InvalidateImages(uint64_t vaddr, uint64_t size);
 // For a fault in a guest range briefly unmapped while the emulator replaced its mapping (MAP_FIXED

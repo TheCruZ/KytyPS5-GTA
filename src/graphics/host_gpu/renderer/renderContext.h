@@ -140,6 +140,10 @@ public:
 	// Before a host write of all of the range: GPU-written bytes it replaces are dropped.
 	[[nodiscard]] bool InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool InvalidateImages(uint64_t vaddr, uint64_t size);
+	// The pages of a range the trackers protect (PageManager::WatchedSpan).
+	[[nodiscard]] bool WatchedSpan(uint64_t vaddr, uint64_t size, uint64_t* first, uint64_t* end) const noexcept {
+		return m_page_manager.WatchedSpan(vaddr, size, first, end);
+	}
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	// Advances whenever a range is mapped or unmapped.
 	[[nodiscard]] uint64_t MappedRangesVersion() const noexcept;
