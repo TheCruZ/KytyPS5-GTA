@@ -11284,11 +11284,15 @@ void TestMemoryFedScalarLeafCall() {
   const uint32_t joined[] = {
       EncodeSopp(0x04, 2), EncodeSMovB32(14, 129), EncodeSopp(0x02, 1),
       EncodeSMovB32(14, 130), EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
-  ExpectFatal([&] { (void)PrepareShaderSource(joined, options); },
-              "ambiguous reaching definitions were accepted for a call target");
+  // Two paths writing the target differently leave it unknown before the shader runs: the call
+  // is reported unsupported (its dispatch is skipped) instead of ending the emulator.
+  const auto joined_source = PrepareShaderSource(joined, options);
+  Check(joined_source.unsupported_call_pc == 16u && joined_source.calls.empty(),
+        "ambiguous reaching definitions were accepted for a call target");
   const uint32_t multiple[] = {EncodeSop1(0x21, 14, 14), EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
-  ExpectFatal([&] { (void)PrepareShaderSource(multiple, options); },
-              "a native return pair was accepted as a later call target");
+  const auto multiple_source = PrepareShaderSource(multiple, options);
+  Check(multiple_source.unsupported_call_pc == 4u && multiple_source.calls.empty(),
+        "a native return pair was accepted as a later call target");
 #endif
 }
 
