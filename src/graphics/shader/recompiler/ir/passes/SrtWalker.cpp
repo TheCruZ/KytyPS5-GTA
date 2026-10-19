@@ -18,6 +18,15 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+namespace {
+
+// Guest memory starts at HOST_SYSTEM_MANAGED_MIN (memoryAddressSpace.inc), so a table pointer or an
+// ordinary read below it comes from a null table pointer. The walker reaches such reads when it
+// follows both sides of a branch it cannot decide, so read zero there instead of faulting the host.
+constexpr uint64_t GUEST_MEMORY_MIN = 0x40000;
+
+} // namespace
+
 SrtRuntime SrtReadCapture::ObservedRuntime() {
 	auto runtime = m_source;
 	runtime.userdata = this;
@@ -32,10 +41,31 @@ bool SrtReadCapture::Read(void* userdata, uint64_t address, std::span<uint32_t> 
 		return false;
 	}
 	capture.m_ranges.emplace_back(address, values.size_bytes());
-	if (capture.m_slots != nullptr) {
-		capture.m_slots->push_back(NoSrtSlot);
+	return true;
+}
+
+bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto& capture = *static_cast<SrtReadCapture*>(userdata);
+	if (capture.m_source.read_memory != nullptr) {
+		if (!capture.m_source.read_memory(capture.m_source.userdata, address, values)) return false;
+		if (address < GUEST_MEMORY_MIN) {
+			// The reader answered a null table with zeros: nothing is mapped there, so the bytes
+			// cannot change and need no entry in the read set that is validated later.
+			return true;
+		}
+	} else if (address < GUEST_MEMORY_MIN) {
+		// A null table pointer (see ReadRawWord): zero, and nothing to validate later.
+		std::ranges::fill(values, 0u);
+		return true;
+	} else {
+		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	}
 	return true;
+}
+
+bool SrtReadCapture::ReadsHostMemory(const SrtRuntime& runtime) {
+	return runtime.read_memory == ReadOrdinary &&
+	       static_cast<const SrtReadCapture*>(runtime.userdata)->m_source.read_memory == nullptr;
 }
 
 SrtRuntime CleanRuntime(SrtRuntime runtime) {
@@ -486,7 +516,46 @@ private:
 		Kind     kind  = Kind::Unknown;
 		uint64_t value = 0;
 
-		bool operator==(const Operand& other) const = default;
+	program.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
+	auto& code = *program.srt_code;
+	Xbyak::Label failed, finished;
+	code.push(code.rbp);
+	code.mov(code.rbp, code.rsp);
+	code.cmp(code.r8, user_data_count);
+	code.jb(failed, Xbyak::CodeGenerator::T_NEAR);
+	code.mov(code.r9, AddressMask & ~uint64_t {3});
+	// Follow shadPS4's VisitPointer: copy one table level in offset order, then
+	// descend through its child pointers. Seed the descriptor evaluator's memo.
+	const auto visit = [&](auto&& self, int32_t pointer_offset, const Reads& reads) -> void {
+		code.push(code.rdi);
+		code.mov(code.rdi, code.qword[code.rdi + pointer_offset]);
+		code.and_(code.rdi, code.r9);
+		const auto first = reads.begin()->first;
+		const auto last = reads.rbegin()->first;
+		// Tables below guest memory and underflowing reads fall back to the interpreted walk.
+		code.mov(code.r10, GUEST_MEMORY_MIN + static_cast<uint64_t>(-std::min<int64_t>(first, 0)));
+		code.cmp(code.rdi, code.r10);
+		code.jb(failed, Xbyak::CodeGenerator::T_NEAR);
+		if (last > 0) {
+			code.mov(code.r10, AddressMask - last);
+			code.cmp(code.rdi, code.r10);
+			code.ja(failed, Xbyak::CodeGenerator::T_NEAR);
+		}
+		for (const auto& [offset, read]: reads) {
+			const auto index = read->value.ResolveInstruction()->EvaluationIndex(program.evaluation_value_count);
+			using Entry = ResourcePlan::EvaluationContext::Entry;
+			const auto slot = code.rdx + index * sizeof(Entry);
+			code.mov(code.r10d, code.dword[code.rdi + offset]);
+			code.mov(code.dword[code.rsi + read->flat_offset * sizeof(uint32_t)], code.r10d);
+			code.mov(code.qword[slot + offsetof(Entry, value)], code.r10);
+			code.mov(code.qword[slot + offsetof(Entry, generation)], code.rcx);
+		}
+		for (const auto& [offset, read]: reads) {
+			const auto child = pointer_uses.find(read->value.ResolveInstruction());
+			if (child == pointer_uses.end()) continue;
+			self(self, offset, child->second);
+		}
+		code.pop(code.rdi);
 	};
 	// masked: the operand depends on its context's EXEC mask, so it is not the root context's.
 	struct Ref {
@@ -1672,6 +1741,17 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 }
 
 bool SrtWalker::ReadRawWord(uint64_t address, uint64_t base, uint64_t& result) {
+	// The walk evaluates both sides of a branch it cannot decide (the exec mask, a count the GPU
+	// writes), so it reads through table pointers that only the side the shader never takes
+	// leaves null: the shader guards those loads itself (it tests the pointer or has no lane
+	// active) and, taken, they would fault on the console. Guest memory starts at 0x40000, so a
+	// host-memory read through a table below it reads zero, whatever its offset: the values of a
+	// side that does not run cannot reach a descriptor the draw uses.
+	if (base < GUEST_MEMORY_MIN &&
+	    (m_runtime.read_memory == nullptr || SrtReadCapture::ReadsHostMemory(m_runtime))) {
+		result = 0;
+		return true;
+	}
 	if (m_fill_active && (m_fill_any || m_reading_inst == m_fill_inst) &&
 	    m_runtime.gpu_written(address, sizeof(uint32_t))) {
 		// Only the shader uses this slot: the GPU copies the bytes into the flat buffer before
@@ -1702,6 +1782,8 @@ bool SrtWalker::ReadRawWord(uint64_t address, uint64_t base, uint64_t& result) {
 		}
 	}
 	if (m_runtime.read_memory != nullptr) {
+		// Names the shader for the notices of the memory callbacks.
+		const Common::HackNotice::ScopedShader shader(m_program.shader_hash);
 		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
 			// A plan without control flow cannot tell a guarded read from an active one: a
 			// failed read through a null base there reads zero (CS 0x0b4b91abfed42248 tests
@@ -2138,8 +2220,11 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		m_context.values.resize(m_program.evaluation_value_count);
 		using Walker = bool KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*,
 		    ResourcePlan::EvaluationContext::Entry*, uint64_t, size_t);
-		return m_program.srt_code->getCode<Walker>()(m_runtime.user_data.data(), flat.data(),
-		    m_context.values.data(), m_context.generation, m_runtime.user_data.size());
+		if (m_program.srt_code->getCode<Walker>()(m_runtime.user_data.data(), flat.data(),
+		                                          m_context.values.data(), m_context.generation,
+		                                          m_runtime.user_data.size())) {
+			return true;
+		}
 	}
 	const auto refresh = [&](uint32_t slot) {
 		if (slot >= m_program.srt_reads.size()) return false;

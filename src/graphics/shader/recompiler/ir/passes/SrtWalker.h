@@ -87,6 +87,8 @@ public:
 	               std::vector<uint32_t>* slots = nullptr):
 	    m_source(source), m_ranges(ranges), m_slots(slots) {}
 	SrtRuntime ObservedRuntime();
+	// True when the runtime's ordinary reads copy host memory directly.
+	static bool ReadsHostMemory(const SrtRuntime& runtime);
 
 private:
 	static bool Read(void* userdata, uint64_t address, std::span<uint32_t> values);
