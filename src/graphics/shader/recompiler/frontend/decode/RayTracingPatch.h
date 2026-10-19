@@ -4,14 +4,16 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 
 #include <cstdint>
-#include <span>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 
 // Native ray tracing of guest BVH traversal loops.
 //
-// GTA V traverses its BVHs in software: a wave-wide loop pops a node from a stack kept in VGPR
-// lanes, tests it with IMAGE_BVH_INTERSECT_RAY and pushes the children the lanes hit. Box nodes
+// Games using sce::Psr traverse its BVHs in software, with a traversal loop of the library
+// compiled into their shaders (the variants GTA V uses are recognized; Astro Bot's are not yet).
+// In the packet variant a wave-wide loop pops a node from a stack kept in
+// VGPR lanes, tests it with IMAGE_BVH_INTERSECT_RAY and pushes the children the lanes hit. Box nodes
 // are 9 of 10 node visits. The patch keeps the guest code that sets up an instance (object
 // space ray, BLAS descriptors) and the code of a leaf (triangle tests, alpha test, results), and
 // replaces the stack walk with ray queries over host acceleration structures whose primitives
@@ -93,19 +95,21 @@ struct RayTracingSite {
 constexpr uint32_t NoAlphaOff = 0xffffffffu;
 
 struct RayTracingPatch {
-	uint64_t                         shader_hash = 0;
-	std::span<const RayTracingSite> sites;
+	std::vector<RayTracingSite> sites;
 	// The guest TLAS header: the 64-bit value at user data pointer `user_sgpr` + `header_offset`.
-	uint32_t                         user_sgpr     = 0;
-	uint32_t                         header_offset = 0;
-	uint32_t                         root          = 0;
+	uint32_t                    user_sgpr     = 0;
+	uint32_t                    header_offset = 0;
+	uint32_t                    root          = 0;
 };
 
-// The patch of a shader, or null.
-[[nodiscard]] const RayTracingPatch* FindRayTracingPatch(uint64_t shader_hash) noexcept;
+// Finds the traversal loops of a decoded program by their structure (see RayTracingPatch.cpp);
+// false when the program has none, or one that does not match in every detail (the program
+// keeps its own traversal).
+bool DeriveRayTracingPatch(const Program& program, RayTracingPatch& patch);
 
-// Applies `patch` to a decoded program. Returns false, leaving the program unchanged, when the
-// program does not match what the patch expects.
+// Applies `patch` to a decoded program (and records its TLAS source in
+// Program::ray_tracing_source). Returns false, leaving the program unchanged, when the program
+// does not match what the patch expects.
 bool ApplyRayTracingPatch(const RayTracingPatch& patch, Program& program);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder
