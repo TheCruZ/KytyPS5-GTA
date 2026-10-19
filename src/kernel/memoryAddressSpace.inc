@@ -41,6 +41,20 @@ static bool ParkUnmapsEnabled() {
 	return enabled;
 }
 
+// chenxiao07's maps and unmaps outside the address-space lock (KYTY_MAP_OUTSIDE_LOCK, on unless it is 0).
+// GuestAddressSpace::MapBacking and UnmapBacking held the lock exclusively during their system calls (cutting
+// placeholders, mapping and unmapping views, unmapping a whole view to split it): the page protections of the GPU
+// trackers (ProtectTransient, a shared lock; every write fault of every guest thread goes through one) all waited
+// behind it, up to milliseconds for a big view. With the switch on the range is marked busy instead, the system calls
+// run without the lock, and only what overlaps the busy range waits. Off: the lock is held throughout.
+static bool MapOutsideLockEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_MAP_OUTSIDE_LOCK");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 // Ranges parked in their views, taken out of the working set by a thread of their own: mapped,
 // their pages stayed counted in use, and dropping them (VirtualUnlock on pages that are not locked)
 // costs ~0.5 us per 4 KiB page, which the guest's threads no longer pay. Harmless when late: on a
@@ -820,6 +834,33 @@ public:
 		return FirstParkedUnlocked(vaddr, size) != m_parked.end();
 	}
 
+	// Whether ranges parked in views overlap [vaddr, vaddr + size); the span of their views widens
+	// [*begin, *end) (Materialize unmaps those views and maps their other parts again).
+	bool ParkedViews(uint64_t vaddr, uint64_t size, uint64_t* begin, uint64_t* end) {
+		std::shared_lock lock(m_mutex);
+		bool             found = false;
+		for (auto it = FirstParkedUnlocked(vaddr, size); it != m_parked.end() && it->first < vaddr + size; ++it) {
+			const auto view = FindViewUnlocked(it->first);
+			EXIT_IF(view == m_views.end());
+			*begin = std::min(*begin, view->first);
+			*end   = std::max(*end, view->first + view->second);
+			found  = true;
+		}
+		return found;
+	}
+
+	// The span of the views over [vaddr, vaddr + size), widening [*begin, *end): an unmap there unmaps
+	// the first and the last view whole to map their other parts again, or releases them.
+	void ViewSpan(uint64_t vaddr, uint64_t size, uint64_t* begin, uint64_t* end) {
+		std::shared_lock lock(m_mutex);
+		if (const auto view = FindViewUnlocked(vaddr); view != m_views.end()) {
+			*begin = std::min(*begin, view->first);
+		}
+		if (const auto view = FindViewUnlocked(vaddr + size - 1); view != m_views.end()) {
+			*end = std::max(*end, view->first + view->second);
+		}
+	}
+
 	// The end of the parked range holding `vaddr`, 0 when none.
 	uint64_t ParkedEnd(uint64_t vaddr) {
 		std::shared_lock lock(m_mutex);
@@ -1403,6 +1444,7 @@ public:
 			return false;
 		}
 		std::shared_lock lock(m_mutex);
+		WaitNotBusy(lock, vaddr, size);
 		if constexpr (!copy_private) {
 			auto mapping = m_mapped.upper_bound(vaddr);
 			if (mapping != m_mapped.begin()) {
@@ -1440,7 +1482,8 @@ public:
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
+		std::unique_lock lock(m_mutex);
+		WaitNotBusy(lock, vaddr, size);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
@@ -1455,12 +1498,19 @@ public:
 		}
 
 		std::shared_lock lock(m_mutex);
+		// (Not while a map or unmap is changing the range outside the lock: MapBackingOutsideLock.)
+		WaitNotBusy(lock, vaddr, size);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
 	bool MapBacking(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                VirtualMemory::Mode               mode,
 	                GuestBackingStore::FailureReason* failure_reason = nullptr) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (MapOutsideLockEnabled()) {
+			return MapBackingOutsideLock(vaddr, size, backing_offset, mode, failure_reason);
+		}
+#endif
 		std::lock_guard lock(m_mutex);
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		const bool replacing = ContainsMappedUnlocked(vaddr, size, MappingType::Backing);
@@ -1490,6 +1540,11 @@ public:
 	}
 
 	bool UnmapBacking(uint64_t vaddr, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (MapOutsideLockEnabled()) {
+			return UnmapBackingOutsideLock(vaddr, size);
+		}
+#endif
 		std::lock_guard lock(m_mutex);
 		if (!ContainsMappedUnlocked(vaddr, size, MappingType::Backing)) {
 			return false;
@@ -1557,7 +1612,13 @@ public:
 	}
 
 	bool Commit(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-		std::lock_guard lock(m_mutex);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (MapOutsideLockEnabled()) {
+			MaterializeParkedOutsideLock(vaddr, size);
+		}
+#endif
+		std::unique_lock lock(m_mutex);
+		WaitNotBusy(lock, vaddr, size);
 		MaterializeParkedUnlocked(vaddr, size);
 		if (!ConsumeUnlocked(vaddr, size)) {
 			return false;
@@ -1593,7 +1654,8 @@ public:
 		if (vaddr == 0 || size == 0 || !IsPageAligned(vaddr) || !IsPageAligned(size)) {
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
+		std::unique_lock lock(m_mutex);
+		WaitNotBusy(lock, vaddr, size);
 		if (!ContainsMappedUnlocked(vaddr, size, MappingType::Private)) {
 			return false;
 		}
@@ -1697,6 +1759,196 @@ private:
 		}
 		return true;
 	}
+
+	// Whether a backing map or unmap is changing a range that overlaps [vaddr, vaddr + size) outside the lock
+	// (MapBackingOutsideLock, UnmapBackingOutsideLock). Called with m_mutex held.
+	[[nodiscard]] bool BusyUnlocked(uint64_t vaddr, uint64_t size) const {
+		for (const auto& [begin, end]: m_busy) {
+			if (vaddr < end && begin < vaddr + size) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// Returns once no map or unmap is changing [vaddr, vaddr + size) (the lock is released while it waits).
+	template <typename Lock>
+	void WaitNotBusy(Lock& lock, uint64_t vaddr, uint64_t size) {
+		if (!BusyUnlocked(vaddr, size)) {
+			return;
+		}
+		m_busy_done.wait(lock, [&] { return !BusyUnlocked(vaddr, size); });
+	}
+
+	void EraseBusyUnlocked(uint64_t begin, uint64_t end) {
+		const auto it =
+		    std::find(m_busy.begin(), m_busy.end(), std::pair<uint64_t, uint64_t> {begin, end});
+		EXIT_IF(it == m_busy.end());
+		m_busy.erase(it);
+	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// A free entry consumed with its placeholder split later (SplitPlaceholders, outside the lock).
+	struct FreeSplit {
+		uint64_t base = 0;
+		uint64_t end  = 0; // the free entry
+	};
+
+	// ConsumeUnlocked's free-list change without its system calls: the remainders become free entries now.
+	bool ConsumeDeferredUnlocked(uint64_t vaddr, uint64_t size, FreeSplit* split) {
+		const auto it = FindContaining(vaddr, size);
+		if (it == m_free.end()) {
+			return false;
+		}
+		split->base = it->first;
+		split->end  = it->first + it->second;
+		m_free.erase(it);
+		if (split->base != vaddr) {
+			m_free.emplace(split->base, vaddr - split->base);
+		}
+		if (vaddr + size != split->end) {
+			m_free.emplace(vaddr + size, split->end - (vaddr + size));
+		}
+		return true;
+	}
+
+	// The placeholder of a consumed free entry split around [vaddr, vaddr + size) (SplitUnlocked's calls).
+	// False when a split failed (RestoreSplitUnlocked).
+	static bool SplitPlaceholders(const FreeSplit& split, uint64_t vaddr, uint64_t size) {
+		if (split.base != vaddr &&
+		    VirtualFree(reinterpret_cast<void*>(split.base), vaddr - split.base,
+		                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0) {
+			LOGF_COLOR(Log::Color::Red,
+			           "\t guest placeholder split failed: base=0x%016" PRIx64 " size=0x%016" PRIx64
+			           " requested=0x%016" PRIx64 " request_size=0x%016" PRIx64 " error=0x%08" PRIx32 "\n",
+			           split.base, split.end - split.base, vaddr, size,
+			           static_cast<uint32_t>(GetLastError()));
+			return false;
+		}
+		if (vaddr + size != split.end &&
+		    VirtualFree(reinterpret_cast<void*>(vaddr), size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0) {
+			LOGF_COLOR(Log::Color::Red,
+			           "\t guest placeholder split failed: base=0x%016" PRIx64 " size=0x%016" PRIx64
+			           " requested=0x%016" PRIx64 " request_size=0x%016" PRIx64 " error=0x%08" PRIx32 "\n",
+			           vaddr, split.end - vaddr, vaddr, size, static_cast<uint32_t>(GetLastError()));
+			return false;
+		}
+		return true;
+	}
+
+	// A map that failed gives its free entry back whole, its placeholders (the ones split) made one again.
+	void RestoreSplitUnlocked(const FreeSplit& split) {
+		m_free.erase(m_free.lower_bound(split.base), m_free.lower_bound(split.end));
+		// (Coalescing one placeholder fails: nothing was split then.)
+		(void)CoalescePlaceholders(split.base, split.end - split.base);
+		m_free.emplace(split.base, split.end - split.base);
+	}
+
+	// MapBacking with its system calls outside the lock (KYTY_MAP_OUTSIDE_LOCK): the free-list change and the
+	// bookkeeping of the mapping under the lock, the range marked busy in between. Guest maps and unmaps run one at a
+	// time (g_memory_operation_mutex): another change over the range is only waited for here, and what waits for
+	// the busy range is the protection of the GPU trackers' pages and the readers of the mappings.
+	bool MapBackingOutsideLock(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
+	                           VirtualMemory::Mode               mode,
+	                           GuestBackingStore::FailureReason* failure_reason) {
+		MaterializeParkedOutsideLock(vaddr, size);
+		FreeSplit split;
+		{
+			std::unique_lock lock(m_mutex);
+			WaitNotBusy(lock, vaddr, size);
+			if (!ConsumeDeferredUnlocked(vaddr, size, &split)) {
+				if (failure_reason != nullptr) {
+					*failure_reason = GuestBackingStore::FailureReason::AddressRangeUnavailable;
+				}
+				return false;
+			}
+			m_busy.emplace_back(vaddr, vaddr + size);
+		}
+		const auto host_mode = VirtualMemory::IsExecute(mode) ? VirtualMemory::Mode::ExecuteReadWrite
+		                                                      : VirtualMemory::Mode::ReadWrite;
+		const bool split_done = SplitPlaceholders(split, vaddr, size);
+		const bool mapped =
+		    split_done && m_backing->MapFixed(vaddr, size, backing_offset, host_mode, failure_reason);
+		if (!split_done && failure_reason != nullptr) {
+			*failure_reason = GuestBackingStore::FailureReason::AddressRangeUnavailable;
+		}
+		{
+			std::unique_lock lock(m_mutex);
+			if (mapped) {
+				EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Backing));
+			} else {
+				RestoreSplitUnlocked(split);
+			}
+			EraseBusyUnlocked(vaddr, vaddr + size);
+		}
+		m_busy_done.notify_all();
+		return mapped;
+	}
+
+	// UnmapBacking with its system calls outside the lock (KYTY_MAP_OUTSIDE_LOCK): the views over the range are busy
+	// (an unmap of part of a view unmaps the view whole to map the rest again: the pages around the range must
+	// keep their protections meanwhile).
+	bool UnmapBackingOutsideLock(uint64_t vaddr, uint64_t size) {
+		uint64_t busy_begin = vaddr;
+		uint64_t busy_end   = vaddr + size;
+		{
+			std::unique_lock lock(m_mutex);
+			for (;;) {
+				if (!ContainsMappedUnlocked(vaddr, size, MappingType::Backing)) {
+					return false;
+				}
+				busy_begin = vaddr;
+				busy_end   = vaddr + size;
+				m_backing->ViewSpan(vaddr, size, &busy_begin, &busy_end);
+				if (!BusyUnlocked(busy_begin, busy_end - busy_begin)) {
+					m_busy.emplace_back(busy_begin, busy_end);
+					break;
+				}
+				m_busy_done.wait(lock);
+			}
+		}
+		bool                                       placeholder_preserved = false;
+		std::vector<std::pair<uint64_t, uint64_t>> freed;
+		const bool                                 done =
+		    m_backing->Unmap(vaddr, size, &placeholder_preserved, &freed) && placeholder_preserved;
+		{
+			std::unique_lock lock(m_mutex);
+			if (done) {
+				EXIT_IF(!RemoveMappedUnlocked(vaddr, size, MappingType::Backing));
+				for (const auto& [freed_vaddr, freed_size]: freed) {
+					AddFreeUnlocked(freed_vaddr, freed_size);
+				}
+			}
+			EraseBusyUnlocked(busy_begin, busy_end);
+		}
+		m_busy_done.notify_all();
+		return done;
+	}
+
+	// MaterializeParkedUnlocked without the lock held during its system calls: the views are busy meanwhile.
+	void MaterializeParkedOutsideLock(uint64_t vaddr, uint64_t size) {
+		uint64_t begin = UINT64_MAX;
+		uint64_t end   = 0;
+		if (!m_backing->ParkedViews(vaddr, size, &begin, &end)) {
+			return;
+		}
+		{
+			std::unique_lock lock(m_mutex);
+			WaitNotBusy(lock, begin, end - begin);
+			m_busy.emplace_back(begin, end);
+		}
+		std::vector<std::pair<uint64_t, uint64_t>> freed;
+		m_backing->Materialize(vaddr, size, &freed);
+		{
+			std::unique_lock lock(m_mutex);
+			for (const auto& [freed_vaddr, freed_size]: freed) {
+				AddFreeUnlocked(freed_vaddr, freed_size);
+			}
+			EraseBusyUnlocked(begin, end);
+		}
+		m_busy_done.notify_all();
+	}
+#endif
 
 	// Whether [vaddr, vaddr + size) is free: free placeholders, or ranges parked in views
 	// (GuestBackingStore::UnmapOne, KYTY_PARK_UNMAPS), which a map or commit there makes free
@@ -2100,6 +2352,10 @@ private:
 	}
 
 	std::shared_mutex                          m_mutex;
+	// Ranges a backing map or unmap is changing outside m_mutex (KYTY_MAP_OUTSIDE_LOCK), under it; what overlaps one
+	// waits for it (WaitNotBusy).
+	std::vector<std::pair<uint64_t, uint64_t>> m_busy;
+	std::condition_variable_any                m_busy_done;
 	std::map<uint64_t, uint64_t>               m_free;
 	std::map<uint64_t, MappedRegion>            m_mapped;
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;
