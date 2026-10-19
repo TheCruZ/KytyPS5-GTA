@@ -194,13 +194,36 @@ inline bool Value::IsPhi() const {
 	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Phi;
 }
 
-inline Inst* Value::ResolveInstruction() const {
-	EXIT_IF(type != Type::Opaque);
-	return IsIdentity() ? inst->Arg(0).ResolveInstruction() : inst;
+inline Value Value::Resolve() const {
+	// Identity chains are followed iteratively; the walker resolves every operand it visits.
+	Value value = *this;
+	while (value.IsIdentity()) {
+		value = value.inst->Arg(0);
+	}
+	return value;
 }
 
-inline Value Value::Resolve() const {
-	return IsIdentity() ? inst->Arg(0).Resolve() : *this;
+inline Inst* Value::ResolveInstruction() const {
+	EXIT_IF(type != Type::Opaque);
+	// An identity may forward an immediate: fail fast as the recursive form did.
+	const auto value = Resolve();
+	EXIT_IF(value.type != Type::Opaque);
+	return value.inst;
+}
+
+inline bool Value::U1() const {
+	EXIT_IF(type != Type::U1);
+	return imm_u1;
+}
+
+inline uint8_t Value::U8() const {
+	EXIT_IF(type != Type::U8);
+	return imm_u8;
+}
+
+inline uint16_t Value::U16() const {
+	EXIT_IF(type != Type::U16);
+	return imm_u16;
 }
 
 inline uint32_t Value::U32() const {
@@ -208,8 +231,43 @@ inline uint32_t Value::U32() const {
 	return imm_u32;
 }
 
+inline uint64_t Value::U64() const {
+	EXIT_IF(type != Type::U64);
+	return imm_u64;
+}
+
+inline uint16_t Value::F16Bits() const {
+	EXIT_IF(type != Type::F16);
+	return imm_u16;
+}
+
+inline float Value::F32Value() const {
+	EXIT_IF(type != Type::F32);
+	return std::bit_cast<float>(imm_u32);
+}
+
 inline size_t Inst::NumArgs() const {
 	return num_args == PhiArity ? phi_args.size() : num_args;
+}
+
+inline bool Value::operator==(const Value& other) const {
+	if (type != other.type) {
+		return false;
+	}
+	switch (type) {
+		case Type::Void: return true;
+		case Type::Opaque: return inst == other.inst;
+		case Type::ScalarReg: return scalar_reg == other.scalar_reg;
+		case Type::VectorReg: return vector_reg == other.vector_reg;
+		case Type::U1: return imm_u1 == other.imm_u1;
+		case Type::U8: return imm_u8 == other.imm_u8;
+		case Type::U16:
+		case Type::F16: return imm_u16 == other.imm_u16;
+		case Type::U32:
+		case Type::F32: return imm_u32 == other.imm_u32;
+		case Type::U64: return imm_u64 == other.imm_u64;
+		default: return false;
+	}
 }
 
 template <typename Self>
