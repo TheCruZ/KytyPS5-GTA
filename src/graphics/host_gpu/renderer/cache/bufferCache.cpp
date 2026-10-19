@@ -572,6 +572,11 @@ bool BufferCache::TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t s
 
 BufferCache::~BufferCache() {
 	m_scheduler.SetSubmitHook(nullptr, nullptr);
+	for (auto& slot: m_async_readbacks) {
+		if (slot.timeline) {
+			m_graphics.device.destroySemaphore(slot.timeline);
+		}
+	}
 	if (m_readback.pool) {
 		m_graphics.device.destroyFence(m_readback.fence);
 		m_graphics.device.destroyCommandPool(m_readback.pool);
@@ -710,6 +715,8 @@ struct BufferCache::AsyncReadback {
 	size_t                      slot = 0;
 	vk::Device                  device;
 	vk::Fence                   fence;
+	vk::Semaphore               timeline = nullptr; // the slot's: reaches timeline_value when the copy completed
+	uint64_t                    timeline_value = 0;
 	Buffer*                     staging = nullptr;
 	std::atomic_bool            finished {false};
 	// Who writes the copy's bytes back (chenxiao07's GuestReadback states): the first of the guest thread and the
@@ -725,6 +732,18 @@ struct BufferCache::AsyncReadback {
 static bool ReadbackGuestCopyEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_READBACK_GUEST_COPY");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// chenxiao07's sleeping readback wait (KYTY_READBACK_SLEEP_WAIT, default on; 0: the guest thread spins on the fence):
+// the guest thread waits for its readback's copy on a timeline semaphore the copy's submission signals, in the kernel,
+// where it spun on getFenceStatus and took a core of the GPU threads for the length of every readback (Demon's Souls:
+// ~65 readbacks a frame). A semaphore is never reset, so the wait cannot race the vkResetFences of the finished request.
+static bool ReadbackSleepWaitEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READBACK_SLEEP_WAIT");
 		return value == nullptr || value[0] != '0';
 	}();
 	return enabled;
@@ -851,6 +870,16 @@ std::shared_ptr<BufferCache::AsyncReadback> BufferCache::BeginAsyncReadback(uint
 			EXIT("BufferCache: could not create the asynchronous readback resources\n");
 		}
 	}
+	if (!slot.timeline && ReadbackSleepWaitEnabled()) {
+		vk::SemaphoreTypeCreateInfo type_info {};
+		type_info.semaphoreType = vk::SemaphoreType::eTimeline;
+		type_info.initialValue  = 0;
+		vk::SemaphoreCreateInfo semaphore_info {};
+		semaphore_info.pNext = &type_info;
+		if (device.createSemaphore(&semaphore_info, nullptr, &slot.timeline) != vk::Result::eSuccess) {
+			EXIT("BufferCache: could not create the asynchronous readback semaphore\n");
+		}
+	}
 	if (!slot.staging || slot.staging->Size() < total_size) {
 		slot.staging = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
 		                                        vk::BufferUsageFlagBits::eTransferDst,
@@ -883,6 +912,12 @@ std::shared_ptr<BufferCache::AsyncReadback> BufferCache::BeginAsyncReadback(uint
 	vk::TimelineSemaphoreSubmitInfo timeline {};
 	timeline.waitSemaphoreValueCount = 1;
 	timeline.pWaitSemaphoreValues    = &needed;
+	// (The copy also signals the slot's timeline semaphore, which a sleeping guest thread waits on.)
+	const uint64_t signal_value = slot.timeline_value + 1;
+	if (slot.timeline) {
+		timeline.signalSemaphoreValueCount = 1;
+		timeline.pSignalSemaphoreValues    = &signal_value;
+	}
 	vk::SubmitInfo submit {};
 	submit.pNext              = &timeline;
 	submit.waitSemaphoreCount = 1;
@@ -890,6 +925,10 @@ std::shared_ptr<BufferCache::AsyncReadback> BufferCache::BeginAsyncReadback(uint
 	submit.pWaitDstStageMask  = &wait_stage;
 	submit.commandBufferCount = 1;
 	submit.pCommandBuffers    = &command;
+	if (slot.timeline) {
+		submit.signalSemaphoreCount = 1;
+		submit.pSignalSemaphores    = &slot.timeline;
+	}
 	if (m_graphics.readback_queue.submit(1, &submit, slot.fence) != vk::Result::eSuccess) {
 		EXIT("BufferCache: readback queue submission failed\n");
 	}
@@ -912,6 +951,11 @@ std::shared_ptr<BufferCache::AsyncReadback> BufferCache::BeginAsyncReadback(uint
 	request->slot           = free_slot;
 	request->device         = device;
 	request->fence          = slot.fence;
+	if (slot.timeline) {
+		slot.timeline_value     = signal_value;
+		request->timeline       = slot.timeline;
+		request->timeline_value = signal_value;
+	}
 	request->staging        = slot.staging.get();
 	slot.request            = request;
 	return request;
@@ -919,6 +963,32 @@ std::shared_ptr<BufferCache::AsyncReadback> BufferCache::BeginAsyncReadback(uint
 
 // Any thread: waits for the copy on the GPU. False when the request was finished meanwhile.
 bool BufferCache::WaitAsyncReadback(AsyncReadback& request) {
+	if (request.timeline) {
+		// Asleep in slices: a request dropped meanwhile (KYTY_READBACK_DETACH) is noticed within a slice and not only
+		// when its copy completes.
+		constexpr uint64_t SliceNs = 1'000'000;
+		for (;;) {
+			if (request.finished.load(std::memory_order_acquire)) {
+				return false;
+			}
+			uint64_t value = 0;
+			if (const auto status = request.device.getSemaphoreCounterValue(request.timeline, &value);
+			    status != vk::Result::eSuccess) {
+				EXIT("BufferCache: readback semaphore query failed: %s\n", vk::to_string(status).c_str());
+			}
+			if (value >= request.timeline_value) {
+				return true;
+			}
+			vk::SemaphoreWaitInfo wait_info {};
+			wait_info.semaphoreCount = 1;
+			wait_info.pSemaphores    = &request.timeline;
+			wait_info.pValues        = &request.timeline_value;
+			if (const auto status = request.device.waitSemaphores(&wait_info, SliceNs);
+			    status != vk::Result::eSuccess && status != vk::Result::eTimeout) {
+				EXIT("BufferCache: readback semaphore wait failed: %s\n", vk::to_string(status).c_str());
+			}
+		}
+	}
 	// (The fence is reset only when the request is finished.)
 	for (;;) {
 		if (request.finished.load(std::memory_order_acquire)) {

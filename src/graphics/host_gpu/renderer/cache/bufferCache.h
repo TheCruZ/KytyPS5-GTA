@@ -368,6 +368,8 @@ private:
 	struct AsyncReadbackSlot {
 		vk::CommandBuffer              command = nullptr;
 		vk::Fence                      fence   = nullptr;
+		vk::Semaphore                  timeline = nullptr; // KYTY_READBACK_SLEEP_WAIT: signalled to timeline_value by the copy
+		uint64_t                       timeline_value = 0;
 		std::unique_ptr<Buffer>        staging;
 		std::shared_ptr<AsyncReadback> request; // the copy in flight, until its guest thread finished it
 		bool                           detached = false; // a dropped request's copy may still be in flight
