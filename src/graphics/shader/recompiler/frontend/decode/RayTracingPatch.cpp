@@ -144,7 +144,32 @@ constexpr std::array<RayTracingSite, 1> ShortRaySites {{
     },
 }};
 
-constexpr std::array<RayTracingPatch, 3> Patches {{
+// The same shader in GTA V 01.011.001 (71445d3087ceb8e1): its prelude is 0x30 bytes shorter, so every
+// pc of ShortRaySites moves down by that much; the registers are unchanged.
+constexpr std::array<RayTracingSite, 1> ShortRaySitesV2 {{
+    {
+        .kind            = RayTracingKind::ClosestOpaque,
+        .entry_pc        = 0x354,
+        .loop_pc         = 0x35c,
+        .origin          = {25, 12, 26},
+        .direction       = {24, 11, 23},
+        .t_max           = 27,
+        .cull_mask       = NoRegister,
+        .header_sgpr     = 16,
+        .alpha_off_sgpr  = NoAlphaOff,
+        .result_t        = 27,
+        .result_word     = 22,
+        .result_instance = 9,
+        .result_u        = 16,
+        .result_v        = 15,
+        .result_node     = 8,
+        .instance_sgpr   = 6,
+        .mask_sgpr       = 6,
+        .exit_pc         = 0xa64,
+    },
+}};
+
+constexpr std::array<RayTracingPatch, 6> Patches {{
     {.shader_hash   = 0xfa8b1616fddc203bull,
      .sites         = ShadowSites,
      .user_sgpr     = 4,
@@ -157,6 +182,23 @@ constexpr std::array<RayTracingPatch, 3> Patches {{
      .root          = 37},
     {.shader_hash   = 0x651da332bc4a3f98ull,
      .sites         = ShortRaySites,
+     .user_sgpr     = 4,
+     .header_offset = 112,
+     .root          = 37},
+    // GTA V 01.011.001: the same three shaders under other hashes (the first two differ from
+    // 01.010.002 in a few constants and loads only, the third in the length of its prelude).
+    {.shader_hash   = 0x8b2cbb0a0c686402ull,
+     .sites         = ShadowSites,
+     .user_sgpr     = 4,
+     .header_offset = 16,
+     .root          = 37},
+    {.shader_hash   = 0xd39726900d9532a5ull,
+     .sites         = SecondShadowSites,
+     .user_sgpr     = 4,
+     .header_offset = 16,
+     .root          = 37},
+    {.shader_hash   = 0x71445d3087ceb8e1ull,
+     .sites         = ShortRaySitesV2,
      .user_sgpr     = 4,
      .header_offset = 112,
      .root          = 37},
