@@ -702,6 +702,7 @@ void BufferCache::InvalidateFaultedPage(uint64_t vaddr) {
 // (DrainAsyncReadbacks()).
 struct BufferCache::AsyncReadback {
 	uint64_t                    vaddr = 0, size = 0;
+	std::vector<std::pair<uint64_t, uint64_t>> pages; // [begin, end) of the copied pages, sorted (KYTY_READBACK_DETACH)
 	uint64_t                    needed = 0; // the submission whose writes the copy waits for
 	uint64_t                    buffer_address = 0;
 	vk::Buffer                  source;     // the cache buffer copied from
@@ -712,6 +713,19 @@ struct BufferCache::AsyncReadback {
 	Buffer*                     staging = nullptr;
 	std::atomic_bool            finished {false};
 };
+
+// chenxiao07's KYTY_READBACK_DETACH (default on; 0 off): a GPU write recorded over the pages of a pending readback
+// settles it first. A finished copy is written back and finished then (its bytes are those before the write); one
+// still in flight is dropped: its pages stay GPU-modified and the guest faults again for the newer bytes. Without it,
+// the write is noticed only when the readback finishes, which then reads its whole window back again, waiting for the
+// GPU (in Demon's Souls 80 % of the asynchronous readbacks).
+static bool ReadbackDetachEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READBACK_DETACH");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
 
 // Demon's Souls by default (chenxiao07's launcher: KYTY_FRAME_PIPELINE, KYTY_READBACK_DETACH, ...).
 static bool AsyncReadbacksEnabled() {
@@ -780,17 +794,27 @@ std::shared_ptr<BufferCache::AsyncReadback> BufferCache::BeginAsyncReadback(uint
 	if (needed >= m_scheduler.CurrentTick()) {
 		return nullptr; // the writes are still being recorded
 	}
+	auto&  device    = m_graphics.device;
 	size_t free_slot = AsyncReadbackSlots;
 	for (size_t i = 0; i < AsyncReadbackSlots; i++) {
-		if (!m_async_readbacks[i].request) {
-			free_slot = i;
-			break;
+		auto& candidate = m_async_readbacks[i];
+		if (candidate.request) {
+			continue;
 		}
+		if (candidate.detached) {
+			// The copy of a dropped request: the slot is free once it completed.
+			if (device.getFenceStatus(candidate.fence) != vk::Result::eSuccess) {
+				continue;
+			}
+			(void)device.resetFences(1, &candidate.fence);
+			candidate.detached = false;
+		}
+		free_slot = i;
+		break;
 	}
 	if (free_slot == AsyncReadbackSlots) {
 		return nullptr;
 	}
-	auto& device = m_graphics.device;
 	if (!m_async_readback_pool) {
 		vk::CommandPoolCreateInfo pool_info {};
 		pool_info.flags            = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
@@ -860,6 +884,15 @@ std::shared_ptr<BufferCache::AsyncReadback> BufferCache::BeginAsyncReadback(uint
 	request->buffer_address = buffer_address;
 	request->source         = buffer.Handle();
 	request->copies         = std::move(copies);
+	for (const auto& copy: request->copies) {
+		const auto begin = Common::AlignDown(buffer_address + copy.srcOffset, TRACKER_PAGE_SIZE);
+		const auto end   = Common::AlignUp(buffer_address + copy.srcOffset + copy.size, TRACKER_PAGE_SIZE);
+		if (!request->pages.empty() && begin <= request->pages.back().second) {
+			request->pages.back().second = std::max(request->pages.back().second, end);
+		} else {
+			request->pages.emplace_back(begin, end);
+		}
+	}
 	request->slot           = free_slot;
 	request->device         = device;
 	request->fence          = slot.fence;
@@ -911,8 +944,19 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& request) {
 	if (request.finished.load(std::memory_order_acquire)) {
 		return;
 	}
-	bool rewritten = m_write_ticks.Latest(request.vaddr, request.vaddr + request.size) > request.needed ||
-	                 m_device_address_tick > request.needed || m_device_address_pending;
+	// (With KYTY_READBACK_DETACH a write over the copied pages settled the request first: only the bytes copied count.
+	// Other bytes of their pages may hold writes newer than the copied ones from before the copy: those were not
+	// GPU-modified any more, or the copy would hold them.)
+	const bool detach    = ReadbackDetachEnabled();
+	bool       rewritten = m_device_address_tick > request.needed || m_device_address_pending;
+	if (detach) {
+		for (const auto& copy: request.copies) {
+			const auto begin = request.buffer_address + copy.srcOffset;
+			rewritten        = rewritten || m_write_ticks.Latest(begin, begin + copy.size) > request.needed;
+		}
+	} else {
+		rewritten = rewritten || m_write_ticks.Latest(request.vaddr, request.vaddr + request.size) > request.needed;
+	}
 	// A write of the operation being recorded supersedes the copy (chenxiao07's KYTY_READBACK_DETACH):
 	// the request is dropped, the range stays GPU-modified and the guest faults again once the write
 	// is recorded, for its bytes, instead of a synchronous readback of bytes about to change.
@@ -930,7 +974,14 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& request) {
 		for (const auto& copy: request.copies) {
 			m_gpu_modified_ranges.Subtract(request.buffer_address + copy.srcOffset, copy.size);
 		}
-		m_memory_tracker.UnmarkRegionAsGpuModified(request.vaddr, request.size);
+		if (detach) {
+			// (The window's other pages may have been written since: they keep their state.)
+			for (const auto& [begin, end]: request.pages) {
+				m_memory_tracker.UnmarkRegionAsGpuModified(begin, end - begin);
+			}
+		} else {
+			m_memory_tracker.UnmarkRegionAsGpuModified(request.vaddr, request.size);
+		}
 		return;
 	}
 	++m_async_readback_rewritten;
@@ -945,6 +996,12 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& request) {
 // written back and finished, as an access of them that does not wait for them needs.
 void BufferCache::DrainAsyncReadbacks(uint64_t vaddr, uint64_t size, vk::Buffer source) {
 	for (auto& slot: m_async_readbacks) {
+		// A dropped request's copy still reading the buffer `source` (about to go).
+		if (source && slot.detached && slot.detached_source == source) {
+			(void)m_graphics.device.waitForFences(1, &slot.fence, VK_TRUE, UINT64_MAX);
+			(void)m_graphics.device.resetFences(1, &slot.fence);
+			slot.detached = false;
+		}
 		const auto request = slot.request;
 		if (!request || request->finished.load(std::memory_order_acquire)) {
 			continue;
@@ -955,6 +1012,31 @@ void BufferCache::DrainAsyncReadbacks(uint64_t vaddr, uint64_t size, vk::Buffer 
 			continue;
 		}
 		CompleteAsyncReadback(*request);
+	}
+}
+
+// Execution thread, before a GPU write of [vaddr, vaddr + size) is recorded (KYTY_READBACK_DETACH).
+void BufferCache::SettleAsyncReadbacks(uint64_t vaddr, uint64_t size) {
+	if (!ReadbackDetachEnabled()) {
+		return;
+	}
+	for (auto& slot: m_async_readbacks) {
+		const auto request = slot.request;
+		if (!request || request->finished.load(std::memory_order_acquire) ||
+		    std::ranges::none_of(request->pages, [&](const auto& page) {
+			    return vaddr < page.second && page.first < vaddr + size;
+		    })) {
+			continue;
+		}
+		if (request->device.getFenceStatus(request->fence) == vk::Result::eSuccess) {
+			CompleteAsyncReadback(*request);
+			continue;
+		}
+		// Its guest thread finds it finished without a copy and faults again.
+		request->finished.store(true, std::memory_order_release);
+		slot.request.reset();
+		slot.detached        = true;
+		slot.detached_source = request->source;
 	}
 }
 
@@ -1473,6 +1555,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
+	if (is_written) {
+		SettleAsyncReadbacks(vaddr, size);
+	}
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (plain_read) {
 		*memo = {.vaddr        = vaddr,
@@ -2208,6 +2293,7 @@ void BufferCache::ProcessUseBuffer() {
 
 void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 	m_gpu_write_generation++;
+	SettleAsyncReadbacks(vaddr, size);
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid GPU write range\n");
 	}

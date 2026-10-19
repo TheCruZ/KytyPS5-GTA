@@ -277,6 +277,7 @@ private:
 	void NoteWrite(uint64_t vaddr, uint64_t size) {
 		// Draws bind the same written ranges again and again.
 		if (m_pending_writes.empty() || m_pending_writes.back() != std::pair {vaddr, size}) {
+			SettleAsyncReadbacks(vaddr, size);
 			m_pending_writes.emplace_back(vaddr, size);
 			InvalidateCopyFeedback(vaddr, size);
 			for (const auto& hot: m_readback_hot) {
@@ -362,11 +363,14 @@ private:
 	static bool WaitAsyncReadback(AsyncReadback& request);
 	void        CompleteAsyncReadback(AsyncReadback& request);
 	void        DrainAsyncReadbacks(uint64_t vaddr, uint64_t size, vk::Buffer source = nullptr);
+	void        SettleAsyncReadbacks(uint64_t vaddr, uint64_t size);
 	struct AsyncReadbackSlot {
 		vk::CommandBuffer              command = nullptr;
 		vk::Fence                      fence   = nullptr;
 		std::unique_ptr<Buffer>        staging;
 		std::shared_ptr<AsyncReadback> request; // the copy in flight, until its guest thread finished it
+		bool                           detached = false; // a dropped request's copy may still be in flight
+		vk::Buffer                     detached_source;  // ... from this cache buffer
 	};
 	// 32, as chenxiao07's KYTY_READBACK_SLOTS: a burst of guest reads did not wait for a free one.
 	static constexpr size_t                         AsyncReadbackSlots = 32;
