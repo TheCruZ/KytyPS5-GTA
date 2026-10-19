@@ -198,6 +198,31 @@ option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
 
 config_compiler_and_linker()
 
+if(KYTY_CLANG_CL)
+	# chenxiao07's Release options: -O3 and ThinLTO (his own builds add -march=native, his Linux release a PGO
+	# profile). Only clang-cl Windows builds take them.
+	option(KYTY_NATIVE_OPT "Release: -O3 (and -march=KYTY_MARCH when set)" ON)
+	# Empty by default: the releases run on other CPUs. native takes this CPU's extensions (AVX-512, GFNI, AVX-VNNI),
+	# which crash CPUs without them at the first use; x86-64-v3 (AVX2, FMA, BMI2) is the safest choice for others.
+	set(KYTY_MARCH "" CACHE STRING "Release: the -march of KYTY_NATIVE_OPT (empty: none)")
+	option(KYTY_THIN_LTO "Release: ThinLTO" ON)
+	set(KYTY_PGO_USE "" CACHE FILEPATH "llvm-profdata output to optimize with (empty: none)")
+	if(KYTY_NATIVE_OPT)
+		add_compile_options("$<$<CONFIG:Release>:/clang:-O3>")
+		if(NOT KYTY_MARCH STREQUAL "")
+			add_compile_options("$<$<CONFIG:Release>:/clang:-march=${KYTY_MARCH}>")
+		endif()
+	endif()
+	if(KYTY_THIN_LTO)
+		add_compile_options("$<$<CONFIG:Release>:-flto=thin>")
+		add_link_options("$<$<CONFIG:Release>:/opt:lldltojobs=all>")
+	endif()
+	if(KYTY_PGO_USE)
+		add_compile_options("-fprofile-instr-use=${KYTY_PGO_USE}" -Wno-profile-instr-unprofiled
+		                    -Wno-profile-instr-out-of-date -Wno-backend-plugin)
+	endif()
+endif()
+
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 
