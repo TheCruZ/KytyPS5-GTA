@@ -57,6 +57,7 @@ public:
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	[[nodiscard]] bool TryWriteFaultWindow(uint64_t fault_vaddr);
 	// Before the emulated GPU writes guest memory (labels, WRITE_DATA): resolves a tracked page
 	// as its write fault would, without raising the exception.
 	void PrepareGpuWrite(const void* destination, uint64_t size) noexcept;

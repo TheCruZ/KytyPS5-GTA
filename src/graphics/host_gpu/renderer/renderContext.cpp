@@ -9,6 +9,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
@@ -26,7 +27,47 @@ bool UnmapProtectSkipEnabled() {
 	return enabled;
 }
 
+// chenxiao07's write windows (KYTY_WRITE_FAULT_WINDOW, default on; 0: the faulting page, or the pages up to the next
+// 64 KiB when the page below is already written). A guest write fault in memory only the CPU owns releases its aligned
+// 16 KiB at once, and the next 64 KiB when it follows the window this thread's last such fault ended in within 2 ms (a
+// stream of writes): Demon's Souls took ~800 write faults a frame, each an exception and a protection change.
+bool WriteFaultWindowEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_WRITE_FAULT_WINDOW");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+uint64_t WindowClockNow() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
 } // namespace
+
+// Any guest thread, at a write fault: true when the fault's write window was released (no image, no GPU-written page
+// and all mapped in it).
+bool RenderContext::TryWriteFaultWindow(uint64_t fault_vaddr) {
+	constexpr uint64_t WindowSize = 4 * TRACKER_PAGE_SIZE;
+	constexpr uint64_t StreamSize = 16 * TRACKER_PAGE_SIZE;
+	constexpr uint64_t StreamNs   = 2'000'000;
+	thread_local uint64_t last_end = 0, last_time = 0;
+	const auto            window   = Common::AlignDown(fault_vaddr, WindowSize);
+	const auto            now      = WindowClockNow();
+	const auto            release  = [&](uint64_t size) {
+		if (!GuestRange {window, size}.Valid() || !IsMapped(window, size) ||
+		    m_buffer_cache.IsRegionGpuModified(window, size) || m_texture_cache.HasImagesInRegion(window, size)) {
+			return false;
+		}
+		m_buffer_cache.InvalidateMemory(window, size);
+		last_end  = window + size;
+		last_time = now;
+		return true;
+	};
+	return (window == last_end && now - last_time < StreamNs && release(StreamSize)) || release(WindowSize);
+}
 
 RenderContext::RenderContext(GraphicContext& graphics)
     : m_graphics(graphics), m_render_executor(*this),
@@ -95,6 +136,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (access == PageFaultAccess::Write && GuestGpu::IsGpuThread()) {
 		// A write of the command stream: device-address readers after it must see it.
 		m_bda_generation++;
+	}
+	if (access == PageFaultAccess::Write && WriteFaultWindowEnabled() && TryWriteFaultWindow(fault_vaddr)) {
+		return true;
 	}
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateFaultedPage(fault_vaddr);
