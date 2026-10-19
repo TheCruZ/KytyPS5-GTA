@@ -361,6 +361,7 @@ private:
 	[[nodiscard]] std::shared_ptr<AsyncReadback> BeginAsyncReadback(uint64_t vaddr, uint64_t size);
 	void                                         FinishAsyncReadback(AsyncReadback& request);
 	static bool WaitAsyncReadback(AsyncReadback& request);
+	bool        CopyAsyncReadback(AsyncReadback& request);
 	void        CompleteAsyncReadback(AsyncReadback& request);
 	void        DrainAsyncReadbacks(uint64_t vaddr, uint64_t size, vk::Buffer source = nullptr);
 	void        SettleAsyncReadbacks(uint64_t vaddr, uint64_t size);

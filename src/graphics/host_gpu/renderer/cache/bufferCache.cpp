@@ -712,7 +712,23 @@ struct BufferCache::AsyncReadback {
 	vk::Fence                   fence;
 	Buffer*                     staging = nullptr;
 	std::atomic_bool            finished {false};
+	// Who writes the copy's bytes back (chenxiao07's GuestReadback states): the first of the guest thread and the
+	// execution thread to claim it (Pending -> Copying -> Copied); a request dropped before (KYTY_READBACK_DETACH)
+	// is Detached and never written back.
+	enum State : uint32_t { Pending, Copying, Copied, Detached };
+	std::atomic<uint32_t> state {Pending};
 };
+
+// chenxiao07's guest-thread copies (KYTY_READBACK_GUEST_COPY, default on; 0: the execution thread writes every copy
+// back): the guest thread that waited for a readback's copy writes its bytes back itself; the execution thread only
+// finishes the request (in Demon's Souls ~65 readbacks a frame of up to 512 KiB, ~75 us each there).
+static bool ReadbackGuestCopyEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READBACK_GUEST_COPY");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
 
 // chenxiao07's KYTY_READBACK_DETACH (default on; 0 off): a GPU write recorded over the pages of a pending readback
 // settles it first. A finished copy is written back and finished then (its bytes are those before the write); one
@@ -919,18 +935,34 @@ bool BufferCache::WaitAsyncReadback(AsyncReadback& request) {
 	}
 }
 
-// Execution thread: the copy's bytes go to guest memory (after the asynchronous publications
-// queued before it, as on the synchronous path) and the request is finished.
-void BufferCache::CompleteAsyncReadback(AsyncReadback& request) {
-	if (!WaitAsyncReadback(request)) {
-		return;
+// Any thread, once the copy completed on the GPU: its bytes go to guest memory (after the asynchronous publications
+// queued before it, as on the synchronous path). False when the request was dropped.
+bool BufferCache::CopyAsyncReadback(AsyncReadback& request) {
+	auto expected = static_cast<uint32_t>(AsyncReadback::Pending);
+	if (request.state.compare_exchange_strong(expected, AsyncReadback::Copying, std::memory_order_acq_rel)) {
+		m_scheduler.WaitPriorityOperations(request.needed);
+		request.staging->Invalidate(0, request.staging->Size());
+		const auto* mapped = request.staging->Mapped().data();
+		for (const auto& copy: request.copies) {
+			Libs::LibKernel::Memory::WriteBacking(request.buffer_address + copy.srcOffset, mapped + copy.dstOffset,
+			                                      copy.size);
+		}
+		request.state.store(AsyncReadback::Copied, std::memory_order_release);
+		request.state.notify_all();
+		return true;
 	}
-	m_scheduler.WaitPriorityOperations(request.needed);
-	request.staging->Invalidate(0, request.staging->Size());
-	const auto* mapped = request.staging->Mapped().data();
-	for (const auto& copy: request.copies) {
-		Libs::LibKernel::Memory::WriteBacking(request.buffer_address + copy.srcOffset, mapped + copy.dstOffset,
-		                                      copy.size);
+	// (Another thread is writing it back.)
+	while (expected == AsyncReadback::Copying) {
+		request.state.wait(AsyncReadback::Copying, std::memory_order_acquire);
+		expected = request.state.load(std::memory_order_acquire);
+	}
+	return expected == AsyncReadback::Copied;
+}
+
+// Execution thread: the copy's bytes go to guest memory and the request is finished.
+void BufferCache::CompleteAsyncReadback(AsyncReadback& request) {
+	if (!WaitAsyncReadback(request) || !CopyAsyncReadback(request)) {
+		return;
 	}
 	FinishAsyncReadback(request);
 }
@@ -1028,7 +1060,9 @@ void BufferCache::SettleAsyncReadbacks(uint64_t vaddr, uint64_t size) {
 		    })) {
 			continue;
 		}
-		if (request->device.getFenceStatus(request->fence) == vk::Result::eSuccess) {
+		auto pending = static_cast<uint32_t>(AsyncReadback::Pending);
+		if (request->device.getFenceStatus(request->fence) == vk::Result::eSuccess ||
+		    !request->state.compare_exchange_strong(pending, AsyncReadback::Detached, std::memory_order_acq_rel)) {
 			CompleteAsyncReadback(*request);
 			continue;
 		}
@@ -1134,10 +1168,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		// written back by an urgent command, as the synchronous path writes them. A write then
 		// makes the range CPU-modified (synchronous() finds nothing left to read back).
 		if (request) {
-			const bool copied = WaitAsyncReadback(*request);
+			const bool guest_copy = ReadbackGuestCopyEnabled();
+			const bool copied     = WaitAsyncReadback(*request) && (!guest_copy || CopyAsyncReadback(*request));
 			if (copied || is_write) {
 				gpu.SendUrgentCommandSync([&] {
-					if (copied) {
+					if (copied && guest_copy) {
+						FinishAsyncReadback(*request);
+					} else if (copied) {
 						CompleteAsyncReadback(*request);
 					}
 					if (is_write) {
