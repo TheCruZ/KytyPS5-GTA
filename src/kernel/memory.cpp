@@ -16,6 +16,7 @@
 #include <bit>
 #include <chrono>
 #include <cinttypes>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>

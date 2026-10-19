@@ -26,6 +26,61 @@ static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 	return size != 0 && VirtualFree(reinterpret_cast<void*>(vaddr), size,
 	                                MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != 0;
 }
+
+// chenxiao07's parked partial unmaps (KYTY_PARK_UNMAPS, on unless it is 0). A Windows file view
+// cannot be split: unmapping part of one used to unmap the whole view, cut its placeholder and map
+// the other parts again, all on the guest's thread (dozens of system calls per unmap, and the
+// texture streaming of Demon's Souls unmaps parts of views every frame). With the switch on the
+// unmapped range stays inside its view, "parked": the guest has no mapping there and a map over it
+// splits the view first (GuestBackingStore::Materialize). Off: the view is split on every unmap.
+static bool ParkUnmapsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PARK_UNMAPS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// Ranges parked in their views, taken out of the working set by a thread of their own: mapped,
+// their pages stayed counted in use, and dropping them (VirtualUnlock on pages that are not locked)
+// costs ~0.5 us per 4 KiB page, which the guest's threads no longer pay. Harmless when late: on a
+// range unmapped meanwhile it fails, on one mapped again its pages are faulted back in.
+class ParkedRangeTrimmer {
+public:
+	static void Trim(uint64_t vaddr, uint64_t size) {
+		// (Never destroyed: its thread may outlive the static destructors.)
+		static auto* trimmer = new ParkedRangeTrimmer;
+		{
+			std::lock_guard lock(trimmer->m_mutex);
+			trimmer->m_ranges.emplace_back(vaddr, size);
+		}
+		trimmer->m_ready.notify_one();
+	}
+
+private:
+	ParkedRangeTrimmer() {
+		std::thread([this] {
+			SetThreadDescription(GetCurrentThread(), L"Kyty.Trim");
+			SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+			std::vector<std::pair<uint64_t, uint64_t>> ranges;
+			for (;;) {
+				{
+					std::unique_lock lock(m_mutex);
+					m_ready.wait(lock, [this] { return !m_ranges.empty(); });
+					ranges.swap(m_ranges);
+				}
+				for (const auto& [vaddr, size]: ranges) {
+					VirtualUnlock(reinterpret_cast<void*>(vaddr), size);
+				}
+				ranges.clear();
+			}
+		}).detach();
+	}
+
+	std::mutex                                 m_mutex;
+	std::condition_variable                    m_ready;
+	std::vector<std::pair<uint64_t, uint64_t>> m_ranges;
+};
 #endif
 
 template <typename Regions, typename Source, typename Gap>
@@ -151,6 +206,10 @@ public:
 		AddressRangeUnavailable,
 	};
 
+	// What an unmap did with a range: it is a free placeholder now, it stays parked inside its view
+	// (KYTY_PARK_UNMAPS), or its view was unmapped whole (the parked ranges of the view are placeholders too).
+	enum class UnmapKind { Placeholder, Parked, Released };
+
 	explicit GuestBackingStore(uint64_t size): m_size(size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		m_handle = CreateFileMappingA(
@@ -210,9 +269,11 @@ public:
 
 	~GuestBackingStore() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		for (const auto& [_, entry]: m_maps) {
-			UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size);
+		for (const auto& [base, size]: m_views) {
+			UnmapViewPreservePlaceholder(reinterpret_cast<void*>(base), size);
 		}
+		m_views.clear();
+		m_parked.clear();
 		m_maps.clear();
 		MapsChangedUnlocked();
 		if (m_backing_base != nullptr) {
@@ -440,6 +501,7 @@ public:
 		{
 			std::lock_guard lock(m_mutex);
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
+			EXIT_IF(!m_views.emplace(vaddr, size).second);
 			MapsChangedUnlocked();
 		}
 		BumpBackingEpoch(vaddr, size);
@@ -460,7 +522,11 @@ public:
 #endif
 	}
 
-	bool Unmap(uint64_t vaddr, uint64_t size, bool* placeholder_preserved = nullptr) {
+	// [vaddr, vaddr + size) unmapped. The ranges that became free placeholders are appended to `freed` (when given):
+	// the range itself, except on Windows with KYTY_PARK_UNMAPS, where a range left parked in its view is none and a
+	// view released whole frees the parked ranges of earlier unmaps with it.
+	bool Unmap(uint64_t vaddr, uint64_t size, bool* placeholder_preserved = nullptr,
+	           std::vector<std::pair<uint64_t, uint64_t>>* freed = nullptr) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
@@ -487,13 +553,19 @@ public:
 			}
 		}
 
-		std::vector<MapEntry> removed;
+		struct Removed {
+			MapEntry  entry;
+			UnmapKind kind;
+		};
+		std::vector<Removed>                       removed;
+		std::vector<std::pair<uint64_t, uint64_t>> part_freed;
 		removed.reserve(targets.size());
 		for (const auto& entry: targets) {
-			bool part_placeholder_preserved = false;
-			if (!UnmapOne(entry.vaddr, entry.size, &part_placeholder_preserved)) {
+			bool      part_placeholder_preserved = false;
+			UnmapKind kind                       = UnmapKind::Placeholder;
+			if (!UnmapOne(entry.vaddr, entry.size, &part_placeholder_preserved, &part_freed, &kind)) {
 				for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
-					EXIT_IF(!MapFixed(it->vaddr, it->size, it->backing_offset, it->mode));
+					RemapUnmapped(it->entry, it->kind);
 				}
 				if (placeholder_preserved != nullptr) {
 					*placeholder_preserved = false;
@@ -501,18 +573,30 @@ public:
 				return false;
 			}
 			EXIT_IF(!part_placeholder_preserved);
-			removed.push_back(entry);
+			removed.push_back({entry, kind});
 		}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		// Each unmapped file view becomes a separate Windows placeholder. The address-space owner
-		// records this contiguous guest span as one free range, so normalize fragmented backing
-		// views into one placeholder before publishing it there.
-		if (removed.size() > 1 && !CoalescePlaceholders(vaddr, size)) {
-			for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
-				EXIT_IF(!MapFixed(it->vaddr, it->size, it->backing_offset, it->mode));
+		if (!ParkUnmapsEnabled()) {
+			// Each unmapped file view becomes a separate Windows placeholder. The address-space owner
+			// records this contiguous guest span as one free range, so normalize fragmented backing
+			// views into one placeholder before publishing it there.
+			if (removed.size() > 1 && !CoalescePlaceholders(vaddr, size)) {
+				for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
+					RemapUnmapped(it->entry, it->kind);
+				}
+				return false;
 			}
-			return false;
+			if (freed != nullptr) {
+				freed->emplace_back(vaddr, size);
+			}
+		} else if (freed != nullptr) {
+			// (Placeholders next to each other are coalesced when the owner adds them to its free list.)
+			freed->insert(freed->end(), part_freed.begin(), part_freed.end());
+		}
+#else
+		if (freed != nullptr) {
+			freed->emplace_back(vaddr, size);
 		}
 #endif
 
@@ -522,7 +606,9 @@ public:
 		return true;
 	}
 
-	bool UnmapOne(uint64_t vaddr, uint64_t size, bool* placeholder_preserved = nullptr) {
+	bool UnmapOne(uint64_t vaddr, uint64_t size, bool* placeholder_preserved = nullptr,
+	              std::vector<std::pair<uint64_t, uint64_t>>* freed = nullptr,
+	              UnmapKind*                                  kind  = nullptr) {
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 		if (g_test_backing_store_unmaps_before_failure == 0) {
 			g_test_backing_store_unmaps_before_failure = UINT32_MAX;
@@ -532,46 +618,116 @@ public:
 			g_test_backing_store_unmaps_before_failure--;
 		}
 #endif
+		if (kind != nullptr) {
+			*kind = UnmapKind::Placeholder;
+		}
 
-		MapEntry old {};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// Whole: the range is its view. Split: the view is unmapped and its other parts mapped again
+		// (a view cannot be split). Park: the range stays in its view (m_parked). Release: the view
+		// is unmapped whole, nothing of it stays mapped.
+		enum class How { Whole, Split, Park, Release };
+		const bool park = ParkUnmapsEnabled();
+		MapEntry   old {};
+		uint64_t   view_base = 0;
+		uint64_t   view_size = 0;
+		How        how       = How::Whole;
 		{
 			std::lock_guard lock(m_mutex);
-			auto            next = m_maps.upper_bound(vaddr);
-			if (next != m_maps.begin()) {
-				auto entry = std::prev(next);
-				if (vaddr + size <= entry->second.vaddr + entry->second.size) {
-					old = entry->second;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-					m_maps.erase(entry);
-					MapsChangedUnlocked();
-#endif
+			const auto      next = m_maps.upper_bound(vaddr);
+			if (next == m_maps.begin()) {
+				return false;
+			}
+			const auto entry = std::prev(next);
+			if (vaddr + size > entry->second.vaddr + entry->second.size) {
+				return false;
+			}
+			old             = entry->second;
+			const auto view = FindViewUnlocked(old.vaddr);
+			EXIT_IF(view == m_views.end() || old.vaddr + old.size > view->first + view->second);
+			view_base             = view->first;
+			view_size             = view->second;
+			const bool whole_view = old.vaddr == view_base && old.size == view_size;
+			const bool exact      = vaddr == old.vaddr && size == old.size;
+			how = !whole_view ? How::Park : exact ? How::Whole : park ? How::Park : How::Split;
+			m_maps.erase(entry);
+			if (how != How::Park) {
+				m_views.erase(view);
+			} else {
+				if (vaddr != old.vaddr) {
+					EXIT_IF(!m_maps
+					             .emplace(old.vaddr, MapEntry {old.vaddr, vaddr - old.vaddr,
+					                                           old.backing_offset, old.mode})
+					             .second);
+				}
+				if (const auto right = vaddr + size; right != old.vaddr + old.size) {
+					EXIT_IF(!m_maps
+					             .emplace(right, MapEntry {right, old.vaddr + old.size - right,
+					                                       old.backing_offset + (right - old.vaddr),
+					                                       old.mode})
+					             .second);
+				}
+				const auto view_end = view_base + view_size;
+				if (const auto live = m_maps.lower_bound(view_base);
+				    live == m_maps.end() || live->first >= view_end) {
+					how = How::Release;
+					m_parked.erase(m_parked.lower_bound(view_base), m_parked.lower_bound(view_end));
+					m_views.erase(view);
+				} else {
+					ParkUnlocked(vaddr, size, view_base, view_end);
 				}
 			}
+			MapsChangedUnlocked();
 		}
 
-		if (old.size == 0) {
-			return false;
-		}
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		const uint64_t left_size  = vaddr - old.vaddr;
-		const uint64_t right_addr = vaddr + size;
-		const uint64_t right_size = old.vaddr + old.size - right_addr;
-		const bool exact_unmap = (vaddr == old.vaddr && size == old.size);
-		if (exact_unmap) {
-			const bool unmapped =
-			    UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size);
-			if (!unmapped) {
-				std::lock_guard lock(m_mutex);
-				m_maps.emplace(old.vaddr, old);
-				MapsChangedUnlocked();
-				return false;
+		if (how == How::Park) {
+			// The range keeps its protection and its pages: the guest has no mapping there (a map over
+			// it splits the view first, Materialize) and the emulator's reads and writes of guest
+			// memory find none either (m_maps). Its pages leave the working set on the trimming thread.
+			ParkedRangeTrimmer::Trim(vaddr, size);
+			if (kind != nullptr) {
+				*kind = UnmapKind::Parked;
 			}
 			if (placeholder_preserved != nullptr) {
 				*placeholder_preserved = true;
 			}
 			return true;
 		}
+		if (how == How::Release) {
+			EXIT_IF(!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(view_base), view_size));
+			if (freed != nullptr) {
+				freed->emplace_back(view_base, view_size);
+			}
+			if (kind != nullptr) {
+				*kind = UnmapKind::Released;
+			}
+			if (placeholder_preserved != nullptr) {
+				*placeholder_preserved = true;
+			}
+			return true;
+		}
+		if (how == How::Whole) {
+			const bool unmapped =
+			    UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size);
+			if (!unmapped) {
+				std::lock_guard lock(m_mutex);
+				m_maps.emplace(old.vaddr, old);
+				m_views.emplace(old.vaddr, old.size);
+				MapsChangedUnlocked();
+				return false;
+			}
+			if (freed != nullptr) {
+				freed->emplace_back(vaddr, size);
+			}
+			if (placeholder_preserved != nullptr) {
+				*placeholder_preserved = true;
+			}
+			return true;
+		}
+
+		const uint64_t left_size  = vaddr - old.vaddr;
+		const uint64_t right_addr = vaddr + size;
+		const uint64_t right_size = old.vaddr + old.size - right_addr;
 
 		// The parts that stay mapped vanish until they are mapped again (see
 		// TransientUnmapWindows), and come back with the view's protection: give them back their
@@ -597,6 +753,9 @@ public:
 			}
 			if (ok) {
 				RestoreProtections(kept_protections);
+				if (freed != nullptr) {
+					freed->emplace_back(vaddr, size);
+				}
 				if (placeholder_preserved != nullptr) {
 					*placeholder_preserved = true;
 				}
@@ -617,9 +776,26 @@ public:
 		}
 		std::lock_guard lock(m_mutex);
 		m_maps.emplace(old.vaddr, old);
+		m_views.emplace(old.vaddr, old.size);
 		MapsChangedUnlocked();
 		return false;
 #else
+		MapEntry old {};
+		{
+			std::lock_guard lock(m_mutex);
+			auto            next = m_maps.upper_bound(vaddr);
+			if (next != m_maps.begin()) {
+				auto entry = std::prev(next);
+				if (vaddr + size <= entry->second.vaddr + entry->second.size) {
+					old = entry->second;
+				}
+			}
+		}
+
+		if (old.size == 0) {
+			return false;
+		}
+
 		// Replace only the requested range so concurrent accesses and GPU watch
 		// protections on the surviving mappings remain intact.
 		if (!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(vaddr), size)) {
@@ -636,6 +812,82 @@ public:
 		return true;
 #endif
 	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Whether ranges parked in views (UnmapOne) overlap [vaddr, vaddr + size).
+	bool HasParked(uint64_t vaddr, uint64_t size) {
+		std::shared_lock lock(m_mutex);
+		return FirstParkedUnlocked(vaddr, size) != m_parked.end();
+	}
+
+	// The end of the parked range holding `vaddr`, 0 when none.
+	uint64_t ParkedEnd(uint64_t vaddr) {
+		std::shared_lock lock(m_mutex);
+		const auto       it = FirstParkedUnlocked(vaddr, 1);
+		return it != m_parked.end() ? it->first + it->second : 0;
+	}
+
+	// The views holding ranges parked over [vaddr, vaddr + size) split for real, before something is
+	// mapped there: each is unmapped whole and its mapped parts are mapped again as views of their own
+	// (as an unmap without KYTY_PARK_UNMAPS does, with their protections given back); its parked
+	// ranges, free placeholders now, are appended to `freed`.
+	void Materialize(uint64_t vaddr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>* freed) {
+		for (;;) {
+			uint64_t                                   view_base = 0;
+			uint64_t                                   view_size = 0;
+			std::vector<MapEntry>                      mapped;
+			std::vector<std::pair<uint64_t, uint64_t>> parts;
+			{
+				std::lock_guard lock(m_mutex);
+				const auto      parked = FirstParkedUnlocked(vaddr, size);
+				if (parked == m_parked.end()) {
+					return;
+				}
+				const auto view = FindViewUnlocked(parked->first);
+				EXIT_IF(view == m_views.end());
+				view_base           = view->first;
+				view_size           = view->second;
+				const auto view_end = view_base + view_size;
+				for (auto it = m_maps.lower_bound(view_base); it != m_maps.end() && it->first < view_end;) {
+					mapped.push_back(it->second);
+					parts.emplace_back(it->second.vaddr, it->second.size);
+					it = m_maps.erase(it);
+				}
+				for (auto it = m_parked.lower_bound(view_base);
+				     it != m_parked.end() && it->first < view_end;) {
+					parts.emplace_back(it->first, it->second);
+					freed->emplace_back(it->first, it->second);
+					it = m_parked.erase(it);
+				}
+				m_views.erase(view);
+				MapsChangedUnlocked();
+			}
+
+			std::vector<KeptProtection> kept_protections;
+			for (const auto& entry: mapped) {
+				SnapshotRange(entry.vaddr, entry.vaddr + entry.size, GetProtect(entry.mode),
+				              kept_protections);
+			}
+			TransientUnmapWindows::Scope transient(view_base, view_base + view_size);
+			EXIT_IF(!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(view_base), view_size));
+			// The view's placeholder is cut at the parts (they tile it), then the mapped ones are mapped again.
+			std::sort(parts.begin(), parts.end());
+			uint64_t at = view_base;
+			for (size_t i = 0; i < parts.size(); ++i) {
+				EXIT_IF(parts[i].first != at);
+				at += parts[i].second;
+				if (i + 1 < parts.size()) {
+					EXIT_IF(!SplitPlaceholder(parts[i].first, parts[i].second));
+				}
+			}
+			EXIT_IF(at != view_base + view_size);
+			for (const auto& entry: mapped) {
+				EXIT_IF(!MapFixed(entry.vaddr, entry.size, entry.backing_offset, entry.mode));
+			}
+			RestoreProtections(kept_protections);
+		}
+	}
+#endif
 
 	bool Contains(uint64_t vaddr, uint64_t size) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
@@ -831,6 +1083,26 @@ private:
 		DWORD    protect = 0;
 	};
 
+	// The protections other than `view_protect` of [start, end), appended to `kept`.
+	static void SnapshotRange(uint64_t start, uint64_t end, DWORD view_protect,
+	                          std::vector<KeptProtection>& kept) {
+		for (auto current = start; current < end;) {
+			MEMORY_BASIC_INFORMATION info {};
+			if (VirtualQuery(reinterpret_cast<const void*>(current), &info, sizeof(info)) == 0) {
+				break;
+			}
+			const auto region_end =
+			    std::min(end, reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize);
+			if (region_end <= current) {
+				break;
+			}
+			if (info.State == MEM_COMMIT && info.Protect != view_protect) {
+				kept.push_back({current, region_end - current, info.Protect});
+			}
+			current = region_end;
+		}
+	}
+
 	// The protections, other than the view's own, of the parts of a view that stay mapped when
 	// [vaddr, vaddr + size) is unmapped from it.
 	static std::vector<KeptProtection> SnapshotProtections(const MapEntry& view, uint64_t vaddr,
@@ -839,21 +1111,7 @@ private:
 		const auto                  view_protect = GetProtect(view.mode);
 		for (const auto& [start, end]:
 		     {std::pair {view.vaddr, vaddr}, std::pair {vaddr + size, view.vaddr + view.size}}) {
-			for (auto current = start; current < end;) {
-				MEMORY_BASIC_INFORMATION info {};
-				if (VirtualQuery(reinterpret_cast<const void*>(current), &info, sizeof(info)) == 0) {
-					break;
-				}
-				const auto region_end =
-				    std::min(end, reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize);
-				if (region_end <= current) {
-					break;
-				}
-				if (info.State == MEM_COMMIT && info.Protect != view_protect) {
-					kept.push_back({current, region_end - current, info.Protect});
-				}
-				current = region_end;
-			}
+			SnapshotRange(start, end, view_protect, kept);
 		}
 		return kept;
 	}
@@ -952,10 +1210,96 @@ private:
 	int m_fd = -1;
 #endif
 
+	// Gives back to the guest a range that Unmap took out, because a later part of the same unmap
+	// failed.
+	void RemapUnmapped(const MapEntry& entry, UnmapKind kind) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (kind == UnmapKind::Parked) {
+			// (It never left its view.)
+			std::lock_guard lock(m_mutex);
+			UnparkUnlocked(entry);
+			return;
+		}
+		// (A view released whole can only be given back by a failure injected by the tests, and
+		// none of them unmaps part of a view first.)
+		EXIT_IF(kind == UnmapKind::Released);
+#else
+		(void)kind;
+#endif
+		EXIT_IF(!MapFixed(entry.vaddr, entry.size, entry.backing_offset, entry.mode));
+	}
+
 	uint8_t*                     m_backing_base = nullptr;
 	uint64_t                     m_size         = 0;
 	std::shared_mutex            m_mutex;
 	std::map<uint64_t, MapEntry> m_maps;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// The file views of the guest mappings (base -> size): each view's mapped parts (m_maps) and
+	// parked ranges (m_parked) tile it. A view is one mapping until an unmap parks a range in it.
+	std::map<uint64_t, uint64_t> m_views;
+	// Ranges the guest unmapped from views that stay mapped (base -> size, each inside one view,
+	// KYTY_PARK_UNMAPS). They are split off for real when something is mapped over one
+	// (Materialize), or unmapped with their view once nothing of it stays mapped.
+	std::map<uint64_t, uint64_t> m_parked;
+
+	std::map<uint64_t, uint64_t>::iterator FindViewUnlocked(uint64_t vaddr) {
+		const auto next = m_views.upper_bound(vaddr);
+		if (next == m_views.begin()) {
+			return m_views.end();
+		}
+		const auto view = std::prev(next);
+		return vaddr < view->first + view->second ? view : m_views.end();
+	}
+
+	// The first parked range that overlaps [vaddr, vaddr + size), or end.
+	std::map<uint64_t, uint64_t>::iterator FirstParkedUnlocked(uint64_t vaddr, uint64_t size) {
+		auto it = m_parked.upper_bound(vaddr);
+		if (it != m_parked.begin() && std::prev(it)->first + std::prev(it)->second > vaddr) {
+			--it;
+		}
+		return it != m_parked.end() && it->first < vaddr + size ? it : m_parked.end();
+	}
+
+	// [vaddr, vaddr + size) parked, joined to the parked ranges next to it in the same view
+	// [view_begin, view_end).
+	void ParkUnlocked(uint64_t vaddr, uint64_t size, uint64_t view_begin, uint64_t view_end) {
+		uint64_t begin = vaddr;
+		uint64_t end   = vaddr + size;
+		auto     next  = m_parked.lower_bound(vaddr);
+		if (next != m_parked.begin()) {
+			const auto previous = std::prev(next);
+			if (previous->first >= view_begin && previous->first + previous->second == begin) {
+				begin = previous->first;
+				m_parked.erase(previous);
+			}
+		}
+		if (next != m_parked.end() && next->first == end && next->first + next->second <= view_end) {
+			end = next->first + next->second;
+			m_parked.erase(next);
+		}
+		EXIT_IF(!m_parked.emplace(begin, end - begin).second);
+	}
+
+	// A parked range mapped for the guest again (an unmap failed after parking it).
+	void UnparkUnlocked(const MapEntry& entry) {
+		auto it = m_parked.upper_bound(entry.vaddr);
+		EXIT_IF(it == m_parked.begin());
+		--it;
+		const auto begin = it->first;
+		const auto end   = it->first + it->second;
+		const auto stop  = entry.vaddr + entry.size;
+		EXIT_IF(entry.vaddr < begin || stop > end);
+		m_parked.erase(it);
+		if (begin < entry.vaddr) {
+			EXIT_IF(!m_parked.emplace(begin, entry.vaddr - begin).second);
+		}
+		if (stop < end) {
+			EXIT_IF(!m_parked.emplace(stop, end - stop).second);
+		}
+		EXIT_IF(!m_maps.emplace(entry.vaddr, entry).second);
+		MapsChangedUnlocked();
+	}
+#endif
 };
 
 class GuestAddressSpace {
@@ -1122,6 +1466,7 @@ public:
 		const bool replacing = ContainsMappedUnlocked(vaddr, size, MappingType::Backing);
 #else
 		constexpr bool replacing = false;
+		MaterializeParkedUnlocked(vaddr, size);
 #endif
 		if (!replacing && !ConsumeUnlocked(vaddr, size)) {
 			if (failure_reason != nullptr) {
@@ -1149,15 +1494,19 @@ public:
 		if (!ContainsMappedUnlocked(vaddr, size, MappingType::Backing)) {
 			return false;
 		}
-		bool placeholder_preserved = false;
-		if (!m_backing->Unmap(vaddr, size, &placeholder_preserved)) {
+		bool                                       placeholder_preserved = false;
+		std::vector<std::pair<uint64_t, uint64_t>> freed;
+		if (!m_backing->Unmap(vaddr, size, &placeholder_preserved, &freed)) {
 			return false;
 		}
 		if (!placeholder_preserved) {
 			return false;
 		}
 		EXIT_IF(!RemoveMappedUnlocked(vaddr, size, MappingType::Backing));
-		AddFreeUnlocked(vaddr, size);
+		// (The range itself, unless it stayed parked in its view: KYTY_PARK_UNMAPS.)
+		for (const auto& [freed_vaddr, freed_size]: freed) {
+			AddFreeUnlocked(freed_vaddr, freed_size);
+		}
 		return true;
 	}
 
@@ -1192,23 +1541,24 @@ public:
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
-		return FindContaining(vaddr, size) != m_free.end();
+		return FreeOrParkedUnlocked(vaddr, size);
 	}
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 	bool TestContainsFree(uint64_t vaddr, uint64_t size) {
 		std::lock_guard lock(m_mutex);
-		return FindContaining(vaddr, size) != m_free.end();
+		return FreeOrParkedUnlocked(vaddr, size);
 	}
 #endif
 
 	bool ReleaseFree(uint64_t vaddr, uint64_t size) {
 		std::lock_guard lock(m_mutex);
-		return FindContaining(vaddr, size) != m_free.end();
+		return FreeOrParkedUnlocked(vaddr, size);
 	}
 
 	bool Commit(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		std::lock_guard lock(m_mutex);
+		MaterializeParkedUnlocked(vaddr, size);
 		if (!ConsumeUnlocked(vaddr, size)) {
 			return false;
 		}
@@ -1346,6 +1696,48 @@ private:
 			}
 		}
 		return true;
+	}
+
+	// Whether [vaddr, vaddr + size) is free: free placeholders, or ranges parked in views
+	// (GuestBackingStore::UnmapOne, KYTY_PARK_UNMAPS), which a map or commit there makes free
+	// placeholders first (MaterializeParkedUnlocked).
+	bool FreeOrParkedUnlocked(uint64_t vaddr, uint64_t size) {
+		if (FindContaining(vaddr, size) != m_free.end()) {
+			return true;
+		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (!ParkUnmapsEnabled()) {
+			return false;
+		}
+		const auto end = vaddr + size;
+		for (auto at = vaddr; at < end;) {
+			if (const auto it = FindContaining(at, 1); it != m_free.end()) {
+				at = it->first + it->second;
+			} else if (const auto parked_end = m_backing->ParkedEnd(at); parked_end != 0) {
+				at = parked_end;
+			} else {
+				return false;
+			}
+		}
+		return true;
+#else
+		return false;
+#endif
+	}
+
+	// The ranges parked in views over [vaddr, vaddr + size) made free placeholders, before a map
+	// or commit there: their views are split for real (GuestBackingStore::Materialize).
+	void MaterializeParkedUnlocked([[maybe_unused]] uint64_t vaddr, [[maybe_unused]] uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (!m_backing->HasParked(vaddr, size)) {
+			return;
+		}
+		std::vector<std::pair<uint64_t, uint64_t>> freed;
+		m_backing->Materialize(vaddr, size, &freed);
+		for (const auto& [freed_vaddr, freed_size]: freed) {
+			AddFreeUnlocked(freed_vaddr, freed_size);
+		}
+#endif
 	}
 
 	bool ConsumeUnlocked(uint64_t vaddr, uint64_t size) {
