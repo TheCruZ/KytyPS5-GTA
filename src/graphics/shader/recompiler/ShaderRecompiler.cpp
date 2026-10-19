@@ -540,6 +540,7 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 	query.blocks.push_back(&block);
 	struct Producer { bool ready = false; std::map<uint32_t, Value> values; };
 	std::map<uint32_t, Producer> producers;
+	bool ambiguous = false;
 	std::function<Value(uint32_t, uint32_t)> Register;
 	std::function<Value(uint32_t, Value)> Resolve = [&](uint32_t before, Value value) -> Value {
 		value = value.Resolve();
@@ -563,6 +564,11 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 	Register = [&](uint32_t before, uint32_t code) -> Value {
 		std::vector<uint32_t> crossed_calls;
 		const auto index = CFG::FindScalarDefinition(source.decoded, graph, before, code, crossed_calls);
+		if (index == CFG::AmbiguousScalarDefinition) {
+			// The paths that reach the call write the register differently: the target is not static.
+			ambiguous = true;
+			return Value(uint32_t {0});
+		}
 		for (const auto crossed: crossed_calls) {
 			std::ranges::find(source.calls, crossed, &ShaderSource::Call::instruction)->preserved_registers.set(code);
 		}
@@ -605,6 +611,11 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 		                     call.src0.reg != call.dst.reg || call.dst.reg >= 105u);
 		for (uint32_t i = 0; i < 2u; ++i) {
 			const auto value = Register(site.instruction, call.src0.reg + i);
+			if (ambiguous) {
+				source.unsupported_call_pc = call.pc;
+				source.calls.clear();
+				return;
+			}
 			if (!ValidateRuntimeValue(query, value, RuntimeValueType::Integer)) {
 				EXIT_IF(value.Instruction()->GetOpcode() != ValueOpcode::ReadConstBuffer);
 				source.unsupported_call_pc = call.pc;
