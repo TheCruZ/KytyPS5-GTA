@@ -73,8 +73,8 @@ bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 		if (!manager->HasCpuDirty()) {
 			return false;
 		}
-		std::scoped_lock lock(manager->lock);
-		return manager->IsModified<DirtySource::Cpu>(offset, bytes);
+		// The bits change only under the lock: read under its sequence (no locked instruction; KYTY_SPIN_YIELD=0 takes it).
+		return manager->lock.ReadShared([&] { return manager->IsModified<DirtySource::Cpu>(offset, bytes); });
 	});
 }
 
@@ -88,8 +88,7 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 		return false;
 	}
 	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		std::scoped_lock lock(manager->lock);
-		return manager->IsModified<DirtySource::Gpu>(offset, bytes);
+		return manager->lock.ReadShared([&] { return manager->IsModified<DirtySource::Gpu>(offset, bytes); });
 	});
 }
 

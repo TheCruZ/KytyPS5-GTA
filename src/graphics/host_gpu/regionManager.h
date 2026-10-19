@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/host_gpu/spinYield.h"
 
 #include <atomic>
 #include <mutex>
@@ -36,22 +37,71 @@ class TrackingSpinLock final {
 public:
 	void lock() noexcept {
 		const auto thread = CurrentThread();
+		if (!SpinYieldEnabled()) {
+			while (m_lock.test_and_set(std::memory_order_acquire)) {
+				EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
+#if defined(__x86_64__) || defined(_M_X64)
+				_mm_pause();
+#elif defined(_M_ARM64)
+				__yield();
+#elif defined(__aarch64__)
+				asm volatile("yield");
+#endif
+			}
+			m_owner.store(thread, std::memory_order_relaxed);
+			return;
+		}
+		uint32_t spins = 0;
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
 			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
+			// Wait with plain loads: repeated locked writes would keep the line away from the owner and slow the very
+			// critical section being waited for. Past a short spin the waiter yields its CPU to a descheduled owner.
+			do {
+				if (++spins < 512) {
 #if defined(__x86_64__) || defined(_M_X64)
-			_mm_pause();
+					_mm_pause();
 #elif defined(_M_ARM64)
-			__yield();
+					__yield();
 #elif defined(__aarch64__)
-			asm volatile("yield");
+					asm volatile("yield");
 #endif
+				} else {
+					YieldCpu();
+				}
+			} while (m_lock.test(std::memory_order_relaxed));
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
+		// Odd while held: ReadShared retries a read that overlapped a holder.
+		m_seq.store(m_seq.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+		std::atomic_thread_fence(std::memory_order_release);
 	}
 	void unlock() noexcept {
 		EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) != CurrentThread());
+		if (SpinYieldEnabled()) {
+			m_seq.store(m_seq.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+		}
 		m_owner.store(0, std::memory_order_relaxed);
 		m_lock.clear(std::memory_order_release);
+	}
+	// A read of state only holders of this lock write, without taking it: valid when no holder was inside while it ran
+	// (the sequence even and unchanged), else done again under the lock. The query then costs no locked instruction and
+	// leaves the lock's line to the writers. With KYTY_SPIN_YIELD=0 it takes the lock.
+	template <typename Read>
+	auto ReadShared(Read&& read) {
+		if (SpinYieldEnabled()) {
+			const auto before = m_seq.load(std::memory_order_acquire);
+			if ((before & 1u) == 0) {
+				auto result = read();
+				std::atomic_thread_fence(std::memory_order_acquire);
+				if (m_seq.load(std::memory_order_relaxed) == before) {
+					return result;
+				}
+			}
+		}
+		lock();
+		auto result = read();
+		unlock();
+		return result;
 	}
 
 private:
@@ -75,6 +125,7 @@ private:
 
 	std::atomic_flag     m_lock = ATOMIC_FLAG_INIT;
 	std::atomic_uint32_t m_owner {0};
+	std::atomic_uint32_t m_seq {0};
 };
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);

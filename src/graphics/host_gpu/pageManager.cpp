@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/host_gpu/spinYield.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -71,14 +72,35 @@ thread_local uint64_t g_unmapping_end   = 0;
 class SpinGuard final {
 public:
 	explicit SpinGuard(std::atomic_flag& lock): m_lock(lock) {
-		while (m_lock.test_and_set(std::memory_order_acquire)) {
+		if (!SpinYieldEnabled()) {
+			while (m_lock.test_and_set(std::memory_order_acquire)) {
 #if defined(__x86_64__) || defined(_M_X64)
-			_mm_pause();
+				_mm_pause();
 #elif defined(_M_ARM64)
-			__yield();
+				__yield();
 #elif defined(__aarch64__)
-			asm volatile("yield");
+				asm volatile("yield");
 #endif
+			}
+			return;
+		}
+		// Owners call VirtualProtect inside: past a short spin a waiter yields its CPU instead of competing with a
+		// descheduled owner (see TrackingSpinLock).
+		uint32_t spins = 0;
+		while (m_lock.test_and_set(std::memory_order_acquire)) {
+			do {
+				if (++spins < 512) {
+#if defined(__x86_64__) || defined(_M_X64)
+					_mm_pause();
+#elif defined(_M_ARM64)
+					__yield();
+#elif defined(__aarch64__)
+					asm volatile("yield");
+#endif
+				} else {
+					YieldCpu();
+				}
+			} while (m_lock.test(std::memory_order_relaxed));
 		}
 	}
 	~SpinGuard() { m_lock.clear(std::memory_order_release); }
