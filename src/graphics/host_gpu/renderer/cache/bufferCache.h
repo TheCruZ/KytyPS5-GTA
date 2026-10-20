@@ -162,6 +162,8 @@ public:
 	// Synchronizes the buffers over the ranges the tracker queued after the CPU wrote to them
 	// (QueueBdaSync); the ranges are cut to the mapped ones.
 	void                            SynchronizeBda(const RangeSet& mapped);
+	// Records the uploads gathered since a batch began (SynchronizeBda) and ends the batch.
+	void                            FlushUploadBatch();
 	void                            QueueBdaSync(uint64_t vaddr, uint64_t size) {
 		m_memory_tracker.QueueBdaSync(vaddr, size);
 	}
@@ -496,6 +498,12 @@ private:
 		uint64_t size;
 	};
 	std::vector<UploadRead> m_upload_reads;
+	// SynchronizeBda(): the uploads of one synchronization, recorded together behind one pair of
+	// barriers (see FlushUploadBatch()).
+	bool                                         m_upload_batching   = false;
+	uint64_t                                     m_upload_batch_tick = 0;
+	std::vector<std::pair<vk::Buffer, uint32_t>> m_upload_batch_buffers;
+	std::vector<vk::BufferCopy>                  m_upload_batch_copies;
 	StreamBuffer                                       m_stream_buffer;
 	StreamBuffer                                       m_download_buffer;
 	StreamBuffer                                       m_device_buffer;

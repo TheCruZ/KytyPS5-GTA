@@ -1663,7 +1663,10 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    });
 	}
 	RecordSync(size, is_written, static_cast<bool>(source), timed ? walk_timer.GetTimeS() : 0.0);
-	if (source) {
+	if (source && m_upload_batching && source == m_staging_buffer.Handle()) {
+		m_upload_batch_buffers.emplace_back(buffer.Handle(), static_cast<uint32_t>(copies.size()));
+		m_upload_batch_copies.insert(m_upload_batch_copies.end(), copies.begin(), copies.end());
+	} else if (source) {
 		KYTY_PROFILER_BLOCK("Sync::Copy");
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
@@ -1724,7 +1727,10 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	Profiler::Add(Profiler::Counter::UploadBytes, static_cast<int64_t>(total_size));
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
 
-	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
+	// Within a batch of uploads (see FlushUploadBatch()) the staging buffer must not wait for the
+	// current command buffer: that would submit it without the batched copies. A copy that does
+	// not fit then goes through a buffer of its own.
+	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4, !m_upload_batching);
 	if (mapped != nullptr) {
 		// Reading guest memory into staging was ~28 MB a frame of memcpy on the GPU thread in
 		// the jungle (~8,500 uploads). With a recording thread the reads run there instead, in
@@ -3983,9 +3989,56 @@ void BufferCache::SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t siz
 	    });
 }
 
+void BufferCache::FlushUploadBatch() {
+	m_upload_batching = false;
+	if (m_upload_batch_buffers.empty()) {
+		return;
+	}
+	KYTY_PROFILER_BLOCK("Sync::CopyBatch");
+	// The staging ranges belong to the command buffer they were mapped for.
+	EXIT_IF(m_scheduler.CurrentTick() != m_upload_batch_tick);
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto native = command.Recorder();
+	// As SynchronizeBuffer() records around each upload, for all the buffers at once.
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+	                       vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion, 1,
+	                       &before, 0, nullptr, 0, nullptr);
+	const auto staging = m_staging_buffer.Handle();
+	size_t     first   = 0;
+	for (const auto& [destination, count]: m_upload_batch_buffers) {
+		native.copyBuffer(staging, destination, count, m_upload_batch_copies.data() + first);
+		first += count;
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands, vk::DependencyFlagBits::eByRegion,
+	                       1, &after, 0, nullptr, 0, nullptr);
+	m_upload_batch_buffers.clear();
+	m_upload_batch_copies.clear();
+}
+
 void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 	// Take before walking: writes queued during synchronization remain pending.
 	const auto pending = m_memory_tracker.TakeBdaSync();
+	// Each buffer's upload would record its own pair of barriers: record them once, around the
+	// copies of every buffer (hundreds per frame in GTA V).
+	struct Batch {
+		BufferCache& cache;
+		explicit Batch(BufferCache& owner): cache(owner) {
+			cache.m_upload_batching   = true;
+			cache.m_upload_batch_tick = cache.m_scheduler.CurrentTick();
+		}
+		~Batch() { cache.FlushUploadBatch(); }
+		Batch(const Batch&)            = delete;
+		Batch& operator=(const Batch&) = delete;
+	} batch {*this};
 	pending.ForEach([&](uint64_t begin, uint64_t end) {
 		mapped.ForEachInRange(begin, end - begin, [this](uint64_t start, uint64_t finish) {
 			SynchronizeBuffersInRange(start, finish - start);
