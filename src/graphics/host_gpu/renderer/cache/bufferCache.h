@@ -156,6 +156,10 @@ public:
 	// Synchronizes the buffers over the ranges the tracker queued after the CPU wrote to them
 	// (QueueBdaSync); the ranges are cut to the mapped ones.
 	void                            SynchronizeBda(const RangeSet& mapped);
+	// As SynchronizeBda(), for the queued CPU writes inside the spans only (the guest memory a
+	// program's device-address reads can reach); the other queued writes stay for later.
+	void SynchronizeBdaSpans(std::span<const std::pair<uint64_t, uint64_t>> spans,
+	                         const RangeSet&                                mapped);
 	// Records the uploads gathered since a batch began (SynchronizeBda) and ends the batch.
 	void                            FlushUploadBatch();
 	void                            QueueBdaSync(uint64_t vaddr, uint64_t size) {

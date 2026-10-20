@@ -1087,7 +1087,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (program.info.uses_dma) {
 		KYTY_PROFILER_BLOCK("Dispatch::PrepareBda");
 		m_context.CacheDmaBases(input_info.stage);
-		m_context.PrepareBda();
+		const ShaderStageRuntime* const dma_stage = &input_info.stage;
+		const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
+		m_context.PrepareBda(!reach_synchronized);
 	}
 	RebindImages(bindings);
 	BindSharedMemory(m_context, input_info, bindings);
@@ -1387,7 +1389,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	if (program.info.uses_dma) {
 		m_context.CacheDmaBases(input_info.stage);
-		m_context.PrepareBda();
+		const ShaderStageRuntime* const dma_stage = &input_info.stage;
+		const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
+		m_context.PrepareBda(!reach_synchronized);
 	}
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
 	RebindImages(bindings);

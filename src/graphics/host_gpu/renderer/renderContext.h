@@ -79,7 +79,13 @@ public:
 		m_page_manager.ResyncHostProtection(vaddr, size);
 	}
 	void               CacheDmaBases(const ShaderStageRuntime& runtime);
-	void               PrepareBda();
+	// Uploads the CPU writes of the guest memory that the device-address reads of the stages can
+	// reach (see ShaderInfo::dma_windows); false when a stage's reach is not known, and nothing
+	// was uploaded.
+	[[nodiscard]] bool SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* const> stages);
+	// full_sync: upload the CPU writes of all cached memory first (SynchronizeDmaFootprint() did
+	// not cover the operation).
+	void               PrepareBda(bool full_sync = true);
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -105,6 +111,8 @@ private:
 	BindlessTable             m_bindless_table;
 	IndirectWriteTables       m_indirect_write_tables {*this};
 	OcclusionQueries          m_occlusion_queries {*this};
+	// SynchronizeDmaFootprint(): the spans of an operation.
+	std::vector<std::pair<uint64_t, uint64_t>> m_dma_spans;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	uint64_t                  m_mapped_ranges_version = 0;
