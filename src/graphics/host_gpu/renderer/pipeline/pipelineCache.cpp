@@ -142,6 +142,14 @@ bool ReadGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 }
 
 bool ReadAheadPlain(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	// As ReadGuestMemory: a table pointer below guest memory (0x40000) is null, and the bytes read
+	// through it are zero for every thread, so they need neither the backing nor a validation entry.
+	if (address < 0x40000u && !values.empty()) {
+		Common::HackNotice::Report("null SRT table read as zero", "ahead resolution plain read", 0,
+		                           address);
+		std::ranges::fill(values, 0u);
+		return true;
+	}
 	return !values.empty() && static_cast<GuestReadLog*>(userdata)->Read(
 	                              address, values.data(), values.size_bytes(), false);
 }
@@ -152,6 +160,12 @@ bool ReadAheadStrict(void* userdata, uint64_t address, std::span<uint32_t> value
 }
 
 bool ReadAheadShaderState(void* userdata, uint64_t address, void* data, uint64_t size) {
+	if (address < 0x40000u && size != 0u) {
+		Common::HackNotice::Report("null SRT table read as zero", "ahead resolution shader-state read",
+		                           0, address);
+		std::memset(data, 0, size);
+		return true;
+	}
 	return static_cast<GuestReadLog*>(userdata)->Read(address, data, size, false);
 }
 
