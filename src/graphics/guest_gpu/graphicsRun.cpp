@@ -460,6 +460,8 @@ void GuestGpu::RunUrgentCommands() {
 	if (m_urgent_pending.load(std::memory_order_acquire) == 0) {
 		return;
 	}
+	// Unmaps free memory that the render targets of the draw before may refer to.
+	m_renderer.GetRenderExecutor().EndDrawWindow();
 	std::vector<Common::UniqueFunction<void>> commands;
 	{
 		std::lock_guard lock(m_urgent_mutex);
@@ -870,6 +872,7 @@ uint64_t CommandProcessor::EmitCallback(GpuCallback&& callback) {
 void CommandProcessor::Execute(GpuOperation& operation) {
 	EXIT_IF(operation.processor != this);
 	BindState(operation.state);
+	m_renderer.GetRenderExecutor().UseContextId(operation.state.context_id);
 	if (operation.prepared) {
 		DrawPrep::SetCurrent(operation.prep_key);
 	} else if (operation.kind != GpuOperationKind::Callback) {

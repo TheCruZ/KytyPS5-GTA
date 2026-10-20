@@ -21,8 +21,6 @@ namespace Libs::Graphics {
 
 struct ShaderStageRuntime;
 
-struct TextureDescDerivation;
-
 // The state of a cached image that its lookups and acquisitions depend on. While an image keeps
 // it (and the image set around its range is unchanged), looking it up again and acquiring its
 // views finds the same image and views and changes nothing.
@@ -50,13 +48,6 @@ struct ImageLookupState {
 		        .storage         = image.usage.storage,
 		        .render_target   = image.usage.render_target};
 	}
-};
-
-// The image state a bindless table element's view was last acquired in: while the image keeps
-// it, the view still holds and acquiring it again would only refresh the image's use.
-struct TableViewMemo {
-	ImageLookupState state;
-	bool             valid = false;
 };
 
 struct TextureBinding {
