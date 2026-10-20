@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
 #include "common/assert.h"
+#include "common/hackNotice.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -119,6 +120,14 @@ bool ReadAheadStrict(void* userdata, uint64_t address, std::span<uint32_t> value
 }
 
 bool ReadAheadShaderState(void* userdata, uint64_t address, void* data, uint64_t size) {
+	// A table pointer below guest memory (0x40000) is null, and the bytes read through it are zero
+	// for every thread, so they need neither the backing nor a validation entry.
+	if (address < 0x40000u && size != 0u) {
+		Common::HackNotice::Report("null SRT table read as zero", "ahead resolution shader-state read",
+		                           0, address);
+		std::memset(data, 0, size);
+		return true;
+	}
 	return static_cast<GuestReadLog*>(userdata)->Read(address, data, size, false);
 }
 
