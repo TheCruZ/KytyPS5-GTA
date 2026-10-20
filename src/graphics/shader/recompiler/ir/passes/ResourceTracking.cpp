@@ -2895,7 +2895,7 @@ private:
 					continue;
 				}
 				const auto* table = inst->Arg(0).Resolve().TryInstruction();
-				if (table == nullptr || !EquivalentValue(m_program, Value(table), Value(reference)) ||
+				if (table == nullptr || !EquivalentValue(m_program, Value(const_cast<Inst*>(table)), Value(const_cast<Inst*>(reference))) ||
 				    (!found.IsEmpty() && !EquivalentValue(m_program, found, leaf))) {
 					return {};
 				}

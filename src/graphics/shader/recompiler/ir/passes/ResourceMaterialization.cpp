@@ -1965,7 +1965,6 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 				}
 			}
 		}
-		}
 		for (const auto& sampler: plan.info.samplers) {
 			const auto* source = Source(plan, sampler.source);
 			if (source != nullptr && source->bindless_sampler.has_value()) {

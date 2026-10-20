@@ -912,9 +912,6 @@ void NormalizeGraphicsPipelineKey(PipelineStaticParameters& params) {
 	params.cull_front               = false;
 	params.cull_back                = false;
 	params.face                     = false;
-	params.depth_bounds_test_enable = false;
-	params.depth_min_bounds         = 0.0f;
-	params.depth_max_bounds         = 0.0f;
 }
 
 } // namespace

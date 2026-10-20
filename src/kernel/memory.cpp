@@ -746,7 +746,6 @@ public:
 		    !IsCommittedRangeType(vma->second.type)) {
 			return 0;
 		}
-		const auto vma_end = End(vma->second.start, vma->second.size);
 
 		uint64_t clamped_size = std::min(size, vma_end - virtual_addr);
 		uint64_t expected     = virtual_addr + clamped_size;
@@ -3898,8 +3897,7 @@ int KYTY_SYSV_ABI KernelMapDirectMemory2(void** addr, size_t len, int type, int 
 	MemoryOperationLock memory_operation_lock(__func__);
 	t_lock_wait_ns += CostNowNs() - lock_begin;
 
-	LOGF("	 type = %d
-", type);
+	LOGF("	 type = %d\n", type);
 
 	return MapDirectMemory(addr, len, prot, flags, direct_memory_start, alignment, "", type);
 }

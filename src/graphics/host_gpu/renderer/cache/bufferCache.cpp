@@ -1866,7 +1866,7 @@ void BufferCache::LoadWrittenWords(uint64_t word_begin, uint64_t word_end,
 		for (; i + 4 <= count; i += 4) {
 			alignas(16) uint32_t loaded[4];
 			_mm_store_si128(reinterpret_cast<__m128i*>(loaded),
-			                _mm_stream_load_si128(const_cast<__m128i*>(
+			                _mm_load_si128((
 			                    reinterpret_cast<const __m128i*>(words + i))));
 			out[i] |= loaded[0];
 			out[i + 1] |= loaded[1];

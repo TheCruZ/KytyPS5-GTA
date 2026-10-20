@@ -68,6 +68,7 @@ struct File {
 	std::filesystem::path               real_name;
 	std::atomic_bool                    opened;
 	std::atomic_bool                    directory;
+	std::atomic_bool                    readable;
 	std::atomic_bool                    writable;
 	std::atomic_bool                    append;
 	std::atomic_bool                    sync_writes;
@@ -180,6 +181,7 @@ int FileDescriptors::CreateDescriptor() {
 	auto* file        = new File {};
 	file->opened      = false;
 	file->directory   = false;
+	file->readable    = false;
 	file->writable    = false;
 	file->append      = false;
 	file->sync_writes = false;

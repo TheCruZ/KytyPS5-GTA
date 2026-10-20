@@ -499,19 +499,20 @@ void CommandScheduler::PopPendingOperations() {
 }
 
 void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) {
+	CheckActive();
+	QueueOperation(std::move(operation), false);
+}
+
+void CommandScheduler::DeferRelease(Common::UniqueFunction<void>&& operation) {
 	QueueOperation(std::move(operation), false);
 }
 
 void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
+	CheckActive();
 	QueueOperation(std::move(operation), true);
 }
 
 void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority) {
-	CheckActive();
-	DeferRelease(std::move(operation));
-}
-
-void CommandScheduler::DeferRelease(Common::UniqueFunction<void>&& operation) {
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {

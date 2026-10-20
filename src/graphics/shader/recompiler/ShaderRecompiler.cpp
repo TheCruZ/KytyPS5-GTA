@@ -806,8 +806,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	    options.stage != ShaderType::Pixel && options.stage != ShaderType::Mesh &&
 	    options.stage != ShaderType::Local && options.stage != ShaderType::TessellationControl &&
 	    options.stage != ShaderType::TessellationEvaluation) {
-		EXIT("shader recompiler received unsupported stage %u
-",
+		EXIT("shader recompiler received unsupported stage %u\n",
 		     static_cast<unsigned>(options.stage));
 	}
 
@@ -932,15 +931,13 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		simplify();
 	}
 	if (const auto folded = IR::SimplifyBoundedLoopRegisters(ir); folded != 0) {
-		LOGF("%s bounded-loop comparisons: hash=0x%016" PRIx64 " folded=%u
-",
+		LOGF("%s bounded-loop comparisons: hash=0x%016" PRIx64 " folded=%u\n",
 		     GetDumpLabel(options), options.shader_hash, folded);
 		simplify();
 	}
 	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
 	if (read_lane_stats.rewritten_reads != 0 || read_lane_stats.rewritten_reductions != 0) {
-		LOGF("%s read-lane elimination: reads=%" PRIu32 " reductions=%" PRIu32 "
-",
+		LOGF("%s read-lane elimination: reads=%" PRIu32 " reductions=%" PRIu32 "\n",
 		     GetDumpLabel(options), read_lane_stats.rewritten_reads, read_lane_stats.rewritten_reductions);
 	}
 	// Cleanup also exposes profitable folds by removing dead predicate consumers.
@@ -952,8 +949,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 				EXIT_NOT_IMPLEMENTED(inst.GetOpcode() == IR::ValueOpcode::GetShaderBase);
 	}
 	if (const auto removed = IR::SimplifyLocalAddressStores(ir); removed != 0) {
-		LOGF("%s local-address proof: hash=0x%016" PRIx64 " removed_global_stores=%u
-",
+		LOGF("%s local-address proof: hash=0x%016" PRIx64 " removed_global_stores=%u\n",
 		     GetDumpLabel(options), options.shader_hash, removed);
 		IR::EliminateDeadCode(ir.blocks);
 	}

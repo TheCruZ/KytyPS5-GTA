@@ -184,7 +184,7 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	expected[static_cast<size_t>(Kind::BdaPagetable)] = program.info.uses_dma;
 	expected[static_cast<size_t>(Kind::FaultBuffer)] = program.info.uses_dma;
 	expected[static_cast<size_t>(Kind::FlattenedSrt)] =
-	    uses_flattened_srt || program.bindings.srt_verify || BindlessOrGpuSizedSrt(program);
+	    uses_flattened_srt || program.bindings.srt_verify || Emitter::BindlessOrGpuSizedSrt(program);
 	expected[static_cast<size_t>(Kind::ShaderData)] =
 	    program.bindings.ShaderDataDwords() != 0 && !program.bindings.UsesPushData();
 	uint64_t descriptor_mask = 0;

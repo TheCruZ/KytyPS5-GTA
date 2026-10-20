@@ -842,15 +842,16 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
+	const uint64_t texture_size = desc.info.data.size;
 	if (use_cache) {
 		if (cache.size() >= 65536) {
 			cache.clear();
 		}
-		cache.emplace(key, TextureDescEntry {desc, pixel_format, view_format, size.size,
+		cache.emplace(key, TextureDescEntry {desc, pixel_format, view_format, static_cast<uint32_t>(texture_size),
 		                                     shader_conversion});
 	}
 	return FindResolvedTexture(resource, descriptor, std::move(desc), shader_conversion,
-	                           pixel_format, view_format, size.size);
+	                           pixel_format, view_format, texture_size);
 }
 
 // ResolveTexture's texture cache lookup for a description (FindImage may adjust it).
@@ -1362,7 +1363,6 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key)
 	heap.slots[key]         = entry;
 	heap.images[key]        = binding.image_id;
 	image->bindless_pinned  = true;
-	image->usage.texture    = true;
 	heap.resolved.push_back(binding.image_id);
 	heap.unchecked.push_back(binding.image_id);
 	table.AddImageReference(binding.image_id, heap, key);
@@ -2781,8 +2781,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				static std::atomic<uint32_t> reported = 0;
 				if (reported.fetch_add(1) < 8) {
 					LOGF("RenderExecutor: buffer descriptor %u in guest page 0: stage=%s words=[0x%08x "
-					     "0x%08x 0x%08x 0x%08x] size=0x%016" PRIx64 "
-",
+					     "0x%08x 0x%08x 0x%08x] size=0x%016" PRIx64 "\n",
 					     resource, ShaderStageResourceName(program.stage), descriptor.fields[0],
 					     descriptor.fields[1], descriptor.fields[2], descriptor.fields[3], size);
 				}
@@ -2824,8 +2823,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 					static std::atomic<uint32_t> reported = 0;
 					if (reported.fetch_add(1) < 8) {
 						LOGF("RenderExecutor: buffer descriptor %u outside mapped memory: stage=%s "
-						     "base=0x%016" PRIx64 "
-",
+						     "base=0x%016" PRIx64 "\n",
 						     resource, ShaderStageResourceName(program.stage), address);
 					}
 					source = {};

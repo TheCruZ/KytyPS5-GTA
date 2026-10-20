@@ -155,9 +155,6 @@ int KYTY_SYSV_ABI AjmDecAt9ParseConfigData(const void*              config_data,
 	if (config_data == nullptr || config_info == nullptr) {
 		return AJM_ERROR_INVALID_PARAMETER;
 	}
-	if (!AjmAt9ConfigDataValid(static_cast<const uint8_t*>(config_data))) {
-		return AJM_ERROR_INVALID_PARAMETER;
-	}
 
 	Atrac9CodecInfo codec_info {};
 	if (!AjmAt9GetCodecInfo(static_cast<const uint8_t*>(config_data), codec_info)) {

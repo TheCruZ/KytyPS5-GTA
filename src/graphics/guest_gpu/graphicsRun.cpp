@@ -119,7 +119,6 @@ static const tracy::SourceLocationData* Pm4ZoneLocation(uint32_t opcode, uint32_
 		custom(Pm4::R_DRAW_RESET, "PM4 NOP DRAW_RESET");
 		custom(Pm4::R_WAIT_FLIP_DONE, "PM4 NOP WAIT_FLIP_DONE");
 		custom(Pm4::R_DISPATCH_RESET, "PM4 NOP DISPATCH_RESET");
-		custom(Pm4::R_ACQUIRE_MEM, "PM4 NOP ACQUIRE_MEM");
 		custom(Pm4::R_WRITE_DATA, "PM4 NOP WRITE_DATA");
 		custom(Pm4::R_FLIP, "PM4 NOP FLIP");
 		custom(Pm4::R_RELEASE_MEM, "PM4 NOP RELEASE_MEM");
@@ -1633,8 +1632,7 @@ static void PatchIndirectDrawOffsets(CommandProcessor& cp, IndirectDrawRegisters
 	if (static const bool log = std::getenv("KYTY_LOG_START_INST") != nullptr; log) {
 		static std::atomic<uint32_t> logged {0};
 		if (logged.fetch_add(1) < 40) {
-			std::fprintf(stderr, "[start-inst] cpu reg=0x%x value=%u
-", registers.instance_offset,
+			std::fprintf(stderr, "[start-inst] cpu reg=0x%x value=%u\n", registers.instance_offset,
 			             instance_offset);
 		}
 	}
