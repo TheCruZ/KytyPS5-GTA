@@ -79,7 +79,9 @@ public:
 	void BeginTextureDump(uint64_t frame);
 	void AddTextureDumpImages(std::span<const ImageId> ids);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
-	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
+	// stencil (optional) receives the stencil association the target refreshed, if any.
+	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc,
+	                                            ImageId* stencil = nullptr);
 	[[nodiscard]] Image&        GetImage(ImageId id) {
 		auto& image = m_slot_images[id];
 		TouchImage(image);

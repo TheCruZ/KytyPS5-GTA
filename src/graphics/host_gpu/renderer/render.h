@@ -198,7 +198,11 @@ public:
 	// interrupt, flip, host command or a WAIT_REG_MEM): the guest cannot have overwritten what
 	// those draws read, as it learns the GPU consumed it only through such an operation.
 	[[nodiscard]] uint64_t DrawWindow() const noexcept { return m_draw_window; }
-	void                   EndDrawWindow() noexcept { m_draw_window++; }
+	void                   InvalidateRenderTargetMemo() noexcept;
+	// Also ends the reuse of the render targets of the draw before.
+	void                   EndDrawWindow() noexcept;
+	// The context snapshot the operation about to execute reads (0: the live registers).
+	void UseContextId(uint64_t id) noexcept { m_context_id = id; }
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
@@ -296,6 +300,22 @@ private:
 	                    GuestRange*                                  examined = nullptr);
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
+	// The render targets the last draw acquired, and the descriptions derived from the target
+	// registers; see RenderTargetMemo.
+	struct DrawRenderStorage;
+	// Reused by every draw.
+	[[nodiscard]] DrawRenderState& AcquireDrawRenderState();
+	struct RenderTargetMemo;
+	struct ColorTargetMemo;
+	struct DepthTargetMemo;
+	void               CaptureRenderTargetKey(const HW::Context& registers, uint32_t mrt_mask,
+	                                          uint32_t slice_offset);
+	[[nodiscard]] bool RenderTargetMemoCurrent();
+	[[nodiscard]] bool TryReuseRenderTargets(const HW::Context& registers, uint32_t mrt_mask,
+	                                         uint32_t slice_offset, DrawRenderState& state);
+	void StoreRenderTargetMemo(const RenderColorInfo* colors, uint32_t color_count,
+	                           const RenderDepthInfo& depth, const vk::ImageView* views,
+	                           vk::ImageView depth_view, std::span<const ImageId> stencil);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
 	                              uint32_t render_target_slice_offset, uint32_t render_target_slot,
 	                              bool ignore_target_mask = false, bool exact_format = false);
@@ -370,6 +390,19 @@ private:
 	std::vector<TableResolution>          m_table_resolutions;
 	uint64_t                              m_table_resolution_tick = 0;
 	uint64_t                              m_draw_window           = 0;
+	uint64_t                              m_context_id            = 0;
+	std::unique_ptr<DrawRenderStorage, void (*)(DrawRenderStorage*)> m_draw_state {nullptr, nullptr};
+	// The last color-target descriptions per slot; see ResolveRenderColorTarget().
+	std::unique_ptr<ColorTargetMemo, void (*)(ColorTargetMemo*)> m_color_target_memo {nullptr,
+	                                                                                  nullptr};
+	// The last depth-target descriptions; see ResolveRenderDepthTarget().
+	std::unique_ptr<DepthTargetMemo, void (*)(DepthTargetMemo*)> m_depth_target_memo {nullptr,
+	                                                                                  nullptr};
+	// The render targets of the last draw; see RenderTargetMemo.
+	std::unique_ptr<RenderTargetMemo, void (*)(RenderTargetMemo*)> m_render_target_memo {nullptr,
+	                                                                                     nullptr};
+	// Whether the executing draw reused the render targets of the draw before.
+	bool m_render_targets_reused = false;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
