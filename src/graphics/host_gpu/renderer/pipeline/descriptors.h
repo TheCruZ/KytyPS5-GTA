@@ -57,12 +57,18 @@ struct TableViewMemo {
 	bool             valid = false;
 };
 
+struct TextureDescDerivation;
+
 struct TextureBinding {
 	ImageId                    image_id;
 	vk::ImageView              image_view = nullptr;
 	TextureCache::ImageDesc    desc;
 	vk::ImageLayout            layout = vk::ImageLayout::eUndefined;
 	std::vector<vk::ImageView> mip_views;
+	// The description whose last lookup this binding reuses (image_view is set) or records once
+	// its view is acquired; see RenderExecutor::ResolveTexture().
+	TextureDescDerivation* lookup = nullptr;
+	bool                   reused = false;
 };
 
 struct PreparedBindings {
@@ -103,6 +109,13 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              shader_data_buffer;
 	vk::DescriptorBufferInfo              shared_memory;
 	std::vector<uint32_t>                 shader_data;
+	// What the previous draw of this stage bound: a stage that binds the same program with the
+	// same T#s as the draw before (about half of them) skips the description lookups.
+	const void*                                        last_program          = nullptr;
+	uint64_t                                           last_descs_generation = 0;
+	std::vector<ShaderRecompiler::IR::DescriptorValue> last_images;
+	// The description each T# of `last_images` has (null when its lookups are not reused).
+	std::vector<TextureDescDerivation*>                image_descs;
 	// Bindless: flattened-SRT words to patch (offset, region, entries) and the heaps whose
 	// resolved images must be readable for this draw (stable: the table keeps heaps in a deque).
 	std::vector<std::array<uint32_t, 3>>  bindless_patches;

@@ -44,6 +44,28 @@ class CommandScheduler;
 class CommandRecorder;
 struct RenderExecutorTestAccess;
 
+// An image description derived from a T# and a shader's view of it (see ResolveTexture).
+struct TextureDescDerivation {
+	TextureCache::ImageDesc desc;
+	bool                    shader_conversion = false;
+	vk::Format              pixel_format      = vk::Format::eUndefined;
+	vk::Format              view_format       = vk::Format::eUndefined;
+	uint64_t                size              = 0;
+	// The image the last lookup of a sampled texture with this description found, the
+	// description it was found with and the view acquired for it. Reused while no image on the
+	// pages of the range was registered or unregistered since and the image keeps the state the
+	// acquisition left it in.
+	struct Found {
+		ImageId                 id;
+		TextureCache::ImageDesc desc;
+		vk::ImageView           view            = nullptr;
+		uint64_t                image_set_epoch = 0;
+		ImageLookupState        state;
+		bool                    valid = false;
+	};
+	Found found;
+};
+
 enum class CommandBufferDebugOp : uint32_t {
 	DispatchDirect,
 	DrawIndex,
@@ -410,7 +432,29 @@ private:
 	    const ShaderRecompiler::IR::ImageResource& resource, const ShaderTextureResource& descriptor,
 	    TextureCache::ImageDesc desc, bool shader_conversion, vk::Format pixel_format,
 	    vk::Format view_format, uint32_t size, bool table_candidate = false,
-	    GuestRange* examined = nullptr);
+	    GuestRange* examined = nullptr, TextureDescDerivation* lookup = nullptr);
+	// ResolveTexture's image descriptions by T# and shader view (see DeriveTextureDesc).
+	struct TextureDescKey {
+		std::array<uint32_t, 8> dwords {};
+		std::array<uint32_t, 5> view {};
+		bool                    operator==(const TextureDescKey&) const = default;
+	};
+	struct TextureDescKeyHash {
+		size_t operator()(const TextureDescKey& key) const noexcept;
+	};
+	[[nodiscard]] static TextureDescKey
+	MakeTextureDescKey(const ShaderRecompiler::IR::ImageResource&   resource,
+	                   const ShaderRecompiler::IR::DescriptorValue& value);
+	// Writes the image and view the last lookup of a description found into `binding`, when
+	// they still hold (see TextureDescDerivation::Found).
+	[[nodiscard]] bool ReuseTextureLookup(TextureDescDerivation& derived, TextureBinding& binding);
+	static constexpr size_t MaxTextureDescs = size_t {1} << 16u;
+	std::unordered_map<TextureDescKey, TextureDescDerivation, TextureDescKeyHash> m_texture_descs;
+	// Bindings point into m_texture_descs until their views are acquired: a full map is cleared
+	// once the bindings of the operation are reset.
+	bool m_clear_texture_descs = false;
+	// Advances when m_texture_descs is cleared (bindings keep pointers into it).
+	uint64_t m_texture_descs_generation = 1;
 	[[nodiscard]] TextureBinding
 	ResolveTableTexture(const ShaderRecompiler::IR::ImageResource&   root,
 	                    const ShaderRecompiler::IR::DescriptorValue& value,
