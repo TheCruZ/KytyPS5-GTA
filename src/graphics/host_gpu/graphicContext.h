@@ -57,6 +57,8 @@ struct GraphicContext {
 	bool                               diagnostic_checkpoints_enabled        = false;
 	// With --profile, for the host GPU timeline (renderer/gpuProfiler).
 	bool                               host_query_reset_enabled              = false;
+	// Draws whose arguments the GPU writes read them on the GPU (vkCmdDraw*Indirect*).
+	bool                               indirect_draws_enabled                = false;
 	bool                               calibrated_timestamps_enabled         = false;
 	bool                               device_fault_enabled                  = false;
 	bool                               shader_device_clock_enabled           = false;
@@ -73,12 +75,6 @@ struct GraphicContext {
 	bool                               robust_buffer_access2_enabled         = false;
 	bool                               occlusion_query_precise               = false;
 	bool                               conditional_rendering_enabled         = false;
-	// Out-of-bounds storage buffer reads return zero (VK_EXT_robustness2).
-	bool                               robust_buffer_access2_enabled         = false;
-	bool                               occlusion_queries_enabled             = false;
-	bool                               occlusion_query_precise_enabled       = false;
-	// Draws whose arguments the GPU writes read them on the GPU (vkCmdDraw*Indirect*).
-	bool                               indirect_draws_enabled                = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
 	// Descriptor indexing for bindless images: runtime arrays indexed non-uniformly, partially
@@ -93,8 +89,6 @@ struct GraphicContext {
 	uint32_t                           min_subgroup_size                     = 0;
 	uint32_t                           max_subgroup_size                     = 0;
 	uint32_t                           max_push_descriptors                  = 0;
-	uint32_t                           device_clock_period_ps                = 0;
-	vk::DescriptorSetLayout            image_heap_layout                     = nullptr;
 	vk::ShaderStageFlags               required_subgroup_size_stages         = {};
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
