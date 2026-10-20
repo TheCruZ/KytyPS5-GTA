@@ -1,17 +1,40 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include "common/assert.h"
+#include "common/hackNotice.h"
+
+#include <fmt/format.h>
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 #include <functional>
 #include <optional>
+#include <string_view>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
+
+// KYTY_LOOP_GUARD_HASHES=<hash>,... lists the shaders whose structured loops are bounded;
+// KYTY_LOOP_GUARD_LIMIT (default 65536) is the number of loop-exit decisions an invocation may
+// take before every loop exit is taken. Both are read once and are part of the compiled code.
+uint32_t LoopGuardLimit() {
+	static const uint32_t limit = [] {
+		const char* value = std::getenv("KYTY_LOOP_GUARD_LIMIT");
+		const auto  parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 0ul;
+		return parsed != 0ul ? static_cast<uint32_t>(parsed) : (1u << 16u);
+	}();
+	return limit;
+}
+
+bool LoopGuardWanted(uint64_t shader_hash) {
+	const char* list = std::getenv("KYTY_LOOP_GUARD_HASHES");
+	return list != nullptr &&
+	       std::string_view(list).find(fmt::format("{:016x}", shader_hash)) != std::string_view::npos;
+}
 
 void EmitKillIfBoolFalse(EmitterState& state, uint32_t active) {
 	const auto kill_label  = state.builder.AllocateId();
@@ -129,7 +152,36 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = ctx.Def(block->condition);
+			auto  condition = ctx.Def(block->condition);
+			auto& st        = ctx.state;
+			if (st.loop_guard_variable != 0 && ctx.half == 0) {
+				const bool true_exits  = std::ranges::find(st.loop_guard_merges, true_block) !=
+				                         st.loop_guard_merges.end();
+				const bool false_exits = std::ranges::find(st.loop_guard_merges, false_block) !=
+				                         st.loop_guard_merges.end();
+				if (true_exits != false_exits) {
+					// Count the decision; past the limit, take the exit.
+					const auto count = st.builder.AllocateId();
+					st.builder.AddFunction(spv::OpLoad, TypeU32(st), count, st.loop_guard_variable);
+					const auto next = st.builder.AllocateId();
+					st.builder.AddFunction(spv::OpIAdd, TypeU32(st), next, count, ConstantU32(st, 1u));
+					st.builder.AddFunction(spv::OpStore, st.loop_guard_variable, next);
+					const auto exhausted = st.builder.AllocateId();
+					st.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(st), exhausted, next,
+					                       ConstantU32(st, LoopGuardLimit()));
+					const auto guarded = st.builder.AllocateId();
+					if (true_exits) {
+						st.builder.AddFunction(spv::OpLogicalOr, TypeBool(st), guarded, condition,
+						                       exhausted);
+					} else {
+						const auto keep = st.builder.AllocateId();
+						st.builder.AddFunction(spv::OpLogicalNot, TypeBool(st), keep, exhausted);
+						st.builder.AddFunction(spv::OpLogicalAnd, TypeBool(st), guarded, condition,
+						                       keep);
+					}
+					condition = guarded;
+				}
+			}
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
 			                              true_block->Definition(), false_block->Definition());
@@ -732,10 +784,33 @@ void EmitProgram(EmitterState& state) {
 			high.scratch_u32_variable = state.builder.AllocateId();
 		}
 	}
+	if (!state.program.dispatcher_fallback && LoopGuardWanted(state.program.shader_hash)) {
+		for (const auto* block: program.blocks) {
+			if (block->terminator.loop_header && block->terminator.merge_block != nullptr) {
+				state.loop_guard_merges.push_back(block->terminator.merge_block);
+			}
+		}
+		if (!state.loop_guard_merges.empty()) {
+			state.loop_guard_variable = state.builder.AllocateId();
+			// Visible in the normal log: the shader now takes every loop exit past the limit. The GPU
+			// cannot report when that happens (the shaders have no feedback buffer), so this notice
+			// only says that the guard is part of the translated code.
+			Common::HackNotice::Report(
+			    "loop guard", "SPIR-V translation", state.program.shader_hash, LoopGuardLimit(),
+			    fmt::format("{} structured loop(s) bounded to {} loop-exit decisions per invocation",
+			                state.loop_guard_merges.size(), LoopGuardLimit()));
+		}
+	}
 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state),
 	                          state.mesh_guest_func != 0 ? state.mesh_guest_func : state.main_func,
 	                          spv::FunctionControlMaskNone, TypeFunction(state));
 	EmitLabel(state, state.entry_label);
+	if (state.loop_guard_variable != 0) {
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.loop_guard_variable, spv::StorageClassFunction,
+		                          ConstantU32(state, 0u));
+	}
 	if (state.split_wave) {
 		state.builder.AddFunction(spv::OpVariable,
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
