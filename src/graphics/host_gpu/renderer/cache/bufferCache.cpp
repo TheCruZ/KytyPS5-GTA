@@ -3989,6 +3989,27 @@ void BufferCache::SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t siz
 	    });
 }
 
+void BufferCache::SynchronizeBdaSpans(std::span<const std::pair<uint64_t, uint64_t>> spans,
+                                      const RangeSet&                                mapped) {
+	// Take before walking: writes queued during synchronization remain pending.
+	const auto pending = m_memory_tracker.TakeBdaSyncIn(spans);
+	struct Batch {
+		BufferCache& cache;
+		explicit Batch(BufferCache& owner): cache(owner) {
+			cache.m_upload_batching   = true;
+			cache.m_upload_batch_tick = cache.m_scheduler.CurrentTick();
+		}
+		~Batch() { cache.FlushUploadBatch(); }
+		Batch(const Batch&)            = delete;
+		Batch& operator=(const Batch&) = delete;
+	} batch {*this};
+	pending.ForEach([&](uint64_t begin, uint64_t end) {
+		mapped.ForEachInRange(begin, end - begin, [this](uint64_t start, uint64_t finish) {
+			SynchronizeBuffersInRange(start, finish - start);
+		});
+	});
+}
+
 void BufferCache::FlushUploadBatch() {
 	m_upload_batching = false;
 	if (m_upload_batch_buffers.empty()) {

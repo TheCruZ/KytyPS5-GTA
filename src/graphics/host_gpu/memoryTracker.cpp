@@ -93,6 +93,33 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	return ptr;
 }
 
+void MemoryTracker::QueueBdaSync(uint64_t vaddr, uint64_t size) {
+	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	std::lock_guard lock(m_bda_sync_mutex);
+	m_bda_sync.Add(begin, end - begin);
+}
+
+RangeSet MemoryTracker::TakeBdaSync() {
+	std::lock_guard lock(m_bda_sync_mutex);
+	return std::exchange(m_bda_sync, RangeSet {});
+}
+
+RangeSet MemoryTracker::TakeBdaSyncIn(std::span<const std::pair<uint64_t, uint64_t>> spans) {
+	RangeSet        taken;
+	std::lock_guard lock(m_bda_sync_mutex);
+	for (const auto& [first, last]: spans) {
+		if (first >= last) {
+			continue;
+		}
+		m_bda_sync.ForEachInRange(first, last - first, [&](uint64_t start, uint64_t end) {
+			taken.Add(start, end - start);
+		});
+	}
+	taken.ForEach([&](uint64_t start, uint64_t end) { m_bda_sync.Subtract(start, end - start); });
+	return taken;
+}
+
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	if (g_tracker_skip_clean && g_tracker_bitmap && IsRangeCpuCleanHint(vaddr, size)) {

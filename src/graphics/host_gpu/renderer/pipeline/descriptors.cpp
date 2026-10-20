@@ -3438,7 +3438,8 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
-	bool uses_dma = false;
+	std::array<const ShaderStageRuntime*, 4> dma_stages {};
+	uint32_t                                 dma_stage_count = 0;
 	// Operations with device-address reads need their buffers before the BDA synchronization.
 	FindBuffers(stages, std::ranges::any_of(stages, [](const auto* stage) {
 		            return stage->runtime->program->info.uses_dma;
@@ -3446,17 +3447,15 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	for (auto* stage: stages) {
 		if (stage->runtime->program->info.uses_dma) {
 			m_context.CacheDmaBases(*stage->runtime);
-			uses_dma = true;
+			EXIT_IF(dma_stage_count == dma_stages.size());
+			dma_stages[dma_stage_count++] = stage->runtime;
 		}
 	}
 	if (dma_stage_count != 0) {
-		// Only operations whose device-address reach is unknown upload all cached memory.
+		// Only operations whose device-address reach is unknown upload all queued CPU writes.
 		const bool reach_synchronized =
 		    m_context.SynchronizeDmaFootprint(std::span {dma_stages.data(), dma_stage_count});
-		m_context.PrepareBda(dma_write, !reach_synchronized);
-	}
-	if (uses_image_heap) {
-		m_context.GetImageHeap().Rebind(*this);
+		m_context.PrepareBda(!reach_synchronized);
 	}
 	for (auto* stage: stages) {
 		RebindImages(*stage);

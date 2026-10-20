@@ -25,7 +25,7 @@ namespace {
 
 // Bump when the encoding below changes in a way the source version cannot see (it hashes this
 // file too, so this is belt and braces).
-constexpr uint32_t FormatVersion = 8;
+constexpr uint32_t FormatVersion = 9;
 constexpr uint32_t FileMagic     = 0x4344534bu; // "KSDC"
 constexpr uint64_t MaxFileSize   = uint64_t {256} << 20u;
 
@@ -196,6 +196,22 @@ void Visit(Io& io, T& v) {
 }
 
 template <typename Io, typename T>
+requires Is<T, IR::ShaderInfo::DmaWindow>
+void Visit(Io& io, T& v) {
+	io(v.base_register);
+	io(v.first);
+	io(v.last);
+}
+
+template <typename Io, typename T>
+requires Is<T, IR::ShaderInfo::DmaDescriptorTable>
+void Visit(Io& io, T& v) {
+	io(v.base_register);
+	io(v.immediate);
+	io(v.offset_bits);
+}
+
+template <typename Io, typename T>
 requires Is<T, IR::ShaderInfo>
 void Visit(Io& io, T& v) {
 	io(v.buffers);
@@ -210,6 +226,10 @@ void Visit(Io& io, T& v) {
 	io(v.instance_offset_sgpr);
 	io(v.has_bitwise_xor);
 	io(v.uses_dma);
+	io(v.dma_base_registers);
+	io(v.dma_windows);
+	io(v.dma_tables);
+	io(v.dma_bounded);
 	io(v.uses_swizzle);
 	io(v.uses_lds);
 	io(v.uses_gds);

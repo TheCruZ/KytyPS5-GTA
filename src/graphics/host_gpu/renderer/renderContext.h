@@ -15,7 +15,6 @@
 #include "graphics/host_gpu/renderer/indirectWriteTables.h"
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
-#include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
@@ -23,8 +22,6 @@
 #include <span>
 #include <memory>
 #include <shared_mutex>
-#include <span>
-#include <utility>
 #include <vector>
 
 namespace Libs::VideoOut {
@@ -37,8 +34,7 @@ class GuestGpu;
 
 class RenderContext {
 public:
-	explicit RenderContext(GraphicContext&              graphics,
-	                       const std::filesystem::path& shader_store = ShaderStorePath());
+	explicit RenderContext(GraphicContext& graphics);
 	~RenderContext();
 	KYTY_CLASS_NO_COPY(RenderContext);
 
@@ -52,7 +48,6 @@ public:
 	CommandScheduler&   GetCommandScheduler() { return m_command_scheduler; }
 	PipelineCache&      GetPipelineCache() { return m_pipeline_cache; }
 	DescriptorHeap&     GetDescriptorHeap() { return m_descriptor_heap; }
-	ImageHeap&          GetImageHeap() { return m_image_heap; }
 	SamplerCache&       GetSamplerCache() { return m_sampler_cache; }
 	BufferCache&        GetBufferCache() { return m_buffer_cache; }
 	TextureCache&       GetTextureCache() { return m_texture_cache; }
@@ -60,7 +55,6 @@ public:
 	IndirectWriteTables& GetIndirectWriteTables() { return m_indirect_write_tables; }
 	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
-	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	// Any thread: a read of these bytes faulted on a page protected because the GPU wrote to it,
@@ -85,7 +79,13 @@ public:
 		m_page_manager.ResyncHostProtection(vaddr, size);
 	}
 	void               CacheDmaBases(const ShaderStageRuntime& runtime);
-	void               PrepareBda();
+	// Uploads the CPU writes of the guest memory that the device-address reads of the stages can
+	// reach (see ShaderInfo::dma_windows); false when a stage's reach is not known, and nothing
+	// was uploaded.
+	[[nodiscard]] bool SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* const> stages);
+	// full_sync: upload the CPU writes of all cached memory first (SynchronizeDmaFootprint() did
+	// not cover the operation).
+	void               PrepareBda(bool full_sync = true);
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -111,6 +111,8 @@ private:
 	BindlessTable             m_bindless_table;
 	IndirectWriteTables       m_indirect_write_tables {*this};
 	OcclusionQueries          m_occlusion_queries {*this};
+	// SynchronizeDmaFootprint(): the spans of an operation.
+	std::vector<std::pair<uint64_t, uint64_t>> m_dma_spans;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	uint64_t                  m_mapped_ranges_version = 0;

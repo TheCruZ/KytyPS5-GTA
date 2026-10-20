@@ -99,6 +99,9 @@ public:
 	// before the dirty pages it describes become visible.
 	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] RangeSet TakeBdaSync();
+	// As TakeBdaSync(), for the parts of the queued ranges inside [first, last) of each span;
+	// the rest stays queued.
+	[[nodiscard]] RangeSet TakeBdaSyncIn(std::span<const std::pair<uint64_t, uint64_t>> spans);
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
