@@ -160,6 +160,11 @@ struct EmitterState {
 	uint32_t                   current_label                         = 0;
 	const IR::Block*           current_block                         = nullptr;
 	uint32_t                   pixel_valid_mask_variable             = 0;
+	// Loop guard (see LoopGuardLimit()): a per-invocation count of loop-exit decisions; past the
+	// limit every loop exit is taken, so a loop whose trip count comes from bad data ends
+	// instead of hanging the GPU. Only structured loops of the guarded shaders are counted.
+	uint32_t                   loop_guard_variable                   = 0;
+	std::vector<const IR::Block*> loop_guard_merges;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
