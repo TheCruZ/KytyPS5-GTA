@@ -188,9 +188,13 @@ public:
 		cache.ProcessFaultBuffer();
 		(KYTY_SUBMIT_REASON(), scheduler.Finish());
 		RangeSet ranges;
-		for (size_t i = 0; i < program.info.buffers.size(); ++i) {
-			const auto& source = bindings.buffer_sources[i];
-			if (!program.info.buffers[i].written || source.size == 0) continue;
+		for (const auto& resource: program.info.buffers) {
+			// The sources are indexed by descriptor slot (FindBuffers), not by resource: the
+			// buffers the shader never reads have no slot, and every one after them shifts down.
+			if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
+			EXIT_IF(resource.descriptor_index >= bindings.buffer_sources.size());
+			const auto& source = bindings.buffer_sources[resource.descriptor_index];
+			if (source.size == 0) continue;
 			const auto start = source.address & ~uint64_t {3};
 			const auto end   = (source.address + source.size + 3) & ~uint64_t {3};
 			ranges.Add(start, end - start);
