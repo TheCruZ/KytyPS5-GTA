@@ -993,132 +993,6 @@ bool MaterializeImageTable(const ResourcePlan& program,
 	}
 	const auto base       = table.Base48();
 	const auto size       = table.GetSize();
-	const auto entry_mask = indirect.table_mask >> 5u;
-	const auto entries    = std::min<uint64_t>(
-	    {size > indirect.table_offset ? (size - indirect.table_offset) / 32u : 0u,
-	     uint64_t {entry_mask} + 1u, MaxIndirectDescriptorProbes});
-	const auto& root = program.info.images[image_index];
-	const auto same_table = [&](const ImageTableSnapshot& candidate) {
-		return candidate.base == base && candidate.size == size &&
-		       candidate.offset == indirect.table_offset && candidate.entry_mask == entry_mask;
-	};
-	auto found = std::ranges::find_if(snapshot.image_tables, same_table);
-	if (found == snapshot.image_tables.end()) {
-		ImageTableSnapshot next {.base = base, .size = size, .offset = indirect.table_offset,
-		                         .entry_mask = entry_mask};
-		// Tables span megabytes and rarely change: read into a reused buffer and keep the
-		// previous snapshot's words when they are equal.
-		static thread_local std::vector<uint32_t> words;
-		words.resize(static_cast<size_t>(entries) * 8u);
-		if (!words.empty() && !ReadScalarTable(base, size, indirect.table_offset, runtime, words)) {
-			return false;
-		}
-		const auto reusable = std::ranges::find_if(previous, [&](const ImageTableSnapshot& old) {
-			return same_table(old) && old.raw == words && !old.slots.empty();
-		});
-		// The tables this thread built last, by any program: resolutions ahead of execution
-		// materialize into a ring of snapshots, so `previous` rarely holds the table.
-		static thread_local std::array<ImageTableSnapshot, 4> built;
-		static thread_local uint32_t                          built_next = 0;
-		const auto cached = reusable != previous.end()
-		                        ? built.end()
-		                        : std::ranges::find_if(built, [&](const ImageTableSnapshot& old) {
-			                          return same_table(old) && !old.slots.empty() &&
-			                                 old.raw == words;
-		                          });
-		if (reusable != previous.end()) {
-			next.raw     = std::move(reusable->raw);
-			next.slots   = std::move(reusable->slots);
-			next.mapping = std::move(reusable->mapping);
-		} else if (cached != built.end()) {
-			next.raw.swap(words);
-			next.slots   = cached->slots;
-			next.mapping = cached->mapping;
-		} else {
-			next.raw.swap(words);
-			next.slots.push_back(DescriptorValue {.dword_count = 8u});
-			next.mapping.assign(static_cast<size_t>(entries) + 1u, 0u);
-			next.mapping[0] = static_cast<uint32_t>(entries);
-			std::unordered_map<std::string_view, uint32_t> slot_of;
-			for (uint32_t entry = 0; entry < entries; entry++) {
-				DescriptorValue candidate {.dword_count = 8u};
-				std::copy_n(next.raw.begin() + entry * 8u, 8u, candidate.dwords.begin());
-				if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, root.r128)) {
-					continue;
-				}
-				const std::string_view key(
-				    reinterpret_cast<const char*>(next.raw.data() + entry * 8u),
-				    8u * sizeof(uint32_t));
-				const auto [slot, inserted] =
-				    slot_of.try_emplace(key, static_cast<uint32_t>(next.slots.size()));
-				if (inserted) {
-					next.slots.push_back(candidate);
-				}
-				next.mapping[entry + 1u] = slot->second;
-			}
-			built[built_next++ % built.size()] = next;
-		}
-		snapshot.image_tables.push_back(std::move(next));
-		mapping_offsets.push_back(static_cast<uint32_t>(snapshot.flattened_srt.size()));
-		const auto& mapping = snapshot.image_tables.back().mapping;
-		snapshot.flattened_srt.insert(snapshot.flattened_srt.end(), mapping.begin(), mapping.end());
-		found = snapshot.image_tables.end() - 1;
-	}
-	const auto table_index     = static_cast<uint32_t>(found - snapshot.image_tables.begin());
-	auto&      image           = specialization.images[image_index];
-	image.table                = table_index;
-	image.table_capacity       = ImageTableCapacity(found->slots.size());
-	image.table_mapping_offset = mapping_offsets[table_index];
-	image.table_entry_mask     = entry_mask;
-	snapshot.images[image_index] = {.dword_count = 8u};
-	for (const bool float_only: {true, false}) {
-		const auto exemplar = std::ranges::find_if(found->slots, [&](const DescriptorValue& slot) {
-			return TableExemplar(root, slot, float_only);
-		});
-		if (exemplar != found->slots.end()) {
-			snapshot.images[image_index] = *exemplar;
-			break;
-		}
-	}
-	return true;
-}
-
-// Exemplar that specializes a table root: a T# with the root's dimension and a native format,
-// preferring the float textures that sampled material tables mostly hold.
-bool TableExemplar(const ImageResource& root, const DescriptorValue& descriptor, bool float_only) {
-	if (NullImageDescriptor(descriptor) || DescriptorIsCube(descriptor) != root.cube) {
-		return false;
-	}
-	const auto format = static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
-	const auto numeric_class = Prospero::SampledTextureNumericClass(format);
-	return DescriptorDimension(descriptor, root.dimension) == root.dimension &&
-	       numeric_class != Prospero::TextureNumericClass::Unsupported &&
-	       (!float_only || numeric_class == Prospero::TextureNumericClass::Float) &&
-	       ImageConversionFormat(format) == Prospero::BufferFormat::kInvalid &&
-	       !Prospero::IsFmaskTextureFormat(format);
-}
-
-uint32_t ImageTableCapacity(size_t slots) {
-	return std::bit_ceil(std::max<uint32_t>(static_cast<uint32_t>(slots), 256u));
-}
-
-// A bindless table: the key the shader computes from GPU data selects entry key & entry_mask,
-// so every entry the table holds is a candidate. Distinct valid T#s become descriptor slots and
-// the per-entry slot mapping is appended to the flattened SRT.
-bool MaterializeImageTable(const ResourcePlan& program,
-                           const DescriptorSource::IndirectDescriptor& indirect,
-                           const DescriptorValue& table_value, uint32_t image_index,
-                           const SrtRuntime& runtime, ResourceSnapshot& snapshot,
-                           ResourceSpecialization& specialization,
-                           std::vector<ImageTableSnapshot>& previous,
-                           std::vector<uint32_t>& mapping_offsets) {
-	ShaderBufferResource table;
-	if (table_value.dword_count != 4u || !DecodeBufferDescriptor(table_value, table) ||
-	    (indirect.table_offset & 31u) != 0u) {
-		return false;
-	}
-	const auto base       = table.Base48();
-	const auto size       = table.GetSize();
 	const auto entry_mask = indirect.key_mask;
 	const auto entries    = std::min<uint64_t>(
 	    {size > indirect.table_offset ? (size - indirect.table_offset) / 32u : 0u,
@@ -2819,6 +2693,14 @@ void NoteGpuSizedBuffer(uint64_t shader_hash) {
 }
 
 } // namespace
+
+void SetComputeIndirectFloors(size_t keys, size_t images) {
+	g_compute_indirect_keys.store(std::max(std::bit_ceil(keys), MinIndirectMappingCapacity),
+	                              std::memory_order_relaxed);
+	g_compute_indirect_images.store(std::max<size_t>(std::bit_ceil(images), 1u),
+	                                std::memory_order_relaxed);
+	g_stable_indirect_layouts.store(true, std::memory_order_relaxed);
+}
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {

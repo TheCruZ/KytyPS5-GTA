@@ -22,6 +22,7 @@
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -60,7 +61,6 @@ struct VulkanExtensions {
 vk::PhysicalDeviceVulkan11Features WindowContext::RequiredVulkan11Features() noexcept {
 	vk::PhysicalDeviceVulkan11Features features {};
 	features.storageBuffer16BitAccess = VK_TRUE;
-	features.shaderDrawParameters     = VK_TRUE;
 	return features;
 }
 
@@ -301,8 +301,6 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		              required_features12.samplerMirrorClampToEdge);
 		check_feature(features11.storageBuffer16BitAccess, "storageBuffer16BitAccess",
 		              WindowContext::RequiredVulkan11Features().storageBuffer16BitAccess);
-		check_feature(features11.shaderDrawParameters, "shaderDrawParameters",
-		              WindowContext::RequiredVulkan11Features().shaderDrawParameters);
 		check_feature(features12.storageBuffer8BitAccess, "storageBuffer8BitAccess",
 		              required_features12.storageBuffer8BitAccess);
 		check_feature(features12.timelineSemaphore, "timelineSemaphore",
@@ -357,7 +355,6 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		check_feature(device_features2.features.shaderImageGatherExtended,
 		              "shaderImageGatherExtended");
-		check_feature(device_features2.features.shaderResourceMinLod, "shaderResourceMinLod");
 
 		check_feature(device_features2.features.independentBlend, "independentBlend");
 		check_feature(device_features2.features.tessellationShader, "tessellationShader");
@@ -542,13 +539,6 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		maintenance8.pNext = supported_features2.pNext;
 		supported_features2.pNext = &maintenance8;
 	}
-	const bool shader_clock_extension =
-	    HasExtension(device_extensions, VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
-	vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock {};
-	if (shader_clock_extension) {
-		shader_clock.pNext = supported_features2.pNext;
-		supported_features2.pNext = &shader_clock;
-	}
 	const bool image_atomic_int64_extension =
 	    HasExtension(device_extensions, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
 	vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic_int64 {};
@@ -687,11 +677,6 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
 	graphics.maintenance8_enabled = maintenance8_extension && maintenance8.maintenance8;
-	// The device clock ticks at timestampPeriod nanoseconds.
-	if (shader_clock_extension && shader_clock.shaderDeviceClock) {
-		graphics.device_clock_period_ps = static_cast<uint32_t>(
-		    std::lround(graphics.physical_device_properties.limits.timestampPeriod * 1000.0f));
-	}
 	graphics.conditional_rendering_enabled =
 	    conditional_rendering_extension && conditional_rendering.conditionalRendering;
 	LOGF("Vulkan maintenance8 support: %s\n",
@@ -742,11 +727,6 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.multiViewport                        = VK_TRUE;
 	device_features.fillModeNonSolid                      = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
-	// Storage image sample counts beyond 1x require the feature.
-	if (!device_features.shaderStorageImageMultisample) {
-		graphics.physical_device_properties.limits.storageImageSampleCounts =
-		    vk::SampleCountFlagBits::e1;
-	}
 	graphics.sample_rate_shading_enabled                 = true;
 	// Host occlusion queries back the guest's ZPASS_DONE counters: exact sample counts, and slots
 	// reset from the host once their results were read.
@@ -907,25 +887,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
 	}
-	if (graphics.device_clock_period_ps != 0u) {
-		shader_clock.pNext = const_cast<void*>(create_info.pNext);
-		create_info.pNext = &shader_clock;
-	}
 	if (graphics.conditional_rendering_enabled) {
 		conditional_rendering.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &conditional_rendering;
 	}
-	// The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates its
-	// PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when a
-	// depth- or stencil-writing fragment shader needs an epilog.
-	vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT extended_dynamic_state {};
-	extended_dynamic_state.extendedDynamicState = VK_TRUE;
-	if (HasExtension(device_extensions, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME)) {
-		extended_dynamic_state.pNext = const_cast<void*>(create_info.pNext);
-		create_info.pNext = &extended_dynamic_state;
-	}
-	create_info.pQueueCreateInfos       = queue_create_infos.data();
-	create_info.queueCreateInfoCount    = queue_create_count;
+	create_info.pQueueCreateInfos       = &queue_create_info;
+	create_info.queueCreateInfoCount    = 1;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
@@ -1411,15 +1378,13 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
 		}
 		for (const auto* extension: {VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
-		                             VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
 		                             VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
 		                             VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
-		                             VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME,
-		                             VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME}) {
+		                             VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}

@@ -71,11 +71,6 @@ struct ResourceSpecialization {
 // its values and is independent of the translated shader CFG.
 ResourcePlan ExtractResourcePlan(const Program& program);
 
-// Shader cache record of a plan; loading it into a default-constructed plan rebuilds the walker
-// and scratch state like extraction. A failed load leaves a plan that must not be used.
-std::vector<uint8_t> SaveResourcePlan(const ResourcePlan& plan);
-bool                 LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan);
-
 // Makes indirect descriptor layouts stable: mappings reserve room for a power of two of keys
 // (compute shaders at least `keys`, other stages at least 8) and indirect image roots bind a power
 // of two of images (compute shaders at least `images`), so that the guest data they select from
