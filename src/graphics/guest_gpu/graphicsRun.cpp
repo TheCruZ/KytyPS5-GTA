@@ -1818,7 +1818,6 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::SuspendPoint:
 			// Age caches at the frame boundary, not once per command list.
 			cp.RunGarbageCollector();
-			cp.EmitGlobalBarrier();
 			// Registered at the operation's place in the stream: a pipelined command processor
 			// runs ahead of the recorded commands. Releasing the slot only touches host state.
 			cp.EmitHostCommand([this, ready = m_suspend_point_ready] {
@@ -2129,7 +2128,21 @@ uint32_t CommandProcessor::ResolveNumInstances(const GpuOperation& operation) co
 			              sizeof(args));
 			return args.instance_count;
 		}
-		return m_indirect_instances;
+		const auto& gpu = m_gpu_indirect_instances;
+		if (gpu.address == 0) {
+			return m_indirect_instances;
+		}
+		// The GPU read the arguments: read the last draw's instance count now (the second dword
+		// of both argument layouts), waiting for the GPU work that wrote it.
+		uint32_t count = gpu.count;
+		if (gpu.count_addr != 0) {
+			const uint32_t written = *reinterpret_cast<const volatile uint32_t*>(gpu.count_addr);
+			count                  = std::min(written, count);
+		}
+		if (count != 0) {
+			return *reinterpret_cast<const volatile uint32_t*>(
+			    gpu.address + uint64_t {count - 1} * gpu.stride + sizeof(uint32_t));
+		}
 	}
 	return operation.num_instances.value;
 }
@@ -2438,6 +2451,24 @@ static bool PatchUserSgpr(HW::Shader& shaders, uint32_t location, uint32_t value
 	return false;
 }
 
+// The user SGPR at an SH register offset of a draw-indirect packet, or false when the offset is
+// not a graphics user SGPR.
+static bool FindUserSgpr(const HW::Shader& shaders, uint32_t location,
+                         const HW::UserSgprInfo** sgprs, uint32_t* id) {
+	const std::pair<uint32_t, const HW::UserSgprInfo*> banks[] = {
+	    {Pm4::SPI_SHADER_USER_DATA_GS_0, &shaders.GetVs().gs_user_sgpr},
+	    {Pm4::SPI_SHADER_USER_DATA_HS_0, &shaders.GetVs().hs_user_sgpr},
+	    {Pm4::SPI_SHADER_USER_DATA_PS_0, &shaders.GetPs().ps_user_sgpr}};
+	for (const auto& [base, bank]: banks) {
+		if (location >= base && location < base + HW::UserSgprInfo::SGPRS_MAX) {
+			*sgprs = bank;
+			*id    = location - base;
+			return true;
+		}
+	}
+	return false;
+}
+
 // Writes the offsets of one draw of an indirect packet to the user SGPRs the packet names, as
 // the CP does before the draw (START_VTX_LOC/START_INST_LOC/START_INDEX_LOC, and the draw index
 // of a multi draw). Fast-launch mesh shaders add the start-instance SGPR to their instance VGPR
@@ -2499,6 +2530,78 @@ bool CommandProcessor::PatchIndirectDrawOffsets(const GpuOperation& operation,
 	return true;
 }
 
+// Leaves the arguments of an indirect draw to the host GPU when the draw allows it: GPU work
+// (culling shaders) writes them, and reading them here would wait for all the GPU work recorded
+// so far. False when the draw must read them on the CPU.
+bool CommandProcessor::TryExecuteDrawIndirectOnGpu(const GpuOperation& operation) {
+	const auto& indirect  = operation.draw_indirect;
+	const auto  args_size = static_cast<uint32_t>(
+        indirect.indexed ? sizeof(GuestDrawIndexedIndirectArgs) : sizeof(GuestDrawIndirectArgs));
+	const auto  args_addr = indirect.args_base + indirect.data_offset;
+	const auto  stride    = indirect.multi ? indirect.stride : args_size;
+	const auto  count     = reinterpret_cast<uint64_t>(indirect.count_addr);
+	if ((args_addr & 3u) != 0 || (count & 3u) != 0 || (stride & 3u) != 0 || stride < args_size) {
+		return false;
+	}
+	uint64_t index_bytes = 0;
+	if (indirect.indexed) {
+		switch (indirect.index_type) {
+			case 0: index_bytes = uint64_t {indirect.index_buffer_size} * 2u; break;
+			case 1: index_bytes = uint64_t {indirect.index_buffer_size} * 4u; break;
+			default: return false;
+		}
+	}
+	if (!m_renderer.GetRenderExecutor().CanDrawIndirectOnGpu(CurrentBuffer(), indirect.indexed,
+	                                                         indirect.index_type, index_bytes)) {
+		return false;
+	}
+	// The host GPU adds the offsets it reads to the vertex and instance indices and leaves the
+	// user SGPRs the packet names as they are. The draw reads the offsets the CP would write there
+	// only if those SGPRs hold zero (a native fetch adds them to the index the host already
+	// offset), and never sees the first index or the draw index of a multi draw: such draws read
+	// their arguments on the CPU. Without a pipeline the CP writes the live registers, which keep
+	// the offsets for later packets as on the console.
+	const auto& registers = indirect.registers;
+	if (registers.index_offset != Pm4::SH_NOP || registers.draw_index != Pm4::SH_NOP ||
+	    (m_pipeline == nullptr &&
+	     (registers.vertex_offset != Pm4::SH_NOP || registers.instance_offset != Pm4::SH_NOP))) {
+		return false;
+	}
+	for (const auto location: {registers.vertex_offset, registers.instance_offset}) {
+		const HW::UserSgprInfo* sgprs = nullptr;
+		uint32_t                id    = 0;
+		if (location != Pm4::SH_NOP &&
+		    (!FindUserSgpr(*operation.state.shaders, location, &sgprs, &id) ||
+		     sgprs->value[id] != 0)) {
+			return false;
+		}
+	}
+	const DrawIndirectArgs source {.address     = args_addr,
+	                               .count       = indirect.max_count,
+	                               .stride      = stride,
+	                               .count_addr  = count,
+	                               .index_bytes = index_bytes};
+	m_indirect_args_address       = 0;
+	m_indirect_instances_sequence = operation.num_instances.sequence;
+	m_has_indirect_instances      = true;
+	m_gpu_indirect_instances      = source;
+	// The counts and offsets are placeholders for the ones the GPU reads.
+	if (indirect.indexed) {
+		ExecuteDrawIndex(operation, {.index_count         = 1,
+		                             .index_addr          = reinterpret_cast<const void*>(indirect.index_base),
+		                             .instance_count      = 1,
+		                             .index_type_and_size = indirect.index_type,
+		                             .offset_source       = DrawOffsetSource::IndirectArgs,
+		                             .indirect            = source});
+	} else {
+		ExecuteDrawAuto(operation, {.vertex_count   = 1,
+		                            .instance_count = 1,
+		                            .offset_source  = DrawOffsetSource::IndirectArgs,
+		                            .indirect       = source});
+	}
+	return true;
+}
+
 // The arguments are read when the draw executes: earlier GPU work may produce them.
 void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 	const auto& indirect  = operation.draw_indirect;
@@ -2545,6 +2648,7 @@ void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 		// 2026-10-03, and 2.9 % for the rest, 2026-10-05).
 		const auto args_address       = indirect.args_base + indirect.data_offset;
 		m_indirect_args_address       = args_address;
+		m_gpu_indirect_instances      = {};
 		m_indirect_instances_sequence = operation.num_instances.sequence;
 		m_has_indirect_instances      = true;
 		// START_INST_LOC: the shader loads the start instance into that user SGPR itself.
@@ -2573,6 +2677,9 @@ void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 		MeshArgsRun().packet = nullptr;
 		return;
 	}
+	if (TryExecuteDrawIndirectOnGpu(operation)) {
+		return;
+	}
 
 	uint64_t index_size = 0;
 	if (indirect.indexed) {
@@ -2599,6 +2706,7 @@ void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 			}
 			m_indirect_instances          = args.instance_count;
 			m_indirect_args_address       = 0;
+			m_gpu_indirect_instances      = {};
 			m_indirect_instances_sequence = operation.num_instances.sequence;
 			m_has_indirect_instances      = true;
 			PatchIndirectDrawOffsets(operation, args.start_vertex_location,
@@ -2639,6 +2747,7 @@ void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 
 		m_indirect_instances          = args.instance_count;
 		m_indirect_args_address       = 0;
+		m_gpu_indirect_instances      = {};
 		m_indirect_instances_sequence = operation.num_instances.sequence;
 		m_has_indirect_instances      = true;
 		ExecuteDrawIndex(operation, {.index_count         = index_count,

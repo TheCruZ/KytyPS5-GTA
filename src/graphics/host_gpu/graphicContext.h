@@ -57,6 +57,8 @@ struct GraphicContext {
 	bool                               diagnostic_checkpoints_enabled        = false;
 	// With --profile, for the host GPU timeline (renderer/gpuProfiler).
 	bool                               host_query_reset_enabled              = false;
+	// Draws whose arguments the GPU writes read them on the GPU (vkCmdDraw*Indirect*).
+	bool                               indirect_draws_enabled                = false;
 	bool                               calibrated_timestamps_enabled         = false;
 	bool                               device_fault_enabled                  = false;
 	bool                               shader_device_clock_enabled           = false;

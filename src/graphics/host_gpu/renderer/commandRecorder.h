@@ -71,6 +71,26 @@ public:
 			command.drawIndexedIndirect(buffer, offset, count, stride);
 		});
 	}
+	void drawIndirectCount(vk::Buffer buffer, vk::DeviceSize offset, vk::Buffer count_buffer,
+	                       vk::DeviceSize count_offset, uint32_t max_draw_count,
+	                       uint32_t stride) const {
+		const bool safe = NextDrawSafe();
+		Run([=](vk::CommandBuffer command) {
+			SetCommandDrawSafe(safe);
+			command.drawIndirectCount(buffer, offset, count_buffer, count_offset, max_draw_count,
+			                          stride);
+		});
+	}
+	void drawIndexedIndirectCount(vk::Buffer buffer, vk::DeviceSize offset,
+	                              vk::Buffer count_buffer, vk::DeviceSize count_offset,
+	                              uint32_t max_draw_count, uint32_t stride) const {
+		const bool safe = NextDrawSafe();
+		Run([=](vk::CommandBuffer command) {
+			SetCommandDrawSafe(safe);
+			command.drawIndexedIndirectCount(buffer, offset, count_buffer, count_offset,
+			                                 max_draw_count, stride);
+		});
+	}
 	void drawMeshTasksEXT(uint32_t x, uint32_t y, uint32_t z) const {
 		const bool safe = NextDrawSafe();
 		Run([=](vk::CommandBuffer command) {

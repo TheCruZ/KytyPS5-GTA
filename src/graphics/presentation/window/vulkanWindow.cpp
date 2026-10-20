@@ -733,6 +733,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	features12.hostQueryReset             = supported_features12.hostQueryReset;
 	graphics.occlusion_query_precise      = device_features.occlusionQueryPrecise == VK_TRUE;
 	graphics.host_query_reset_enabled     = features12.hostQueryReset == VK_TRUE;
+	// Indirect draws whose arguments GPU work writes are drawn without reading them back.
+	device_features.multiDrawIndirect         = supported_features2.features.multiDrawIndirect;
+	device_features.drawIndirectFirstInstance = supported_features2.features.drawIndirectFirstInstance;
+	features12.drawIndirectCount              = supported_features12.drawIndirectCount;
+	graphics.indirect_draws_enabled = device_features.multiDrawIndirect == VK_TRUE &&
+	                                  device_features.drawIndirectFirstInstance == VK_TRUE &&
+	                                  features12.drawIndirectCount == VK_TRUE;
 	device_features.shaderInt64 = VK_TRUE;
 	device_features.shaderFloat64 =
 	    supported_features2.features.shaderFloat64 &&

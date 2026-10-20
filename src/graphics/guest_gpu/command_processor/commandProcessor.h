@@ -249,6 +249,8 @@ private:
 	void ExecuteDrawIndex(const GpuOperation& operation, DrawIndexArgs args);
 	void ExecuteDrawAuto(const GpuOperation& operation, DrawAutoArgs args);
 	void ExecuteDrawIndirect(const GpuOperation& operation);
+	// Leaves the arguments of an indirect draw to the host GPU when the draw allows it.
+	[[nodiscard]] bool TryExecuteDrawIndirectOnGpu(const GpuOperation& operation);
 	bool PatchIndirectDrawOffsets(const GpuOperation& operation, uint32_t vertex_offset,
 	                              uint32_t instance_offset, uint32_t first_index,
 	                              uint32_t draw_index);
@@ -339,6 +341,9 @@ private:
 	// Address of the arguments of a DRAW_INDIRECT whose instance count the GPU reads (0: the CPU
 	// read it into m_indirect_instances).
 	uint64_t m_indirect_args_address      = 0;
+	// The last indirect draw the GPU read the arguments of: its instance count is read when a later
+	// draw needs it.
+	DrawIndirectArgs   m_gpu_indirect_instances {};
 	uint64_t m_indirect_instances_sequence = 0;
 	bool     m_has_indirect_instances      = false;
 	// The shader registers of a pipelined indirect draw with its offsets written to user SGPRs.

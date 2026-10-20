@@ -56,11 +56,19 @@ enum class DrawOffsetSource : uint8_t {
 	IndirectArgs,
 };
 
-// Nonzero address: the GPU reads count Vulkan indirect draw records, stride bytes apart.
+// The draw records of a DRAW_INDEX_INDIRECT/DRAW_INDIRECT(_MULTI) packet left in guest memory for
+// the host GPU to read (GPU work writes them: culling compute shaders, so reading them on the CPU
+// would wait for the GPU to finish everything recorded before the draw). Nonzero address: the GPU
+// reads count Vulkan indirect draw records, stride bytes apart.
 struct DrawIndirectArgs {
 	uint64_t address = 0;
+	// The draw count, or the most the GPU may draw when count_addr is set.
 	uint32_t count   = 0;
 	uint32_t stride  = 0;
+	// Nonzero: the GPU reads the draw count from this guest dword (at most `count` draws).
+	uint64_t count_addr = 0;
+	// Indexed draws: the bytes of the index buffer the draws may read from the index base.
+	uint64_t index_bytes = 0;
 };
 
 struct DrawIndexArgs {
@@ -83,9 +91,9 @@ struct DrawAutoArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
-	// DRAW_INDIRECT read on the GPU: the guest address of its DrawIndirectArgs (vertex count,
-	// instance count, start vertex, start instance). The counts above are then unknown on the
-	// CPU; only fast-launch mesh draws come this way.
+	// DRAW_INDIRECT read on the GPU: the guest address of its vk::DrawIndirectCommand (vertex
+	// count, instance count, start vertex, start instance). The counts above are then unknown on
+	// the CPU; only fast-launch mesh draws come this way.
 	uint64_t         gpu_args_address           = 0;
 	// Nonzero (vertex count known): the instance count is the dword the GPU reads there (the
 	// NUM_INSTANCES a DRAW_INDIRECT read on the GPU left).
@@ -195,6 +203,10 @@ public:
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode, bool async_compute);
+	// Whether an indirect draw with the bound registers can leave its arguments to the GPU
+	// (see DrawIndirectArgs); `index_type` is the guest index type of an indexed draw.
+	[[nodiscard]] bool CanDrawIndirectOnGpu(const CommandBuffer& buffer, bool indexed,
+	                                        uint32_t index_type, uint64_t index_bytes) const;
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode, bool async_compute);
 
