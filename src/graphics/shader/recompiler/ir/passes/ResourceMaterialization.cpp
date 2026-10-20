@@ -2616,8 +2616,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
 	g_materialize_phase = "flat";
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
-		return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
-		    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
+		return SpecializationFail(fmt::format(
+		    "SRT refresh complete={} reads={} user_data={} shader={:016x} failure={} at 0x{:x}/0x{:x}",
+		    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size(),
+		    program.shader_hash, walker.ReadFailure() != nullptr ? walker.ReadFailure() : "-",
+		    walker.ReadFailureAddress(), clean.ReadFailureAddress()));
 	}
 	const auto active = std::span<const uint8_t>(program.active_sources);
 	std::array<uint32_t, 3> workgroup_counts {};
