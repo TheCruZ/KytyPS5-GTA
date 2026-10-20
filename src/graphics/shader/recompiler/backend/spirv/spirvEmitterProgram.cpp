@@ -19,21 +19,25 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
 // KYTY_LOOP_GUARD_HASHES=<hash>,... lists the shaders whose structured loops are bounded;
-// KYTY_LOOP_GUARD_LIMIT (default 65536) is the number of loop-exit decisions an invocation may
+// KYTY_LOOP_GUARD_LIMIT (default 16384) is the number of loop-exit decisions an invocation may
 // take before every loop exit is taken. Both are read once and are part of the compiled code.
 uint32_t LoopGuardLimit() {
 	static const uint32_t limit = [] {
 		const char* value = std::getenv("KYTY_LOOP_GUARD_LIMIT");
 		const auto  parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 0ul;
-		return parsed != 0ul ? static_cast<uint32_t>(parsed) : (1u << 16u);
+		return parsed != 0ul ? static_cast<uint32_t>(parsed) : (1u << 14u);
 	}();
 	return limit;
 }
 
+// Guarded unless KYTY_LOOP_GUARD_HASHES (which may be empty) replaces the list: ASTRO BOT's tiled
+// lighting compute, which hangs the GPU when the lists it walks contain a cycle.
+constexpr std::string_view DefaultLoopGuardHashes = "657ad04626bf9d55";
+
 bool LoopGuardWanted(uint64_t shader_hash) {
-	const char* list = std::getenv("KYTY_LOOP_GUARD_HASHES");
-	return list != nullptr &&
-	       std::string_view(list).find(fmt::format("{:016x}", shader_hash)) != std::string_view::npos;
+	const char*      value = std::getenv("KYTY_LOOP_GUARD_HASHES");
+	const std::string_view list = value != nullptr ? std::string_view(value) : DefaultLoopGuardHashes;
+	return list.find(fmt::format("{:016x}", shader_hash)) != std::string_view::npos;
 }
 
 void EmitKillIfBoolFalse(EmitterState& state, uint32_t active) {
