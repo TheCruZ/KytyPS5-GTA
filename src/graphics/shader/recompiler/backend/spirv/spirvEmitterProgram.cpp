@@ -3,12 +3,16 @@
 #include "common/assert.h"
 #include "common/hackNotice.h"
 
+#include <fmt/format.h>
+
 #include <algorithm>
 #include <bit>
+#include <charconv>
 #include <cstdlib>
 #include <functional>
 #include <optional>
 #include <set>
+#include <string_view>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -17,26 +21,33 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
-// KYTY_LOOP_GUARD_HASHES=<hash>,... lists the shaders whose structured loops are bounded;
-// KYTY_LOOP_GUARD_LIMIT (default 16384) is the number of loop-exit decisions an invocation may
-// take before every loop exit is taken. Both are read once and are part of the compiled code.
-uint32_t LoopGuardLimit() {
-	static const uint32_t limit = [] {
+// KYTY_LOOP_GUARD_HASHES=<hash>[:<limit>],...: the shaders whose structured loops are bounded, each
+// with its own number of loop-exit decisions an invocation may take before every loop exit is taken
+// (KYTY_LOOP_GUARD_LIMIT, default 65536, when the entry has none). Both variables are part of the
+// compiled code (the shader cache key reads them through getenv).
+std::optional<uint32_t> LoopGuardLimitFor(uint64_t shader_hash) {
+	const char* list = std::getenv("KYTY_LOOP_GUARD_HASHES");
+	if (list == nullptr) {
+		return std::nullopt;
+	}
+	const std::string_view text(list);
+	const auto             at = text.find(fmt::format("{:016x}", shader_hash));
+	if (at == std::string_view::npos) {
+		return std::nullopt;
+	}
+	static const uint32_t default_limit = [] {
 		const char* value = std::getenv("KYTY_LOOP_GUARD_LIMIT");
-		const auto  parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 0ul;
-		return parsed != 0ul ? static_cast<uint32_t>(parsed) : (1u << 14u);
+		const auto  limit = value != nullptr ? std::strtoul(value, nullptr, 10) : 0ul;
+		return limit != 0ul ? static_cast<uint32_t>(limit) : (1u << 16u);
 	}();
-	return limit;
-}
-
-// Guarded unless KYTY_LOOP_GUARD_HASHES (which may be empty) replaces the list: ASTRO BOT's tiled
-// lighting compute, which hangs the GPU when the lists it walks contain a cycle.
-constexpr std::string_view DefaultLoopGuardHashes = "657ad04626bf9d55";
-
-bool LoopGuardWanted(uint64_t shader_hash) {
-	const char*      value = std::getenv("KYTY_LOOP_GUARD_HASHES");
-	const std::string_view list = value != nullptr ? std::string_view(value) : DefaultLoopGuardHashes;
-	return list.find(fmt::format("{:016x}", shader_hash)) != std::string_view::npos;
+	const auto rest = text.substr(at + 16u);
+	uint32_t   own  = 0;
+	if (rest.starts_with(':') &&
+	    std::from_chars(rest.data() + 1, rest.data() + rest.size(), own).ec == std::errc() &&
+	    own != 0u) {
+		return own;
+	}
+	return default_limit;
 }
 
 void EmitKillIfBoolFalse(EmitterState& state, uint32_t active) {
@@ -163,13 +174,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				const bool false_exits = std::ranges::find(st.loop_guard_merges, term.false_block) !=
 				                         st.loop_guard_merges.end();
 				if (true_exits != false_exits) {
-					// Count the decision; past the limit, take the exit. KYTY_LOOP_GUARD_LIMIT
-					// (default 65536) sets the limit (part of the shader cache key via getenv).
-					static const uint32_t LoopGuardLimit = [] {
-						const char* value = std::getenv("KYTY_LOOP_GUARD_LIMIT");
-						const auto  limit = value != nullptr ? std::strtoul(value, nullptr, 10) : 0ul;
-						return limit != 0ul ? static_cast<uint32_t>(limit) : (1u << 16u);
-					}();
+					// Count the decision; past the limit, take the exit.
 					const auto         count          = st.builder.AllocateId();
 					st.builder.AddFunction(spv::OpLoad, TypeU32(st), count, st.loop_guard_variable);
 					const auto next = st.builder.AllocateId();
@@ -177,7 +182,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 					st.builder.AddFunction(spv::OpStore, st.loop_guard_variable, next);
 					const auto exhausted = st.builder.AllocateId();
 					st.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(st), exhausted, next,
-					                       ConstantU32(st, LoopGuardLimit));
+					                       ConstantU32(st, st.loop_guard_limit));
 					const auto guarded = st.builder.AllocateId();
 					if (true_exits) {
 						st.builder.AddFunction(spv::OpLogicalOr, TypeBool(st), guarded, condition,
@@ -296,9 +301,9 @@ void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto op = inst.GetOpcode();
 	if (ctx.half != 0 &&
 	    (op == Op::Ballot || op == Op::ReadFirstLane || op == Op::SubgroupUMinU32 ||
-	     op == Op::SubgroupUMaxU32 || op == Op::ReadConstBuffer || op == Op::ReadRealtimeClock ||
+	     op == Op::ReadConstBuffer ||
 	     (op == Op::LoadAddressU32 && ctx.Memory(inst).kind == IR::ResourceKind::ScalarAddress))) {
-		// Whole-wave results, clocks and SMEM loads (SGPR operands, no EXEC) match in both halves.
+		// Whole-wave results and SMEM loads (SGPR operands, no EXEC) are identical in both halves.
 		ctx.Define(inst, ctx.other_half->Result(inst));
 		return;
 	}
@@ -1126,6 +1131,11 @@ void EmitProgram(EmitterState& state) {
 		}
 	}
 	if (state.mesh_passes > 1u) {
+		if (LoopGuardLimitFor(state.program.shader_hash)) {
+			Common::HackNotice::ReportTranslation(
+			    "loop guard listed but not applied", "SPIR-V translation", state.program.shader_hash, 1,
+			    "mesh shader run in passes");
+		}
 		// TranslateProgram gave up on programs that cannot be cut.
 		std::vector<MeshSplit> splits;
 		if (const auto* reason = FindMeshSplits(program, splits); reason != nullptr) {
@@ -1135,10 +1145,13 @@ void EmitProgram(EmitterState& state) {
 		EmitMeshEntryPoint(state);
 		return;
 	}
-	if (static const char* guard_list = std::getenv("KYTY_LOOP_GUARD_HASHES");
-	    guard_list != nullptr && !state.program.dispatcher_fallback &&
-	    std::string_view(guard_list).find(fmt::format("{:016x}", state.program.shader_hash)) !=
-	        std::string_view::npos) {
+	if (state.program.dispatcher_fallback && LoopGuardLimitFor(state.program.shader_hash)) {
+		Common::HackNotice::ReportTranslation(
+		    "loop guard listed but not applied", "SPIR-V translation", state.program.shader_hash, 0,
+		    "block-dispatcher shader: its loops are not structured");
+	}
+	if (const auto guard_limit = LoopGuardLimitFor(state.program.shader_hash);
+	    guard_limit && !state.program.dispatcher_fallback) {
 		for (const auto* block: program.blocks) {
 			if (block->terminator.loop_header && block->terminator.merge_block != nullptr) {
 				state.loop_guard_merges.push_back(block->terminator.merge_block);
@@ -1146,6 +1159,15 @@ void EmitProgram(EmitterState& state) {
 		}
 		if (!state.loop_guard_merges.empty()) {
 			state.loop_guard_variable = state.builder.AllocateId();
+			state.loop_guard_limit    = *guard_limit;
+			// [HACK] Visible in the normal log: the shader takes every loop exit past the limit. The
+			// GPU cannot report when that happens (the shaders have no feedback buffer), so this
+			// notice only says that the guard is part of the translated code.
+			Common::HackNotice::ReportTranslation(
+			    "loop guard", "SPIR-V translation", state.program.shader_hash, *guard_limit,
+			    fmt::format("{} structured loop(s) may take every exit after {} loop-exit decisions "
+			                "of an invocation (listed in KYTY_LOOP_GUARD_HASHES)",
+			                state.loop_guard_merges.size(), *guard_limit));
 		}
 	}
 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state),

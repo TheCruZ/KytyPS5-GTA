@@ -540,7 +540,9 @@ static void ApplyFrankEnvironmentDefaults() {
 	    {"KYTY_SHARED_BUFFERS", "1"},
 	    {"KYTY_WRITE_BITMAP", "1"},
 	    // Ray traversal (dc76e1223a9bf673) loops without end on our side: a 2048-step cap.
-	    {"KYTY_LOOP_GUARD_HASHES", "dc76e1223a9bf673"},
+	    // ASTRO BOT's tiled lighting compute (657ad04626bf9d55) walks per-pixel linked lists that
+	    // sometimes contain a cycle, which resets the NVIDIA device: capped at 16384 exits.
+	    {"KYTY_LOOP_GUARD_HASHES", "dc76e1223a9bf673,657ad04626bf9d55:16384"},
 	    {"KYTY_LOOP_GUARD_LIMIT", "2048"},
 	    // No barriers between dispatches the game's command stream does not order.
 	    {"KYTY_DISPATCH_RUNS", "1"},

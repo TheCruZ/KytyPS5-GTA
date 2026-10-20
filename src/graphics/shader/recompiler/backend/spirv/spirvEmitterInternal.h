@@ -219,8 +219,8 @@ struct EmitterState {
 	// the GPU (structured loops; the dispatcher has its own bound).
 	uint32_t                   loop_guard_variable                   = 0;
 	std::vector<const IR::Block*> loop_guard_merges;
+	uint32_t                   loop_guard_limit                      = 0;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
-	uint32_t                   helper_invocation_variable            = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
 	uint32_t                   clip_distance_variable                = 0;
@@ -383,7 +383,6 @@ struct ImageSampleLayout {
 	uint32_t bias   = NoImageComponent;
 	uint32_t coord  = 0;
 	uint32_t lod    = NoImageComponent;
-	uint32_t clamp  = NoImageComponent;
 	uint32_t grad_x = NoImageComponent;
 	uint32_t grad_y = NoImageComponent;
 	uint32_t clamp  = NoImageComponent; // IMAGE_SAMPLE*_CL minimum LOD, the last component
@@ -408,7 +407,6 @@ uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind ki
 
 
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp);
-uint32_t MrtOutputType(EmitterState& state, uint32_t index);
 
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 
@@ -444,9 +442,8 @@ uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampl
                           uint32_t mip = 0, uint32_t array_index = 0,
                           bool sampler_dynamic = false);
 
-// sample is 0 (no id) for single-sampled images.
 void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,
-                           uint32_t texel, uint32_t array_index, uint32_t sample);
+                           uint32_t texel, uint32_t array_index);
 
 spv::ExecutionModel ExecutionModelForStage(ShaderType stage);
 
@@ -564,8 +561,6 @@ struct MemoryResourceAccess {
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                    uint32_t search_iterations, uint32_t default_resource);
-// Slot word of an image heap byte offset; offsets past the heap select the null element.
-uint32_t EmitImageHeapEntry(EmitterState& state, uint32_t key, uint32_t mapping_offset);
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem,
                                                  uint32_t array_index = 0u);
 
@@ -670,7 +665,6 @@ inline constexpr auto EmitFNegateValue = EmitNative<spv::OpFNegate, IR::Type::F3
 inline constexpr auto EmitFAbsValue = EmitGlsl<GLSLstd450FAbs, IR::Type::F32, uint32_t>;
 
 uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits);
-uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits);
 
 void EmitProgram(EmitterState& state);
 
