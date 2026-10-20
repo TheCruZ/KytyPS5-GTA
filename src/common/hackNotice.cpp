@@ -17,6 +17,9 @@
 #include <chrono>
 #include <cstdio>
 #include <string>
+#include <mutex>
+#include <set>
+#include <utility>
 
 namespace Common::HackNotice {
 namespace {
@@ -104,6 +107,25 @@ void Summarize() {
 
 } // namespace
 
+namespace {
+
+std::string g_startup_defaults;
+
+} // namespace
+
+void NoteStartupDefault(std::string text) {
+	if (!g_startup_defaults.empty()) {
+		g_startup_defaults += ", ";
+	}
+	g_startup_defaults += text;
+}
+
+void ReportStartupDefaults() {
+	if (!g_startup_defaults.empty()) {
+		Report("defaults of this fork in force", "startup", 0, 0, g_startup_defaults);
+	}
+}
+
 void Report(const char* hack, const char* site, uint64_t shader_hash, uint64_t where,
             std::string_view detail) {
 	if (shader_hash == 0) shader_hash = CurrentShaderSlot();
@@ -162,6 +184,50 @@ void Report(const char* hack, const char* site, uint64_t shader_hash, uint64_t w
 	           g_next_summary_ns.compare_exchange_strong(deadline, now + SUMMARY_NS,
 	                                                     std::memory_order_acq_rel)) {
 		Summarize();
+	}
+}
+
+namespace {
+
+// The notes are "<hack>\x1f<site>\x1e" records.
+thread_local std::string t_translation_notes;
+
+} // namespace
+
+void ReportTranslation(const char* hack, const char* site, uint64_t shader_hash, uint64_t where,
+                       std::string_view detail) {
+	Report(hack, site, shader_hash, where, detail);
+	const std::string note = std::string(hack) + '\x1f' + site + '\x1e';
+	if (t_translation_notes.find(note) == std::string::npos) {
+		t_translation_notes += note;
+	}
+}
+
+std::string TakeTranslationHacks() {
+	return std::exchange(t_translation_notes, {});
+}
+
+void ReplayTranslationHacks(std::string_view notes, uint64_t shader_hash) {
+	// Report() tells sites apart by the address of their text: equal texts get one address.
+	static std::mutex            mutex;
+	static std::set<std::string> interned;
+	while (!notes.empty()) {
+		const auto end  = notes.find('\x1e');
+		const auto note = notes.substr(0, end);
+		if (const auto separator = note.find('\x1f'); separator != std::string_view::npos) {
+			const char* hack = nullptr;
+			const char* site = nullptr;
+			{
+				std::scoped_lock lock(mutex);
+				hack = interned.emplace(note.substr(0, separator)).first->c_str();
+				site = interned.emplace(note.substr(separator + 1)).first->c_str();
+			}
+			Report(hack, site, shader_hash, 0, "translation loaded from the shader cache");
+		}
+		if (end == std::string_view::npos) {
+			break;
+		}
+		notes.remove_prefix(end + 1);
 	}
 }
 
