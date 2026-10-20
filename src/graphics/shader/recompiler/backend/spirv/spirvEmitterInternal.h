@@ -219,6 +219,7 @@ struct EmitterState {
 	// the GPU (structured loops; the dispatcher has its own bound).
 	uint32_t                   loop_guard_variable                   = 0;
 	std::vector<const IR::Block*> loop_guard_merges;
+	uint32_t                   loop_guard_limit                      = 0;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
