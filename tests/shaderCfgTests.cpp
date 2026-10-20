@@ -16321,10 +16321,10 @@ void TestSpirvConditionVotes() {
     IR::CollectShaderInfo(compiled.program, options.input_info);
     const auto binary = Spirv::EmitProgram(compiled.program, options.input_info);
     CheckSpirvBinaryValidates(binary);
-    // KYTY_WAVE64_WARPS (on by default) runs wave64 on a 32-wide host as a split wave, whose
-    // conditions take a ballot of the whole wave instead of one subgroup's vote.
+    // KYTY_WAVE64_WARPS=1 runs wave64 on a 32-wide host as a split wave, whose conditions take a
+    // ballot of the whole wave instead of one subgroup's vote.
     const char *split_setting = std::getenv("KYTY_WAVE64_WARPS");
-    if (wave != host && (split_setting == nullptr || split_setting[0] != '0')) {
+    if (wave != host && split_setting != nullptr && split_setting[0] == '1') {
       Check(SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformBallot) > 0,
             "split-wave condition votes did not take a whole-wave ballot");
       continue;
