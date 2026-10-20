@@ -17002,8 +17002,10 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeSopp(0x02, 0xfffeu), // B -> C
       EncodeSopp(0x01),
   };
+  // The dispatcher also carries Frank's bounded transition counter (MaxDispatcherTransitions),
+  // two words over upstream's budget of 255.
   auto dispatcher_result = compile("dispatcher", dispatcher,
-                                         {.words = 255,
+                                         {.words = 257,
                                           .instructions = 70,
                                           .variables = 3,
                                           .function_variables = 3,

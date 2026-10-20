@@ -1123,7 +1123,8 @@ uint32_t LoadRawBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	const auto second = ByteAddress(ctx, inst, RebaseRawComponent(mem, 1), resource.byte_offset);
 	const auto wide =
 	    PrepareStorageBufferResourceAccess(state, mem, state.storage_buffers[3],
-	                                       resource.non_uniform ? resource.descriptor_index : 0u);
+	                                       resource.non_uniform ? resource.descriptor_index : 0u,
+	                                       64u);
 	const auto index =
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), first, ConstantU32(state, 3));
 	auto atomic =

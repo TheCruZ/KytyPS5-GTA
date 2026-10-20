@@ -7927,7 +7927,7 @@ void TestDefaultSamplerKeepsDataReads() {
   sample.kind = ResourceKind::Image;
   sample.image_dimension = Decoder::ImageDimension::Dim2D;
   const auto sampled = fixture.Emit(ValueOpcode::ImageSampleRaw,
-                                    {image, sampler, fixture.ImageAddress()},
+                                    {image, sampler, fixture.ImageAddress(), Value(true)},
                                     fixture.AddMemory(sample, 0x110));
   fixture.Emit(ValueOpcode::ReferenceU32,
                {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)})});

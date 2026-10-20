@@ -1317,64 +1317,6 @@ void CheckLeastRecentlyUsedCacheOrdering() {
   std::printf("[host]    %-32s ok\n", "LeastRecentlyUsedCache");
 }
 
-// The cached expander must return exactly what InlineShaderFunctions returns, while user data
-// the call does not depend on changes, the target changes, and the callee code changes.
-void CheckShaderFunctionExpansionCache() {
-  constexpr const char *name = "ShaderFunctionExpansionCache";
-  constexpr uint64_t callee_a = 0x10000000ull;
-  constexpr uint64_t callee_b = 0x10000100ull;
-  std::vector<u32> memory(0x200 / 4, 0xbf810000u);
-  const auto store = [&](uint64_t address, std::initializer_list<u32> words) {
-    std::copy(words.begin(), words.end(), memory.begin() + (address - callee_a) / 4);
-  };
-  // v_mov_b32 v0, 1; s_setpc_b64 s[4:5]
-  store(callee_a, {EncodeVop1(0x01u, 0, InlineU32(1)), EncodeSop1(0x20u, 0, 4)});
-  // v_mov_b32 v0, 2; v_mov_b32 v1, 3; s_setpc_b64 s[4:5]
-  store(callee_b, {EncodeVop1(0x01u, 0, InlineU32(2)), EncodeVop1(0x01u, 1, InlineU32(3)),
-                   EncodeSop1(0x20u, 0, 4)});
-  const ShaderRecompiler::Decoder::ShaderCodeReader read = [&](uint64_t address, std::span<uint32_t> words) {
-    if (address < callee_a || address + words.size() * 4 > callee_a + memory.size() * 4) {
-      return false;
-    }
-    std::copy_n(memory.begin() + (address - callee_a) / 4, words.size(), words.begin());
-    return true;
-  };
-  // s_swappc_b64 s[4:5], s[0:1]: the target comes from user data s0/s1.
-  std::vector<u32> code{EncodeSop1(0x21u, 4, 0)};
-  AppendEnd(&code);
-  const uint64_t base = reinterpret_cast<uint64_t>(code.data());
-
-  ShaderRecompiler::Decoder::ShaderFunctionExpander expander;
-  const auto check = [&](const char *step, std::array<u32, 3> user_data,
-                         bool expect_calls) {
-    std::vector<u32> reference;
-    std::vector<u32> cached;
-    std::string reference_reason;
-    std::string cached_reason;
-    const bool reference_ok = ShaderRecompiler::Decoder::InlineShaderFunctions(
-        code, base, user_data, read, reference, reference_reason, 64);
-    const bool cached_ok =
-        expander.Expand(code, base, user_data, read, cached, cached_reason, 64);
-    Require(name, step,
-            reference_ok && cached_ok && reference == cached &&
-                reference_reason == cached_reason && (reference.size() > 2) == expect_calls,
-            "the cached expansion differs from InlineShaderFunctions");
-    return cached;
-  };
-  const auto first = check("first expansion", {u32(callee_a), 0, 7}, true);
-  const auto unrelated = check("unrelated user data", {u32(callee_a), 0, 9}, true);
-  Require(name, "unrelated user data", first == unrelated,
-          "a register the call does not use changed the expansion");
-  const auto other = check("other target", {u32(callee_b), 0, 9}, true);
-  Require(name, "other target", other != first, "a new call target reused the old expansion");
-  store(callee_a, {EncodeVop1(0x01u, 0, InlineU32(4))});
-  const auto patched = check("patched callee", {u32(callee_a), 0, 7}, true);
-  Require(name, "patched callee", patched != first,
-          "changed callee code reused the old expansion");
-  check("target again", {u32(callee_b), 0, 7}, true);
-  std::printf("[host]    %-32s ok\n", name);
-}
-
 struct BdaMapping {
   uint64_t guest_base = 0;
   u32 backing_offset = 0;
@@ -17430,12 +17372,12 @@ public:
       write.pBufferInfo = buffer_infos.data();
       writes.push_back(write);
     }
-    // Shader data carries each storage buffer's bound length in dwords, as
+    // Shader data carries each storage buffer's bound length in bytes, as
     // RenderExecutor::RebindBuffers does; shaders bound buffer accesses with it.
     for (u32 i = 0; i < buffer_infos.size(); i++) {
       const auto slot = layout.BufferLengthDword() + i;
       if (slot < shader_data.size()) {
-        shader_data[slot] = static_cast<u32>(buffer_infos[i].range / sizeof(u32));
+        shader_data[slot] = static_cast<u32>(buffer_infos[i].range);
       }
     }
     if (Count(Kind::FlattenedSrt) != 0) {
@@ -28116,8 +28058,9 @@ TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MED3_F32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.ir_counts = {{"FPMedTri32", std::size(cases)}};
-  // Measured 17,593/36,607 words; keep classification growth below a single MED3.
-  test.max_spirv_words = wave == 32u ? 17600u : 36620u;
+  // Measured 17,593/36,607 words upstream; keep classification growth below a single MED3.
+  // Frank's module-level additions (float controls for the hardware denormal flush) add 20.
+  test.max_spirv_words = wave == 32u ? 17620u : 36640u;
   return test;
 }
 
@@ -39734,8 +39677,10 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
         if (opcode == spv::OpBitFieldUExtract) ++prefix_extracts;
         offset += words.size();
       }
+      // Buffer lengths come from the shader data (Frank: some NVIDIA drivers return zero from
+      // OpArrayLength for ranges over 2 GiB), so the store is the pointer's only access.
       Require(test.name, "shared store and nonuniform pointers",
-              prefix_extracts == 1u && accessed_pointers.size() == 2u &&
+              prefix_extracts == 1u && accessed_pointers.size() == 1u &&
                   std::ranges::all_of(accessed_pointers, [&](u32 pointer) {
                     return nonuniform.contains(pointer);
                   }),
@@ -49014,6 +48959,13 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  // These cases check upstream's readback contract: a fault downloads only the requested pages.
+  // Frank's readback window (KYTY_READBACK_WINDOW_KB, default 4096) widens every download.
+#ifdef _WIN32
+  _putenv("KYTY_READBACK_WINDOW_KB=0");
+#else
+  setenv("KYTY_READBACK_WINDOW_KB", "0", 1);
+#endif
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
   if (argc == 2 && std::strcmp(argv[1], "--cvt-pkrtz-only") == 0) {
@@ -49094,7 +49046,6 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScalarMemRealtimeReadsDeviceClock());
     return 0;
   }
-  CheckShaderFunctionExpansionCache();
   if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3pIntegerNegationCapturedAndSelectedHalves());

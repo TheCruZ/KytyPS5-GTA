@@ -1185,16 +1185,10 @@ bool GuestGpu::Process(Submission& submission) {
 					break;
 				}
 			}
-			if (progressed) {
-				if (complete) {
-					m_renderer.RunGarbageCollector();
-				}
-				if (!(complete && CoalesceSubmits() && HasReadySubmission())) {
-					SetSubmitReason("end of graphics submission");
-					cp.BufferFlush();
-				}
-			} else if (complete) {
-				m_renderer.RunGarbageCollector();
+			// Caches age at the frame boundary (SuspendPoint), not once per command list.
+			if (progressed && !(complete && CoalesceSubmits() && HasReadySubmission())) {
+				SetSubmitReason("end of graphics submission");
+				cp.BufferFlush();
 			}
 			break;
 		}
@@ -1217,16 +1211,10 @@ bool GuestGpu::Process(Submission& submission) {
 			}
 			complete = cp.Process(submission.command_execution, submission.commands) ==
 			           Pm4ProcessResult::Complete;
-			if (submission.command_execution.MadeProgress()) {
-				if (complete) {
-					m_renderer.RunGarbageCollector();
-				}
-				if (!(complete && CoalesceSubmits() && HasReadySubmission())) {
-					SetSubmitReason("end of compute submission");
-					cp.BufferFlush();
-				}
-			} else if (complete) {
-				m_renderer.RunGarbageCollector();
+			if (submission.command_execution.MadeProgress() &&
+			    !(complete && CoalesceSubmits() && HasReadySubmission())) {
+				SetSubmitReason("end of compute submission");
+				cp.BufferFlush();
 			}
 			break;
 		}
@@ -1789,7 +1777,15 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters 
 	const auto* args_addr =
 	    reinterpret_cast<const void*>(m_draw_indirect_args_base_addr + data_offset);
 
-	if (!indexed && GpuIndirectDraws()) {
+	// The GPU path below can only hand the start instance to a GS user SGPR; a draw whose packet
+	// names a START_VTX_LOC destination, or a start-instance destination outside the GS user
+	// data, needs the CP to write those registers from the arguments (PatchIndirectDrawOffsets).
+	const bool gpu_args_supported =
+	    registers.vertex_offset == Pm4::SH_NOP &&
+	    (registers.instance_offset == Pm4::SH_NOP ||
+	     (registers.instance_offset >= Pm4::SPI_SHADER_USER_DATA_GS_0 &&
+	      registers.instance_offset <= Pm4::SPI_SHADER_USER_DATA_GS_31));
+	if (!indexed && GpuIndirectDraws() && gpu_args_supported) {
 		// The GPU reads the counts (RenderExecutor::DrawAuto and ExecutePreparedDraw): fast-launch
 		// mesh draws and vertex-pipeline draws; other mesh draws read them there on the CPU. The
 		// arguments are usually written by a dispatch just before; reading them here waited for

@@ -157,7 +157,7 @@ void EmitMemoryOffsets(EmitterState& state) {
 			if (dynamic_offsets[i + lane]) continue;
 			state.memory_byte_offsets[i + lane] = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
 			    state, word, ConstantU32(state, lane * 8u), ConstantU32(state, 8u));
-			// The bound range's length in dwords (OpArrayLength is zero for ranges over 2 GiB on
+			// The bound range's length in bytes (OpArrayLength is zero for ranges over 2 GiB on
 			// some NVIDIA drivers), from the shader data.
 			state.memory_dword_lengths[i + lane] = EmitShaderDataDwordLoad(
 			    state, state.program.bindings.BufferLengthDword() + i + lane);
@@ -165,7 +165,7 @@ void EmitMemoryOffsets(EmitterState& state) {
 	}
 	// A buffer bound with a conservative record count (KYTY_GPU_SIZED_DYNAMIC): its length is the
 	// smaller of the bound range and the exact count's, read from the flattened SRT dword the GPU
-	// filled before the dispatch (BufferResource::gpu_records_flat). Lengths count dwords from the
+	// filled before the dispatch (BufferResource::gpu_records_flat). Lengths count bytes from the
 	// aligned binding start, so the byte offset of the guest base is added first; sums saturate.
 	if (state.flattened_srt_variable != 0) {
 		const auto bool_type = TypeBool(state);
@@ -211,11 +211,9 @@ void EmitMemoryOffsets(EmitterState& state) {
 			                              EmitBinaryU32(state, spv::OpISub, max_u32, offset));
 			const auto end       = Select(state, u32, saturated, max_u32,
 			                              EmitBinaryU32(state, spv::OpIAdd, bytes, offset));
-			const auto dwords    = EmitBinaryU32(state, spv::OpShiftRightLogical, end,
-			                                     ConstantU32(state, 2u));
 			const auto bound     = state.memory_dword_lengths[i];
 			state.memory_dword_lengths[i] =
-			    Select(state, u32, Binary(state, spv::OpULessThan, bool_type, dwords, bound), dwords,
+			    Select(state, u32, Binary(state, spv::OpULessThan, bool_type, end, bound), end,
 			           bound);
 		}
 	}
@@ -482,7 +480,7 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	const bool write_tracked = state.emitting_write && mem.kind == IR::ResourceKind::Buffer &&
 	                           state.program.bindings.write_tracking &&
 	                           state.program.info.buffers[mem.resource].write_tracked;
-	uint32_t dwords = 0;
+	uint32_t bytes = 0;
 	if (non_uniform) {
 		state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
 		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
@@ -499,7 +497,7 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 		    ConstantU32(state, 3));
 		access.byte_offset = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
 		    state, word, shift, ConstantU32(state, 8));
-		dwords = EmitShaderDataDwordLoadAt(state, EmitAddU32(
+		bytes = EmitShaderDataDwordLoadAt(state, EmitAddU32(
 		    state, ConstantU32(state, bindings.BufferLengthDword() + push_start), array_index));
 		if (write_tracked) {
 			// The guest base of this binding (2 dwords) in the write-tracking table.
@@ -516,16 +514,17 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 		}
 	} else {
 		access.byte_offset = state.memory_byte_offsets[static_index];
-		dwords             = state.memory_dword_lengths[static_index];
+		bytes              = state.memory_dword_lengths[static_index];
 		if (write_tracked) {
 			access.write_base = state.write_track_bases[static_index];
 		}
 	}
 	// Some NVIDIA drivers return zero from OpArrayLength for ranges over 2 GiB: the length is
 	// the actual bound range, including alignment, without truncating guest memory.
-	// The length is in dwords; the bounds checks index elements of the access's own width (narrow
-	// storage indexes bytes or halfwords, 64-bit atomics qwords). A dword length compared with a
-	// byte index dropped every access past the first quarter of the buffer.
+	// The length is in bytes; the bounds checks index elements of the access's own width (narrow
+	// storage indexes bytes or halfwords, 64-bit atomics qwords). A byte length keeps the tail of
+	// a range that ends inside a dword (an 8-bit record count of 20 bound at byte offset 2), which
+	// a dword length dropped.
 	// gpu_records_ssa: also within the count of the descriptor this access names (the handle's
 	// dword 2, which the shader computes), from the guest base; sums saturate.
 	if ((mem.kind == IR::ResourceKind::Buffer || mem.kind == IR::ResourceKind::ScalarBuffer) &&
@@ -540,42 +539,31 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 			const auto max_u32   = ConstantU32(state, UINT32_MAX);
 			const auto records   = state.emitting_ctx->Arg(*handle, 2);
 			const uint32_t stride = state.program.info.buffers[mem.resource].packed_stride & 0x3fffu;
-			uint32_t       bytes  = records;
+			uint32_t       record_bytes = records;
 			if (stride > 1u) {
 				const auto overflow = Binary(state, spv::OpUGreaterThan, bool_type, records,
 				                             ConstantU32(state, UINT32_MAX / stride));
-				bytes = Select(state, u32, overflow, max_u32,
-				               EmitBinaryU32(state, spv::OpIMul, records, ConstantU32(state, stride)));
+				record_bytes = Select(state, u32, overflow, max_u32,
+				                      EmitBinaryU32(state, spv::OpIMul, records,
+				                                    ConstantU32(state, stride)));
 			}
 			const auto offset    = access.byte_offset;
-			const auto saturated = Binary(state, spv::OpUGreaterThan, bool_type, bytes,
+			const auto saturated = Binary(state, spv::OpUGreaterThan, bool_type, record_bytes,
 			                              EmitBinaryU32(state, spv::OpISub, max_u32, offset));
 			const auto end       = Select(state, u32, saturated, max_u32,
-			                              EmitBinaryU32(state, spv::OpIAdd, bytes, offset));
-			const auto own       = EmitBinaryU32(state, spv::OpShiftRightLogical, end,
-			                                     ConstantU32(state, 2u));
-			dwords = Select(state, u32, Binary(state, spv::OpULessThan, bool_type, own, dwords), own,
-			                dwords);
+			                              EmitBinaryU32(state, spv::OpIAdd, record_bytes, offset));
+			bytes = Select(state, u32, Binary(state, spv::OpULessThan, bool_type, end, bytes), end,
+			               bytes);
 		}
 	}
-	switch (element_bits) {
-		case 8u:
-		case 16u: {
-			const auto shift = element_bits == 8u ? 2u : 1u;
-			access.length    = Select(
-			    state, TypeU32(state),
-			    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), dwords,
-			           ConstantU32(state, 1u << (32u - shift))),
-			    ConstantU32(state, UINT32_MAX),
-			    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), dwords, ConstantU32(state, shift)));
-			break;
-		}
-		case 64u:
-			access.length = Binary(state, spv::OpShiftRightLogical, TypeU32(state), dwords,
-			                       ConstantU32(state, 1u));
-			break;
-		default: access.length = dwords; break;
-	}
+	const uint32_t element_shift = element_bits == 8u    ? 0u
+	                               : element_bits == 16u ? 1u
+	                               : element_bits == 64u ? 3u
+	                                                     : 2u;
+	access.length = element_shift == 0u
+	                    ? bytes
+	                    : Binary(state, spv::OpShiftRightLogical, TypeU32(state), bytes,
+	                             ConstantU32(state, element_shift));
 	return access;
 }
 

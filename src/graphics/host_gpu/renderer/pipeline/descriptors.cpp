@@ -2880,10 +2880,11 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		// The fallback allocation makes the Vulkan descriptor valid, but an empty guest
 		// buffer still has no accessible elements. In particular, never let a null store
 		// modify the shared fallback and affect subsequent null reads.
+		// The length is the bound range in bytes (the shader bounds each access by it).
 		prepared.shader_data[layout.BufferLengthDword() + index] =
 		    prepared.buffer_sources[index].size == 0
 		        ? 0u
-		        : static_cast<uint32_t>(prepared.buffers[index].range / sizeof(uint32_t));
+		        : static_cast<uint32_t>(prepared.buffers[index].range);
 	}
 	// KYTY_SRT_VERIFY: the values the host used in place of GPU-written bytes, each followed by
 	// a slot the GPU fills with its own copy (FillFlatSlotsOnGpu); the shader compares them.

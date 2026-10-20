@@ -132,6 +132,7 @@ struct EmitterState {
 	uint32_t                                         lane_half               = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
+	// Each buffer binding's bound range in bytes (BufferLengthDword in the shader data).
 	std::vector<uint32_t>                            memory_dword_lengths;
 	// Write bitmap (Bindings::write_tracking): the bitmap's device address, each memory
 	// binding's guest base (u64 ids; a base of 0 is not tracked in that draw), and whether the
