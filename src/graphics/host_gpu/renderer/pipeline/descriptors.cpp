@@ -2844,6 +2844,18 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 					continue;
 				}
 			}
+			if (!GuestRange {address, size}.Valid()) {
+				// A descriptor the guest never meant to be read: a stale or garbage V# (GTA V's
+				// 0xddff3c6d72c4e994 binds 0x077efda67f8b, a host-looking pointer) names memory outside
+				// the guest address space. The hardware faults only if the shader touches it, which a
+				// working game never does; binding null gives the same, where asking the cache for it
+				// ended the emulator.
+				Common::HackNotice::Report(
+				    "buffer descriptor outside the guest address space bound as null",
+				    "RenderExecutor::FindBuffers", program.shader_hash, address);
+				source = {};
+				continue;
+			}
 			source = {address, size, cache.FindBuffer(address, size)};
 		}
 	}
