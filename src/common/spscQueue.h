@@ -81,15 +81,16 @@ private:
 	uint64_t                              m_iterations = 0;
 };
 
-// A monotonically increasing counter one thread advances and one other thread waits on.
+// A monotonically increasing counter one thread advances and any threads wait on.
 //
-// The waiter spins (SpinWait) and only then sleeps. A wake-up is only issued when the value
-// reaches the sleeping thread's target. WaitFor() stores the target and then reads the value,
-// seq_cst; Notify() issues a seq_cst fence and then reads the target. Either the waiter sees a
-// value published before the fence, or Notify() sees the target and wakes the waiter;
-// atomic::wait() also returns at once when the value already differs from the one the waiter
-// read. Publish() alone is a plain release store: a sleeper it satisfies wakes at the next
-// Notify().
+// A waiter spins (SpinWait) and only then sleeps. A wake-up is only issued when the value
+// reaches the lowest target a sleeping thread registered. WaitFor() registers its target (it
+// lowers the shared one) and then reads the value, seq_cst; Notify() issues a seq_cst fence and
+// then reads the target. Either the waiter sees a value published before the fence, or Notify()
+// sees the target, takes the registration out and wakes every sleeper; a sleeper whose own
+// target is not reached yet registers it again and sleeps on. atomic::wait() also returns at
+// once when the value already differs from the one the waiter read. Publish() alone is a plain
+// release store: a sleeper it satisfies wakes at the next Notify().
 class ProgressCounter {
 public:
 	ProgressCounter() = default;
@@ -101,8 +102,12 @@ public:
 
 	void Notify() noexcept {
 		std::atomic_thread_fence(std::memory_order_seq_cst);
-		if (m_wait_target.load(std::memory_order_relaxed) <=
-		    m_value.load(std::memory_order_relaxed)) {
+		auto registered = m_wait_target.load(std::memory_order_relaxed);
+		if (registered <= m_value.load(std::memory_order_relaxed)) {
+			// The registered target is reached: every sleeper wakes and registers again. A
+			// lower target registered meanwhile stays.
+			(void)m_wait_target.compare_exchange_strong(registered, NoTarget,
+			                                            std::memory_order_seq_cst);
 			m_value.notify_all();
 		}
 	}
@@ -124,15 +129,23 @@ public:
 				return;
 			}
 		}
-		m_wait_target.store(target, std::memory_order_seq_cst);
 		for (;;) {
+			// Lower the registered target to ours: another thread may sleep on a lower one.
+			auto registered = m_wait_target.load(std::memory_order_seq_cst);
+			while (registered > target &&
+			       !m_wait_target.compare_exchange_weak(registered, target,
+			                                            std::memory_order_seq_cst)) {
+			}
 			const auto value = m_value.load(std::memory_order_seq_cst);
 			if (value >= target) {
 				break;
 			}
+			// A Notify() took the registration out since: register again.
+			if (m_wait_target.load(std::memory_order_seq_cst) > target) {
+				continue;
+			}
 			m_value.wait(value, std::memory_order_seq_cst);
 		}
-		m_wait_target.store(NoTarget, std::memory_order_relaxed);
 	}
 
 private:
