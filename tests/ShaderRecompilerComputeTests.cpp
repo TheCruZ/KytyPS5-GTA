@@ -17951,14 +17951,6 @@ public:
         cmd.setCullMode(cull_mode);
         cmd.setFrontFace(mode.face ? vk::FrontFace::eClockwise
                                    : vk::FrontFace::eCounterClockwise);
-#if !defined(__APPLE__)
-        const bool bounds_test = depth.depth_bounds_test_enable &&
-                                 rendering.depth_stencil_attachment.has_depth;
-        cmd.setDepthBoundsTestEnable(bounds_test ? VK_TRUE : VK_FALSE);
-        if (bounds_test) {
-          cmd.setDepthBounds(depth.depth_min_bounds, depth.depth_max_bounds);
-        }
-#endif
       }
       cmd.setStencilTestEnable(depth.stencil_test_enable);
       if (depth.stencil_test_enable) {
