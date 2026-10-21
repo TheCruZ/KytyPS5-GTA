@@ -341,8 +341,9 @@ bool CanReadIndexedSelector(const ShaderBufferResource& material, uint32_t offse
 	           uint64_t {UINT32_MAX} + 1u;
 }
 
-bool EvaluateIndirectCount(const ResourcePlan& program, const DescriptorSource::IndirectDescriptor& indirect,
-                           const SrtRuntime& runtime, uint32_t& count) {
+template <typename Walker>
+bool EvaluateIndirectCount(const DescriptorSource::IndirectDescriptor& indirect,
+                           const SrtRuntime& runtime, Walker& clean, uint32_t& count) {
 	if (indirect.workgroup_axis != UINT32_MAX) {
 		if (runtime.workgroup_counts.size() != 3u || indirect.workgroup_axis >= 3u) return false;
 		count = std::ranges::find(runtime.workgroup_counts, 0u) != runtime.workgroup_counts.end()
@@ -354,9 +355,10 @@ bool EvaluateIndirectCount(const ResourcePlan& program, const DescriptorSource::
 	return true;
 }
 
-bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::IndirectDescriptor& indirect,
+template <typename Walker>
+bool ResolveSelectorKeys(const DescriptorSource::IndirectDescriptor& indirect,
                          const DescriptorValue& material_value, const SrtRuntime& runtime,
-                         std::vector<uint32_t>& keys) {
+                         Walker& clean, std::vector<uint32_t>& keys) {
 	const auto* selector = &*indirect.selector;
 	keys.clear();
 	const auto read_selector = [&](uint64_t base, uint64_t size, uint64_t offset,
@@ -597,11 +599,12 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 	return true;
 }
 
-template <typename Specialization, typename Normalize>
+template <typename Specialization, typename Normalize, typename Walker>
 bool MaterializeIndirectDescriptor(const ResourcePlan&                         program,
                                    uint32_t source_index,
                                    uint32_t resource_index, uint32_t dword_count, uint32_t read_dwords,
-                                   const SrtRuntime& runtime, ResourceSnapshot& snapshot,
+                                   const SrtRuntime& runtime, Walker& clean,
+                                   ResourceSnapshot&             snapshot,
                                    std::vector<DescriptorValue>& descriptors,
                                    std::vector<Specialization>&  specializations,
                                    Normalize&& normalize) {
@@ -2304,7 +2307,8 @@ struct WriteInterval {
 // The unsigned 32-bit range a store address operand takes over the dispatch: invocation IDs range
 // over the workgroup count and size, everything else the host evaluates exactly. Fails on an
 // unknown dispatch size or a range that could wrap.
-bool EvaluateWriteInterval(const ResourcePlan& program, const SrtRuntime& runtime, SrtWalker& walker,
+template <typename Walker>
+bool EvaluateWriteInterval(const ResourcePlan& program, const SrtRuntime& runtime, Walker& walker,
                            Value value, Value predicate, WriteInterval& out, uint32_t& budget) {
 	constexpr uint64_t Max32 = UINT32_MAX;
 	if (budget == 0u) {
@@ -2420,8 +2424,9 @@ thread_local bool t_gpu_sized_snapshot = false;
 thread_local uint64_t t_extents_shader_hash = 0; // for OptionalScope below
 
 // See ResourceSnapshot::buffer_write_extents.
+template <typename Walker>
 void ComputeBufferWriteExtents(const ResourcePlan& program, const SrtRuntime& runtime,
-                               SrtWalker& walker, ResourceSnapshot& snapshot) {
+                               Walker& walker, ResourceSnapshot& snapshot) {
 	snapshot.buffer_write_extents.assign(program.info.buffers.size(), {});
 	t_extents_shader_hash = program.shader_hash;
 	if (program.buffer_writes.empty()) {
@@ -2702,8 +2707,9 @@ void SetComputeIndirectFloors(size_t keys, size_t images) {
 	g_stable_indirect_layouts.store(true, std::memory_order_relaxed);
 }
 
-bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+template <typename Walker>
+static bool MaterializeWith(const ResourcePlan& program, const SrtRuntime& runtime,
+                            ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	for (auto& keys: program.selector_keys) keys.resolved = false;
 	g_indirect_failure_line = 0;
 	t_gpu_sized_snapshot    = false;
@@ -2726,9 +2732,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
 	// Reads through the fast page path are captured there.
 	if (capture_reads) observed.capture_ranges = &reads;
-	SrtWalker clean(program, CleanRuntime(observed));
-	SrtWalker walker(program, observed,
-	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
+	Walker clean(program, CleanRuntime(observed));
+	Walker walker(program, observed,
+	              capture_reads || program.requires_specialization_memory ? &clean : nullptr);
 	g_materialize_phase = "flat";
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
 		return SpecializationFail(fmt::format(
@@ -3248,50 +3254,26 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	return true;
 }
 
-uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value) {
-	// Mirrors BuildResourceSpecialization for sampled roots: entries it would reject, entries of
-	// another dimension and entries that need shader-side conversion read as null instead of
-	// failing the draw.
-	const auto format = static_cast<Prospero::BufferFormat>((value.dwords[1] >> 20u) & 0x1ffu);
-	const auto tile = static_cast<Prospero::TileMode>((value.dwords[3] >> 20u) & 0x1fu);
-	const auto numeric_class =
-	    Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
-	if (NullImageDescriptor(value) || !ValidImageDescriptor(value, root.r128) ||
-	    DescriptorDimension(value, root.dimension) != root.dimension ||
-	    Prospero::IsFmaskTextureFormat(format) || format == Prospero::BufferFormat::k11_11_10UNorm ||
-	    ImageConversionFormat(format) != Prospero::BufferFormat::kInvalid ||
-	    (root.unfiltered_access_only && format == Prospero::BufferFormat::k16UInt &&
-	     tile == Prospero::TileMode::kDepth) ||
-	    numeric_class == Prospero::TextureNumericClass::Unsupported ||
-	    (root.depth_compare && numeric_class != Prospero::TextureNumericClass::Float)) {
-		value.dwords.fill(0u);
-		return 0u;
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	// KYTY_COMPILED_SRT=0: the IR walker for every plan. The compiled plan does not model the GPU
+	// fills of compute stages (SrtGpuFill) or the machine-code walker of plans without a reader.
+	static const bool compiled_enabled = [] {
+		const char* value = std::getenv("KYTY_COMPILED_SRT");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (compiled_enabled && runtime.gpu_fills == nullptr && runtime.gpu_written == nullptr &&
+	    !(program.srt_code && runtime.read_memory == nullptr) &&
+	    CompileSrtPlan(program) != nullptr) {
+		return MaterializeWith<CompiledSrtWalker>(program, runtime, snapshot, specialization);
 	}
-	return 1u + static_cast<uint32_t>(numeric_class) * 2u + (DescriptorIsCube(value) ? 1u : 0u);
+	return MaterializeWith<SrtWalker>(program, runtime, snapshot, specialization);
 }
 
-ImageResource ImageHeapResource(const ImageResource& root, uint32_t kind) {
-	ImageResource resource;
-	resource.resource_class         = ImageResourceClass::Sampled;
-	resource.read                   = true;
-	resource.heap                   = true;
-	resource.dimension              = root.dimension;
-	resource.unfiltered_access_only = root.unfiltered_access_only;
-	resource.depth_compare          = root.depth_compare;
-	resource.r128                   = root.r128;
-	if (kind != 0u) {
-		resource.numeric_class = static_cast<Prospero::TextureNumericClass>((kind - 1u) / 2u);
-		resource.cube          = ((kind - 1u) & 1u) != 0u;
-	}
-	return resource;
-}
-
-void SetComputeIndirectFloors(size_t keys, size_t images) {
-	g_compute_indirect_keys.store(std::max(std::bit_ceil(keys), MinIndirectMappingCapacity),
-	                              std::memory_order_relaxed);
-	g_compute_indirect_images.store(std::max<size_t>(std::bit_ceil(images), 1u),
-	                                std::memory_order_relaxed);
-	g_stable_indirect_layouts.store(true, std::memory_order_relaxed);
+bool MaterializeResourcesReference(const ResourcePlan& program, const SrtRuntime& runtime,
+                                   ResourceSnapshot& snapshot,
+                                   ResourceSpecialization& specialization) {
+	return MaterializeWith<SrtWalker>(program, runtime, snapshot, specialization);
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {

@@ -116,6 +116,14 @@ struct ImageTableSnapshot {
 	std::vector<uint32_t>        mapping; // Entry count, then the slot of each entry.
 };
 
+inline constexpr uint32_t NoSrtSlot = UINT32_MAX;
+// A specialization read made by a scalar load the shader also issues itself (not flattened):
+// RawReadSlotBit | the load's memory-info index.
+inline constexpr uint32_t RawReadSlotBit = 0x80000000u;
+[[nodiscard]] constexpr uint32_t RawReadSlot(uint32_t memory_index) {
+	return memory_index < RawReadSlotBit ? (RawReadSlotBit | memory_index) : NoSrtSlot;
+}
+
 struct ResourceSnapshot {
 	std::vector<BufferWriteExtent>      buffer_write_extents;
 	std::vector<BindlessHeapUse>        bindless_heaps;

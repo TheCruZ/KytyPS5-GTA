@@ -895,6 +895,8 @@ struct UniformFillPlan {
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
 // Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
+struct CompiledSrtPlan;
+
 struct ResourcePlan {
 	struct SelectorKeys {
 		std::vector<uint32_t> values;
@@ -934,6 +936,10 @@ struct ResourcePlan {
 	bool                                bindless_images = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
+	// Flattened evaluation program, built on the first refresh (null: SrtWalker evaluates).
+	// The plan's values must not change after that refresh.
+	mutable bool                                   compiled_srt_built = false;
+	mutable std::shared_ptr<const CompiledSrtPlan> compiled_srt;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
 	// x86 walker over the retained SRT, descriptor and condition values.

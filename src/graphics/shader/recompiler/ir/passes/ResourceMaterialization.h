@@ -81,6 +81,11 @@ void SetComputeIndirectFloors(size_t keys, size_t images);
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
+// The same refresh through SrtWalker alone, without the compiled plan; tests compare the two.
+bool MaterializeResourcesReference(const ResourcePlan& program, const SrtRuntime& runtime,
+                                   ResourceSnapshot& snapshot,
+                                   ResourceSpecialization& specialization);
+
 // Diagnostics: the source line of the indirect-image check that failed the last
 // MaterializeResources call on this thread, or 0.
 int LastIndirectImageFailureLine();
@@ -90,13 +95,6 @@ bool ImageTableSlotCompatible(const ImageResource& root, const DescriptorValue& 
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
-
-// Kind of an image heap entry as root sees it, or 0 (and a zeroed value) when root reads it as
-// null. Entries of one kind specialize identically.
-uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value);
-// The sampled resource that root resolves entries of kind as; kind 0 gives the identity of
-// root's view of a heap.
-ImageResource ImageHeapResource(const ImageResource& root, uint32_t kind);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 
