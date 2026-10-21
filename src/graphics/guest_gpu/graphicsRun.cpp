@@ -1812,16 +1812,17 @@ bool GuestGpu::Process(Submission& submission) {
 
 	if (first_slice) {
 		g_guest_submission_seq.fetch_add(1, std::memory_order_relaxed);
-		// Texture-heap entries the guest wrote before submitting are visible to all of this
-		// submission's draws, as on the console.
-		m_renderer.GetRenderExecutor().SyncBindlessHeaps();
-	}
-
-	if (first_slice) {
 		submission.started = true;
 		cp.SetSubmitId(++m_submit_id);
 		cp.ResetDeCe();
 		cp.SetFlip({});
+		// Texture-heap entries the guest wrote before submitting are visible to all of this
+		// submission's draws, as on the console. The sync looks images up and records into the
+		// command buffer, so it runs where the draws execute (the execution thread when the
+		// pipeline is on), ahead of this submission's first operation: from the command
+		// processor thread it raced with the submission of the execution thread's command
+		// buffer ("image lookup requires a valid command buffer").
+		cp.EmitHostCommand([this] { m_renderer.GetRenderExecutor().SyncBindlessHeaps(); });
 	}
 
 	cp.BufferInit();
