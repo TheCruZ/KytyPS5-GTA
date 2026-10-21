@@ -1396,7 +1396,10 @@ static bool MaybeGpuDirtyForClean(uint64_t vaddr, uint64_t size) {
 	if (t_gpu_read_delegate) {
 		return buffers.HasGpuDirtyBytesShared(vaddr, size) || buffers.HasPendingDownload(vaddr, size);
 	}
-	return !Graphics::GuestGpu::IsGpuThread() || buffers.HasGpuDirtyBytes(vaddr, size) ||
+	// Byte ranges the GPU wrote lie on GPU-dirty pages: the lock-free page check answers for most
+	// reads.
+	return !Graphics::GuestGpu::IsGpuThread() ||
+	       (buffers.MayBeGpuModified(vaddr, size) && buffers.HasGpuDirtyBytes(vaddr, size)) ||
 	       buffers.HasPendingDownload(vaddr, size);
 }
 
