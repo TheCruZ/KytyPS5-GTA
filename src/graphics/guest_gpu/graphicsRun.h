@@ -122,6 +122,7 @@ private:
 	void              ExecutionThread();
 	void              ResolveThread();
 	void              PrepareAhead(GpuOperation& operation);
+	void              ResolveAhead(GpuOperation& operation);
 	void              StopExecution();
 	// Command processor thread of a pipelined GPU: runs a command on the execution thread and
 	// waits for it.

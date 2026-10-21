@@ -107,6 +107,9 @@ struct GpuOperation {
 	// (DrawPrep::Take), under this key.
 	DrawPrep::Key prep_key {};
 	bool          prepared = false;
+	// KYTY_PIPELINE_CACHE=ours: the shader programs the resolve thread resolved ahead of
+	// execution (released by the execution thread once the operation executed).
+	RenderExecutor::ResolvedDraw* resolved = nullptr;
 	// The command processor processed a WAIT_REG_MEM since the previous operation: the guest may
 	// have written memory the operations before it read.
 	bool after_wait = false;
