@@ -348,6 +348,11 @@ public:
 	// Whether the shader at this address is on the skip list (--skip-shaders): its dispatches can
 	// be dropped before anything is prepared for them.
 	[[nodiscard]] static bool IsSkipListed(uint64_t shader_addr);
+	// Whether the compute shader at this address read guest memory to build its descriptors in its
+	// last resolution (specialization reads). True until a resolution says otherwise.
+	[[nodiscard]] static bool ReadsDescriptorMemory(uint64_t shader_addr);
+	// What a resolution of the shader found (tests set it for shaders they never resolve).
+	static void SetReadsDescriptorMemory(uint64_t shader_addr, bool reads);
 	// KYTY_SRT_DEFER=1 (GPU thread, around one dispatch): SRT reads of GPU-written bytes start
 	// their download and fail instead of waiting; EndSrtDefer returns the tick to wait for before
 	// the dispatch runs again (0: it ran). SrtDeferPending: the current refresh was deferred.

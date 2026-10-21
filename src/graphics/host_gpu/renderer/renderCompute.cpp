@@ -13,7 +13,6 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
-#include "gpu_tiler_shaders/indirect_thread_dispatch_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/dispatchRun.h"
@@ -320,7 +319,7 @@ static bool PrepareIndirectWriteTargets(RenderContext& context, const PreparedBi
 
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
                                                 const CommandBuffer&          buffer) {
-	const auto& program   = input.stage.module->info;
+	const auto& program   = *input.stage.program;
 	const auto& resources = *input.stage.resources;
 	if (resources.buffers.size() != program.info.buffers.size()) {
 		EXIT("compute runtime buffer count does not match shader metadata\n");
@@ -402,7 +401,7 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
                                           CommandBuffer& command, uint32_t group_x,
                                           uint32_t group_y, uint32_t group_z, uint32_t mode) {
-	const auto& program   = input.stage.module->info;
+	const auto& program   = *input.stage.program;
 	const auto& resources = *input.stage.resources;
 	const auto& fill      = resources.uniform_fill;
 	auto&       cache     = command.GetContext().GetTextureCache();
@@ -477,7 +476,7 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	if (logged_clears.fetch_add(1, std::memory_order_relaxed) < 32) {
 		LOGF("GraphicsRenderDispatchDirect: compute %s shader=0x%016" PRIx64
 		     " addr=0x%016" PRIx64 " size=0x%016" PRIx64 " value=0x%08" PRIx32 "\n",
-		     image_clear ? "image clear" : "buffer fill", input.stage.module->info.shader_hash,
+		     image_clear ? "image clear" : "buffer fill", input.stage.program->shader_hash,
 		     descriptor.Base48(), size, packed_clear);
 	}
 	return true;
@@ -485,7 +484,7 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 
 static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& input,
                              PreparedBindings& bindings, uint64_t indirect_args = 0) {
-	if (input.stage.module->info.bindings.descriptor_counts[
+	if (input.stage.program->bindings.descriptor_counts[
 	        static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::SharedMemory)] == 0) {
 		return;
 	}
@@ -917,6 +916,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	EXIT_IF(buffer.IsInvalid());
 	DispatchRunPost run_post(m_context, buffer);
 	m_context.GetCommandScheduler().PopPendingOperations();
+	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect), submit_id,
@@ -970,6 +970,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	const auto& cs_regs = sh_ctx.GetCs();
+	const auto& sh_regs = ctx.GetShaderRegisters();
 
 	ShaderComputeInputInfo input_info {};
 	input_info.async_compute = async_compute;
@@ -1071,7 +1072,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	buffer.EndRendering();
-	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info);
+	auto& pipeline =
+	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
@@ -1258,10 +1260,34 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
 	Common::LockGuard lock(m_context.GetMutex());
 	vk::DispatchIndirectCommand args {};
-	if (!m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
-	    LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args)) &&
-	    (args.x == 0 || args.y == 0 || args.z == 0)) {
-		return;
+	// A dispatch whose arguments name no group runs nothing on the console, whatever its
+	// descriptors hold: GTA V's BVH builder dispatches once per instance and the empty ones leave
+	// their table entries unwritten, which the resolution below would read as garbage V#s (strides
+	// by the thousands, ranges of gigabytes, a lost device). The arguments are read as the GPU holds
+	// them (waiting for the work that writes them: one wait for the whole table, the bytes are
+	// clean afterwards). Only for shaders that read guest memory to build their descriptors: for the
+	// others (culling, sorting) nothing resolves differently when the dispatch is empty, and the
+	// wait would cost the GPU thread a drain of the GPU per frame. KYTY_INDIRECT_ARGS_EXACT=0: only
+	// arguments the GPU did not write, for all; =2: exact for all.
+	// 0: never, 1 (default): shaders that read descriptor memory, 2: every indirect dispatch.
+	static const int exact_mode = [] {
+		const char* value = std::getenv("KYTY_INDIRECT_ARGS_EXACT");
+		return value == nullptr ? 1 : std::atoi(value);
+	}();
+	const bool exact_args = exact_mode != 0;
+	static const bool skip_empty = [] {
+		const char* value = std::getenv("KYTY_INDIRECT_ARGS_SKIP");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (exact_args && (exact_mode == 2 ||
+	                   PipelineCache::ReadsDescriptorMemory(
+	                       buffer.GetShaders().GetCs().cs_regs.data_addr))
+	        ? LibKernel::Memory::TryReadBufferBacking(args_addr, &args, sizeof(args))
+	               : (!m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
+	                  LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args)))) {
+		if (skip_empty && (args.x == 0 || args.y == 0 || args.z == 0)) {
+			return;
+		}
 	}
 	const auto& cs_regs = buffer.GetShaders().GetCs();
 	if (cs_regs.cs_regs.data_addr == 0) {
@@ -1395,9 +1421,6 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		m_context.PrepareBda(!reach_synchronized);
 	}
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
-	if (program.info.uses_image_heap) {
-		m_context.GetImageHeap().Rebind(*this);
-	}
 	RebindImages(bindings);
 	// Acquiring arguments can merge cache buffers; the loop below finalizes the shader bindings
 	// afterward (KYTY_SINGLE_REBIND=0: also bind them here first, as before).
