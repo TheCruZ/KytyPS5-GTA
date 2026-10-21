@@ -397,16 +397,19 @@ public:
 			const char* value = std::getenv("KYTY_BACKING_CACHE");
 			return value == nullptr || value[0] != '0';
 		}();
-		thread_local std::array<Cached, 8> cache {};
-		thread_local uint32_t              cache_next = 0;
+		// Direct-mapped by the 64 KB chunk of the address (the main fork's "remember backing
+		// mappings per 64 KB of guest addresses"): a handful of entries missed for the dozens of
+		// mappings a frame's guest reads touch, and each miss took the lock and a map lookup.
+		constexpr size_t ChunkBits = 16;
+		thread_local std::array<Cached, 256> cache {};
+		const auto                           slot = static_cast<size_t>((vaddr >> ChunkBits) & 255u);
 		if (cache_enabled) {
-			const auto generation = m_maps_generation.load(std::memory_order_acquire);
-			for (const auto& cached: cache) {
-				if (cached.owner == this && cached.generation == generation &&
-				    vaddr >= cached.vaddr && vaddr + size <= cached.vaddr + cached.size) {
-					const auto offset = cached.offset + vaddr - cached.vaddr;
-					return RangeOk(offset, size) ? m_backing_base + offset : nullptr;
-				}
+			const auto  generation = m_maps_generation.load(std::memory_order_acquire);
+			const auto& cached     = cache[slot];
+			if (cached.owner == this && cached.generation == generation && vaddr >= cached.vaddr &&
+			    vaddr + size <= cached.vaddr + cached.size) {
+				const auto offset = cached.offset + vaddr - cached.vaddr;
+				return RangeOk(offset, size) ? m_backing_base + offset : nullptr;
 			}
 		}
 		DiagLockGuard lock(m_mutex, __func__);
@@ -415,9 +418,8 @@ public:
 			return nullptr;
 		}
 		if (cache_enabled) {
-			cache[cache_next++ % cache.size()] = {this,
-			                                      m_maps_generation.load(std::memory_order_acquire),
-			                                      entry.vaddr, entry.size, entry.backing_offset};
+			cache[slot] = {this, m_maps_generation.load(std::memory_order_acquire), entry.vaddr,
+			               entry.size, entry.backing_offset};
 		}
 		const auto offset = entry.backing_offset + vaddr - entry.vaddr;
 		return RangeOk(offset, size) ? m_backing_base + offset : nullptr;
