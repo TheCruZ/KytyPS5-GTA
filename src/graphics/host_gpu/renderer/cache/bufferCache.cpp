@@ -1455,6 +1455,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	}
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	new_buffer.ready_tick = m_scheduler.CurrentTick();
 	DeleteBuffer(overlap_id);
 }
 
@@ -3742,8 +3743,11 @@ uint64_t BufferCache::TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin
 	    window_begin >= window_end) {
 		return 0;
 	}
-	const auto latest_write = LatestGpuWriteTick(window_begin, window_end);
-	const bool finished     = latest_write == 0 || m_scheduler.IsFree(latest_write);
+	// A buffer a merge just created holds the GPU-written bytes of the buffers it replaced only
+	// once the copies recorded for it have executed: read earlier, the copy queue gets zeros.
+	const auto latest_write =
+	    std::max(LatestGpuWriteTick(window_begin, window_end), buffer.ready_tick);
+	const bool finished = latest_write == 0 || m_scheduler.IsFree(latest_write);
 	if (!finished) {
 		m_copy_running++;
 	}
