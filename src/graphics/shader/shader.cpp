@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
@@ -18,8 +19,8 @@
 
 #include <algorithm>
 #include <array>
-#include <cstdlib>
 #include <atomic>
+#include <cstdlib>
 #include <bit>
 #include <cstdio>
 #include <cstring>
@@ -45,19 +46,15 @@
 
 namespace Libs::Graphics {
 
-// A mapped shader and its vertex metadata, parsed once when it is mapped.
-struct ShaderMapData: ShaderMappedData {
-	ShaderVertexMetadata vertex;
-	const char*          vertex_error = nullptr;
-};
-
 struct ShaderMapEntry {
-	ShaderMapData data;
-	uint64_t      hash;
+	ShaderMappedData data;
+	uint64_t hash;
 };
 
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMapEntry>> g_shader_map;
 static std::mutex                                                      g_shader_map_mutex;
+static std::unordered_map<uint64_t, ShaderTessellationInputInfo>       g_tess_layouts;
+static std::mutex                                                      g_tess_layouts_mutex;
 
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
@@ -303,8 +300,8 @@ static uint32_t ShaderCalcPsSystemInputBase(const HW::ShaderRegisters& regs) {
 
 static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserSgprInfo& user_sgpr,
                                            uint32_t user_sgpr_num, const HW::ShaderRegisters& sh,
-                                           const ShaderMapData&   data,
-                                           ShaderVertexInputInfo& info) {
+                                           const ShaderMappedData& data,
+                                           ShaderVertexInputInfo&  info) {
 	KYTY_PROFILER_FUNCTION();
 
 	// In place: assigning a temporary zeroes and then copies the 10 KiB structure.
@@ -320,12 +317,13 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 		     " user_sgpr_num=%u\n",
 		     shader_addr, user_sgpr_num);
 	}
-	if (data.vertex_error != nullptr) {
+	ShaderVertexMetadata metadata;
+	std::string          metadata_error;
+	if (!ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, metadata, &metadata_error)) {
 		LOGF("ShaderGetVertexInputInfo(): invalid AGC metadata shader=0x%016" PRIx64 ": %s\n",
-		     shader_addr, data.vertex_error);
+		     shader_addr, metadata_error.c_str());
 		return false;
 	}
-	const auto& metadata = data.vertex;
 
 	if (metadata.vertex_attrib_reg >= 0) {
 		info.fetch_external   = false;
@@ -450,6 +448,7 @@ static void ShaderGetStaticInputInfoPS(
 }
 
 static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
+                                       const HW::ShaderRegisters& /*sh*/,
                                        const ShaderMappedData& data, ShaderComputeInputInfo& info) {
 	const bool async_compute                = info.async_compute;
 	const bool dispatch_thread_dimensions   = info.dispatch_thread_dimensions;
@@ -524,7 +523,6 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	words.push_back(info.lds_size_dwords);
 	words.push_back(info.pa_cl_vs_out_cntl);
 	words.push_back(info.user_clip_planes);
-	words.push_back(info.indirect_offsets.vertex | (uint32_t {info.indirect_offsets.instance} << 8u));
 	words.push_back(static_cast<uint32_t>(info.clip_space.enabled));
 	if (info.clip_space.enabled) {
 		for (const float value: info.clip_space.scale) {
@@ -541,7 +539,7 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	words.push_back(info.mesh.threads_num[0]);
 	if (info.mesh.threads_num[0] != 0) {
 		const auto& mesh = info.mesh;
-		key.insert(key.end(), {mesh.wave_size, mesh.host_subgroup_size, mesh.lds_size_dwords,
+		words.insert({mesh.wave_size, mesh.host_subgroup_size, mesh.lds_size_dwords,
 		                       mesh.scratch_size_dwords, mesh.input_primitive,
 		                       mesh.primitives_per_group, mesh.vertices_per_group,
 		                       mesh.max_vertices, mesh.max_primitives, mesh.provoking_vertex,
@@ -550,7 +548,7 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	words.push_back(info.tess.input_control_points);
 	if (info.tess.input_control_points != 0) {
 		const auto& tess = info.tess;
-		key.insert(key.end(), {tess.output_control_points, tess.ls_stride, tess.hs_stride,
+		words.insert({tess.output_control_points, tess.ls_stride, tess.hs_stride,
 		                       tess.domain, tess.partitioning, tess.output_topology,
 		                       tess.patch_base, tess.patch_size});
 	}
@@ -567,36 +565,36 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 
 void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>& key) {
 	EXIT_IF(info.input_num > std::size(info.interpolator_settings));
-	key.clear();
-	key.push_back(info.scratch_size_dwords);
-	key.push_back(info.lds_size_dwords);
-	key.push_back(info.input_num);
-	key.push_back(info.wave_size);
-	key.push_back(info.ps_system_input_base);
-	key.push_back(info.custom_interpolation_mask);
-	key.push_back(info.ps_perspective_center_vgpr);
-	key.push_back(info.ps_perspective_sample_vgpr);
-	key.push_back(info.ps_perspective_centroid_vgpr);
-	key.push_back(static_cast<uint32_t>(info.ps_pos_x));
-	key.push_back(static_cast<uint32_t>(info.ps_pos_y));
-	key.push_back(static_cast<uint32_t>(info.ps_pos_z));
-	key.push_back(static_cast<uint32_t>(info.ps_pos_w));
-	key.push_back(static_cast<uint32_t>(info.ps_front_face));
-	key.push_back(static_cast<uint32_t>(info.ps_front_face_all_bits));
-	key.push_back(static_cast<uint32_t>(info.ps_ancillary));
-	key.push_back(static_cast<uint32_t>(info.ps_no_perspective));
-	key.push_back(static_cast<uint32_t>(info.parameter_mode));
-	key.push_back(static_cast<uint32_t>(info.ps_pixel_kill_enable));
-	key.push_back(static_cast<uint32_t>(info.ps_depth_export_enable));
-	key.push_back(static_cast<uint32_t>(info.ps_sample_mask_export_enable));
-	key.push_back(static_cast<uint32_t>(info.ps_early_z));
-	key.push_back(static_cast<uint32_t>(info.dual_source_blending));
-	key.push_back(static_cast<uint32_t>(info.object_primitive_id));
-	key.push_back(static_cast<uint32_t>(info.alpha_blend_source));
-	key.insert(key.end(), std::begin(info.target_output_mode), std::end(info.target_output_mode));
-	key.push_back(info.target_uint_mask);
-	key.push_back(info.target_sint_mask);
-	key.push_back(info.target_packed_unorm_mask | (uint32_t {info.target_round_mode} << 8u));
+	StaticKeyBuilder words;
+	words.push_back(info.scratch_size_dwords);
+	words.push_back(info.lds_size_dwords);
+	words.push_back(info.input_num);
+	words.push_back(info.wave_size);
+	words.push_back(info.ps_system_input_base);
+	words.push_back(info.custom_interpolation_mask);
+	words.push_back(info.ps_perspective_center_vgpr);
+	words.push_back(info.ps_perspective_sample_vgpr);
+	words.push_back(info.ps_perspective_centroid_vgpr);
+	words.push_back(static_cast<uint32_t>(info.ps_pos_x));
+	words.push_back(static_cast<uint32_t>(info.ps_pos_y));
+	words.push_back(static_cast<uint32_t>(info.ps_pos_z));
+	words.push_back(static_cast<uint32_t>(info.ps_pos_w));
+	words.push_back(static_cast<uint32_t>(info.ps_front_face));
+	words.push_back(static_cast<uint32_t>(info.ps_front_face_all_bits));
+	words.push_back(static_cast<uint32_t>(info.ps_ancillary));
+	words.push_back(static_cast<uint32_t>(info.ps_no_perspective));
+	words.push_back(static_cast<uint32_t>(info.parameter_mode));
+	words.push_back(static_cast<uint32_t>(info.ps_pixel_kill_enable));
+	words.push_back(static_cast<uint32_t>(info.ps_depth_export_enable));
+	words.push_back(static_cast<uint32_t>(info.ps_sample_mask_export_enable));
+	words.push_back(static_cast<uint32_t>(info.ps_early_z));
+	words.push_back(static_cast<uint32_t>(info.dual_source_blending));
+	words.push_back(static_cast<uint32_t>(info.object_primitive_id));
+	words.push_back(static_cast<uint32_t>(info.alpha_blend_source));
+	words.insert(std::begin(info.target_output_mode), std::end(info.target_output_mode));
+	words.push_back(info.target_uint_mask);
+	words.push_back(info.target_sint_mask);
+	words.push_back(info.target_packed_unorm_mask | (uint32_t {info.target_round_mode} << 8u));
 	const auto mask = info.target_shader_mask;
 	words.push_back((mask | (mask >> 1u) | (mask >> 2u) | (mask >> 3u)) & 0x11111111u);
 	for (uint32_t base = 0; base < info.target_export_mapping.size(); base += 4u) {
@@ -613,16 +611,16 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 }
 
 void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_t>& key) {
-	key.clear();
-	key.push_back(info.workgroup_register);
-	key.push_back(info.wave_size | (static_cast<uint32_t>(info.float_mode) << 8u));
-	key.push_back(info.host_subgroup_size);
-	key.push_back(info.thread_ids_num);
-	key.push_back(info.lds_size_dwords);
-	key.push_back(info.scratch_size_dwords);
-	key.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions) |
+	StaticKeyBuilder words;
+	words.push_back(info.workgroup_register);
+	words.push_back(info.wave_size | (static_cast<uint32_t>(info.float_mode) << 8u));
+	words.push_back(info.host_subgroup_size);
+	words.push_back(info.thread_ids_num);
+	words.push_back(info.lds_size_dwords);
+	words.push_back(info.scratch_size_dwords);
+	words.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions) |
 	              (static_cast<uint32_t>(info.async_compute) << 1u));
-	key.push_back(static_cast<uint32_t>(info.dispatch_dimensions_indirect));
+	words.push_back(static_cast<uint32_t>(info.dispatch_dimensions_indirect));
 	for (int i = 0; i < 3; i++) {
 		words.push_back(info.threads_num[i]);
 		words.push_back(static_cast<uint32_t>(info.group_id[i]));
@@ -879,9 +877,10 @@ ShaderParams PrepareProgram(
 	    std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr), data);
 }
 
-ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, ShaderComputeInputInfo& info) {
+ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
+                            ShaderComputeInputInfo& info) {
 	const auto [data, hash] = ShaderGetMappedData(regs.cs_regs.data_addr, "ShaderGetInputInfoCS():");
-	ShaderGetStaticInputInfoCS(regs, data, info);
+	ShaderGetStaticInputInfoCS(regs, sh, data, info);
 	return GetShaderParams(
 	    regs.cs_regs.data_addr, hash,
 	    std::span<const uint32_t>(regs.cs_user_sgpr.value, regs.cs_regs.user_sgpr), data);
