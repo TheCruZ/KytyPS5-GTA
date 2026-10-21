@@ -1,7 +1,6 @@
 #include "kernel/memory.h"
 
 #include "common/assert.h"
-#include "common/hackNotice.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -11,7 +10,6 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
-#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <array>
@@ -76,21 +74,15 @@ constexpr int PROT_GPU_WRITE = 0x20;
 
 enum class GpuAccessMode { NoAccess, Read, Write, ReadWrite };
 
-constexpr uint64_t PAGE_TABLE_GRANULARITY       = 2ull * 1024ull * 1024ull;
-constexpr uint64_t DEFAULT_FLEXIBLE_MEMORY_SIZE = 448ull * 1024ull * 1024ull;
-// A game gets 12.5 GiB. A fixed 64 MiB cache and mapping table memory past the 64 MiB included
-// for each of the CPU, GPU and AMM tables come off the top; flexible and direct memory share what
-// is left. One 4 KiB table maps 2 MiB.
-constexpr uint64_t GUEST_MEMORY_BUDGET   = 12800ull * 1024ull * 1024ull;
-constexpr uint64_t RESERVED_CACHE_SIZE   = 64ull * 1024ull * 1024ull;
-constexpr uint64_t INCLUDED_TABLE_MEMORY = 64ull * 1024ull * 1024ull;
-constexpr uint64_t MAPPING_TABLE_SIZE    = 4ull * 1024ull;
+constexpr uint64_t PAGE_TABLE_POOL_SIZE   = 4ull * 1024ull * 1024ull * 1024ull;
+constexpr uint64_t PAGE_TABLE_GRANULARITY = 2ull * 1024ull * 1024ull;
+constexpr int      PAGE_TABLE_POOL_ENTRIES =
+    static_cast<int>(PAGE_TABLE_POOL_SIZE / PAGE_TABLE_GRANULARITY);
+constexpr uint64_t DEFAULT_FLEXIBLE_MEMORY_SIZE = 1ull * 1024ull * 1024ull * 1024ull;
 
-static uint64_t                 g_guest_memory_size    = GUEST_MEMORY_BUDGET - RESERVED_CACHE_SIZE;
-static uint64_t                 g_flexible_memory_size = DEFAULT_FLEXIBLE_MEMORY_SIZE;
-static uint64_t                 g_cpu_table_memory     = INCLUDED_TABLE_MEMORY;
-static uint64_t                 g_gpu_table_memory     = INCLUDED_TABLE_MEMORY;
-static Graphics::RenderContext* g_gpu_resources        = nullptr;
+static uint64_t                      g_flexible_memory_size        = DEFAULT_FLEXIBLE_MEMORY_SIZE;
+static bool                          g_flexible_memory_size_frozen = false;
+static Graphics::RenderContext*       g_gpu_resources               = nullptr;
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static void (*g_test_gpu_range)(bool, uint64_t, size_t) = nullptr;
 #endif
@@ -1068,8 +1060,11 @@ public:
 
 	KYTY_CLASS_NO_COPY(PhysicalMemory);
 
-	static uint64_t TotalSize() { return g_guest_memory_size; }
-	static uint64_t Size() { return TotalSize() - g_flexible_memory_size; }
+	static constexpr uint64_t TotalSize() { return static_cast<uint64_t>(13824) * 1024 * 1024; }
+	static uint64_t           Size() {
+		EXIT_IF(g_flexible_memory_size >= TotalSize());
+		return TotalSize() - g_flexible_memory_size;
+	}
 
 	bool Alloc(uint64_t search_start, uint64_t search_end, size_t len, size_t alignment,
 	           uint64_t* phys_addr_out, int memory_type,
@@ -1089,8 +1084,7 @@ public:
 	bool Find(uint64_t phys_addr, bool next, PhysicalMemory::AllocatedBlock* out);
 	bool CanMapDirect(uint64_t phys_addr, size_t len);
 	bool ReleasePoolExpansion(uint64_t phys_addr, size_t len);
-	bool GetAllocatedSpan(uint64_t phys_addr, size_t len, bool skip_gaps,
-	                      std::vector<AllocatedBlock>* blocks);
+	bool GetAllocatedSpan(uint64_t phys_addr, size_t len, std::vector<AllocatedBlock>* blocks);
 	std::vector<AllocatedBlock> FindMappings(uint64_t phys_addr, size_t len);
 	void ProtectMapping(uint64_t vaddr, uint64_t size, int prot, VirtualMemory::Mode mode,
 	                    GpuAccessMode gpu_mode);
@@ -1139,8 +1133,6 @@ public:
 
 	static uint64_t Size() { return g_flexible_memory_size; }
 	uint64_t        Available();
-	void            Charge(uint64_t size);
-	void            Release(uint64_t size);
 
 	bool Map(uint64_t vaddr, size_t len, int prot, VirtualMemory::Mode mode, GpuAccessMode gpu_mode,
 	         const char* name);
@@ -1349,9 +1341,6 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 		}
 		auto& buffers = GetGpuResources().GetBufferCache();
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
-			if (buffers.TryReadMirroredGpuWrites(vaddr, data, size)) {
-				return true;
-			}
 			buffers.ReadMemory(vaddr, size);
 		} else if (buffers.HasPendingDownload(vaddr, size)) {
 			// Downloading: current in guest memory only once published.
@@ -1403,9 +1392,12 @@ static bool MaybeGpuDirtyForClean(uint64_t vaddr, uint64_t size) {
 		return false;
 	}
 	auto& buffers = GetGpuResources().GetBufferCache();
-	// Bytes still downloading are not current in the backing yet either.
+	// Bytes still downloading are not current in the backing yet either. Byte ranges the GPU wrote
+	// lie on GPU-dirty pages: the lock-free page check answers for nearly every read (the resolve
+	// thread took two shared locks a read).
 	if (t_gpu_read_delegate) {
-		return buffers.HasGpuDirtyBytesShared(vaddr, size) || buffers.HasPendingDownload(vaddr, size);
+		return (buffers.MayBeGpuModified(vaddr, size) && buffers.HasGpuDirtyBytesShared(vaddr, size)) ||
+		       buffers.HasPendingDownload(vaddr, size);
 	}
 	// Byte ranges the GPU wrote lie on GPU-dirty pages: the lock-free page check answers for most
 	// reads.
@@ -1742,22 +1734,7 @@ static bool SelfTestSub64SharedPlaceholderAlias() {
 static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size);
 
 void Initialize() {
-	const auto params = Loader::SystemContentGetMemoryParams();
-	if (params.flexible_size != 0) {
-		g_flexible_memory_size = params.flexible_size;
-	}
-	g_cpu_table_memory = std::max(params.cpu_table_memory, INCLUDED_TABLE_MEMORY);
-	g_gpu_table_memory = std::max(params.gpu_table_memory, INCLUDED_TABLE_MEMORY);
-
-	const auto table_overhead = g_cpu_table_memory + g_gpu_table_memory +
-	                            std::max(params.amm_table_memory, INCLUDED_TABLE_MEMORY) -
-	                            3 * INCLUDED_TABLE_MEMORY;
-	EXIT_IF(g_flexible_memory_size + table_overhead >= GUEST_MEMORY_BUDGET - RESERVED_CACHE_SIZE);
-	g_guest_memory_size = GUEST_MEMORY_BUDGET - RESERVED_CACHE_SIZE - table_overhead;
-	LOGF("\t flexible memory size = %" PRIu64 " MiB, direct memory size = %" PRIu64 " MiB\n",
-	     g_flexible_memory_size / (1024ull * 1024ull),
-	     (g_guest_memory_size - g_flexible_memory_size) / (1024ull * 1024ull));
-
+	g_flexible_memory_size_frozen = true;
 	VirtualMemory::Init();
 	g_guest_address_space = std::make_unique<GuestAddressSpace>(PhysicalMemory::TotalSize());
 	g_physical_memory     = std::make_unique<PhysicalMemory>();
@@ -1823,6 +1800,15 @@ void RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func) {
 	for (const auto& mapping: g_pooled_memory->GetMappings()) {
 		g_alloc_callback(mapping.vaddr, mapping.size);
 	}
+}
+
+void SetFlexibleMemorySize(uint64_t size) {
+	constexpr uint64_t GuestPageSize = 0x4000;
+	EXIT_IF(g_flexible_memory_size_frozen || g_guest_address_space != nullptr);
+	EXIT_IF(size == 0 || (size & (GuestPageSize - 1u)) != 0 || size >= PhysicalMemory::TotalSize());
+	g_flexible_memory_size = size;
+	LOGF("\t flexible memory size = 0x%016" PRIx64 " (%" PRIu64 " MiB)\n", size,
+	     size / (1024ull * 1024ull));
 }
 
 bool PhysicalMemory::Alloc(uint64_t search_start, uint64_t search_end, size_t len, size_t alignment,
@@ -2106,31 +2092,87 @@ bool PhysicalMemory::Map(uint64_t vaddr, uint64_t phys_addr, size_t len, int pro
                          int memory_type) {
 	Common::LockGuard lock(m_mutex);
 
-	if (!CanMapDirect(phys_addr, len)) {
+	if (len == 0 || UINT64_MAX - phys_addr < len) {
 		return false;
 	}
 
-	AllocatedBlock mapping {};
-	mapping.start_addr  = phys_addr;
-	mapping.size        = len;
-	mapping.map_vaddr   = vaddr;
-	mapping.map_size    = len;
-	mapping.host_vaddr  = vaddr;
-	mapping.host_size   = len;
-	mapping.prot        = prot;
-	mapping.mode        = mode;
-	mapping.gpu_mode    = gpu_mode;
-	mapping.memory_type = memory_type;
+	auto current = phys_addr;
+	auto next    = m_physical.upper_bound(current);
+	if (next == m_physical.begin()) {
+		return false;
+	}
+	auto first = std::prev(next);
+	bool has_automatic = false;
+	while (current < phys_addr + len) {
+		auto block = m_physical.upper_bound(current);
+		if (block == m_physical.begin()) {
+			return false;
+		}
+		--block;
+		const auto block_end = block->second.start_addr + block->second.size;
+		if (block->second.kind == AllocationKind::Pooled || current < block->second.start_addr ||
+		    current >= block_end) {
+			return false;
+		}
+		has_automatic |= block->second.kind == AllocationKind::Automatic;
+		current = std::min<uint64_t>(phys_addr + len, block_end);
+		if (current < phys_addr + len) {
+			const auto following = std::next(block);
+			if (following == m_physical.end() || following->second.start_addr != current) {
+				return false;
+			}
+		}
+	}
+
+	AllocatedBlock mapping = first->second;
+	mapping.start_addr     = phys_addr;
+	mapping.size           = len;
+	mapping.map_vaddr      = vaddr;
+	mapping.map_size       = len;
+	mapping.host_vaddr     = vaddr;
+	mapping.host_size      = len;
+	mapping.prot           = prot;
+	mapping.mode           = mode;
+	mapping.gpu_mode       = gpu_mode;
+	mapping.memory_type    = memory_type;
 	CopyVirtualRangeName(mapping.name, name);
 	m_mappings.push_back(mapping);
-	RemoveFreeRange(m_automatic_free, phys_addr, len);
+	if (has_automatic) {
+		RemoveFreeRange(m_automatic_free, phys_addr, len);
+	}
 
 	return true;
 }
 
 bool PhysicalMemory::CanMapDirect(uint64_t phys_addr, size_t len) {
-	std::vector<AllocatedBlock> blocks;
-	return GetAllocatedSpan(phys_addr, len, false, &blocks);
+	Common::LockGuard lock(m_mutex);
+
+	if (len == 0 || UINT64_MAX - phys_addr < len) {
+		return false;
+	}
+
+	const auto end     = phys_addr + len;
+	auto       current = phys_addr;
+	while (current < end) {
+		auto block = m_physical.upper_bound(current);
+		if (block == m_physical.begin()) {
+			return false;
+		}
+		--block;
+		const auto block_end = block->second.start_addr + block->second.size;
+		if (block->second.kind == AllocationKind::Pooled || current < block->second.start_addr ||
+		    current >= block_end) {
+			return false;
+		}
+		current = std::min(end, block_end);
+		if (current < end) {
+			const auto following = std::next(block);
+			if (following == m_physical.end() || following->second.start_addr != current) {
+				return false;
+			}
+		}
+	}
+	return true;
 }
 
 bool PhysicalMemory::ReleasePoolExpansion(uint64_t phys_addr, size_t len) {
@@ -2145,7 +2187,7 @@ bool PhysicalMemory::ReleasePoolExpansion(uint64_t phys_addr, size_t len) {
 	return true;
 }
 
-bool PhysicalMemory::GetAllocatedSpan(uint64_t phys_addr, size_t len, bool skip_gaps,
+bool PhysicalMemory::GetAllocatedSpan(uint64_t phys_addr, size_t len,
                                       std::vector<AllocatedBlock>* blocks) {
 	EXIT_IF(blocks == nullptr);
 	blocks->clear();
@@ -2156,26 +2198,34 @@ bool PhysicalMemory::GetAllocatedSpan(uint64_t phys_addr, size_t len, bool skip_
 	Common::LockGuard lock(m_mutex);
 	const auto        end     = phys_addr + len;
 	auto              current = phys_addr;
-	auto              block   = m_physical.upper_bound(phys_addr);
-	if (block != m_physical.begin()) {
-		--block;
-	}
-	for (; block != m_physical.end() && block->second.start_addr < end; ++block) {
-		const auto block_end = block->second.start_addr + block->second.size;
-		if (block_end <= current) {
-			continue;
-		}
-		if (block->second.kind == AllocationKind::Pooled ||
-		    (!skip_gaps && current < block->second.start_addr)) {
+	while (current < end) {
+		auto block = m_physical.upper_bound(current);
+		if (block == m_physical.begin()) {
+			blocks->clear();
 			return false;
 		}
+		--block;
+		const auto block_end = block->second.start_addr + block->second.size;
+		if (block->second.kind == AllocationKind::Pooled || current < block->second.start_addr ||
+		    current >= block_end) {
+			blocks->clear();
+			return false;
+		}
+
 		auto part       = block->second;
-		part.start_addr = std::max(current, part.start_addr);
-		current         = std::min(end, block_end);
-		part.size       = current - part.start_addr;
+		part.start_addr = current;
+		part.size       = std::min(end, block_end) - current;
 		blocks->push_back(part);
+		current += part.size;
+		if (current < end) {
+			const auto following = std::next(block);
+			if (following == m_physical.end() || following->second.start_addr != current) {
+				blocks->clear();
+				return false;
+			}
+		}
 	}
-	return skip_gaps || current == end;
+	return true;
 }
 
 bool PhysicalMemory::Unmap(uint64_t vaddr, uint64_t size, GpuAccessMode* gpu_mode,
@@ -2717,19 +2767,6 @@ uint64_t FlexibleMemory::Available() {
 	Common::LockGuard lock(m_mutex);
 
 	return (Size() >= m_allocated_total ? Size() - m_allocated_total : 0);
-}
-
-void FlexibleMemory::Charge(uint64_t size) {
-	Common::LockGuard lock(m_mutex);
-
-	m_allocated_total += size;
-}
-
-void FlexibleMemory::Release(uint64_t size) {
-	Common::LockGuard lock(m_mutex);
-
-	EXIT_IF(size > m_allocated_total);
-	m_allocated_total -= size;
 }
 
 void PooledMemory::AddFreeUnlocked(uint64_t start, uint64_t size) {
@@ -3441,12 +3478,12 @@ int KYTY_SYSV_ABI KernelGetPageTableStats(int* cpu_total, int* cpu_available, in
 	const auto gpu_used =
 	    (g_virtual_ranges != nullptr ? g_virtual_ranges->CountPageTableEntries(true) : 0);
 
-	const auto cpu_tables = g_cpu_table_memory / MAPPING_TABLE_SIZE;
-	const auto gpu_tables = g_gpu_table_memory / MAPPING_TABLE_SIZE;
-	*cpu_total            = static_cast<int>(cpu_tables);
-	*gpu_total            = static_cast<int>(gpu_tables);
-	*cpu_available        = static_cast<int>(cpu_tables - std::min(cpu_used, cpu_tables));
-	*gpu_available        = static_cast<int>(gpu_tables - std::min(gpu_used, gpu_tables));
+	*cpu_total     = PAGE_TABLE_POOL_ENTRIES;
+	*gpu_total     = PAGE_TABLE_POOL_ENTRIES;
+	*cpu_available = PAGE_TABLE_POOL_ENTRIES -
+	                 static_cast<int>(std::min<uint64_t>(cpu_used, PAGE_TABLE_POOL_ENTRIES));
+	*gpu_available = PAGE_TABLE_POOL_ENTRIES -
+	                 static_cast<int>(std::min<uint64_t>(gpu_used, PAGE_TABLE_POOL_ENTRIES));
 
 	LOGF_COLOR(Log::Color::Green,
 	           "\t cpu_total     = %d\n"
@@ -3604,8 +3641,7 @@ static int ReleaseDirectMemoryInternal(int64_t start, size_t len) {
 	}
 
 	std::vector<PhysicalMemory::AllocatedBlock> allocated_span;
-	if (!g_physical_memory->GetAllocatedSpan(static_cast<uint64_t>(start), len, skip_gaps,
-	                                         &allocated_span)) {
+	if (!g_physical_memory->GetAllocatedSpan(static_cast<uint64_t>(start), len, &allocated_span)) {
 		return KERNEL_ERROR_EACCES;
 	}
 
@@ -3704,8 +3740,7 @@ int KYTY_SYSV_ABI KernelReleaseDirectMemory(int64_t start, size_t len) {
 		return validation;
 	}
 	if (len != 0) {
-		// An unchecked release frees the allocated parts and skips the unallocated ones.
-		(void)ReleaseDirectMemoryInternal(start, len, true);
+		(void)ReleaseDirectMemoryInternal(start, len);
 	}
 	return OK;
 }
@@ -3722,7 +3757,7 @@ int KYTY_SYSV_ABI KernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
 		return validation;
 	}
 
-	const int result = ReleaseDirectMemoryInternal(start, len, false);
+	const int result = ReleaseDirectMemoryInternal(start, len);
 	return result == KERNEL_ERROR_EACCES ? KERNEL_ERROR_ENOENT : result;
 }
 
@@ -4598,14 +4633,6 @@ uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size, VirtualMemor
 	return AllocateGuestRuntimeMemory(search_addr, size, mode, name, VirtualRangeType::Code, false);
 }
 
-void ChargeFlexibleMemory(uint64_t size) {
-	g_flexible_memory->Charge(size);
-}
-
-void ReleaseFlexibleMemory(uint64_t size) {
-	g_flexible_memory->Release(size);
-}
-
 void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 	MemoryOperationLock memory_operation_lock(__func__);
 
@@ -5276,8 +5303,7 @@ DebugStats GetDebugStats() {
 	stats.direct_total       = PhysicalMemory::Size();
 	stats.flexible_total     = FlexibleMemory::Size();
 	stats.pool_committed     = g_memory_pool_committed.load(std::memory_order_relaxed);
-	stats.cpu_page_entries_total = g_cpu_table_memory / MAPPING_TABLE_SIZE;
-	stats.gpu_page_entries_total = g_gpu_table_memory / MAPPING_TABLE_SIZE;
+	stats.page_entries_total = PAGE_TABLE_POOL_ENTRIES;
 	if (g_physical_memory != nullptr) {
 		Common::LockGuard lock(g_physical_memory->GetMutex());
 		for (const auto& [start, block]: g_physical_memory->GetPhysicalBlocks()) {
