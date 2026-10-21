@@ -347,6 +347,7 @@ bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t 
 			    // Keep packed ranges on separate cache lines, as in shadPS4.
 			    total_size += Common::AlignUp(end - start, 64);
 			    m_downloading_ranges.Add(start, end - start);
+			    NoteDownloadingChange();
 			    m_downloading_list.emplace_back(start, end - start);
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
@@ -453,10 +454,12 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 				m_downloading_list.pop_back();
 			}
 			m_downloading_ranges.Subtract(buffer_address + copy.srcOffset, copy.size);
+			NoteDownloadingChange();
 		}
 		// Ranges another download still has in flight stay marked.
 		for (const auto& [start, bytes]: m_downloading_list) {
 			m_downloading_ranges.Add(start, bytes);
+			NoteDownloadingChange();
 		}
 	};
 	if constexpr (async) {
@@ -3068,6 +3071,9 @@ bool BufferCache::HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::HasPendingDownload(uint64_t vaddr, uint64_t size) {
+	if (!m_downloading_nonempty.load(std::memory_order_acquire)) {
+		return false;
+	}
 	std::shared_lock lock(m_dirty_ranges_mutex);
 	return m_downloading_ranges.Intersects(vaddr, size);
 }
@@ -3858,6 +3864,7 @@ uint64_t BufferCache::TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		for (const auto& copy: copies) {
 			m_downloading_ranges.Add(buffer_address + copy.srcOffset, copy.size);
+			NoteDownloadingChange();
 			m_gpu_modified_ranges.Subtract(buffer_address + copy.srcOffset, copy.size);
 			ClearWriteBits(buffer_address + copy.srcOffset, copy.size);
 		}
@@ -4044,6 +4051,7 @@ void BufferCache::CompleteCopyReadback(uint64_t marker) {
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		for (const auto& copy: slot.copies) {
 			m_downloading_ranges.Subtract(slot.buffer_address + copy.srcOffset, copy.size);
+			NoteDownloadingChange();
 		}
 	}
 	RequireVulkanSuccess(device.resetFences(1, &slot.fence), "reset readback fence");

@@ -456,6 +456,12 @@ private:
 	bool                                               m_record_released = false;
 	// Bytes whose download is recorded but not yet in guest memory.
 	RangeSet                                           m_downloading_ranges;
+	// Whether m_downloading_ranges holds anything, kept up to date under m_dirty_ranges_mutex:
+	// HasPendingDownload() answers without the lock while nothing is in flight.
+	std::atomic<bool>                                  m_downloading_nonempty {false};
+	void NoteDownloadingChange() noexcept {
+		m_downloading_nonempty.store(!m_downloading_ranges.Empty(), std::memory_order_release);
+	}
 	// Every in-flight download's ranges, one entry each: m_downloading_ranges is their union. A
 	// publication removes only its own entries (ISSUES #26: the first of two downloads of one
 	// window cleared the range while the second was in flight; a game thread then took the

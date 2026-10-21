@@ -1392,9 +1392,12 @@ static bool MaybeGpuDirtyForClean(uint64_t vaddr, uint64_t size) {
 		return false;
 	}
 	auto& buffers = GetGpuResources().GetBufferCache();
-	// Bytes still downloading are not current in the backing yet either.
+	// Bytes still downloading are not current in the backing yet either. Byte ranges the GPU wrote
+	// lie on GPU-dirty pages: the lock-free page check answers for nearly every read (the resolve
+	// thread took two shared locks a read).
 	if (t_gpu_read_delegate) {
-		return buffers.HasGpuDirtyBytesShared(vaddr, size) || buffers.HasPendingDownload(vaddr, size);
+		return (buffers.MayBeGpuModified(vaddr, size) && buffers.HasGpuDirtyBytesShared(vaddr, size)) ||
+		       buffers.HasPendingDownload(vaddr, size);
 	}
 	// Byte ranges the GPU wrote lie on GPU-dirty pages: the lock-free page check answers for most
 	// reads.
