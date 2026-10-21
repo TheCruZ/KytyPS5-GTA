@@ -4145,10 +4145,20 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			    !ImageRangeOverlaps(span_begin, span_end - span_begin, written.address, written.size)) {
 				continue;
 			}
-			for (const auto [address, size]: reads) {
+			for (size_t read = 0; read < reads.size(); ++read) {
+				const auto [address, size] = reads[read];
 				if (!ImageRangeOverlaps(address, size, written.address, written.size)) continue;
 				if (written.writer == nullptr) {
 					EXIT("scalar resource reads overlap an image or attachment write\n");
+				}
+				// A flattened scalar load issued before the shader's own writes to the buffer may
+				// observe its dispatch-time snapshot on hardware (GTA V's BVH build loads the flags of
+				// a header and sets a bit in it with an atomic).
+				if (written.writer == reader->runtime->program &&
+				    !ShaderRecompiler::IR::SpecializationReadFollowsBufferWrite(
+				        *reader->runtime->program, *reader->runtime->resources, read,
+				        written.resource)) {
+					continue;
 				}
 				// Upstream (6409be28) exits here. Wolverine's CS 0x85a58319a7a75e48 reads a
 				// branch input from a 256-byte buffer the same dispatch updates; the host

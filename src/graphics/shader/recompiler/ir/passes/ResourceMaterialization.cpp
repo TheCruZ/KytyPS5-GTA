@@ -2670,10 +2670,14 @@ static bool MaterializeWith(const ResourcePlan& program, const SrtRuntime& runti
 	     std::ranges::any_of(program.descriptor_sources, uses_workgroup_count));
 	auto& reads = snapshot.specialization_reads;
 	reads = program.source_reads;
-	SrtReadCapture capture {runtime, reads};
+	snapshot.specialization_read_slots.assign(reads.size(), NoSrtSlot);
+	SrtReadCapture capture {runtime, reads, &snapshot.specialization_read_slots};
 	auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
 	// Reads through the fast page path are captured there.
-	if (capture_reads) observed.capture_ranges = &reads;
+	if (capture_reads) {
+		observed.capture_ranges = &reads;
+		observed.capture_slots  = &snapshot.specialization_read_slots;
+	}
 	Walker clean(program, CleanRuntime(observed));
 	Walker walker(program, observed,
 	              capture_reads || program.requires_specialization_memory ? &clean : nullptr);
