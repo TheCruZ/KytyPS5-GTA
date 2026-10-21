@@ -140,7 +140,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 			             static_cast<unsigned long long>(GetGraphics().presented_frames.load()),
 			             m_buffer_cache.HasGpuDirtyBytes(fault_vaddr & ~uint64_t {0xfff}, 0x1000) ? 1 : 0);
 		}
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		m_buffer_cache.InvalidateFaultedPage(fault_vaddr);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_bindless_table.OnCpuWrite(fault_vaddr, fault_size);
 	} else {
@@ -525,6 +525,16 @@ void RenderContext::RunGarbageCollector() {
 		m_buffer_cache.ProcessWriteBuffer([this](std::span<const uint64_t> pages) {
 			m_indirect_write_tables.NoteWrites(pages);
 		});
+	}
+	// Device-address accesses ran since the use bitmap was last read: read it one collection in
+	// UseScanPeriod (the buffer cache's age collection waits much longer).
+	constexpr uint32_t UseScanPeriod = 256;
+	if (m_use_scan_countdown != 0) {
+		m_use_scan_countdown--;
+	} else if (m_use_scan_pending) {
+		m_use_scan_pending   = false;
+		m_use_scan_countdown = UseScanPeriod;
+		m_buffer_cache.ProcessUseBuffer();
 	}
 	m_texture_cache.ProcessDownloadImages();
 	m_texture_cache.RunGarbageCollector();

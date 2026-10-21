@@ -41,6 +41,9 @@ public:
 	// Clears the write bitmap and, once the GPU work recorded so far completes, passes the guest
 	// addresses of the written caching pages to `handler`.
 	void                            ProcessWriteBuffer(PagesHandler&& handler);
+	// The same for the pages that device-address accesses found cached (their buffers are in
+	// use); only host state changes, so an unmap does not wait for it.
+	void                            ProcessUseBuffer(PagesHandler&& handler);
 	// Page faults reported while no dispatch transaction was collecting (for example by a
 	// dispatch that ran without recovery). A change re-arms dispatch recovery.
 	[[nodiscard]] uint64_t UnattributedFaults() const noexcept {
@@ -49,6 +52,11 @@ public:
 
 private:
 	void                                   ProcessFaultBufferImpl(ShaderFaultReport* report);
+	// Clears a bitmap of the fault buffer and, once the GPU work recorded so far completes, passes
+	// the guest addresses of its set pages to `handler`.
+	void ProcessBitmap(uint64_t bitmap_offset, Buffer& download, size_t area_size,
+	                   std::array<uint64_t, MaxPendingFaults>& areas, uint32_t& current,
+	                   PagesHandler&& handler, bool host_only);
 	GraphicContext&                        m_graphics;
 	CommandScheduler&                      m_scheduler;
 	BufferCache&                           m_buffer_cache;
@@ -67,6 +75,11 @@ private:
 	size_t                                 m_write_area_size;
 	std::array<uint64_t, MaxPendingFaults> m_write_areas {};
 	uint32_t                               m_current_write_area = 0;
+	// Readback of the use bitmap, in its own areas.
+	Buffer                                 m_use_download;
+	size_t                                 m_use_area_size;
+	std::array<uint64_t, MaxPendingFaults> m_use_areas {};
+	uint32_t                               m_current_use_area = 0;
 };
 
 } // namespace Libs::Graphics
