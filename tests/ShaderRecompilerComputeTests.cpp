@@ -12134,6 +12134,9 @@ public:
                              .num_thread_x = 4, .num_thread_y = 1, .num_thread_z = 1,
                              .wave_size = 64, .user_sgpr = 4, .tgid_x_en = true});
         set_buffer(0, output, 16u * sizeof(u32));
+        // The consumer builds no descriptors from guest memory: its indirect arguments are not read
+        // back before the dispatch (shaders that do are, see DispatchIndirect).
+        PipelineCache::SetReadsDescriptorMemory(reinterpret_cast<uint64_t>(consumer.data()), false);
         const auto tick = scheduler.CurrentTick();
         if (test.transfer) {
           const std::array<u32, 3> packet{static_cast<u32>(args),

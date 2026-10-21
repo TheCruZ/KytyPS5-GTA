@@ -1260,10 +1260,34 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
 	Common::LockGuard lock(m_context.GetMutex());
 	vk::DispatchIndirectCommand args {};
-	if (!m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
-	    LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args)) &&
-	    (args.x == 0 || args.y == 0 || args.z == 0)) {
-		return;
+	// A dispatch whose arguments name no group runs nothing on the console, whatever its
+	// descriptors hold: GTA V's BVH builder dispatches once per instance and the empty ones leave
+	// their table entries unwritten, which the resolution below would read as garbage V#s (strides
+	// by the thousands, ranges of gigabytes, a lost device). The arguments are read as the GPU holds
+	// them (waiting for the work that writes them: one wait for the whole table, the bytes are
+	// clean afterwards). Only for shaders that read guest memory to build their descriptors: for the
+	// others (culling, sorting) nothing resolves differently when the dispatch is empty, and the
+	// wait would cost the GPU thread a drain of the GPU per frame. KYTY_INDIRECT_ARGS_EXACT=0: only
+	// arguments the GPU did not write, for all; =2: exact for all.
+	// 0: never, 1 (default): shaders that read descriptor memory, 2: every indirect dispatch.
+	static const int exact_mode = [] {
+		const char* value = std::getenv("KYTY_INDIRECT_ARGS_EXACT");
+		return value == nullptr ? 1 : std::atoi(value);
+	}();
+	const bool exact_args = exact_mode != 0;
+	static const bool skip_empty = [] {
+		const char* value = std::getenv("KYTY_INDIRECT_ARGS_SKIP");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (exact_args && (exact_mode == 2 ||
+	                   PipelineCache::ReadsDescriptorMemory(
+	                       buffer.GetShaders().GetCs().cs_regs.data_addr))
+	        ? LibKernel::Memory::TryReadBufferBacking(args_addr, &args, sizeof(args))
+	               : (!m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
+	                  LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args)))) {
+		if (skip_empty && (args.x == 0 || args.y == 0 || args.z == 0)) {
+			return;
+		}
 	}
 	const auto& cs_regs = buffer.GetShaders().GetCs();
 	if (cs_regs.cs_regs.data_addr == 0) {

@@ -3411,6 +3411,39 @@ bool PipelineCache::IsSkipListed(uint64_t shader_addr) {
 	return SkipShaderRequested(ShaderDeclaredHash(shader_addr));
 }
 
+namespace {
+std::shared_mutex                  g_descriptor_memory_mutex;
+std::unordered_map<uint64_t, bool> g_descriptor_memory;
+} // namespace
+
+bool PipelineCache::ReadsDescriptorMemory(uint64_t shader_addr) {
+	std::shared_lock lock(g_descriptor_memory_mutex);
+	const auto       found = g_descriptor_memory.find(shader_addr);
+	return found == g_descriptor_memory.end() || found->second;
+}
+
+static void NoteDescriptorMemory(uint64_t shader_addr, const ShaderComputeInputInfo& input_info) {
+	if (input_info.stage.resources == nullptr) {
+		return;
+	}
+	PipelineCache::SetReadsDescriptorMemory(shader_addr,
+	                                        !input_info.stage.resources->specialization_reads.empty());
+}
+
+void PipelineCache::SetReadsDescriptorMemory(uint64_t shader_addr, bool reads) {
+	{
+		std::shared_lock lock(g_descriptor_memory_mutex);
+		if (const auto found = g_descriptor_memory.find(shader_addr);
+		    found != g_descriptor_memory.end() && (found->second || !reads)) {
+			return;
+		}
+	}
+	// A shader that ever reads descriptor memory keeps the exact arguments.
+	std::unique_lock lock(g_descriptor_memory_mutex);
+	auto&            known = g_descriptor_memory[shader_addr];
+	known                  = known || reads;
+}
+
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info,
@@ -3421,9 +3454,16 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	uint32_t          push_data_cursor = 0;
 	if (ahead != nullptr) {
-		return m_program_cache->GetAhead(params, input_info, push_data_cursor, *ahead);
+		auto resolved = m_program_cache->GetAhead(params, input_info, push_data_cursor, *ahead);
+		if (resolved) {
+			NoteDescriptorMemory(regs.cs_regs.data_addr, input_info);
+		}
+		return resolved;
 	}
 	auto              program          = m_program_cache->Get(params, input_info, push_data_cursor);
+	if (program) {
+		NoteDescriptorMemory(regs.cs_regs.data_addr, input_info);
+	}
 	if (program && input_info.stage.program != nullptr) {
 		const auto* compiled = input_info.stage.program;
 		GpuTiming::NoteComputeLanes(compiled->shader_hash,
