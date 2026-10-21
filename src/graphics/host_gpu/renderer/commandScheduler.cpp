@@ -529,6 +529,20 @@ void CommandScheduler::PopPendingOperations() {
 	}
 }
 
+void CommandScheduler::PollPendingOperations() {
+	const auto front = m_pending_front_tick.load(std::memory_order_acquire);
+	if (front == UINT64_MAX) {
+		return;
+	}
+	if (!m_master.IsFree(front)) {
+		m_master.Refresh();
+		if (!m_master.IsFree(front)) {
+			return;
+		}
+	}
+	PopPendingOperations();
+}
+
 void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation, uint64_t address,
                                       uint64_t size) {
 	CheckActive();
