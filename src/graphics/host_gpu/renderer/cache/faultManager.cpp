@@ -28,6 +28,8 @@ constexpr size_t PageFaultAreaSize   = MaxPageFaults * sizeof(uint64_t);
 constexpr size_t PageFaultBitsetSize = BufferCache::CACHING_NUMPAGES / 8;
 // Pages V#-table stores may write between two reads; more stay in the bitmap for the next read.
 constexpr size_t MaxPageWrites       = 16384;
+// Pages device-address accesses found cached between two reads; more stay for the next read.
+constexpr size_t MaxPageUses         = 65536;
 
 size_t DownloadAreaSize(const GraphicContext& graphics) {
 	const auto& limits = graphics.physical_device_properties.limits;
@@ -36,12 +38,16 @@ size_t DownloadAreaSize(const GraphicContext& graphics) {
 	return (PageFaultAreaSize + sizeof(ShaderTrapRecord) + alignment - 1) & ~(alignment - 1);
 }
 
-// The write bitmap's readback area: the count, then the pages (MaxPageWrites at most).
-size_t WriteAreaSize(const GraphicContext& graphics) {
+// A bitmap's readback area: the count, then the pages (`max_pages` at most).
+size_t BitmapAreaSize(const GraphicContext& graphics, size_t max_pages) {
 	const auto& limits = graphics.physical_device_properties.limits;
 	const auto  alignment =
 	    std::max(limits.nonCoherentAtomSize, limits.minStorageBufferOffsetAlignment);
-	return ((MaxPageWrites + 1) * sizeof(uint64_t) + alignment - 1) & ~(alignment - 1);
+	return ((max_pages + 1) * sizeof(uint64_t) + alignment - 1) & ~(alignment - 1);
+}
+
+size_t WriteAreaSize(const GraphicContext& graphics) {
+	return BitmapAreaSize(graphics, MaxPageWrites);
 }
 
 } // namespace
@@ -56,7 +62,10 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
                         MaxPendingFaults * m_download_area_size),
       m_write_download(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
                        MaxPendingFaults * WriteAreaSize(graphics)),
-      m_write_area_size(WriteAreaSize(graphics)) {
+      m_write_area_size(WriteAreaSize(graphics)),
+      m_use_download(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
+                     MaxPendingFaults * BitmapAreaSize(graphics, MaxPageUses)),
+      m_use_area_size(BitmapAreaSize(graphics, MaxPageUses)) {
 	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
 
 	const vk::DescriptorSetLayoutBinding bindings[] {
@@ -242,7 +251,7 @@ void FaultManager::ProcessFaultBufferImpl(ShaderFaultReport* report) {
 			// The guest may have unmapped the range since the GPU accessed it: an unmap does not
 			// wait for this completion.
 			if (m_scheduler.Context().IsMapped(start, end - start)) {
-				(void)m_buffer_cache.FindBuffer(start, end - start);
+				m_buffer_cache.CacheFaultedMemory(start, end - start);
 			} else {
 				Common::HackNotice::Report(
 				    "device-address fault on memory the guest has unmapped ignored",
@@ -261,19 +270,21 @@ void FaultManager::ProcessFaultBufferImpl(ShaderFaultReport* report) {
 	m_current_area %= MaxPendingFaults;
 }
 
-void FaultManager::ProcessWriteBuffer(PagesHandler&& handler) {
+void FaultManager::ProcessBitmap(uint64_t bitmap_offset, Buffer& download, size_t area_size,
+                                 std::array<uint64_t, MaxPendingFaults>& areas, uint32_t& current,
+                                 PagesHandler&& handler, bool host_only) {
 	KYTY_PROFILER_FUNCTION();
 	(void)GetFaultBuffer();
-	if (const auto wait_tick = m_write_areas[m_current_write_area]; wait_tick != 0) {
+	if (const auto wait_tick = areas[current]; wait_tick != 0) {
 		m_scheduler.Wait(wait_tick);
 		m_scheduler.PopPendingOperations();
 	}
 
-	const auto offset = m_current_write_area * m_write_area_size;
-	auto*      mapped = m_write_download.Mapped().data() + offset;
+	const auto offset = current * area_size;
+	auto*      mapped = download.Mapped().data() + offset;
 	// The parser appends after the count; the host reads only the entries it counted.
 	std::memset(mapped, 0, sizeof(uint64_t));
-	m_write_download.Flush(offset, sizeof(uint64_t));
+	download.Flush(offset, sizeof(uint64_t));
 
 	vk::BufferMemoryBarrier2 pre_barrier {};
 	pre_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
@@ -281,7 +292,7 @@ void FaultManager::ProcessWriteBuffer(PagesHandler&& handler) {
 	pre_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
 	pre_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderRead;
 	pre_barrier.buffer        = m_fault_buffer.Handle();
-	pre_barrier.offset        = BufferCache::WRITE_BITMAP_OFFSET;
+	pre_barrier.offset        = bitmap_offset;
 	pre_barrier.size          = PageFaultBitsetSize;
 	auto post_barrier          = pre_barrier;
 	post_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
@@ -290,8 +301,8 @@ void FaultManager::ProcessWriteBuffer(PagesHandler&& handler) {
 	post_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderWrite;
 
 	const vk::DescriptorBufferInfo infos[] {
-	    {m_fault_buffer.Handle(), BufferCache::WRITE_BITMAP_OFFSET, PageFaultBitsetSize},
-	    {m_write_download.Handle(), offset, m_write_area_size},
+	    {m_fault_buffer.Handle(), bitmap_offset, PageFaultBitsetSize},
+	    {download.Handle(), offset, area_size},
 	};
 	std::array<vk::WriteDescriptorSet, 2> writes {};
 	for (uint32_t index = 0; index < writes.size(); ++index) {
@@ -321,21 +332,22 @@ void FaultManager::ProcessWriteBuffer(PagesHandler&& handler) {
 	download_barrier.srcAccessMask   = vk::AccessFlagBits2::eShaderWrite;
 	download_barrier.dstStageMask    = vk::PipelineStageFlagBits2::eHost;
 	download_barrier.dstAccessMask   = vk::AccessFlagBits2::eHostRead;
-	download_barrier.buffer          = m_write_download.Handle();
+	download_barrier.buffer          = download.Handle();
 	download_barrier.offset          = offset;
-	download_barrier.size            = m_write_area_size;
+	download_barrier.size            = area_size;
 	dependency.pBufferMemoryBarriers = &download_barrier;
 	command.pipelineBarrier2(dependency);
 
-	const auto area = m_current_write_area;
+	const auto area = current;
 	// The write scan marks the pages the GPU wrote as GPU-owned: an unmap waits for it, or a remap
-	// of the range would inherit the marks.
-	m_scheduler.DeferOperation([this, mapped, offset, area, handler = std::move(handler)] {
-		m_write_download.Invalidate(offset, m_write_area_size);
+	// of the range would inherit the marks. The use scan only changes host state.
+	auto completion = [this, mapped, offset, area, &download, area_size, &areas,
+	                   handler = std::move(handler)]() mutable {
+		download.Invalidate(offset, area_size);
 		const auto* entries = std::bit_cast<const uint64_t*>(mapped);
 		// The parser counts every set bit but stores only the entries the area holds; it leaves
 		// the others set for the next read.
-		const auto capacity = m_write_area_size / sizeof(uint64_t) - 1;
+		const auto capacity = area_size / sizeof(uint64_t) - 1;
 		const auto count    = std::min<uint64_t>(static_cast<uint32_t>(entries[0]), capacity);
 		std::vector<uint64_t> pages;
 		pages.reserve(count);
@@ -345,11 +357,26 @@ void FaultManager::ProcessWriteBuffer(PagesHandler&& handler) {
 		if (!pages.empty()) {
 			handler(pages);
 		}
-		m_write_areas[area] = 0;
-	});
+		areas[area] = 0;
+	};
+	if (host_only) {
+		m_scheduler.DeferHostOperation(std::move(completion));
+	} else {
+		m_scheduler.DeferOperation(std::move(completion));
+	}
 
-	m_write_areas[m_current_write_area++] = m_scheduler.CurrentTick();
-	m_current_write_area %= MaxPendingFaults;
+	areas[current++] = m_scheduler.CurrentTick();
+	current %= MaxPendingFaults;
+}
+
+void FaultManager::ProcessWriteBuffer(PagesHandler&& handler) {
+	ProcessBitmap(BufferCache::WRITE_BITMAP_OFFSET, m_write_download, m_write_area_size,
+	              m_write_areas, m_current_write_area, std::move(handler), false);
+}
+
+void FaultManager::ProcessUseBuffer(PagesHandler&& handler) {
+	ProcessBitmap(BufferCache::USE_BITMAP_OFFSET, m_use_download, m_use_area_size, m_use_areas,
+	              m_current_use_area, std::move(handler), true);
 }
 
 } // namespace Libs::Graphics

@@ -54,6 +54,7 @@ public:
 	// accesses found without a cached buffer, then (after the shader trap record) pages that
 	// V#-table stores wrote.
 	static constexpr uint64_t WRITE_BITMAP_OFFSET = BufferCachePages::kWriteBitmapOffset;
+	static constexpr uint64_t USE_BITMAP_OFFSET   = BufferCachePages::kUseBitmapOffset;
 	static constexpr uint64_t FAULT_BUFFER_SIZE   = BufferCachePages::kFaultBufferBytes;
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
@@ -74,9 +75,13 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// A guest write faulted on a page the cache protects.
+	void                   InvalidateFaultedPage(uint64_t vaddr);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	// Caches memory a shader reached through a device address the host did not know beforehand.
+	void CacheFaultedMemory(uint64_t vaddr, uint64_t size);
 	// needs_device_address: the caller reads the data through a buffer device address, which
 	// the stream buffer used for small CPU-written reads does not have.
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
@@ -236,6 +241,9 @@ public:
 	void NoteGpuWrites(uint64_t vaddr, uint64_t size);
 	// Clears the page-write bitmap of V#-table stores and, once the GPU work recorded so far
 	// completes, passes the guest addresses of the written caching pages to `handler`.
+	// Counts the buffers that shaders reached through device addresses since the last call as
+	// used, once the GPU work recorded so far completes: the age collection keeps them.
+	void ProcessUseBuffer();
 	void ProcessWriteBuffer(FaultManager::PagesHandler&& handler) {
 		m_fault_manager.ProcessWriteBuffer(std::move(handler));
 	}
@@ -371,6 +379,7 @@ private:
 	template <bool insert>
 	void                     ChangeRegister(BufferId id);
 	void                     DeleteBuffer(BufferId id);
+	void                     CollectStaleBuffers(uint64_t clock);
 	[[nodiscard]] bool       SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                           bool is_written, bool is_texel_buffer);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
@@ -455,6 +464,11 @@ private:
 	RangeSet                                           m_released_ranges;
 	bool                                               m_record_released = false;
 	// Bytes whose download is recorded but not yet in guest memory.
+	// The last buffers CollectStaleBuffers() released ([address, size] pairs, a ring): a device
+	// address fault inside one of them means a shader reached memory the age release dropped.
+	static constexpr size_t                            StaleRingSize = 32;
+	std::array<std::atomic<uint64_t>, StaleRingSize * 2> m_stale_ring {};
+	std::atomic<uint32_t>                              m_stale_ring_next {0};
 	RangeSet                                           m_downloading_ranges;
 	// Whether m_downloading_ranges holds anything, kept up to date under m_dirty_ranges_mutex:
 	// HasPendingDownload() answers without the lock while nothing is in flight.

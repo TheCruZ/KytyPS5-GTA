@@ -86,6 +86,9 @@ public:
 	// The tick whose recording holds the copies that fill a merged buffer from the buffers it
 	// replaced: until it has executed, the buffer's bytes are not those of the guest range (0: none).
 	uint64_t ready_tick = 0;
+	// Shaders reached the buffer's memory through device addresses the host did not know
+	// beforehand (a device-address fault): the age collection keeps it.
+	bool device_address_pinned = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
 
