@@ -3343,7 +3343,9 @@ void CommandProcessor::ExecuteWriteAtEndOfPipe(uint64_t submit_id, uint32_t eop_
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
 		EXIT_IF(dst == nullptr);
-		(void)command.Handle();
+		// A label is written to guest memory as the command processor reaches it; the recording
+		// thread has no part in it (the raw handle drains it: 13 % of the execution thread).
+		EXIT_IF(command.IsInvalid());
 		if (at_completion) {
 			m_renderer.GetGpu().DeferLabelWrite(reinterpret_cast<uint64_t>(dst), data,
 			                                    sizeof(data));
@@ -3392,7 +3394,7 @@ void CommandProcessor::ExecuteWriteAtEndOfPipe(uint64_t submit_id, uint32_t eop_
 				auto write64 = [&] {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
 					EXIT_IF(dst == nullptr);
-					(void)command.Handle();
+					EXIT_IF(command.IsInvalid());
 					if (at_completion) {
 						m_renderer.GetGpu().DeferLabelWrite(reinterpret_cast<uint64_t>(dst),
 						                                    value, sizeof(value));
@@ -3530,7 +3532,7 @@ void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id)
 }
 
 void CommandProcessor::DeferEopInterrupt(uint32_t interrupt_context_id) {
-	(void)CurrentBuffer().Handle();
+	EXIT_IF(CurrentBuffer().IsInvalid());
 	GetScheduler().DeferHostOperation(
 	    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
 		    renderer.TriggerInterrupt(event_id, interrupt_context_id);
@@ -3669,7 +3671,7 @@ void CommandProcessor::Flip() {
 		m_renderer.GetOcclusionQueries().OnFrame();
 		auto  request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
 		                                          flip.flip_mode, flip.flip_arg);
-		(void)command.Handle();
+		EXIT_IF(command.IsInvalid());
 		GetScheduler().DeferHostOperation(
 		    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); },
 		    true);
@@ -3692,7 +3694,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 		m_renderer.GetOcclusionQueries().OnFrame();
 		auto request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
 		                                         flip.flip_mode, flip.flip_arg);
-		(void)command.Handle();
+		EXIT_IF(command.IsInvalid());
 		GetScheduler().DeferHostOperation(
 		    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); },
 		    true);
@@ -3722,7 +3724,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 		m_renderer.GetOcclusionQueries().OnFrame();
 		auto request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
 		                                         flip.flip_mode, flip.flip_arg);
-		(void)command.Handle();
+		EXIT_IF(command.IsInvalid());
 		GetScheduler().DeferHostOperation(
 		    [&renderer = m_renderer, event_id = m_interrupt_event_id, request] {
 			    renderer.GetVideoOut().CompleteFlip(request);
