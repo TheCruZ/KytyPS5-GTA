@@ -139,6 +139,11 @@ public:
 	// until a GPU write or download.
 	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
 	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
+	// Whether a page of the tracking regions the range touches may be GPU dirty, without taking
+	// any lock: false means the range holds no GPU-written bytes.
+	[[nodiscard]] bool MayBeGpuModified(uint64_t vaddr, uint64_t size) const {
+		return m_memory_tracker.MayBeGpuModified(vaddr, size);
+	}
 	[[nodiscard]] bool              HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	// The same, under the dirty-range lock: for a GPU-read delegate (Memory::SetGpuReadDelegate).
 	[[nodiscard]] bool              HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size);
