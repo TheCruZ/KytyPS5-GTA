@@ -3739,8 +3739,18 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		}
 		return nullptr;
 	};
+	// Consecutive draws mostly use the pipeline of the draw before.
+	if (m_last_graphics_pipeline != nullptr && key == m_last_graphics_key) {
+		auto& found = *m_last_graphics_pipeline;
+		if (found.pending && !FinishPending(found)) {
+			return defer();
+		}
+		return &found;
+	}
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
 		auto& found = *iter->second;
+		m_last_graphics_key      = key;
+		m_last_graphics_pipeline = &found;
 		if (found.pending && !FinishPending(found)) {
 			return defer();
 		}
