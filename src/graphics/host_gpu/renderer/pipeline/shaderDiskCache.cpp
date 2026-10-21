@@ -280,6 +280,8 @@ void Visit(Io& io, T& v) {
 	io(v.has_address_writes);
 	io(v.info);
 	io(v.bindings);
+	io(v.srt_reads_after_buffer_writes);
+	io(v.raw_reads_after_buffer_writes);
 }
 
 template <typename Io, typename T>

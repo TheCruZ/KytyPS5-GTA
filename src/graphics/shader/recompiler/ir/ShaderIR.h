@@ -884,6 +884,15 @@ struct CompiledShaderInfo {
 	std::vector<std::vector<uint32_t>> raw_reads_after_buffer_writes;
 };
 
+// Whether a write of the shader to a buffer (an info.buffers index) can be visible to one of
+// its specialization reads. A read that a flattened scalar load made before any write to that
+// buffer in program order is not: the shader consumes the value from the flattened SRT, and
+// each wave performs that load before its own writes, so the dispatch-time snapshot is a value
+// the load observes on hardware.
+bool SpecializationReadFollowsBufferWrite(const CompiledShaderInfo& program,
+                                          const ResourceSnapshot& resources, size_t read,
+                                          uint32_t buffer);
+
 // Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
 struct UniformFillPlan {
 	UniformFill          fill;
