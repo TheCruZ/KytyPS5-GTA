@@ -398,11 +398,13 @@ private:
 		PipelineVertexInputState vertex_input;
 		PipelineStaticParameters static_params;
 
-		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
-		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
-		template <bool HasCalls>
-		ShaderModule* FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
-		                         uint32_t                                push_data_cursor);
+		bool operator==(const GraphicsPipelineKey& other) const {
+			// The parts that differ most often between consecutive draws first.
+			return vertex_shader_ids[0] == other.vertex_shader_ids[0] &&
+			       ps_shader_id == other.ps_shader_id && static_params == other.static_params &&
+			       vertex_input == other.vertex_input && rendering == other.rendering &&
+			       vertex_shader_ids == other.vertex_shader_ids;
+		}
 	};
 
 	struct ProgramKey {
@@ -441,6 +443,9 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	// The pipeline the last lookup found; pipelines are never removed while the cache lives.
+	GraphicsPipelineKey m_last_graphics_key {};
+	Pipeline*           m_last_graphics_pipeline = nullptr;
 	std::unique_ptr<PipelineCompiler>                       m_compiler;
 	uint64_t                                                m_deferred_draws = 0;
 
