@@ -81,6 +81,11 @@ void SetComputeIndirectFloors(size_t keys, size_t images);
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
+// The same refresh through SrtWalker alone, without the compiled plan; tests compare the two.
+bool MaterializeResourcesReference(const ResourcePlan& program, const SrtRuntime& runtime,
+                                   ResourceSnapshot& snapshot,
+                                   ResourceSpecialization& specialization);
+
 // Diagnostics: the source line of the indirect-image check that failed the last
 // MaterializeResources call on this thread, or 0.
 int LastIndirectImageFailureLine();
