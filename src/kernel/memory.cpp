@@ -1421,6 +1421,11 @@ const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space->FindBacking(vaddr, size);
 }
 
+bool MayBeGpuWritten(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	       GetGpuResources().GetBufferCache().MayBeGpuModified(vaddr, size);
+}
+
 bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return !MaybeGpuDirtyForClean(vaddr, size) && TryReadBacking(vaddr, data, size);
 }

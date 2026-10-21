@@ -31,10 +31,9 @@ struct DebugStats {
 	uint64_t flexible_total      = 0;
 	uint64_t flexible_used       = 0;
 	uint64_t pool_committed      = 0;
-	uint64_t cpu_page_entries       = 0; // 2 MiB page-table entries in use.
-	uint64_t gpu_page_entries       = 0;
-	uint64_t cpu_page_entries_total = 0;
-	uint64_t gpu_page_entries_total = 0;
+	uint64_t cpu_page_entries    = 0; // 2 MiB page-table entries in use.
+	uint64_t gpu_page_entries    = 0;
+	uint64_t page_entries_total  = 0; // Per side.
 };
 [[nodiscard]] DebugStats GetDebugStats();
 
@@ -131,6 +130,7 @@ static_assert(sizeof(KernelMemoryPoolBlockStats) == 16,
               "KernelMemoryPoolBlockStats struct size is incorrect");
 
 void                   RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
+void                   SetFlexibleMemorySize(uint64_t size);
 int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, size_t alignment,
                          int memory_type, int64_t* phys_addr_out, bool automatic = false);
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
@@ -165,6 +165,8 @@ void SetGpuReadDelegate(bool delegate);
 // GPU thread or delegate: copies [vaddr, vaddr + size) from the backing store when no GPU work has
 // written any of it. Never downloads, faults or waits; false otherwise.
 [[nodiscard]] bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// Whether the range may hold bytes the GPU wrote (a lock-free page check: false is exact).
+[[nodiscard]] bool MayBeGpuWritten(uint64_t vaddr, uint64_t size);
 // Any thread, for a read that faulted at fault_vaddr on a page protected because the GPU wrote to
 // it: reads [vaddr, vaddr + size) from the backing store when none of those bytes is GPU-written.
 bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size);
@@ -290,9 +292,6 @@ int KYTY_SYSV_ABI KernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* outp
 
 uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size,
                                Common::VirtualMemory::Mode mode, const char* name);
-// Loaded modules' segments use flexible memory without taking its backing.
-void ChargeFlexibleMemory(uint64_t size);
-void ReleaseFlexibleMemory(uint64_t size);
 void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
 uint64_t AllocateRuntimeMemory(uint64_t search_addr, uint64_t size,
                                Common::VirtualMemory::Mode mode, const char* name,
