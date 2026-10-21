@@ -761,6 +761,14 @@ private:
 		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
+		// One mapping holds the whole range (nearly every read): the thread's recent mappings
+		// (FindBacking, valid until the mapping table changes) answer without the lock and its
+		// map lookups, which the resolve thread's guest reads took tens of thousands of times a
+		// frame. The copy then runs outside the lock as below.
+		if (const auto* backing = FindBacking(vaddr, size); backing != nullptr) {
+			transfer(const_cast<uint8_t*>(backing), uint64_t {0}, static_cast<size_t>(size));
+			return true;
+		}
 
 		// Planned under the lock, copied outside it (TryReadSparseBacking).
 		struct Segment {
