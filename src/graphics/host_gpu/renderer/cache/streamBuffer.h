@@ -83,6 +83,9 @@ public:
 	bool   is_deleted   = false;
 	// The last scheduler tick a draw or dispatch bound the buffer in (the buffer cache's).
 	uint64_t last_use_tick = 0;
+	// The tick whose recording holds the copies that fill a merged buffer from the buffers it
+	// replaced: until it has executed, the buffer's bytes are not those of the guest range (0: none).
+	uint64_t ready_tick = 0;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
 	// Shaders reached the buffer's memory through device addresses the host did not know
