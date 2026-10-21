@@ -1287,7 +1287,7 @@ bool GuestReadLog::Read(uint64_t address, void* data, uint64_t size) {
 	}
 	if (!Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, data, size)) {
 		m_failed      = true;
-		m_gpu_written = m_gpu_written || Libs::LibKernel::Memory::TryReadBacking(address, data, size);
+		m_gpu_written = m_gpu_written || Libs::LibKernel::Memory::MayBeGpuWritten(address, size);
 		return false;
 	}
 	m_own.Add(address, data, static_cast<uint32_t>(size));
@@ -1378,17 +1378,25 @@ struct PipelineCache::ProgramCache {
 		// `permutations`, reads without the lock).
 		Permutation* FindPermutationFor(const ShaderRecompiler::IR::ResourceSpecialization& wanted,
 		                                uint32_t push_data_cursor) {
-			for (auto& candidate: permutations) {
+			// Consecutive lookups of a thread mostly repeat their permutation; a program can have
+			// thousands. One slot per kind of thread: the execution thread's and the others'.
+			const auto matches = [&](const Permutation& candidate) {
 				const auto& layout = candidate.program.bindings;
-				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
-				        push_data_cursor, layout.ShaderDataDwords()) ||
-				    candidate.specialization != wanted) {
-					continue;
+				return layout.push_data_start_dword ==
+				           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
+				                                                    layout.ShaderDataDwords()) &&
+				       candidate.specialization == wanted &&
+				       (!call_source || std::ranges::equal(candidate.function_code, FunctionCode()));
+			};
+			auto& last = last_permutation[GuestGpu::IsGpuThread() ? 0u : 1u];
+			if (last < permutations.size() && matches(permutations[last])) {
+				return &permutations[last];
+			}
+			for (size_t index = 0; index < permutations.size(); index++) {
+				if (matches(permutations[index])) {
+					last = index;
+					return &permutations[index];
 				}
-				if (call_source && !std::ranges::equal(candidate.function_code, FunctionCode())) {
-					continue;
-				}
-				return &candidate;
 			}
 			return nullptr;
 		}
@@ -1401,6 +1409,8 @@ struct PipelineCache::ProgramCache {
 			return FindPermutationFor(wanted, push_data_cursor);
 		}
 
+		// The permutation FindPermutationFor() found last (the execution thread's and the others').
+		std::array<size_t, 2> last_permutation {SIZE_MAX, SIZE_MAX};
 		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;

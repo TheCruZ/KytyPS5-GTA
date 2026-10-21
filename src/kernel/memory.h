@@ -165,6 +165,8 @@ void SetGpuReadDelegate(bool delegate);
 // GPU thread or delegate: copies [vaddr, vaddr + size) from the backing store when no GPU work has
 // written any of it. Never downloads, faults or waits; false otherwise.
 [[nodiscard]] bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// Whether the range may hold bytes the GPU wrote (a lock-free page check: false is exact).
+[[nodiscard]] bool MayBeGpuWritten(uint64_t vaddr, uint64_t size);
 // Any thread, for a read that faulted at fault_vaddr on a page protected because the GPU wrote to
 // it: reads [vaddr, vaddr + size) from the backing store when none of those bytes is GPU-written.
 bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size);
