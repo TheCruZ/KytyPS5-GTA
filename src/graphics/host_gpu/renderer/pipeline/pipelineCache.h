@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -30,54 +31,61 @@
 
 namespace Libs::Graphics {
 
+// On by default (KYTY_PIPELINE_CACHE=frank or KYTY_PROGRAM_RESOLUTION=0 turn it off): the resolve
+// thread resolves the shader programs of draws and dispatches ahead of execution
+// (ProgramResolution), instead of preparing only their SRT walks (DrawPrep).
+[[nodiscard]] bool ProgramResolutionEnabled();
+
 // Guest memory that a resolution ahead of execution read. The execution thread repeats the reads
 // before it uses the resolution: guest memory may have changed in between (operations that
-// execute before the draw write it), and ahead of execution GPU-owned bytes cannot be read.
+// execute before the draw write it), and ahead of execution GPU-owned bytes cannot be read. The
+// reads of the stages' SRT walks are recorded by their stage results; this log adds those of the
+// shader state (vertex fetch tables) and the verdict of the resolution.
 class GuestReadLog {
 public:
+	static constexpr uint32_t MaxSets = 5;
+
 	void Clear() {
-		m_entries.clear();
-		m_bytes.clear();
+		m_own.Clear();
+		m_set_count   = 0;
 		m_failed      = false;
 		m_gpu_written = false;
 	}
-	// Reads the backing store without faulting. Strict reads are checked the way specialization
-	// memory is read (GPU-owned bytes fail), the others as plain loads.
-	bool               Read(uint64_t address, void* data, uint64_t size, bool strict);
-	// A plain load the SRT walker made.
-	void               RecordLoad(uint64_t address, uint32_t value);
+	// Reads the bytes of the backing store no GPU work has written, and records them. False (and
+	// the log fails) when the range cannot be read that way.
+	bool Read(uint64_t address, void* data, uint64_t size);
+	// A read set kept elsewhere (a stage result's) that StillValid() checks as well.
+	void Attach(const DrawPrep::ReadSet* set) {
+		if (m_set_count < m_sets.size()) {
+			m_sets[m_set_count++] = set;
+		} else {
+			m_failed = true;
+		}
+	}
 	void               Fail() { m_failed = true; }
 	[[nodiscard]] bool Failed() const { return m_failed; }
-	// Whether some read may have taken stale bytes of memory the GPU wrote (the backing store
-	// gets them only once read back).
+	// Whether some read failed because the GPU wrote its bytes (the backing store gets them only
+	// once read back).
 	[[nodiscard]] bool MayHaveReadGpuWrites() const { return m_gpu_written; }
 	// Execution thread: whether every read still gives the recorded bytes.
 	[[nodiscard]] bool StillValid() const;
 
 private:
-	static constexpr uint64_t StrictCheckBytes = 64;
-	struct Entry {
-		uint64_t address = 0;
-		uint32_t size    = 0;
-		uint32_t offset  = 0;
-		bool     strict  = false;
-	};
-	void                 Append(uint64_t address, const void* data, uint32_t size, bool strict);
-	std::vector<Entry>   m_entries;
-	std::vector<uint8_t> m_bytes;
-	bool                 m_failed      = false;
-	bool                 m_gpu_written = false;
+	DrawPrep::ReadSet                                m_own;
+	std::array<const DrawPrep::ReadSet*, MaxSets>    m_sets {};
+	uint32_t                                         m_set_count   = 0;
+	bool                                             m_failed      = false;
+	bool                                             m_gpu_written = false;
 };
 
-// Storage of the shader programs a draw resolved ahead of its execution: the resource snapshots
-// and specializations its stages point to, and the guest memory they read.
+// Storage of the shader programs a draw resolved ahead of its execution: the stage results the
+// stages' resource snapshots and specializations live in, and the guest memory they read.
 struct ProgramResolution {
 	static constexpr uint32_t MaxStages = 4;
 
-	std::array<ShaderRecompiler::IR::ResourceSnapshot, MaxStages>       resources;
-	std::array<ShaderRecompiler::IR::ResourceSpecialization, MaxStages> specializations;
-	GuestReadLog                                                        reads;
-	uint32_t                                                            stages = 0;
+	std::array<DrawPrep::StageResult, MaxStages> results;
+	GuestReadLog                                 reads;
+	uint32_t                                     stages = 0;
 
 	void Reset() {
 		reads.Clear();
@@ -320,7 +328,7 @@ public:
 	                    const HW::Context& context, const HW::UserConfig& user_config,
 	                    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
 	                    bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
-	                    ShaderPixelInputInfo& pixel_info);
+	                    ShaderPixelInputInfo& pixel_info, ProgramResolution* ahead = nullptr);
 	// Draw prep (KYTY_DRAW_PREP, drawPrep.h), scanner thread: the SRT refreshes GetGraphicsPrograms
 	// would run for these registers, into `out`. False when nothing was prepared.
 	bool DrawPrepGraphics(const HW::VertexShaderInfo& vertex_regs,
@@ -331,9 +339,12 @@ public:
 	// The same for a dispatch: the SRT refresh GetComputeProgram would run.
 	bool DrawPrepCompute(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
 	                     ShaderComputeInputInfo& input_info, DrawPrep::PacketResult& out);
+	// With `ahead` (KYTY_PIPELINE_CACHE=ours, resolve thread): only a program and permutation that
+	// exist, with the SRT walk read through the resolution's log (see GetGraphicsPrograms).
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
-	                                ShaderComputeInputInfo&      input_info);
+	                                ShaderComputeInputInfo&      input_info,
+	                                ProgramResolution*           ahead = nullptr);
 	// Whether the shader at this address is on the skip list (--skip-shaders): its dispatches can
 	// be dropped before anything is prepared for them.
 	[[nodiscard]] static bool IsSkipListed(uint64_t shader_addr);

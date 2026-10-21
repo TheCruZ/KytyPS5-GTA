@@ -1314,6 +1314,50 @@ private:
 	std::thread               m_thread;
 };
 
+bool ProgramResolutionEnabled() {
+	static const bool enabled = [] {
+		if (const char* value = std::getenv("KYTY_PIPELINE_CACHE"); value != nullptr && *value != 0) {
+			return std::strcmp(value, "frank") != 0;
+		}
+		const char* value = std::getenv("KYTY_PROGRAM_RESOLUTION");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+bool GuestReadLog::Read(uint64_t address, void* data, uint64_t size) {
+	if (size == 0 || size > UINT32_MAX) {
+		m_failed = true;
+		return false;
+	}
+	// Guest memory starts at 0x40000: a read below it goes through a null table pointer on a side
+	// of a branch the shader never takes (see ReadShaderGuestMemoryRaw), which reads zero for
+	// every thread and needs no validation entry.
+	if (address < 0x40000u) {
+		std::memset(data, 0, size);
+		return true;
+	}
+	if (!Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, data, size)) {
+		m_failed      = true;
+		m_gpu_written = m_gpu_written || Libs::LibKernel::Memory::TryReadBacking(address, data, size);
+		return false;
+	}
+	m_own.Add(address, data, static_cast<uint32_t>(size));
+	return true;
+}
+
+bool GuestReadLog::StillValid() const {
+	if (m_failed || !m_own.Validate()) {
+		return false;
+	}
+	for (uint32_t i = 0; i < m_set_count; i++) {
+		if (!m_sets[i]->Validate()) {
+			return false;
+		}
+	}
+	return true;
+}
+
 std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPipelineKey& key) const {
 	std::size_t hash = 0;
 	PipelineKeyHash::Mix(hash, key.rendering.color_count);
@@ -1416,9 +1460,7 @@ static bool SameGuestBytes(const void* guest, const uint8_t* recorded, uint32_t 
 	struct SourceEntry {
 		SourceEntry(ShaderRecompiler::IR::ResourcePlan plan,
 		            std::unique_ptr<ShaderRecompiler::ShaderSource> call_source)
-		    : call_source(std::move(call_source)), resource_plan(std::move(plan)) {
-			permutations.reserve(8);
-		}
+		    : call_source(std::move(call_source)), resource_plan(std::move(plan)) {}
 
 		std::span<const uint32_t> FunctionCode() const {
 			return call_source
@@ -1436,11 +1478,18 @@ static bool SameGuestBytes(const void* guest, const uint8_t* recorded, uint32_t 
 		// The permutation compiled for the specialization the last materialization produced, this
 		// push-data position and (for a source with calls) the code the calls resolve to now.
 		Permutation* FindPermutation(uint32_t push_data_cursor) {
+			return FindPermutationFor(specialization, push_data_cursor);
+		}
+
+		// The permutation compiled for `wanted` (the execution thread, the only writer of
+		// `permutations`, reads without the lock).
+		Permutation* FindPermutationFor(const ShaderRecompiler::IR::ResourceSpecialization& wanted,
+		                                uint32_t push_data_cursor) {
 			for (auto& candidate: permutations) {
 				const auto& layout = candidate.program.bindings;
 				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
 				        push_data_cursor, layout.ShaderDataDwords()) ||
-				    candidate.specialization != specialization) {
+				    candidate.specialization != wanted) {
 					continue;
 				}
 				if (call_source && !std::ranges::equal(candidate.function_code, FunctionCode())) {
@@ -1450,11 +1499,22 @@ static bool SameGuestBytes(const void* guest, const uint8_t* recorded, uint32_t 
 			return nullptr;
 		}
 
+		// Resolve thread (KYTY_PIPELINE_CACHE=ours): as FindPermutationFor() while the execution
+		// thread may add permutations.
+		Permutation* FindPermutationAhead(const ShaderRecompiler::IR::ResourceSpecialization& wanted,
+		                                  uint32_t push_data_cursor) {
+			std::shared_lock lock(permutations_mutex);
+			return FindPermutationFor(wanted, push_data_cursor);
+		}
+
 		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<Permutation>                    permutations;
+		// A deque: resolutions ahead of execution keep pointers to permutations while new ones are
+		// added (under permutations_mutex, which the resolve thread's lookups hold shared).
+		std::deque<Permutation>                     permutations;
+		std::shared_mutex                           permutations_mutex;
 		// Held around every walk of resource_plan, whose memo and replay state are mutable: the
 		// draw-prep scanner (KYTY_DRAW_PREP) walks programs while the GPU thread does.
 		std::mutex walk_mutex;
@@ -1611,15 +1671,18 @@ ShaderModule PipelineCache::BuildModule(const ProgramKey&                       
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(spirv.size()), options.wave_size);
 		}
-		source.permutations.push_back({
-		    .function_code  = {function_code.begin(), function_code.end()},
-		    .specialization = source.specialization,
-		    .program        = std::move(program),
-		    .handle         = {.id          = ++next_shader_id,
-		                       .module      = module,
-		                       .spirv_words = static_cast<uint32_t>(spirv.size()),
-		                       .hash        = options.shader_hash},
-		});
+		{
+			std::unique_lock permutations_lock(source.permutations_mutex);
+			source.permutations.push_back({
+			    .function_code  = {function_code.begin(), function_code.end()},
+			    .specialization = source.specialization,
+			    .program        = std::move(program),
+			    .handle         = {.id          = ++next_shader_id,
+			                       .module      = module,
+			                       .spirv_words = static_cast<uint32_t>(spirv.size()),
+			                       .hash        = options.shader_hash},
+			});
+		}
 		const auto& permutation = source.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &source.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -2780,6 +2843,48 @@ ShaderModule PipelineCache::BuildModule(const ProgramKey&                       
 		return true;
 	}
 
+	// Resolves a stage ahead of execution (KYTY_PIPELINE_CACHE=ours, resolve thread): only a
+	// program and permutation that exist, with the SRT walk read through the resolution's stage
+	// result. Any failure fails the resolution: the execution thread resolves the draw itself.
+	template <typename InputInfo>
+	ShaderProgram GetAhead(const ShaderParams& params, InputInfo& input_info,
+	                       uint32_t& push_data_cursor, ProgramResolution& ahead) {
+		ShaderType stage;
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			stage = input_info.logical_stage;
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			stage = ShaderType::Pixel;
+		} else {
+			static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
+			stage = ShaderType::Compute;
+		}
+		if (ahead.stages == ProgramResolution::MaxStages) {
+			ahead.reads.Fail();
+			return {};
+		}
+		auto& result = ahead.results[ahead.stages];
+		// SWAPPC programs link the functions they call from guest memory: the execution thread
+		// resolves them (ScanStage finds no entry for them).
+		if (!ScanStage(params, input_info, stage, result)) {
+			ahead.reads.Fail();
+			return {};
+		}
+		auto* entry = static_cast<SourceEntry*>(const_cast<void*>(result.entry));
+		const auto* permutation =
+		    entry->FindPermutationAhead(result.specialization, push_data_cursor);
+		if (permutation == nullptr) {
+			// Only the execution thread own lookup compiles (a specialization read ahead can be
+			// made of stale bytes of GPU-written memory).
+			ahead.reads.Fail();
+			return {};
+		}
+		ahead.stages++;
+		ahead.reads.Attach(&result.reads);
+		input_info.stage = {.program = &permutation->program, .resources = &result.resources};
+		permutation->program.bindings.AdvancePushData(push_data_cursor);
+		return permutation->handle;
+	}
+
 	// The first field in which two refreshes differ, or null.
 	static const char* DiffRefresh(const ShaderRecompiler::IR::ResourceSnapshot&       a,
 	                               const ShaderRecompiler::IR::ResourceSpecialization& a_spec,
@@ -3380,12 +3485,29 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
-    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
+    ProgramResolution* ahead) {
 	std::array<ShaderParams, 3> vertex_params;
 	ShaderParams                pixel_params;
+	if (ahead != nullptr && user_config.GetPrimType() == Prospero::PrimitiveType::kPatch) {
+		// Tessellation resolves its three vertex stages on the execution thread.
+		ahead->reads.Fail();
+		return {};
+	}
+	// A resolution ahead of execution reads the vertex fetch tables through its log.
+	const ShaderGuestReaderScope reader(
+	    ahead != nullptr
+	        ? +[](void* userdata, uint64_t address, void* data, uint64_t size) {
+		          return static_cast<GuestReadLog*>(userdata)->Read(address, data, size);
+	          }
+	        : nullptr,
+	    ahead != nullptr ? &ahead->reads : nullptr);
 	if (!DescribeGraphicsStages(vertex_regs, pixel_regs, sh, context, user_config,
 	                            target_export_mapping, pixel_active, vertex_info, pixel_info,
 	                            vertex_params, pixel_params)) {
+		if (ahead != nullptr) {
+			ahead->reads.Fail();
+		}
 		return {};
 	}
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
@@ -3394,6 +3516,24 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	const auto& last_stage = vertex_info[tess_active ? 2u : 0u];
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
+	if (ahead != nullptr) {
+		// Programs and permutations that exist, one stage after the other as Get() takes them.
+		if (tess_active || ahead->reads.Failed()) {
+			ahead->reads.Fail();
+			return {};
+		}
+		GraphicsPrograms resolved;
+		if (pixel_active) {
+			resolved.pixel =
+			    m_program_cache->GetAhead(pixel_params, pixel_info, push_data_cursor, *ahead);
+			if (!resolved.pixel) {
+				return {};
+			}
+		}
+		resolved.vertex[0] =
+		    m_program_cache->GetAhead(vertex_params[0], vertex_info[0], push_data_cursor, *ahead);
+		return resolved.vertex[0] ? resolved : GraphicsPrograms {};
+	}
 	GraphicsPrograms  result;
 	// New shaders of 3D draws (depth test on) translate on the workers while the draw is skipped;
 	// UI and layer draws translate at once (TranslationWorkers).
@@ -3499,12 +3639,16 @@ bool PipelineCache::IsSkipListed(uint64_t shader_addr) {
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
-                                               ShaderComputeInputInfo&      input_info) {
+                                               ShaderComputeInputInfo&      input_info,
+                                               ProgramResolution*           ahead) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, input_info);
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	uint32_t          push_data_cursor = 0;
+	if (ahead != nullptr) {
+		return m_program_cache->GetAhead(params, input_info, push_data_cursor, *ahead);
+	}
 	auto              program          = m_program_cache->Get(params, input_info, push_data_cursor);
 	if (program && input_info.stage.program != nullptr) {
 		const auto* compiled = input_info.stage.program;

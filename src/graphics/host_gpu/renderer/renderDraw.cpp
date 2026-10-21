@@ -512,7 +512,62 @@ struct DrawRenderState {
 
 struct RenderExecutor::DrawRenderStorage {
 	DrawRenderState state {};
+	// Whether the last draw that used this storage had tessellation stages.
+	bool tessellation_stages_written = false;
 };
+
+// A resolution ahead of execution (see ResolveDrawAhead): the draw state with its shader
+// programs, the storage their stages point to, and whether the execution thread still uses it.
+struct RenderExecutor::ResolvedDraw {
+	DrawRenderStorage storage;
+	ProgramResolution programs;
+	// A dispatch resolved ahead: its program and stage input (pointing into `programs`).
+	ShaderComputeInputInfo compute;
+	ShaderProgram          compute_program;
+	std::atomic_bool       busy {false};
+};
+
+// More resolutions than operations can wait between the resolve and execution threads, so the
+// resolve thread only ever waits for room in that queue.
+struct RenderExecutor::ResolvedDrawRing {
+	static constexpr size_t Size = 320;
+
+	std::array<ResolvedDraw, Size> draws;
+	size_t                         next = 0;
+};
+
+// Counters of the resolutions ahead of execution, logged every 16384 uses.
+namespace {
+// The two threads' counters sit on separate cache lines, and the execution thread's are plain:
+// it counted every draw with an atomic increment on a line the resolve thread wrote as well.
+struct ResolutionCounters {
+	alignas(64) std::atomic<uint64_t> resolved {0};   // resolve thread: resolutions handed over
+	std::atomic<uint64_t> unresolved {0};             // resolve thread: draws and dispatches it could not
+	alignas(64) uint64_t used = 0;                    // execution thread: resolutions used
+	uint64_t             stale = 0;                   // execution thread: resolutions whose reads changed
+	uint64_t             absent = 0;                  // execution thread: draws without a resolution
+
+	void Log() {
+		const auto total = used + stale + absent;
+		if (total % 16384u != 0u) {
+			return;
+		}
+		std::fprintf(stderr,
+		             "[program-resolution] resolve thread: %llu resolved, %llu left to the execution "
+		             "thread; execution thread: %llu used, %llu stale, %llu without\n",
+		             static_cast<unsigned long long>(resolved.load()),
+		             static_cast<unsigned long long>(unresolved.load()),
+		             static_cast<unsigned long long>(used),
+		             static_cast<unsigned long long>(stale),
+		             static_cast<unsigned long long>(absent));
+	}
+};
+ResolutionCounters g_resolution_counters;
+} // namespace
+
+void RenderExecutor::ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept {
+	resolved->busy.store(false, std::memory_order_release);
+}
 
 template <typename T>
 static void ValueInitialize(T& object) {
@@ -523,13 +578,7 @@ static void ValueInitialize(T& object) {
 // value-initializing one on the stack took ~0.6 us per draw. Reuse one state and restore its
 // value-initialized contents, skipping the tessellation stages when the last draw did not use
 // them. A draw resolving a color target resets it first, so only the first one is restored.
-DrawRenderState& RenderExecutor::AcquireDrawRenderState() {
-	if (m_draw_state == nullptr) {
-		m_draw_state = {new DrawRenderStorage {}, [](DrawRenderStorage* s) { delete s; }};
-		return m_draw_state->state;
-	}
-	auto&      state = m_draw_state->state;
-	const bool wide  = state.programs.VertexStageCount() > 1u;
+static void ResetDrawRenderState(DrawRenderState& state, bool wide) {
 	ValueInitialize(state.depth_info);
 	ValueInitialize(state.color_info[0]);
 	state.color_count = 0;
@@ -543,6 +592,28 @@ DrawRenderState& RenderExecutor::AcquireDrawRenderState() {
 	ValueInitialize(state.programs);
 	state.colors = state.color_info;
 	state.depth  = &state.depth_info;
+}
+
+DrawRenderState& RenderExecutor::AcquireDrawRenderState(bool& shaders_resolved) {
+	// The operations before this draw executed: the resolution holds when the guest memory it
+	// read still has the same bytes.
+	auto* resolved   = std::exchange(m_resolved_draw, nullptr);
+	shaders_resolved = resolved != nullptr && resolved->programs.reads.StillValid();
+	if (ProgramResolutionEnabled()) {
+		(shaders_resolved ? g_resolution_counters.used
+		                  : resolved != nullptr ? g_resolution_counters.stale
+		                                        : g_resolution_counters.absent)++;
+		g_resolution_counters.Log();
+	}
+	if (shaders_resolved) {
+		return resolved->storage.state;
+	}
+	if (m_draw_state == nullptr) {
+		m_draw_state = {new DrawRenderStorage {}, [](DrawRenderStorage* s) { delete s; }};
+		return m_draw_state->state;
+	}
+	auto&      state = m_draw_state->state;
+	ResetDrawRenderState(state, state.programs.VertexStageCount() > 1u);
 	return state;
 }
 
@@ -1347,9 +1418,52 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
-RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(
-    const HW::Context& context, const HW::UserConfig& user_config, const HW::Shader& shaders,
-    const ShaderIndirectOffsets& indirect_offsets) {
+static void RefreshShaderPrograms(PipelineCache& pipeline_cache, const HW::Context& ctx,
+                                  const HW::Shader& sh_ctx, const HW::UserConfig& user_config,
+                                  uint32_t color_output_mask, DrawRenderState& state,
+                                  ProgramResolution* ahead) {
+	const auto& vertex_shader_info = sh_ctx.GetVs();
+	const auto& pixel_shader_info  = sh_ctx.GetPs();
+	const auto& shader_regs        = ctx.GetShaderRegisters();
+
+	state.programs      = {};
+	state.ps_input_info = {};
+	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX>
+	    target_export_mapping {};
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		const auto& rt = ctx.GetRenderTarget(slot);
+		if ((color_output_mask & (1u << slot)) != 0 && rt.base.addr != 0) {
+			target_export_mapping[slot] =
+			    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
+			                                 rt.info.channel_order)
+			        .export_mapping;
+		}
+	}
+	state.programs = pipeline_cache.GetGraphicsPrograms(
+	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, user_config, target_export_mapping,
+	    state.ps_active, state.vertex_info, state.ps_input_info, ahead);
+}
+
+static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
+                           uint32_t color_output_mask, DrawRenderState& state) {
+	if (draw.IsIndexed()) {
+		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
+	}
+	RefreshShaderPrograms(buffer.GetContext().GetPipelineCache(), buffer.GetRegisters(),
+	                      buffer.GetShaders(), buffer.GetUserConfig(), color_output_mask, state,
+	                      nullptr);
+}
+
+static bool PixelShaderActive(const HW::Context& ctx, const HW::Shader& shaders,
+                              uint32_t color_output_mask) {
+	return shaders.GetPs().ps_regs.data_addr != 0 &&
+	       (color_output_mask != 0 ||
+	        PixelShaderHasDepthOrCoverageSideEffects(ctx.GetShaderRegisters()));
+}
+
+RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(const HW::Context&    context,
+                                                               const HW::UserConfig& user_config,
+                                                               const HW::Shader&     shaders) {
 	if (!DrawHasValidVertexShader(shaders)) {
 		return nullptr;
 	}
@@ -1364,22 +1478,143 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(
 			std::this_thread::yield();
 		}
 	}
-	ring.next           = (ring.next + 1) % ResolvedDrawRing::Size;
-	draw.compute_module = nullptr;
-	auto& state         = draw.storage.state;
+	ring.next            = (ring.next + 1) % ResolvedDrawRing::Size;
+	draw.compute_program = {};
+	auto& state          = draw.storage.state;
 	ResetDrawRenderState(state, draw.storage.tessellation_stages_written);
 	draw.storage.tessellation_stages_written =
 	    user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
-	state.indirect_offsets = indirect_offsets;
 	draw.programs.Reset();
-	if (!m_context.GetPipelineCache().GetGraphicsProgramsAhead(context, user_config, shaders, state,
-	                                                          draw.programs) ||
-	    draw.programs.reads.Failed() || state.vertex_info[0].stage.module == nullptr) {
+	const auto color_output_mask = DrawColorOutputMask(context);
+	state.ps_active              = PixelShaderActive(context, shaders, color_output_mask);
+	RefreshShaderPrograms(m_context.GetPipelineCache(), context, shaders, user_config,
+	                      color_output_mask, state, &draw.programs);
+	if (draw.programs.reads.Failed()) {
+		g_resolution_counters.unresolved++;
 		return nullptr;
 	}
+	g_resolution_counters.resolved++;
 	// Published to the execution thread with the operation that carries it.
 	draw.busy.store(true, std::memory_order_relaxed);
 	return &draw;
+}
+
+RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDispatchAhead(const HW::Context& context,
+                                                                   const HW::Shader&  shaders,
+                                                                   const uint32_t (&groups)[3],
+                                                                   uint32_t mode,
+                                                                   bool async_compute) {
+	const auto& cs_regs = shaders.GetCs();
+	if (cs_regs.cs_regs.data_addr == 0 || PipelineCache::IsSkipListed(cs_regs.cs_regs.data_addr)) {
+		return nullptr;
+	}
+	if (groups[0] == 0 || groups[1] == 0 || groups[2] == 0) {
+		return nullptr;
+	}
+	if (m_resolved_ring == nullptr) {
+		m_resolved_ring = {new ResolvedDrawRing {}, [](ResolvedDrawRing* ring) { delete ring; }};
+	}
+	auto& ring = *m_resolved_ring;
+	auto& slot = ring.draws[ring.next];
+	// The execution thread releases resolutions in order.
+	for (Common::SpinWait wait; slot.busy.load(std::memory_order_acquire);) {
+		if (!wait.Spin()) {
+			std::this_thread::yield();
+		}
+	}
+	ring.next = (ring.next + 1) % ResolvedDrawRing::Size;
+	slot.programs.Reset();
+	ValueInitialize(slot.compute);
+	slot.compute.async_compute = async_compute;
+	// DISPATCH_INITIATOR.USE_THREAD_DIMENSIONS and the workgroup counts (see DispatchDirect()).
+	slot.compute.dispatch_thread_dimensions = (mode & (1u << 5u)) != 0;
+	const uint32_t group_sizes[] = {cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y,
+	                                cs_regs.cs_regs.num_thread_z};
+	for (uint32_t axis = 0; axis < 3u; ++axis) {
+		slot.compute.workgroup_counts[axis] = groups[axis];
+		if (slot.compute.dispatch_thread_dimensions) {
+			const auto size = std::max(group_sizes[axis], 1u);
+			slot.compute.workgroup_counts[axis] = groups[axis] / size + (groups[axis] % size != 0u);
+		}
+	}
+	slot.compute_program = m_context.GetPipelineCache().GetComputeProgram(
+	    cs_regs, context.GetShaderRegisters(), slot.compute, &slot.programs);
+	if (slot.programs.reads.Failed() || !slot.compute_program) {
+		g_resolution_counters.unresolved++;
+		return nullptr;
+	}
+	g_resolution_counters.resolved++;
+	// Published to the execution thread with the operation that carries it.
+	slot.busy.store(true, std::memory_order_relaxed);
+	return &slot;
+}
+
+RenderExecutor::ResolvedDraw* RenderExecutor::ResolveIndirectDispatchAhead(
+    const HW::Context& context, const HW::Shader& shaders, uint32_t mode, uint64_t args_addr,
+    bool async_compute) {
+	const auto& cs_regs = shaders.GetCs();
+	if (cs_regs.cs_regs.data_addr == 0 || PipelineCache::IsSkipListed(cs_regs.cs_regs.data_addr)) {
+		return nullptr;
+	}
+	if (m_resolved_ring == nullptr) {
+		m_resolved_ring = {new ResolvedDrawRing {}, [](ResolvedDrawRing* ring) { delete ring; }};
+	}
+	auto& ring = *m_resolved_ring;
+	auto& slot = ring.draws[ring.next];
+	// The execution thread releases resolutions in order.
+	for (Common::SpinWait wait; slot.busy.load(std::memory_order_acquire);) {
+		if (!wait.Spin()) {
+			std::this_thread::yield();
+		}
+	}
+	ring.next = (ring.next + 1) % ResolvedDrawRing::Size;
+	slot.programs.Reset();
+	ValueInitialize(slot.compute);
+	slot.compute.async_compute = async_compute;
+	// As DispatchIndirect() looks the program up: the workgroup counts are unknown until the
+	// dispatch executes.
+	const bool use_thread_dimensions =
+	    (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+	slot.compute.dispatch_thread_dimensions   = use_thread_dimensions;
+	slot.compute.dispatch_dimensions_indirect = use_thread_dimensions;
+	slot.compute.indirect_args_address        = args_addr;
+	slot.compute_program = m_context.GetPipelineCache().GetComputeProgram(
+	    cs_regs, context.GetShaderRegisters(), slot.compute, &slot.programs);
+	if (slot.programs.reads.Failed() || !slot.compute_program) {
+		g_resolution_counters.unresolved++;
+		return nullptr;
+	}
+	g_resolution_counters.resolved++;
+	slot.busy.store(true, std::memory_order_relaxed);
+	return &slot;
+}
+
+bool RenderExecutor::TakeResolvedDispatch(ShaderComputeInputInfo& input_info,
+                                          ShaderProgram&          program) {
+	auto* resolved = std::exchange(m_resolved_draw, nullptr);
+	if (resolved == nullptr || !resolved->compute_program ||
+	    !resolved->programs.reads.StillValid()) {
+		if (ProgramResolutionEnabled()) {
+			(resolved != nullptr ? g_resolution_counters.stale : g_resolution_counters.absent)++;
+			g_resolution_counters.Log();
+		}
+		return false;
+	}
+	if (ProgramResolutionEnabled()) {
+		g_resolution_counters.used++;
+		g_resolution_counters.Log();
+	}
+	input_info = resolved->compute;
+	program    = resolved->compute_program;
+	if (input_info.stage.program != nullptr) {
+		const auto* compiled = input_info.stage.program;
+		GpuTiming::NoteComputeLanes(compiled->shader_hash,
+		                            compiled->wave_size == 64u &&
+		                                    input_info.host_subgroup_size == 32u
+		                                ? 2u
+		                                : 1u);
+	}
+	return true;
 }
 
 bool DrawPrepHasVertexShader(const HW::Shader& sh_ctx) {
@@ -1726,15 +1961,16 @@ void RenderExecutor::LogWatchedDraw(const DrawCallInfo& draw, const DrawRenderSt
 	     base_vertex, first_vertex, host_vertex_offset, host_first_instance, indirect ? 1 : 0);
 }
 
-bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
+bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_resolved,
+                                            const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
-	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
-	const auto  color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
-	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
-	                  (color_output_mask != 0 ||
-	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
-	RefreshShaders(buffer, draw, color_output_mask, state);
+	const auto color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
+	if (!shaders_resolved) {
+		state.ps_active =
+		    PixelShaderActive(buffer.GetRegisters(), buffer.GetShaders(), color_output_mask);
+		RefreshShaders(buffer, draw, color_output_mask, state);
+	}
 	LogDrawCensus(buffer, draw, state);
 	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
 		return false;
@@ -2589,8 +2825,10 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance};
-	DrawRenderState& state = AcquireDrawRenderState();
-	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+	bool             shaders_resolved = false;
+	DrawRenderState& state            = AcquireDrawRenderState(shaders_resolved);
+	if (!PrepareDrawRenderState(buffer, shaders_resolved, draw, args.render_target_slice_offset,
+	                            state)) {
 		ResetBindings();
 		return true;
 	}
@@ -2761,8 +2999,10 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		ResetBindings();
 		return true;
 	}
-	DrawRenderState& state = AcquireDrawRenderState();
-	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+	bool             shaders_resolved = false;
+	DrawRenderState& state            = AcquireDrawRenderState(shaders_resolved);
+	if (!PrepareDrawRenderState(buffer, shaders_resolved, draw, args.render_target_slice_offset,
+	                            state)) {
 		ResetBindings();
 		return true;
 	}

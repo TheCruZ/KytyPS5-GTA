@@ -988,7 +988,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 	ShaderProgram compute_program;
-	{
+	if (!TakeResolvedDispatch(input_info, compute_program)) {
 		KYTY_PROFILER_BLOCK("Dispatch::GetComputeProgram");
 		compute_program =
 		    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
@@ -1277,8 +1277,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	input_info.dispatch_dimensions_indirect = use_thread_dimensions;
 	input_info.async_compute = async_compute;
 	input_info.indirect_args_address = args_addr;
-	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
-	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	ShaderProgram compute_program;
+	if (!TakeResolvedDispatch(input_info, compute_program)) {
+		compute_program = m_context.GetPipelineCache().GetComputeProgram(
+		    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	}
 	if (!compute_program && PipelineCache::SrtDeferPending()) {
 		// Suspended until the SRT bytes it reads land (KYTY_SRT_DEFER); not skipped.
 		ResetBindings();

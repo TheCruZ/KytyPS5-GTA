@@ -679,7 +679,10 @@ void GuestGpu::ResolveThread() {
 	// The clean-backing reads answer "maybe GPU-written" on any other thread than the execution
 	// thread; a read delegate checks the buffer cache's GPU-dirty ranges under their shared lock.
 	LibKernel::Memory::SetGpuReadDelegate(true);
-	const bool prepare = DrawPrep::Enabled();
+	// KYTY_PIPELINE_CACHE=ours: the programs of draws and dispatches are resolved ahead (programs,
+	// SRT walks and vertex fetch tables); otherwise their SRT walks are (DrawPrep).
+	const bool resolve = ProgramResolutionEnabled();
+	const bool prepare = !resolve && DrawPrep::Enabled();
 	for (;;) {
 		auto operation = m_operations.TryPop();
 		if (!operation) {
@@ -688,12 +691,45 @@ void GuestGpu::ResolveThread() {
 				break;
 			}
 		}
-		if (prepare) {
+		if (resolve) {
+			ResolveAhead(*operation);
+		} else if (prepare) {
 			PrepareAhead(*operation);
 		}
 		m_resolved.Push(std::move(*operation));
 	}
 	m_resolved.Stop();
+}
+
+void GuestGpu::ResolveAhead(GpuOperation& operation) {
+	auto& executor = m_renderer.GetRenderExecutor();
+	// The register snapshots stay valid until the operation executed.
+	const auto& state = operation.state;
+	switch (operation.kind) {
+		case GpuOperationKind::DrawIndex:
+		case GpuOperationKind::DrawAuto:
+		case GpuOperationKind::DrawIndirect:
+			operation.resolved =
+			    executor.ResolveDrawAhead(*state.context, *state.user_config, *state.shaders);
+			break;
+		case GpuOperationKind::DispatchDirect: {
+			const uint32_t groups[] = {operation.dispatch.thread_group_x,
+			                           operation.dispatch.thread_group_y,
+			                           operation.dispatch.thread_group_z};
+			operation.resolved      = executor.ResolveDispatchAhead(
+                *state.context, *state.shaders, groups, operation.dispatch.mode,
+                operation.processor->IsAsyncComputeQueue());
+			break;
+		}
+		case GpuOperationKind::DispatchIndirect:
+			// The program does not depend on the GPU-written arguments, only on the registers and
+			// the guest memory its resources read.
+			operation.resolved = executor.ResolveIndirectDispatchAhead(
+			    *state.context, *state.shaders, operation.dispatch.mode,
+			    operation.dispatch.args_addr, operation.processor->IsAsyncComputeQueue());
+			break;
+		default: break;
+	}
 }
 
 void GuestGpu::PrepareAhead(GpuOperation& operation) {
@@ -907,6 +943,10 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 			copies->Drain();
 		}
 	}
+	auto& resolving_executor = m_renderer.GetRenderExecutor();
+	// The programs a draw or dispatch resolved ahead (KYTY_PIPELINE_CACHE=ours): used when the
+	// guest memory they read still holds the same bytes.
+	resolving_executor.UseResolvedDraw(operation.resolved);
 	switch (operation.kind) {
 		case GpuOperationKind::DrawIndex: ExecuteDrawIndex(operation, operation.draw_index); break;
 		case GpuOperationKind::DrawAuto: ExecuteDrawAuto(operation, operation.draw_auto); break;
@@ -926,6 +966,11 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 	}
 	if (operation.prepared) {
 		DrawPrep::ClearCurrent();
+	}
+	resolving_executor.UseResolvedDraw(nullptr);
+	if (operation.resolved != nullptr) {
+		RenderExecutor::ReleaseResolvedDraw(operation.resolved);
+		operation.resolved = nullptr;
 	}
 	// Starts the copies of the operation while the next ones are prepared.
 	if (auto* copies = GetScheduler().HostCopies(); copies != nullptr) {
@@ -2526,10 +2571,17 @@ bool CommandProcessor::PatchIndirectDrawOffsets(const GpuOperation& operation,
 		m_indirect_shaders = std::make_unique<HW::Shader>();
 	}
 	*m_indirect_shaders = *operation.state.shaders;
+	bool changed        = false;
 	for (const auto& [location, value]: writes) {
 		if (location != Pm4::SH_NOP) {
-			PatchUserSgpr(*m_indirect_shaders, location, value);
+			changed |= PatchUserSgpr(*m_indirect_shaders, location, value);
 		}
+	}
+	if (changed) {
+		// The programs the ahead resolution made read the unpatched registers: the vertex stage
+		// would run with whatever the game's SET_SH_REG left in the dword the CP overwrites (the
+		// draw index, the start instance), so the draw resolves its programs again.
+		m_renderer.GetRenderExecutor().UseResolvedDraw(nullptr);
 	}
 	GetScheduler().Begin(*operation.state.context, *operation.state.user_config,
 	                     *m_indirect_shaders);

@@ -245,6 +245,36 @@ public:
 	void                   InvalidateRenderTargetMemo() noexcept;
 	// Also ends the reuse of the render targets of the draw before.
 	void                   EndDrawWindow() noexcept;
+	// Shader programs and resources of a draw resolved ahead of its execution
+	// (KYTY_PIPELINE_CACHE=ours).
+	struct ResolvedDraw;
+	// Resolve thread: resolves the shader programs of a draw with the given registers ahead of
+	// its execution; null when the draw resolves them itself (tessellation, programs that are not
+	// compiled yet, guest memory that cannot be read ahead). Waits while every resolution is in
+	// use: the execution thread releases them in order.
+	[[nodiscard]] ResolvedDraw* ResolveDrawAhead(const HW::Context&    context,
+	                                             const HW::UserConfig& user_config,
+	                                             const HW::Shader&     shaders);
+	// Resolve thread: the compute program of a DISPATCH_DIRECT with the given registers and
+	// initiator; null when the dispatch resolves it itself. Shares the ring of draw resolutions.
+	[[nodiscard]] ResolvedDraw* ResolveDispatchAhead(const HW::Context& context,
+	                                                 const HW::Shader& shaders,
+	                                                 const uint32_t (&groups)[3], uint32_t mode,
+	                                                 bool async_compute);
+	// Resolve thread: the compute program of a DISPATCH_INDIRECT with the given registers and
+	// initiator, which does not depend on the arguments the dispatch reads when it executes.
+	[[nodiscard]] ResolvedDraw* ResolveIndirectDispatchAhead(const HW::Context& context,
+	                                                         const HW::Shader&  shaders,
+	                                                         uint32_t           mode, uint64_t args_addr,
+	                                                         bool               async_compute);
+	// Execution thread: the program a dispatch resolved ahead, when the guest memory the
+	// resolution read still holds the same bytes.
+	bool TakeResolvedDispatch(ShaderComputeInputInfo& input_info, ShaderProgram& program);
+	// Execution thread: the next draw uses `resolved` when the guest memory it read still holds
+	// the same bytes.
+	void UseResolvedDraw(ResolvedDraw* resolved) noexcept { m_resolved_draw = resolved; }
+	// Execution thread: the operation that carried `resolved` executed.
+	static void ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept;
 	// The context snapshot the operation about to execute reads (0: the live registers).
 	void UseContextId(uint64_t id) noexcept { m_context_id = id; }
 	KYTY_CLASS_NO_COPY(RenderExecutor);
@@ -544,8 +574,9 @@ private:
 	// The render targets the last draw acquired, and the descriptions derived from the target
 	// registers; see RenderTargetMemo.
 	struct DrawRenderStorage;
+	struct ResolvedDrawRing;
 	// Reused by every draw.
-	[[nodiscard]] DrawRenderState& AcquireDrawRenderState();
+	[[nodiscard]] DrawRenderState& AcquireDrawRenderState(bool& shaders_resolved);
 	struct RenderTargetMemo;
 	struct ColorTargetMemo;
 	struct DepthTargetMemo;
@@ -564,25 +595,6 @@ private:
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
 	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                   const DrawEmitInfo& emit, DrawRenderState& state);
-	struct DrawRenderStorage;
-	struct ColorTargetMemo;
-	struct DepthTargetMemo;
-	struct RenderTargetMemo;
-	struct ResolvedDrawRing;
-	// See RenderTargetMemo.
-	void               CaptureRenderTargetKey(const HW::Context& registers, uint32_t mrt_mask,
-	                                          uint32_t slice_offset);
-	[[nodiscard]] bool RenderTargetMemoCurrent();
-	[[nodiscard]] bool TryReuseRenderTargets(const HW::Context& registers, uint32_t mrt_mask,
-	                                         uint32_t slice_offset, DrawRenderState& state);
-	void StoreRenderTargetMemo(const RenderColorInfo* colors, uint32_t color_count,
-	                           const RenderDepthInfo& depth, const vk::ImageView* views,
-	                           vk::ImageView depth_view, ImageId stencil);
-	// The draw state of the executing draw: the one its resolution prepared when that is still
-	// valid (shaders_resolved), otherwise the reused state.
-	[[nodiscard]] DrawRenderState& AcquireDrawRenderState(bool  tessellation,
-	                                                      bool& shaders_resolved,
-	                                                      const ShaderIndirectOffsets& indirect_offsets);
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_resolved,
 	                                          const DrawCallInfo& draw,
 	                                          uint32_t            render_target_slice_offset,
@@ -673,6 +685,10 @@ private:
 	std::vector<uint8_t>                               m_table_flags;
 	uint64_t                              m_draw_window           = 0;
 	uint64_t                              m_context_id            = 0;
+	// Resolutions ahead of execution; see ResolveDrawAhead().
+	std::unique_ptr<ResolvedDrawRing, void (*)(ResolvedDrawRing*)> m_resolved_ring {nullptr,
+	                                                                                nullptr};
+	ResolvedDraw*                                                  m_resolved_draw = nullptr;
 	std::unique_ptr<DrawRenderStorage, void (*)(DrawRenderStorage*)> m_draw_state {nullptr, nullptr};
 	// The last color-target descriptions per slot; see ResolveRenderColorTarget().
 	std::unique_ptr<ColorTargetMemo, void (*)(ColorTargetMemo*)> m_color_target_memo {nullptr,
