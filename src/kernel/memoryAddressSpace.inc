@@ -166,87 +166,6 @@ static void CopySparseRange(const Regions& regions, uint64_t vaddr, void* data, 
 	    [&](uint64_t start, uint64_t bytes) { gap(start, destination + (start - vaddr), bytes); });
 }
 
-// Ranges whose guest mapping is briefly absent while the emulator replaces it: a guest mmap with
-// MAP_FIXED over an existing mapping (unmapped, then mapped again), and, on Windows, the parts of a
-// file view that stay mapped when part of it is unmapped (Windows splits a view only by unmapping
-// all of it). On the console these replacements are atomic, so guest threads keep using the
-// memory: GTA V's streamer decompresses into buffers whose 64 KiB pages are mapped again or
-// neighbour an unmap. A fault inside such a range waits until the mapping is back and is retried
-// instead of being reported as an access violation.
-struct TransientUnmapWindow {
-	std::atomic<uint64_t> id {0};
-	std::atomic<uint64_t> start {0};
-	std::atomic<uint64_t> end {0};
-	std::atomic<int64_t>  closed_ns {0}; // 0 while the range is being remapped
-};
-
-class TransientUnmapWindows {
-public:
-	using Window = TransientUnmapWindow;
-
-	class Scope {
-	public:
-		Scope(uint64_t start, uint64_t end) noexcept: m_window(Open(start, end)) {}
-		~Scope() { m_window->closed_ns.store(Now(), std::memory_order_release); }
-		KYTY_CLASS_NO_COPY(Scope);
-
-	private:
-		Window* m_window;
-	};
-
-	// The newest range being remapped recently that holds vaddr (0: none). Waits while it still
-	// is being remapped.
-	static uint64_t Wait(uint64_t vaddr) noexcept {
-		constexpr int64_t Second  = 1000000000;
-		uint64_t          matched = 0;
-		for (auto& window: s_windows) {
-			if (vaddr < window.start.load(std::memory_order_acquire) ||
-			    vaddr >= window.end.load(std::memory_order_acquire)) {
-				continue;
-			}
-			const auto begin = Now();
-			for (uint32_t spins = 0; window.closed_ns.load(std::memory_order_acquire) == 0; spins++) {
-				if (Now() - begin > Second * 10) {
-					return 0; // never closed: report the fault
-				}
-				if (spins < 4096) {
-#if defined(_M_X64) || defined(__x86_64__)
-					_mm_pause();
-#endif
-				} else {
-					std::this_thread::yield();
-				}
-			}
-			// The fault may be handled after the mapping is already back.
-			if (Now() - window.closed_ns.load(std::memory_order_acquire) < Second) {
-				matched = std::max(matched, window.id.load(std::memory_order_acquire));
-			}
-		}
-		return matched;
-	}
-
-private:
-	static Window* Open(uint64_t start, uint64_t end) noexcept {
-		auto& window = s_windows[s_next.fetch_add(1, std::memory_order_relaxed) % s_windows.size()];
-		window.closed_ns.store(0, std::memory_order_relaxed);
-		window.id.store(s_opened.fetch_add(1, std::memory_order_relaxed) + 1,
-		                std::memory_order_relaxed);
-		window.start.store(start, std::memory_order_relaxed);
-		window.end.store(end, std::memory_order_seq_cst);
-		return &window;
-	}
-
-	static int64_t Now() noexcept {
-		return std::chrono::duration_cast<std::chrono::nanoseconds>(
-		           std::chrono::steady_clock::now().time_since_epoch())
-		    .count();
-	}
-
-	inline static std::array<Window, 16> s_windows {};
-	inline static std::atomic<uint32_t>  s_next {0};
-	inline static std::atomic<uint64_t>  s_opened {0};
-};
-
 class GuestBackingStore {
 public:
 	enum class FailureReason {
@@ -336,7 +255,6 @@ public:
 		}
 		m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_maps.clear();
-		MapsChangedUnlocked();
 		if (m_backing_base != nullptr) {
 			UnmapViewOfFile(m_backing_base);
 		}
@@ -350,7 +268,6 @@ public:
 		}
 		m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_maps.clear();
-		MapsChangedUnlocked();
 		if (m_backing_base != nullptr) {
 			munmap(m_backing_base, m_size);
 		}
@@ -432,21 +349,11 @@ public:
 			return false;
 		}
 
-		const auto* source = static_cast<const uint8_t*>(data);
-		if (TryCachedTransfer(vaddr, size, [source](uint8_t* backing, size_t bytes) {
-			    std::memcpy(backing, source, bytes);
-		    })) {
-			return true;
-		}
-
 		// Skip unbacked gaps, mirroring sparse reads that zero-fill them.
 		DiagLockGuard lock(m_mutex, __func__);
 		ForEachSparseRange(
 		    m_maps, vaddr, size,
 		    [&](const auto& entry, uint64_t start, uint64_t bytes) {
-			    if (start == vaddr && start + bytes == end) {
-				    RememberMapping(entry, vaddr, end);
-			    }
 			    std::memcpy(m_backing_base + (entry.backing_offset + start - entry.vaddr),
 			                source + (start - vaddr), bytes);
 		    },
@@ -490,16 +397,19 @@ public:
 			const char* value = std::getenv("KYTY_BACKING_CACHE");
 			return value == nullptr || value[0] != '0';
 		}();
-		thread_local std::array<Cached, 8> cache {};
-		thread_local uint32_t              cache_next = 0;
+		// Direct-mapped by the 64 KB chunk of the address (the main fork's "remember backing
+		// mappings per 64 KB of guest addresses"): a handful of entries missed for the dozens of
+		// mappings a frame's guest reads touch, and each miss took the lock and a map lookup.
+		constexpr size_t ChunkBits = 16;
+		thread_local std::array<Cached, 256> cache {};
+		const auto                           slot = static_cast<size_t>((vaddr >> ChunkBits) & 255u);
 		if (cache_enabled) {
-			const auto generation = m_maps_generation.load(std::memory_order_acquire);
-			for (const auto& cached: cache) {
-				if (cached.owner == this && cached.generation == generation &&
-				    vaddr >= cached.vaddr && vaddr + size <= cached.vaddr + cached.size) {
-					const auto offset = cached.offset + vaddr - cached.vaddr;
-					return RangeOk(offset, size) ? m_backing_base + offset : nullptr;
-				}
+			const auto  generation = m_maps_generation.load(std::memory_order_acquire);
+			const auto& cached     = cache[slot];
+			if (cached.owner == this && cached.generation == generation && vaddr >= cached.vaddr &&
+			    vaddr + size <= cached.vaddr + cached.size) {
+				const auto offset = cached.offset + vaddr - cached.vaddr;
+				return RangeOk(offset, size) ? m_backing_base + offset : nullptr;
 			}
 		}
 		DiagLockGuard lock(m_mutex, __func__);
@@ -508,9 +418,8 @@ public:
 			return nullptr;
 		}
 		if (cache_enabled) {
-			cache[cache_next++ % cache.size()] = {this,
-			                                      m_maps_generation.load(std::memory_order_acquire),
-			                                      entry.vaddr, entry.size, entry.backing_offset};
+			cache[slot] = {this, m_maps_generation.load(std::memory_order_acquire), entry.vaddr,
+			               entry.size, entry.backing_offset};
 		}
 		const auto offset = entry.backing_offset + vaddr - entry.vaddr;
 		return RangeOk(offset, size) ? m_backing_base + offset : nullptr;
@@ -607,7 +516,6 @@ public:
 			DiagLockGuard lock(m_mutex, __func__);
 			m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
-			MapsChangedUnlocked();
 		}
 		BumpBackingEpoch(vaddr, size);
 		SetFailure(failure_reason, FailureReason::None);
@@ -713,7 +621,6 @@ public:
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 					m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 					m_maps.erase(entry);
-					MapsChangedUnlocked();
 #endif
 				}
 			}
@@ -735,7 +642,6 @@ public:
 				DiagLockGuard lock(m_mutex, __func__);
 				m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 				m_maps.emplace(old.vaddr, old);
-				MapsChangedUnlocked();
 				return false;
 			}
 			if (placeholder_preserved != nullptr) {
@@ -809,7 +715,6 @@ public:
 		DiagLockGuard lock(m_mutex, __func__);
 		m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_maps.emplace(old.vaddr, old);
-		MapsChangedUnlocked();
 		return false;
 #else
 		// Replace only the requested range so concurrent accesses and GPU watch
@@ -820,7 +725,6 @@ public:
 
 		DiagLockGuard lock(m_mutex, __func__);
 		RemoveMappingsUnlocked(vaddr, size);
-		MapsChangedUnlocked();
 
 		if (placeholder_preserved != nullptr) {
 			*placeholder_preserved = true;
@@ -936,85 +840,6 @@ private:
 		}
 	}
 #endif
-	// The mapping of each 64 KB of guest addresses that a transfer started in, direct mapped:
-	// GPU threads stream thousands of small buffers per frame from rings spread over more
-	// mappings than the round-robin entries hold.
-	static constexpr uint32_t SlotBits  = 16;
-	static constexpr size_t   SlotCount = 1024;
-	struct LookupCache {
-		const GuestBackingStore*         owner      = nullptr;
-		uint64_t                         generation = 0;
-		uint32_t                         next       = 0;
-		std::array<MapEntry, 4>          entries {};
-		std::array<MapEntry, SlotCount>  slots {};
-	};
-
-	[[nodiscard]] static size_t SlotOf(uint64_t vaddr) noexcept {
-		return static_cast<size_t>(vaddr >> SlotBits) % SlotCount;
-	}
-
-	static LookupCache& ThreadLookupCache() noexcept {
-		thread_local LookupCache cache;
-		return cache;
-	}
-
-	// Called after every change of m_maps, under m_mutex. The generation is shared by all stores,
-	// so a store recreated at the address of a destroyed one never matches a stale lookup.
-	static void MapsChangedUnlocked() noexcept {
-		s_maps_generation.fetch_add(1, std::memory_order_release);
-	}
-
-	inline static std::atomic<uint64_t> s_maps_generation {0};
-
-	// The GPU thread streams thousands of small buffers per frame from a few mappings: reuse the
-	// lookups it made last, without the lock, while no mapping changed. The entries and the
-	// generation were read together under m_mutex, and every change of m_maps advances the
-	// generation under m_mutex, so observing it unchanged (acquire) means no change completed
-	// since. A change racing with this transfer orders as if it followed it: the backing alias
-	// stays mapped for the store's lifetime, and host views are never unmapped under m_mutex
-	// either.
-	template <typename Transfer>
-	bool TryCachedTransfer(uint64_t vaddr, uint64_t size, Transfer transfer) {
-		const auto& cached = ThreadLookupCache();
-		if (cached.owner != this ||
-		    cached.generation != s_maps_generation.load(std::memory_order_acquire)) {
-			return false;
-		}
-		const auto end  = vaddr + size;
-		const auto& slot = cached.slots[SlotOf(vaddr)];
-		if (vaddr >= slot.vaddr && end <= slot.vaddr + slot.size && slot.size != 0) {
-			transfer(m_backing_base + slot.backing_offset + (vaddr - slot.vaddr),
-			         static_cast<size_t>(size));
-			return true;
-		}
-		for (const auto& entry: cached.entries) {
-			if (vaddr >= entry.vaddr && end <= entry.vaddr + entry.size) {
-				transfer(m_backing_base + entry.backing_offset + (vaddr - entry.vaddr),
-				         static_cast<size_t>(size));
-				return true;
-			}
-		}
-		return false;
-	}
-
-	// Called under m_mutex (shared or exclusive) after a lookup: remembers a mapping that holds
-	// the whole transfer [entry.vaddr <= vaddr, end].
-	void RememberMapping(const MapEntry& entry, uint64_t vaddr, uint64_t end) {
-		if (end > entry.vaddr + entry.size || !RangeOk(entry.backing_offset, entry.size)) {
-			return;
-		}
-		auto&      cached     = ThreadLookupCache();
-		const auto generation = s_maps_generation.load(std::memory_order_relaxed);
-		if (cached.owner != this || cached.generation != generation) {
-			cached.owner      = this;
-			cached.generation = generation;
-			cached.next       = 0;
-			cached.entries.fill({});
-			cached.slots.fill({});
-		}
-		cached.entries[cached.next++ % cached.entries.size()] = entry;
-		cached.slots[SlotOf(vaddr)]                           = entry;
-	}
 
 	bool FindContainingUnlocked(uint64_t vaddr, uint64_t size, MapEntry* out) const {
 		EXIT_IF(out == nullptr);
