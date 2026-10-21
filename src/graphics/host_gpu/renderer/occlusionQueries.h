@@ -146,6 +146,11 @@ public:
 	void OnUnmap(uint64_t address, uint64_t size);
 	// Whether a dump waits for the GPU before its counters reach guest memory.
 	[[nodiscard]] bool HasPendingDumps() const noexcept { return !m_pending.empty(); }
+	// The tick of the newest pending dump: while it is the tick being recorded, the GPU has not
+	// even been given the dump.
+	[[nodiscard]] uint64_t NewestPendingTick() const noexcept {
+		return m_pending.empty() ? 0 : m_pending.back().tick;
+	}
 
 private:
 	void BeginQuery(const CommandRecorder& recorder);

@@ -649,7 +649,48 @@ void GuestGpu::ExecutionThread() {
 		if (!operation) {
 			m_executed.Notify();
 			unnotified = 0;
-			operation  = operations.Pop();
+			// Work deferred to a GPU tick (readbacks published to guest memory, releases, the
+			// counters of an occlusion dump) otherwise runs when a draw or dispatch comes next.
+			// The guest may be polling what it writes and so submit nothing more (Marvel's
+			// Wolverine, after its logos: the render thread spun on the sixteen ready bits of a
+			// ZPASS_DONE dump for good): while any of it waits, poll instead of sleeping.
+			auto& scheduler = m_renderer.GetCommandScheduler();
+			auto& queries   = m_renderer.GetOcclusionQueries();
+			if (scheduler.HasPendingOperations() || queries.HasPendingDumps()) {
+				const auto begin = std::chrono::steady_clock::now();
+				for (;;) {
+					if (queries.HasPendingDumps()) {
+						// Give the GPU the command buffer holding the dump, then publish the
+						// counters once it finishes it (not at the next dump or flip).
+						if (scheduler.Active() &&
+						    queries.NewestPendingTick() >= scheduler.CurrentTick()) {
+							(KYTY_SUBMIT_REASON(), scheduler.Flush());
+						}
+						queries.PublishCompleted(true);
+					}
+					scheduler.PollPendingOperations();
+					if (m_urgent_pending.load(std::memory_order_relaxed) != 0) {
+						break;
+					}
+					operation = operations.TryPop();
+					if (operation ||
+					    (!scheduler.HasPendingOperations() && !queries.HasPendingDumps())) {
+						break;
+					}
+					// Spin first, then yield the core: the GPU takes milliseconds.
+					if (std::chrono::steady_clock::now() - begin < std::chrono::microseconds(500)) {
+						Common::SpinPause();
+					} else {
+						std::this_thread::sleep_for(std::chrono::microseconds(200));
+					}
+				}
+				if (!operation && m_urgent_pending.load(std::memory_order_relaxed) != 0) {
+					continue;
+				}
+			}
+			if (!operation) {
+				operation = operations.Pop();
+			}
 			if (!operation) {
 				break;
 			}

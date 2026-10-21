@@ -74,6 +74,13 @@ public:
 	void                      Shutdown();
 	void                      Wait(uint64_t tick);
 	void                      PopPendingOperations();
+	// Operations deferred to a tick the GPU has not finished are waiting (cheap, lock-free).
+	[[nodiscard]] bool        HasPendingOperations() const noexcept {
+		return m_pending_front_tick.load(std::memory_order_acquire) != UINT64_MAX;
+	}
+	// PopPendingOperations() for a thread with nothing else to do: asks the GPU timeline every call
+	// instead of every few draws.
+	void                      PollPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
 	// Whether a deferred or priority operation that may write guest memory in
