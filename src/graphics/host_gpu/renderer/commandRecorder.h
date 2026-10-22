@@ -172,6 +172,10 @@ public:
 			                                                   writes);
 			return;
 		}
+		RequireNoNext(writes, count);
+		if (m_scheduler->RecordPushDescriptors(bind_point, layout, set, count, writes)) {
+			return;
+		}
 		const auto* copy = StashWrites(writes, count);
 		m_scheduler->Record([=](vk::CommandBuffer command) {
 			command.pushDescriptorSetKHR(bind_point, layout, set, count, copy);
