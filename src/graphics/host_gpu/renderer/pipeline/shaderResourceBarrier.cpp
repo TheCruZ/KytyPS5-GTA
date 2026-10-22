@@ -92,6 +92,9 @@ vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer) {
 bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 	EXIT_IF(!runtime);
 	const auto& program   = *runtime.program;
+	if (!program.has_written_buffers) {
+		return false;
+	}
 	const auto& resources = *runtime.resources;
 	EXIT_IF(resources.buffers.size() != program.info.buffers.size());
 	// Address writes reach memory outside the bound buffer descriptors.

@@ -851,6 +851,9 @@ struct CompiledShaderInfo {
 	uint32_t                      scratch_dwords      = 0;
 	uint32_t                      param_export_mask   = 0;
 	bool                          has_address_writes  = false;
+	// Some info.buffers entry is written: the renderer asks per draw and stage, and shaders that
+	// write no buffer (most of them) then skip the walk over the buffer list.
+	bool                          has_written_buffers = false;
 	ShaderInfo                    info;
 	Bindings                      bindings;
 	// For each flat SRT slot, the written info.buffers that a store or atomic of the shader

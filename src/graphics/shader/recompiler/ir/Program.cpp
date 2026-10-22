@@ -3,6 +3,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <xbyak/xbyak.h>
@@ -159,6 +160,8 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 	    .srt_reads_after_buffer_writes = std::move(srt_reads_after_writes),
 	    .raw_reads_after_buffer_writes = std::move(raw_reads_after_writes),
 	};
+	result.has_written_buffers = std::ranges::any_of(
+	    result.info.buffers, [](const auto& buffer) { return buffer.written; });
 	for (const auto& output: result.info.outputs) {
 		if (output.kind == StageOutputKind::Parameter && output.index < 32) {
 			result.param_export_mask |= 1u << output.index;

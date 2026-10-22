@@ -1186,6 +1186,7 @@ void TestNativeShaderResourceDependencies() {
       .user_data_base = program.user_data_base,
       .user_data_count = program.user_data_count,
       .scratch_dwords = program.scratch_dwords,
+      .has_written_buffers = true,
       .info = program.info,
       .bindings = program.bindings,
   };
