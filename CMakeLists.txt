@@ -247,12 +247,41 @@ if(KYTY_PGO_GENERATE)
 	message(STATUS "PGO: instrumented build (run with KYTY_PGO_FILE=<file.profraw>)")
 elseif(KYTY_PGO_USE)
 	if(NOT EXISTS "${KYTY_PGO_USE}")
-		message(FATAL_ERROR "KYTY_PGO_USE: ${KYTY_PGO_USE} does not exist")
+		# A missing profile never fails the build: it is built without one.
+		message(WARNING "KYTY_PGO_USE: ${KYTY_PGO_USE} does not exist, building without a profile")
+	else()
+		# No warnings for sources without profile data (launcher, tests) or per function; a
+		# function that changed since the profile was recorded is optimized without it.
+		add_compile_options("-fprofile-instr-use=${KYTY_PGO_USE}" -Wno-profile-instr-unprofiled
+		                    -Wno-profile-instr-out-of-date -Wno-backend-plugin)
+		message(STATUS "PGO: optimizing with ${KYTY_PGO_USE}")
 	endif()
-	# No warnings for sources without profile data (launcher, tests) or per function.
-	add_compile_options("-fprofile-instr-use=${KYTY_PGO_USE}" -Wno-profile-instr-unprofiled
-	                    -Wno-profile-instr-out-of-date -Wno-backend-plugin)
-	message(STATUS "PGO: optimizing with ${KYTY_PGO_USE}")
+endif()
+
+# Code generation for the machine class this runs on, both off by default (a release must run on
+# any x86-64 CPU and a clean build with ThinLTO takes about as long again):
+# - KYTY_NATIVE_V3: x86-64-v3 (AVX2, BMI1/2, FMA, LZCNT, MOVBE: Intel since Haswell 2013, AMD since
+#   Excavator/Zen). The emulator does not start on older CPUs.
+# - KYTY_THINLTO: ThinLTO across translation units (clang and clang-cl, with lld).
+option(KYTY_NATIVE_V3 "Compile for x86-64-v3 (AVX2/BMI2/FMA CPUs; clang)" OFF)
+option(KYTY_THINLTO "Optimize across translation units with ThinLTO (clang with lld)" OFF)
+if(KYTY_NATIVE_V3)
+	if(NOT CLANG)
+		message(FATAL_ERROR "KYTY_NATIVE_V3 needs clang or clang-cl")
+	endif()
+	if(KYTY_CLANG_CL)
+		add_compile_options("/clang:-march=x86-64-v3")
+	else()
+		add_compile_options(-march=x86-64-v3)
+	endif()
+	message(STATUS "Code generation: x86-64-v3 (AVX2)")
+endif()
+if(KYTY_THINLTO)
+	if(NOT CLANG)
+		message(FATAL_ERROR "KYTY_THINLTO needs clang or clang-cl")
+	endif()
+	add_compile_options(-flto=thin)
+	message(STATUS "Code generation: ThinLTO")
 endif()
 
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
