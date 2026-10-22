@@ -1520,7 +1520,15 @@ void DbgExit(int) { std::abort(); }
 } // namespace Common
 
 int main() {
-  TestWalkerLoadsBypassSpecializationReader();
+  // These cases check upstream's materialization contract. Frank's GPU-sized buffers
+  // (KYTY_GPU_SIZED_BUFFERS, on by default) bind a conservative record count instead of failing
+  // when a GPU-written count cannot be read clean; keep them off here.
+#ifdef _WIN32
+  _putenv("KYTY_GPU_SIZED_BUFFERS=0");
+#else
+  setenv("KYTY_GPU_SIZED_BUFFERS", "0", 1);
+#endif
+  TestMappedSrtUsesDirectReaderByDefault();
   TestNativeNestedSrtRefresh();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesShareReads();
