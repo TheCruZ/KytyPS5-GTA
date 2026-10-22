@@ -1722,8 +1722,13 @@ ShaderModule PipelineCache::BuildModule(const ProgramKey&                       
 		{
 			std::lock_guard walk_lock(source.walk_mutex);
 			source.prepared_serial = 0;
+			// Once per program, so the wait costs nothing a frame: a condition read left to the
+			// GPU makes the walk take both successors and read the descriptors of paths the
+			// shader never runs, which can fail the first use (the dispatch is skipped for good).
+			ShaderRecompiler::IR::SrtSetConditionsWait(true);
 			ok = ShaderRecompiler::IR::MaterializeResources(source.resource_plan, runtime,
 			                                                source.resources, source.specialization);
+			ShaderRecompiler::IR::SrtSetConditionsWait(false);
 		}
 		if (ok) {
 			return true;
@@ -2063,6 +2068,22 @@ ShaderModule PipelineCache::BuildModule(const ProgramKey&                       
 					Profiler::CommandZone::Annotate("deferred %s %016" PRIx64 ": SRT bytes downloading",
 					                                StageLabel(stage), params.hash);
 					return ShaderProgram {};
+				}
+				if (!materialized && ShaderRecompiler::IR::SrtConditionsNoWait()) {
+					// A condition read left to the GPU makes the walk take both successors, and the
+					// descriptors of a path the shader never runs can fail it. Walk again reading
+					// the conditions exactly (waiting for the GPU) before giving the dispatch up:
+					// the CSs 0x18cee445972cd5de and 0x45d596b956684928 of Marvel's Wolverine,
+					// skipped in the middle of a BVH chain, left the sort that followed to loop
+					// until the device was lost.
+					std::lock_guard walk_lock(entry->second.walk_mutex);
+					t_srt_shader_hash = params.hash;
+					ShaderRecompiler::IR::SrtSetConditionsWait(true);
+					materialized = ShaderRecompiler::IR::MaterializeResources(
+					    entry->second.resource_plan, runtime, entry->second.resources,
+					    entry->second.specialization);
+					ShaderRecompiler::IR::SrtSetConditionsWait(false);
+					t_srt_shader_hash = 0;
 				}
 				if (!materialized) {
 					// A descriptor source that cannot be read right now (memory the guest has

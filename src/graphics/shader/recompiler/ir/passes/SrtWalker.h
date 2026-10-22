@@ -2,7 +2,6 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SRTWALKER_H_
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
-#include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 
 #include <algorithm>
 #include <array>
@@ -15,39 +14,14 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+class Value;
+
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
-using SrtLoadRecorder = void (*)(void* userdata, uint64_t address, uint32_t value);
-
-// Image descriptors at base + first + k * step, k < count, within size bytes that a sampled
-// root selects by GPU-computed byte offset. The host keeps them resident instead of
-// materializing them.
-struct ImageHeapRequest {
-	uint64_t             base  = 0;
-	uint64_t             size  = 0;
-	uint64_t             step  = 0;
-	uint64_t             first = 0;
-	uint64_t             count = 0;
-	const ImageResource* root  = nullptr;
-};
-
-struct ImageHeapView {
-	uint64_t                         slots      = 0; // Device address of one slot per heap dword.
-	uint32_t                         slot_count = 0; // Keys past it select a trailing null slot.
-	std::span<const DescriptorValue> kinds; // One representative descriptor per kind.
-};
-
-class ImageHeapSource {
-public:
-	// False when the host does not keep the table resident.
-	virtual bool Acquire(const ImageHeapRequest& request, ImageHeapView& view) = 0;
-
-protected:
-	~ImageHeapSource() = default;
-};
 
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
 	uint64_t                  shader_base                = 0;
+	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
@@ -86,11 +60,6 @@ struct SrtRuntime {
 	// whose exact record count the shader reads on the GPU.
 	uint32_t (*peek_gpu_dword)(uint64_t address) = nullptr;
 	uint64_t                  indirect_args_address = 0;
-	ImageHeapSource*          image_heap            = nullptr;
-	// A walk ahead of execution: a guest load that faults fails the walk instead of resolving
-	// the fault (GPU-written bytes cannot be downloaded there), and the walk reports every load
-	// above the null page with the value it read.
-	SrtLoadRecorder           record_load           = nullptr;
 };
 
 class SrtReadCapture {
@@ -128,27 +97,9 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
 // Uniform across a compute wave, including values derived from its workgroup ID.
 // This does not imply that the host can evaluate the value.
 bool ValidateWaveUniformValue(const ResourcePlan& program, Value value);
-// Compiles the plan's x86 walker. Without values it walks the plan's resources; otherwise it
-// only evaluates the values, with every block reachable.
-void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values = {});
-// Runs the walker. flat receives the scalar reads of reachable blocks and reads, when non-null,
-// one DWORD range per guest load; read_slots, when non-null, receives for each the flat SRT slot
-// whose scalar load made it, the RawReadSlot() of a load the shader issues itself, or NoSrtSlot.
-// False when a reachable read is unknown.
-bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
-             std::vector<std::pair<uint64_t, uint64_t>>* reads,
-             std::vector<uint32_t>* read_slots = nullptr);
-// Results of the last walk; false when unknown.
-bool WalkedValue(const ResourcePlan& plan, Value value, uint32_t& result);
-bool WalkedDescriptor(const ResourcePlan& plan, uint32_t source, DescriptorValue& result);
-bool WalkedActive(const ResourcePlan& plan, uint32_t source);
-bool WalkedImageActive(const ResourcePlan& plan, uint32_t image);
-// Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
-// The exception handler completes such a load as a zero read.
-uint32_t SrtWalkerLoadLength(uint64_t rip);
-// As SrtWalkerLoadLength, for a fault the walker on this thread must not resolve: a walk ahead
-// of execution, which then fails. Loads below guest memory read zero in any walk.
-uint32_t SrtWalkerAheadLoadLength(uint64_t rip, uint64_t address);
+void CompileSrtWalker(ResourcePlan& program);
+// Uses the strict reader for values that affect shader specialization.
+SrtRuntime CleanRuntime(SrtRuntime runtime);
 
 // True while the walker evaluates a control-flow condition (which blocks, and so which
 // descriptor sources, are active). The renderer's readers then fail a read of GPU-written bytes
@@ -156,6 +107,9 @@ uint32_t SrtWalkerAheadLoadLength(uint64_t rip, uint64_t address);
 // walked. KYTY_SRT_CONDITIONS_WAIT=1 restores waiting.
 bool SrtEvaluatingCondition();
 bool SrtConditionsNoWait();
+// The calling thread reads GPU-written condition bytes exactly (waiting for the GPU) whatever
+// KYTY_SRT_CONDITIONS_WAIT says: a program's first use, which happens once.
+void SrtSetConditionsWait(bool wait);
 // The same for other values the host only uses to narrow what it does (buffer write extents):
 // a failed evaluation falls back to the conservative answer.
 void SrtSetEvaluatingCondition(bool evaluating);
