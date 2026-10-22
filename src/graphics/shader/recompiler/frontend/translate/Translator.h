@@ -4,8 +4,22 @@
 #include "graphics/shader/recompiler/ir/IREmitter.h"
 
 #include <array>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
+
+struct ProbePc {
+	uint64_t hash = 0;
+	uint32_t pc   = 0;
+	// Up to three registers, shown as red, green and blue (one register: grey). v<n> raw bits;
+	// u<n> (VGPR) and s<n> (SGPR, vcc = s106) as unsigned integers scaled by 1/8.
+	uint32_t vgprs[3] = {0, 0, 0};
+	char     kinds[3] = {'v', 'v', 'v'};
+	uint32_t count    = 0;
+};
+// KYTY_PROBE_PC (Translate.cpp).
+const ProbePc& ProbePcSetting();
+constexpr uint32_t ProbeVgpr = 253; // 253..255
 
 class Translator {
 public:
@@ -19,6 +33,12 @@ public:
 	                            uint32_t component_count, const ShaderBufferResource& resource);
 	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
 	                        IR::Block& info);
+	// Diagnostics (KYTY_FORCE_PC): overwrites the first destination dwords of an instruction
+	// with constants after it is translated.
+	void ForceDestination(const Decoder::Instruction& inst, const std::vector<uint32_t>& values);
+	void ForceVectorRegisters(uint32_t first, const std::vector<uint32_t>& values);
+	// Diagnostics (KYTY_PROBE_PC): copies the probed registers to v253..v255.
+	void ProbeCopy(const ProbePc& probe);
 
 private:
 	const Decoder::Operand& SourceAt(const Decoder::Instruction& inst, uint32_t index);
@@ -89,7 +109,10 @@ private:
 	void          IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode32,
 	                           IR::ValueOpcode opcode64 = IR::ValueOpcode::Count);
 	void DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool returns_value);
+	void DS_ADD_U64(const Decoder::Instruction& inst);
 	void FLAT_LOAD(const Decoder::Instruction& inst);
+	void IMAGE_BVH_INTERSECT_RAY(const Decoder::Instruction& inst);
+	void FLAT_APERTURE(const Decoder::Instruction& inst, bool store);
 	void FLAT_STORE(const Decoder::Instruction& inst);
 	void IMAGE_GET_RESINFO(const Decoder::Instruction& inst);
 	void IMAGE_GET_LOD(const Decoder::Instruction& inst);
@@ -260,5 +283,47 @@ private:
 	bool            flush_f32_inputs;
 	bool            graphics_compute;
 };
+
+inline bool& TranslationNonFatalFlag() {
+	static thread_local bool value = false;
+	return value;
+}
+
+inline bool& TranslationUnsupportedFlag() {
+	static thread_local bool value = false;
+	return value;
+}
+
+// Scope the non-fatal mode to a single compile. Left set on the thread it leaks into
+// whatever runs next, which silently disarms every later EXIT on that thread.
+class TranslationNonFatalScope {
+public:
+	explicit TranslationNonFatalScope(bool enabled)
+	    : m_previous(TranslationNonFatalFlag()) {
+		TranslationNonFatalFlag()    = enabled;
+		TranslationUnsupportedFlag() = false;
+	}
+	~TranslationNonFatalScope() {
+		TranslationNonFatalFlag() = m_previous;
+	}
+	TranslationNonFatalScope(const TranslationNonFatalScope&)            = delete;
+	TranslationNonFatalScope& operator=(const TranslationNonFatalScope&) = delete;
+
+private:
+	bool m_previous;
+};
+
+inline void SetTranslationNonFatal(bool enabled) {
+	TranslationNonFatalFlag()    = enabled;
+	TranslationUnsupportedFlag() = false;
+}
+
+inline bool TranslationUnsupported() {
+	return TranslationUnsupportedFlag();
+}
+
+inline bool TranslationNonFatal() {
+	return TranslationNonFatalFlag();
+}
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

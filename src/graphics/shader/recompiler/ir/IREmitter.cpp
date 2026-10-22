@@ -127,6 +127,16 @@ U32 IREmitter::BitCastU32(F32 value) {
 	return U32(Emit(ValueOpcode::BitCastU32F32, {value}));
 }
 
+F16 IREmitter::BitCastF16(U32 value) {
+	const auto half = U16(Emit(ValueOpcode::ConvertU16U32, {value}));
+	return F16(Emit(ValueOpcode::BitCastF16U16, {half}));
+}
+
+U32 IREmitter::BitCastU32(F16 value) {
+	const auto half = U16(Emit(ValueOpcode::BitCastU16F16, {value}));
+	return U32(Emit(ValueOpcode::ConvertU32U16, {half}));
+}
+
 U64 IREmitter::ConstructU64(U32 low, U32 high) {
 	return U64(Emit(ValueOpcode::CompositeConstructU64, {low, high}));
 }

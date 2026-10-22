@@ -541,6 +541,7 @@ enum class Opcode {
 	S_BUFFER_LOAD_DWORDX4,
 	S_BUFFER_LOAD_DWORDX8,
 	S_BUFFER_LOAD_DWORDX16,
+	// SMEM 0x25: no address, writes the 64-bit real-time counter to SDST.
 	S_MEMREALTIME,
 	BUFFER_LOAD_FORMAT_X,
 	BUFFER_LOAD_FORMAT_XY,
@@ -764,9 +765,14 @@ enum class OperandKind {
 	M0,
 	PopsExitingWaveId,
 	SharedBase,
+	SharedLimit,
 	PrivateBase,
+	PrivateLimit,
 	Null,
 	Vgpr,
+	// A special register the recompiler does not model;
+	// DecodeInstruction turns the instruction into UNSUPPORTED, so the shader gives up.
+	Unsupported,
 };
 
 enum ImageSampleFlag : uint32_t {

@@ -17,6 +17,8 @@
 namespace Libs::Graphics::ShaderRecompiler {
 
 struct CompileOptions {
+	bool                        non_fatal = false;
+	bool                        bindless_images = false;
 	ShaderType                  stage           = ShaderType::Compute;
 	uint32_t                    wave_size       = 64;
 	uint32_t                    user_data_base  = 0;
@@ -25,6 +27,7 @@ struct CompileOptions {
 	bool                        early_dump                 = false;
 	bool                        emit_debug_info            = false;
 	const Spirv::Profile*       profile                    = &Spirv::DefaultProfile;
+	bool                        robust_buffer_access2      = false;
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
@@ -32,9 +35,13 @@ struct CompileOptions {
 };
 
 struct TranslateResult {
+	bool        unsupported = false;
 	IR::Program program;
 	std::string decoded_dump;
 	std::string cfg_dump;
+	// The workarounds the translation applied (Common::HackNotice::TakeTranslationHacks): the
+	// shader disk cache keeps them with the translation.
+	std::string hacks;
 };
 
 struct CompileResult {
@@ -42,6 +49,8 @@ struct CompileResult {
 	std::string            decoded_dump;
 	std::string            ir_dump;
 	IR::Program            program;
+	// The workarounds the SPIR-V emission applied; see TranslateResult::hacks.
+	std::string            hacks;
 };
 
 // Decoded source and typed scalar call queries are retained once per cache source.

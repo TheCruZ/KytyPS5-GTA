@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
@@ -176,6 +177,7 @@ void AddBuiltinInput(ShaderInfo& info, StageInputKind kind) {
 			AddInput(info, kind, 0, 3, "gl_GlobalInvocationID");
 			break;
 		case StageInputKind::PackedAncillary:
+		case StageInputKind::DispatchThreadCount:
 		case StageInputKind::Parameter: break;
 	}
 }
@@ -466,6 +468,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				case StageInputKind::WorkgroupId:
 				case StageInputKind::LocalInvocationId:
 				case StageInputKind::GlobalInvocationId:
+				case StageInputKind::DispatchThreadCount:
 					if (component >= 3u) {
 						return Fail("typed invocation builtin component is out of range");
 					}
@@ -592,8 +595,18 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	const auto uses_mapping = [](const auto& resource) {
 		return resource.indirect_root != UINT32_MAX;
 	};
-	info.uses_flattened_srt |= std::ranges::any_of(info.buffers, uses_mapping) ||
-	                           std::ranges::any_of(info.images, uses_mapping);
+	// Bindless images and samplers read the flat SRT for their translation-table region, GPU-sized
+	// buffers for their record counts, and KYTY_SRT_VERIFY for the pairs to check.
+	info.uses_flattened_srt |=
+	    std::ranges::any_of(info.buffers, uses_mapping) ||
+	    std::ranges::any_of(info.images, [&](const ImageResource& image) {
+		    return uses_mapping(image) || image.bindless;
+	    }) ||
+	    std::ranges::any_of(info.samplers, &SamplerResource::bindless) ||
+	    std::ranges::any_of(info.buffers, [](const BufferResource& buffer) {
+		    return buffer.gpu_records_flat != BufferResource::NoGpuRecords;
+	    }) ||
+	    (SrtVerifyEnabled() && program.stage == ShaderType::Compute && !program.srt_reads.empty());
 	switch (program.stage) {
 		case ShaderType::Vertex:
 		case ShaderType::Local: CollectVertexInputs(input_info.vertex, info, inputs.components); break;

@@ -2,6 +2,7 @@
 
 #include "common/abi.h"
 #include "common/assert.h"
+#include "common/hackNotice.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <xbyak/xbyak.h>
@@ -9,6 +10,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <unordered_map>
@@ -46,6 +48,9 @@ bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<ui
 }
 
 SrtRuntime CleanRuntime(SrtRuntime runtime) {
+	if (runtime.read_specialization_memory == nullptr) {
+		runtime.map_clean_page = nullptr;
+	}
 	runtime.read_memory = runtime.read_specialization_memory != nullptr
 	                          ? runtime.read_specialization_memory
 	                          : +[](void*, uint64_t, std::span<uint32_t>) { return false; };
@@ -75,6 +80,41 @@ bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 	result = base + magnitude;
 	return true;
 }
+
+// LoadAddressU32 / ReadConstBuffer after its operands (EvaluateRawRead's address computation):
+// Read with the address to read, Zero for a constant buffer read past the end (reads zero), or
+// Fail.
+enum class RawAddress : uint8_t { Fail, Read, Zero };
+RawAddress ComputeRawAddress(bool const_buffer, int64_t immediate, uint64_t low, uint64_t high,
+                             uint64_t offset, uint64_t records, uint64_t& base, uint64_t& address) {
+	// A raw scalar address and a constant buffer's base are 48 bits.
+	base = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
+	if (const_buffer) {
+		if (immediate < 0) {
+			return RawAddress::Fail;
+		}
+		const auto byte_offset = (static_cast<uint64_t>(immediate) & ~uint64_t {3}) +
+		                         (static_cast<uint32_t>(offset) & ~3u);
+		const auto stride = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
+		const auto size   = stride == 0u
+		                        ? static_cast<uint64_t>(static_cast<uint32_t>(records))
+		                        : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
+		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
+			// A scalar buffer read past the end returns zero,
+			// as the shader's own load does (EmitReadConstBuffer). Failing skipped the draw.
+			return RawAddress::Zero;
+		}
+		address = (base & ~uint64_t {3}) + byte_offset;
+		return RawAddress::Read;
+	}
+	const auto relative =
+	    (immediate & ~int64_t {3}) + static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
+	return AddSignedAddress(base & ~uint64_t {3}, relative, address) ? RawAddress::Read
+	                                                                  : RawAddress::Fail;
+}
+
+thread_local bool     t_evaluating_condition = false;
+thread_local uint64_t t_condition_refusals   = 0;
 
 bool IsRawRead(const ResourcePlan& values, const Inst& inst) {
 	const auto op = inst.GetOpcode();
@@ -369,6 +409,30 @@ private:
 
 } // namespace
 
+bool SrtEvaluatingCondition() {
+	return t_evaluating_condition;
+}
+
+void SrtSetEvaluatingCondition(bool evaluating) {
+	t_evaluating_condition = evaluating;
+}
+
+uint64_t SrtConditionRefusals() {
+	return t_condition_refusals;
+}
+
+void SrtNoteConditionRefusal() {
+	t_condition_refusals++;
+}
+
+bool SrtConditionsNoWait() {
+	static const bool no_wait = [] {
+		const char* value = std::getenv("KYTY_SRT_CONDITIONS_WAIT");
+		return value == nullptr || value[0] != '1';
+	}();
+	return no_wait;
+}
+
 void CompileSrtWalker(ResourcePlan& program) {
 	if (!program.resource_tracking_complete || !program.srt_plan_complete ||
 	    program.capture_specialization_reads || !program.control_flow.empty() ||
@@ -659,8 +723,8 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		return false;
 	}
 	const auto& mem    = m_program.memory_info[flags.index];
-	const bool vector = inst.GetOpcode() == ValueOpcode::LoadBufferU32;
-	const auto guard = vector ? inst.Arg(4).Resolve() : Value {};
+	const bool  vector = inst.GetOpcode() == ValueOpcode::LoadBufferU32;
+	const auto  guard  = vector ? inst.Arg(4).Resolve() : Value {};
 	if (vector && (guard.IsImmediate() || guard != m_active_mask)) {
 		uint64_t enabled = 0;
 		if (!Arg(inst, 4, enabled)) return false;
@@ -679,53 +743,122 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	if (!Arg(*handle, 0, low) || !Arg(*handle, 1, high) || !Arg(inst, 1, offset)) {
 		return false;
 	}
-	const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
-	const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
-	uint64_t   address   = 0;
-	if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer || vector) {
-		uint64_t records = 0;
-		uint64_t word3   = 0;
+	const bool const_buffer = inst.GetOpcode() == ValueOpcode::ReadConstBuffer;
+	const auto immediate    = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
+	uint64_t   records      = 0;
+	uint64_t   word3        = 0;
+	if (const_buffer || vector) {
 		if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
 			return false;
 		}
+	}
+	if (vector) {
+		// Only the uniform, unswizzled structured DWORD address is evaluated on the host, through
+		// the strict (specialization) reader.
 		if (immediate < 0) {
 			return false;
 		}
+		const auto base = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
 		const auto byte_offset =
 		    (static_cast<uint64_t>(immediate) & ~uint64_t {3}) + (static_cast<uint32_t>(offset) & ~3u);
-		const auto stride  = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
-		if (vector) {
-			// Only the uniform, unswizzled structured DWORD address is evaluated on the host.
-			if ((high & (1u << 31u)) != 0u || (word3 & ((1u << 23u) | 0xf0000000u)) != 0u)
-				return false;
-			if (stride == 0u || records == 0u || ((word3 >> 12u) & 0x7fu) == 0u) {
-				result = 0u;
-				return true;
-			}
-		}
-		const auto size = stride == 0u
-		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
-		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
-		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
+		const auto stride = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
+		if ((high & (1u << 31u)) != 0u || (word3 & ((1u << 23u) | 0xf0000000u)) != 0u)
+			return false;
+		if (stride == 0u || records == 0u || ((word3 >> 12u) & 0x7fu) == 0u) {
 			result = 0u;
 			return true;
 		}
-		address = (base & ~uint64_t {3}) + byte_offset;
-	} else {
-		const auto relative = (immediate & ~int64_t {3}) +
-		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
-		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
+		const auto size = static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
+		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
+			result = 0;
+			return true;
+		}
+		const auto address = (base & ~uint64_t {3}) + byte_offset;
+		uint32_t   word    = 0;
+		if (m_runtime.read_specialization_memory == nullptr) {
 			return false;
 		}
+		if (!m_runtime.read_specialization_memory(m_runtime.userdata, address, {&word, 1})) {
+			if (base == 0 && m_program.control_flow.empty()) {
+				Common::HackNotice::Report("failed SRT read through a null base read as zero",
+				                           "SrtWalker::EvaluateRawRead (vector)", m_program.shader_hash,
+				                           0, "a plan without control flow cannot tell a guarded read");
+				result = 0;
+				return true;
+			}
+			m_read_failure         = "guest memory unreadable";
+			m_read_failure_address = address;
+			m_read_failure_offset  = 0;
+			m_read_failure_size    = 0;
+			return false;
+		}
+		result = word;
+		return true;
+	}
+	uint64_t base    = 0;
+	uint64_t address = 0;
+	switch (ComputeRawAddress(const_buffer, immediate, low, high, offset, records, base, address)) {
+		case RawAddress::Fail: return false;
+		case RawAddress::Zero: result = 0; return true;
+		case RawAddress::Read: break;
+	}
+	m_reading_inst = &inst;
+	const bool ok  = ReadRawWord(address, base, result);
+	m_reading_inst = nullptr;
+	return ok;
+}
+
+bool SrtWalker::ReadRawWord(uint64_t address, uint64_t base, uint64_t& result) {
+	if (m_fill_active && (m_fill_any || m_reading_inst == m_fill_inst) &&
+	    m_runtime.gpu_written(address, sizeof(uint32_t))) {
+		// Only the shader uses this slot: the GPU copies the bytes into the flat buffer before
+		// the command (SrtGpuFill), where reading them here would wait for the GPU.
+		m_runtime.gpu_fills->push_back({m_fill_offset, address});
+		result = 0;
+		return true;
 	}
 	uint32_t word = 0;
-	const auto reader = vector ? m_runtime.read_specialization_memory : m_runtime.read_memory;
-	if (reader != nullptr) {
-		if (!reader(m_runtime.userdata, address, {&word, 1})) {
+	if (m_runtime.map_clean_page != nullptr) {
+		// The reader's own first step (a GPU-clean page is read from its backing), without the
+		// callback chain and its page search for every dword. Raw reads are dword aligned.
+		const auto page = address >> m_runtime.page_shift;
+		if (page != m_mapped_page) {
+			m_mapped_page  = page;
+			m_mapped_bytes = m_runtime.map_clean_page(m_runtime.page_userdata,
+			                                          page << m_runtime.page_shift);
+		}
+		if (m_mapped_bytes != nullptr && (address & 3u) == 0u) {
+			std::memcpy(&word,
+			            m_mapped_bytes + (address & ((uint64_t {1} << m_runtime.page_shift) - 1u)),
+			            sizeof(word));
+			if (m_runtime.capture_ranges != nullptr) {
+				m_runtime.capture_ranges->emplace_back(address, sizeof(word));
+			}
+			result = word;
+			return true;
+		}
+	}
+	if (m_runtime.read_memory != nullptr) {
+		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
+			// A plan without control flow cannot tell a guarded read from an active one: a
+			// failed read through a null base there reads zero (CS 0x0b4b91abfed42248 tests
+			// s[4:5] against zero before its s_load; failing skipped its dispatch every frame).
+			// With control flow, the reachability walk skips guarded reads and a null read in a
+			// reachable block fails (ResourceTrackingTests, guarded scalar descriptor reads).
+			if (base == 0 && m_program.control_flow.empty()) {
+				Common::HackNotice::Report("failed SRT read through a null base read as zero",
+				                           "SrtWalker::ReadRawWord", m_program.shader_hash, 0,
+				                           "a plan without control flow cannot tell a guarded read");
+				result = 0;
+				return true;
+			}
+			m_read_failure         = "guest memory unreadable";
+			m_read_failure_address = address;
+			m_read_failure_offset  = 0;
+			m_read_failure_size    = 0;
 			return false;
 		}
 	} else {
-		if (vector) return false;
 		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 	}
 	result = word;
@@ -1157,7 +1290,40 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr))
 			return false;
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
-		return read.flat_offset < flat.size() && evaluator.Evaluate(read.value, flat[read.flat_offset]);
+		if (read.flat_offset >= flat.size()) return false;
+		if (!clean && slot < m_program.gpu_fill_slots.size() && m_program.gpu_fill_slots[slot] != 0u &&
+		    m_runtime.gpu_written != nullptr && m_runtime.gpu_fills != nullptr) {
+			// ReadRawWord leaves GPU-written bytes to the GPU (SrtGpuFill) instead of waiting for it.
+			m_fill_active = true;
+			m_fill_offset = read.flat_offset;
+			m_fill_any    = m_program.gpu_fill_slots[slot] == 1u;
+			m_fill_inst   = inst;
+			const auto fills_before = m_runtime.gpu_fills->size();
+			bool       ok           = false;
+			if (!m_fill_any && m_fill_inst != nullptr &&
+			    (m_fill_inst->GetOpcode() == ValueOpcode::LoadAddressU32 ||
+			     m_fill_inst->GetOpcode() == ValueOpcode::ReadConstBuffer)) {
+				// Its own read: the reads that make its address are done on the host.
+				uint64_t wide = 0;
+				ok            = EvaluateRawRead(*m_fill_inst, wide);
+				flat[read.flat_offset] = static_cast<uint32_t>(wide);
+			} else {
+				ok = Evaluate(read.value, flat[read.flat_offset]);
+			}
+			m_fill_active = false;
+			m_fill_any    = true;
+			if (m_runtime.gpu_fills->size() != fills_before && m_fill_inst != nullptr) {
+				// The read left a placeholder (0) for the GPU to fill: forget it, so a host use of the
+				// same value in this walk (a branch condition) reads it again instead of taking 0.
+				const auto index = m_fill_inst->EvaluationIndex(m_program.evaluation_value_count);
+				if (index < m_context.values.size()) {
+					m_context.values[index].generation = 0;
+				}
+			}
+			m_fill_inst = nullptr;
+			return ok;
+		}
+		return evaluator.Evaluate(read.value, flat[read.flat_offset]);
 	};
 	auto& active = m_program.active_sources;
 	if (m_program.control_flow.empty()) {
@@ -1190,9 +1356,16 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			const auto& block = m_program.control_flow[index];
 			uint32_t condition = 0;
 			auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+			// A condition whose bytes the GPU wrote is "not known" instead of a wait for the GPU:
+			// both successors are walked.
+			bool known = false;
 			if (!block.condition.IsEmpty() &&
-			    (m_runtime.read_specialization_memory != nullptr || !m_program.capture_specialization_reads) &&
-			    predicate.Evaluate(block.condition, condition)) {
+			    (m_runtime.read_specialization_memory != nullptr || !m_program.capture_specialization_reads)) {
+				t_evaluating_condition = true;
+				known                  = predicate.Evaluate(block.condition, condition);
+				t_evaluating_condition = false;
+			}
+			if (known) {
 				pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
 			} else {
 				pending.insert(pending.end(), block.successors.begin(), block.successors.end());
@@ -1227,6 +1400,5 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValue
 bool ValidateWaveUniformValue(const ResourcePlan& program, Value value) {
 	return RuntimeValidator(program, RuntimeValueType::Any, true).Run(value);
 }
-
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
