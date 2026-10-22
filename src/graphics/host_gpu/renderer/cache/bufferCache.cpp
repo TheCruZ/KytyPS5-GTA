@@ -497,10 +497,15 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
 	                     "BDA Page Table Buffer");
+	// Cleared in a command buffer of its own, submitted and waited for at once: left open it was
+	// the first command of the guest GPU too and ran after the host copy queue had written
+	// page-table entries, which it then cleared (Wolverine stalled on its title screen).
 	m_scheduler.BeginCommand();
 	for (auto* buffer: {&m_bda_pagetable_buffer, m_fault_manager.GetFaultBuffer()}) {
 		buffer->Fill(0, buffer->Size(), 0);
 	}
+	const auto clear_tick = m_scheduler.Submit();
+	EXIT_IF(!m_scheduler.WaitFor(clear_tick, 10ull * 1000000000ull));
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
