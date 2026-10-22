@@ -545,6 +545,8 @@ void TestSharedIntegerRuntimeDependencies() {
         "shared integer dependencies hid a floating-point sibling");
 }
 
+// Past num_records a scalar buffer read returns zero without touching memory; the offset
+// components neither misalign nor wrap.
 void TestConstantBufferBounds() {
   struct Case {
     uint32_t offset;
