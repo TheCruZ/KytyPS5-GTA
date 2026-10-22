@@ -2726,7 +2726,12 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	uc_check(ucfg);
 
-	hw_check(buffer);
+	// A pure check of the context registers: once per register snapshot.
+	if (m_context_id == 0 || m_context_id != m_checked_context_id ||
+	    graphics_debug_dump_enabled()) {
+		hw_check(buffer);
+		m_checked_context_id = m_context_id;
+	}
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, topology)) {
@@ -2927,7 +2932,12 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	uc_check(ucfg);
 
-	hw_check(buffer);
+	// A pure check of the context registers: once per register snapshot.
+	if (m_context_id == 0 || m_context_id != m_checked_context_id ||
+	    graphics_debug_dump_enabled()) {
+		hw_check(buffer);
+		m_checked_context_id = m_context_id;
+	}
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto,
 	                         args.vertex_count, args.instance_count, args.first_instance};

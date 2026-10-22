@@ -609,6 +609,8 @@ private:
 	std::vector<uint8_t>                               m_table_flags;
 	uint64_t                              m_draw_window           = 0;
 	uint64_t                              m_context_id            = 0;
+	// The context snapshot whose registers hw_check() last accepted.
+	uint64_t                              m_checked_context_id    = 0;
 	// Resolutions ahead of execution; see ResolveDrawAhead().
 	std::unique_ptr<ResolvedDrawRing, void (*)(ResolvedDrawRing*)> m_resolved_ring {nullptr,
 	                                                                                nullptr};
