@@ -2969,13 +2969,26 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 	}
 }
 
-void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
-                                     PreparedBindings& prepared) {
-	KYTY_PROFILER_FUNCTION();
-	EXIT_IF(!runtime);
+// Whether a PrepareBindings diagnostic is on (read once).
+static bool PrepareBindingDiagnosticsEnabled() {
+	static const bool enabled = [] {
+		for (const char* name: {"KYTY_WATCH_SHADER", "KYTY_TRACE_WRITERS", "KYTY_TRACE_ORDER_FRAME",
+		                        "KYTY_TRACE_ORDER_HASH", "KYTY_TRACE_COPY", "KYTY_KEY_CAPTURE",
+		                        "KYTY_TRACE_READERS"}) {
+			if (std::getenv(name) != nullptr) {
+				return true;
+			}
+		}
+		return false;
+	}();
+	return enabled;
+}
+
+// Diagnostics of PrepareBindings (KYTY_WATCH_SHADER, KYTY_TRACE_*, KYTY_KEY_CAPTURE...), kept out of
+// the per-draw path: PrepareBindingDiagnosticsEnabled() says whether any of them is on.
+void RenderExecutor::PrepareBindingDiagnostics(const ShaderStageRuntime& runtime) {
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
-	const DiagShaderScope diag_shader_scope(program.shader_hash);
 	// Diagnostics: KYTY_WATCH_SHADER=<hash> logs the buffer and texture descriptors a shader is
 	// bound with (first few uses; KYTY_WATCH_SHADER_EVERY=<n> adds every n-th use, up to 8 more).
 	const uint64_t        watch_shader = WatchedShaderHash();
@@ -3387,6 +3400,18 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 				}
 			}
 		}
+	}
+}
+
+void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
+                                     PreparedBindings& prepared) {
+	KYTY_PROFILER_FUNCTION();
+	EXIT_IF(!runtime);
+	const auto& program  = *runtime.program;
+	const auto& snapshot = *runtime.resources;
+	const DiagShaderScope diag_shader_scope(program.shader_hash);
+	if (PrepareBindingDiagnosticsEnabled()) {
+		PrepareBindingDiagnostics(runtime);
 	}
 	prepared.runtime = &runtime;
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};

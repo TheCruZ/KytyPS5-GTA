@@ -268,6 +268,7 @@ public:
 	                      uint32_t mode, bool async_compute);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
+	void PrepareBindingDiagnostics(const ShaderStageRuntime& runtime);
 	// Bindless heaps: register the draw's heaps, patch their regions, and once per frame resolve
 	// the keys shaders flagged as pending.
 	void PrepareBindlessHeaps(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
