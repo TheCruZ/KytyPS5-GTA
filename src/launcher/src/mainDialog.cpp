@@ -22,6 +22,7 @@
 #include <QObject>
 #include <QPointer>
 #include <QProcess>
+#include <QPushButton>
 #include <QRadioButton>
 #include <QRegularExpression>
 #include <QSettings>
@@ -266,7 +267,6 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	AddFlag(args, info.fullscreen_enabled, "--fullscreen");
 	AddFlag(args, info.hdr_enabled, "--hdr");
 	AddFlag(args, info.hide_cursor_enabled, "--hide-cursor");
-	AddFlag(args, info.readback_linear_images, "--readback-linear-images");
 	AddFlag(args, !info.readback_linear_images, "--no-readback-linear-images");
 	AddFlag(args, info.readback_tiled_images, "--readback-tiled-images");
 	AddFlag(args, info.sync_raw_image_buffers, "--sync-raw-image-buffers");
@@ -275,11 +275,14 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	AddFlag(args, info.perf_overlay_enabled, "--perf-overlay");
 	AddFlag(args, info.skip_notice_screen, "--skip-notice-screen");
 	AddFlag(args, info.network_connected, "--network-connected");
-	args << (info.tessellation_enabled ? "--tessellation" : "--no-tessellation");
+	AddFlag(args, !info.tessellation_enabled, "--no-tessellation");
 	AddFlag(args, info.bindless_images_enabled, "--bindless");
 	if (!info.skip_shader_hashes.isEmpty()) {
 		args << "--skip-shaders" << info.skip_shader_hashes;
 	}
+	AddFlag(args, !info.occlusion_queries_enabled, "--no-occlusion-queries");
+	AddFlag(args, info.shader_cache_enabled, "--shader-cache");
+	AddFlag(args, !info.async_pipelines_enabled, "--no-async-pipelines");
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
 	AddFlag(args, info.vulkan_validation_enabled, "--vulkan-validation");
@@ -294,7 +297,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	AddFlag(args, info.profiler_enabled, "--profile");
 	AddFlag(args, info.amd_cpu_enabled, "--amd-cpu");
 #if defined(_WIN32)
-	args << (info.red_zone_protection_enabled ? "--redzone" : "--no-redzone");
+	AddFlag(args, !info.red_zone_protection_enabled, "--no-redzone");
 #endif
 	for (const auto& binding: info.host_input_mapping) {
 		args << "--keymap" << binding;
@@ -501,12 +504,72 @@ void MainDialogPrivate::ReadSettings(QSettings& s) {
 	s.endGroup();
 }
 
+// GTA V (PPSA04263, PPSA04264) needs these settings: without red zone protection its streaming
+// thread crashes, without linear image readback cars deform wildly in collisions, without
+// tiled image readback boats and jet skis do not ride the waves, and without tessellation the
+// trunks of nearby trees are not drawn. Offers to launch with them when the
+// configuration turns any of them off. Returns false to cancel the launch.
+static bool ApplyRecommendedSettings(QWidget* parent, Configuration* info) {
+	if (info->title_id != QStringLiteral("PPSA04263") &&
+	    info->title_id != QStringLiteral("PPSA04264")) {
+		return true;
+	}
+	QStringList missing;
+#if defined(_WIN32)
+	if (!info->red_zone_protection_enabled) {
+		missing << QObject::tr("Windows SysV red zone crash protection (streaming crashes)");
+	}
+#endif
+	if (!info->readback_linear_images) {
+		missing << QObject::tr("Read back linear images (vehicle damage)");
+	}
+	if (!info->readback_tiled_images) {
+		missing << QObject::tr("Read back small tiled images (water level for boats and jet skis)");
+	}
+	if (!info->tessellation_enabled) {
+		missing << QObject::tr("Tessellation support (trunks of nearby trees)");
+	}
+	if (!info->shader_cache_enabled) {
+		missing << QObject::tr("Cache shaders (shader and pipeline compilation stutter)");
+	}
+	if (missing.isEmpty()) {
+		return true;
+	}
+	QMessageBox box(QMessageBox::Warning, QObject::tr("Recommended settings"),
+	                QObject::tr("Grand Theft Auto V needs these settings, which are off in this "
+	                            "configuration:\n\n- %1\n\nLaunch with them turned on?")
+	                    .arg(missing.join(QStringLiteral("\n- "))),
+	                QMessageBox::NoButton, parent);
+	auto* recommended = box.addButton(QObject::tr("Launch with recommended settings"),
+	                                  QMessageBox::AcceptRole);
+	auto* as_is = box.addButton(QObject::tr("Launch as configured"), QMessageBox::DestructiveRole);
+	box.addButton(QMessageBox::Cancel);
+	box.setDefaultButton(recommended);
+	box.exec();
+	if (box.clickedButton() == recommended) {
+#if defined(_WIN32)
+		info->red_zone_protection_enabled = true;
+#endif
+		info->readback_linear_images = true;
+		info->readback_tiled_images  = true;
+		info->tessellation_enabled   = true;
+		info->shader_cache_enabled   = true;
+		return true;
+	}
+	return box.clickedButton() == as_is;
+}
+
 void MainDialogPrivate::Run() {
 	if (m_update_checker->IsInstalling()) {
 		return;
 	}
 	QPointer<ConfigurationItem> item = m_ui->widget->GetSelectedItem();
 	if (item == nullptr) {
+		return;
+	}
+
+	auto info = m_ui->widget->CreateConfiguration(*item);
+	if (!ApplyRecommendedSettings(m_main_dialog, info.get())) {
 		return;
 	}
 
@@ -527,7 +590,6 @@ void MainDialogPrivate::Run() {
 			        Update();
 		        }
 	        });
-	auto info = m_ui->widget->CreateConfiguration(*item);
 	m_main_dialog->RunInterpreter(process, *info, g_close_terminal);
 
 	Update();
