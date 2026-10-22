@@ -2868,13 +2868,13 @@ static bool MaterializeWith(const ResourcePlan& program, const SrtRuntime& runti
 						if (d == 2u) {
 							const auto refusals = SrtConditionRefusals();
 							SrtSetEvaluatingCondition(true);
-							sized = !walker_ref.Evaluate(src.dwords[2], value.dwords[2]);
+							sized = !walker_ref.EvaluateDescriptorDword(base.source, 2u, value.dwords[2]);
 							SrtSetEvaluatingCondition(false);
 							sized = sized || SrtConditionRefusals() != refusals ||
 							        DependsOnGpuFill(program, src.dwords[2], snapshot.gpu_fills);
 							continue;
 						}
-						ok = walker_ref.Evaluate(src.dwords[d], value.dwords[d]);
+						ok = walker_ref.EvaluateDescriptorDword(base.source, d, value.dwords[d]);
 					}
 					if (ok && sized && GpuSizedDynamicEnabled()) {
 						// The count must be one flat slot read as it is, so the shader can read
@@ -2972,7 +2972,7 @@ static bool MaterializeWith(const ResourcePlan& program, const SrtRuntime& runti
 						}
 						if (gpu_records_flat == BufferResource::NoGpuRecords && !gpu_records_ssa &&
 						    base.written) {
-							ok    = walker_ref.Evaluate(src.dwords[2], value.dwords[2]);
+							ok    = walker_ref.EvaluateDescriptorDword(base.source, 2u, value.dwords[2]);
 							sized = false;
 						}
 					}
