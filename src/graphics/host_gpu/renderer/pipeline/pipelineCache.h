@@ -168,7 +168,24 @@ struct PipelineVertexInputState {
 	uint8_t                                               binding_count   = 0;
 	uint8_t                                               attribute_count = 0;
 
-	bool operator==(const PipelineVertexInputState&) const = default;
+	// Only the used entries count (the others are zero in every key), and consecutive draws mostly
+	// repeat a handful of them: the defaulted comparison walked all sixty-four.
+	bool operator==(const PipelineVertexInputState& other) const {
+		if (binding_count != other.binding_count || attribute_count != other.attribute_count) {
+			return false;
+		}
+		for (uint32_t i = 0; i < binding_count; i++) {
+			if (!(bindings[i] == other.bindings[i])) {
+				return false;
+			}
+		}
+		for (uint32_t i = 0; i < attribute_count; i++) {
+			if (!(attributes[i] == other.attributes[i])) {
+				return false;
+			}
+		}
+		return true;
+	}
 };
 
 struct ShaderProgram {
