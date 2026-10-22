@@ -1,0 +1,39 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+// DRAW_INDIRECT of a fast-launch mesh draw: one task group per guest vertex, one row per
+// instance. The guest's counts become the mesh-tasks command here, on the GPU, instead of the
+// command processor reading them (which drained the GPU for each draw). Counts the device cannot
+// run (guest memory not written yet, or stale) draw nothing instead of losing the device.
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer DrawArgs {
+    uint words[2]; // vertex count, instance count
+};
+
+layout(std430, binding = 0) writeonly buffer Commands {
+    uint commands[];
+};
+
+layout(push_constant) uniform Push {
+    uvec2 args_address;
+    uint  output_dword;
+    uint  max_x;
+    uint  max_y;
+    uint  max_total;
+} pc;
+
+void main() {
+    DrawArgs args = DrawArgs(pc.args_address);
+    uint x = args.words[0];
+    uint y = args.words[1];
+    if (x > pc.max_x || y > pc.max_y || (x != 0u && y > pc.max_total / x)) {
+        x = 0u;
+        y = 0u;
+    }
+    commands[pc.output_dword + 0u] = x;
+    commands[pc.output_dword + 1u] = y;
+    commands[pc.output_dword + 2u] = 1u;
+}

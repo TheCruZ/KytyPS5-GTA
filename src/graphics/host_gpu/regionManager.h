@@ -5,7 +5,11 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
+#include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <memory>
 #include <mutex>
 #include <utility>
 
@@ -79,6 +83,60 @@ private:
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);
 
+// Bumped whenever pages become CPU-dirty anywhere (a write fault, an untrack, an
+// invalidation). A consumer that must see every CPU write, such as the pre-dispatch sync of
+// all buffers for global-memory shaders, can skip its walk while this has not moved.
+inline std::atomic<uint64_t> g_cpu_dirty_epoch {1};
+
+// Bumped whenever pages stop being GPU-dirty anywhere (a download, a release of pages the GPU
+// write bitmap shows unwritten). With g_cpu_dirty_epoch, an unchanged pair means no page changed
+// state in a way a repeated identical sync would act on (BufferCache::SynchronizeBuffer).
+inline std::atomic<uint64_t> g_gpu_clean_epoch {1};
+
+// Bumped by the GPU thread when it starts a guest submission (its first slice).
+inline std::atomic<uint64_t> g_guest_submission_seq {1};
+
+// Hot pages (KYTY_HOT_PAGES=1). A page the CPU writes again and again (a ring of per-frame
+// constants, say) used to cost a write fault on the game thread and two protection changes per
+// write: in the jungle ~120,000 faults a second over the same ~40,000 pages. A page that faults
+// KYTY_HOT_PAGE_FAULTS times (default 6) within 2 s turns hot: it stays CPU-dirty and writable,
+// so the CPU writes it without faults, and a sync uploads it like any CPU-dirty page, at most once
+// per hot generation. The GPU thread bumps the generation whenever the game may have written
+// since without the command stream noticing: when a submission starts (the game submitted after
+// writing) and when the command stream reads a label the CPU wrote (a wait or a conditional on a
+// CPU-dirty page), and at predication. Within a generation the commands read the bytes as they were at its start, as a
+// game that writes only before submitting or before setting a label the GPU waits on expects.
+// A page the GPU is about to write stops being hot (its CPU copy was just uploaded); every page
+// stops being hot every 60 s and turns hot again only if it still faults.
+inline bool HotPagesEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_HOT_PAGES");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+inline uint32_t HotPageFaults() {
+	static const uint32_t faults = [] {
+		const char* value = std::getenv("KYTY_HOT_PAGE_FAULTS");
+		const auto  n     = value != nullptr ? std::strtoul(value, nullptr, 10) : 6ul;
+		return static_cast<uint32_t>(n < 2 ? 2 : n > 200 ? 200 : n);
+	}();
+	return faults;
+}
+inline std::atomic<uint32_t> g_hot_generation {1};
+inline std::atomic<uint32_t> g_hot_epoch {1};
+struct HotPageStats {
+	std::atomic<uint64_t> promoted {0}, uploads {0}, repeats {0}, demoted_by_gpu {0},
+	    faults {0};
+};
+inline HotPageStats g_hot_stats;
+// GPU thread: the game may have written guest memory since the last bump.
+inline void BumpHotGeneration() {
+	if (HotPagesEnabled()) {
+		g_hot_generation.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
 class RegionManager final {
 public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
@@ -108,6 +166,14 @@ public:
 	KYTY_CLASS_NO_COPY(RegionManager);
 
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
+
+	// Lock-free "any page in this region may be dirty" summaries. A binding that spans a
+	// whole heap covers hundreds of regions; without these every draw locks and walks each
+	// one. False is exact (set only after a walk saw no bits); true is conservative.
+	template <DirtySource source>
+	[[nodiscard]] bool MaybeModified() const noexcept {
+		return GetSummary<source>().load(std::memory_order_acquire);
+	}
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
@@ -115,8 +181,73 @@ public:
 		return bits.AnyInRange(start, end);
 	}
 
+	// Under the lock, before ChangeState<Cpu, true> for a CPU write (a fault or an invalidation):
+	// counts the faults of the pages it makes CPU-dirty and turns busy ones hot.
+	void NoteCpuWrite(uint64_t vaddr, uint64_t size) {
+		if (!HotPagesEnabled()) {
+			return;
+		}
+		const auto [start, end] = GetPageRange(vaddr, size);
+		if (!m_hot) {
+			m_hot = std::make_unique<HotState>();
+		}
+		auto&      hot = *m_hot;
+		SyncHotEpoch();
+		const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+		                     std::chrono::steady_clock::now().time_since_epoch())
+		                     .count();
+		if (now - hot.window_start > 2000) {
+			hot.faults.fill(0);
+			hot.window_start = now;
+		}
+		const auto threshold = HotPageFaults();
+		for (size_t page = start; page < end; page++) {
+			if (m_cpu_dirty.Get(page) || m_gpu_dirty.Get(page)) {
+				continue; // no fault: already writable, or the GPU owns it
+			}
+			g_hot_stats.faults.fetch_add(1, std::memory_order_relaxed);
+			if (hot.faults[page] < 255) {
+				hot.faults[page]++;
+			}
+			if (hot.faults[page] >= threshold && !hot.hot.Get(page)) {
+				hot.hot.Set(page);
+				hot.uploaded[page] = 0;
+				g_hot_stats.promoted.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+	}
+
+	// Under the lock: the hot pages of the range stop being hot and lose their CPU-dirty state
+	// (the GPU writes them next; their CPU bytes were uploaded in this generation). Returns
+	// whether there were any.
+	bool DemoteHot(uint64_t vaddr, uint64_t size) {
+		if (!m_hot) {
+			return false;
+		}
+		const auto [start, end] = GetPageRange(vaddr, size);
+		RegionBits in(m_hot->hot, start, end);
+		if (in.None()) {
+			return false;
+		}
+		for (const auto [first, last]: in) {
+			for (size_t page = first; page < last; page++) {
+				m_hot->hot.Unset(page);
+				m_cpu_dirty.Unset(page);
+				g_hot_stats.demoted_by_gpu.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+		if (m_cpu_dirty.None()) {
+			StoreSummary<DirtySource::Cpu>(false);
+		}
+		UpdateProtection<true, false>();
+		return true;
+	}
+
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t vaddr, uint64_t size) {
+		if constexpr (source == DirtySource::Gpu && enable) {
+			DemoteHot(vaddr, size);
+		}
 		const auto [start, end] = GetPageRange(vaddr, size);
 		if constexpr (source == DirtySource::Cpu && enable) {
 			if (m_gpu_dirty.AnyInRange(start, end)) {
@@ -131,8 +262,18 @@ public:
 		auto& bits = GetBits<source>();
 		if constexpr (enable) {
 			bits.SetRange(start, end);
+			StoreSummary<source>(true);
+			if constexpr (source == DirtySource::Cpu) {
+				g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
+			}
 		} else {
 			bits.UnsetRange(start, end);
+			if (bits.None()) {
+				StoreSummary<source>(false);
+			}
+			if constexpr (source == DirtySource::Gpu) {
+				g_gpu_clean_epoch.fetch_add(1, std::memory_order_release);
+			}
 		}
 		if constexpr (source == DirtySource::Cpu) {
 			if constexpr (enable) {
@@ -147,6 +288,21 @@ public:
 		}
 	}
 
+	// KYTY_READ_SNAPSHOT: let CPU reads of these GPU-dirty pages through without a fault (they
+	// read the snapshot published there), or fault again (restore). The GPU-dirty state is kept:
+	// writes still fault and wait, and the GPU thread's reads still download.
+	template <bool lift>
+	void SetReadLift(uint64_t vaddr, uint64_t size) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		if constexpr (lift) {
+			m_read_lift.SetRange(start, end);
+			UpdateProtection<false, true>();
+		} else {
+			m_read_lift.UnsetRange(start, end);
+			UpdateProtection<true, true>();
+		}
+	}
+
 	template <DirtySource source, bool clear, typename Func>
 	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		const auto [start, end] = GetPageRange(vaddr, size);
@@ -155,8 +311,40 @@ public:
 			return;
 		}
 		RegionBits mask(bits, start, end);
+		if constexpr (source == DirtySource::Cpu && clear) {
+			if (m_hot) {
+				SyncHotEpoch();
+				RegionBits hot_in(m_hot->hot, start, end);
+				if (hot_in.Any()) {
+					// Hot pages stay CPU-dirty (and writable); each is uploaded once a generation.
+					const auto generation = g_hot_generation.load(std::memory_order_relaxed);
+					for (const auto [first, last]: hot_in) {
+						for (size_t page = first; page < last; page++) {
+							if (m_hot->uploaded[page] == generation) {
+								mask.Unset(page);
+								g_hot_stats.repeats.fetch_add(1, std::memory_order_relaxed);
+							} else {
+								m_hot->uploaded[page] = generation;
+								g_hot_stats.uploads.fetch_add(1, std::memory_order_relaxed);
+							}
+						}
+					}
+					bits.UnsetRange(start, end);
+					bits |= hot_in;
+					UpdateProtection<true, false>();
+					for (const auto [first, last]: mask) {
+						func(m_cpu_addr + first * TRACKER_PAGE_SIZE,
+						     (last - first) * TRACKER_PAGE_SIZE);
+					}
+					return;
+				}
+			}
+		}
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
+			if (bits.None()) {
+				StoreSummary<source>(false);
+			}
 			if constexpr (source == DirtySource::Cpu) {
 				m_has_cpu_dirty.store(m_cpu_dirty.Any(), std::memory_order_release);
 				UpdateProtection<true, false>();
@@ -169,56 +357,55 @@ public:
 		}
 	}
 
-	// Calls func(address, size) for the runs of pages in the range that became CPU dirty since
-	// the previous call over them, or are still CPU dirty (further writes to a dirty page do not
-	// fault), and forgets the former. Callers hold the lock.
-	template <typename Func>
-	void ConsumeCpuWritten(uint64_t vaddr, uint64_t size, Func&& func) {
-		const auto [start, end] = GetPageRange(vaddr, size);
-		RegionBits mask(m_cpu_written, start, end);
-		mask |= RegionBits(m_cpu_dirty, start, end);
-		m_cpu_written.UnsetRange(start, end);
-		for (const auto [first, last]: mask) {
-			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
-		}
-	}
-
-	// Marks the pages of the range GPU dirty unless they are CPU dirty, and calls func(address,
-	// size) for the runs it marked. Callers hold the lock.
-	template <typename Func>
-	void MarkGpuDirtyUnlessCpuDirty(uint64_t vaddr, uint64_t size, Func&& func) {
-		const auto [start, end] = GetPageRange(vaddr, size);
-		RegionBits mask(~m_cpu_dirty, start, end);
-		if (mask.None()) {
-			return;
-		}
-		for (const auto [first, last]: mask) {
-			m_gpu_dirty.SetRange(first, last);
-		}
-		UpdateProtection<true, true>();
-		for (const auto [first, last]: mask) {
-			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
-		}
-	}
-
-	// Whether any page holds CPU writes not yet uploaded. Read without the lock: a concurrent
-	// CPU write that is not observed yet is equivalent to one that lands after the read.
-	[[nodiscard]] bool HasCpuDirty() const {
-		return m_has_cpu_dirty.load(std::memory_order_acquire);
-	}
-
-	// Whether any page is GPU dirty, i.e. read protected. Read without the lock: a stale answer
-	// only chooses between a plain read and a checked one.
-	[[nodiscard]] bool HasGpuDirty() const {
-		return m_has_gpu_dirty.load(std::memory_order_acquire);
+	// The tracker mirrors the CPU summary in one bit per region (MemoryTracker::IsRangeCpuCleanHint).
+	// Set before the region is published.
+	void SetCpuSummaryBit(std::atomic<uint64_t>* word, uint64_t bit) noexcept {
+		m_cpu_summary_word = word;
+		m_cpu_summary_bit  = bit;
 	}
 
 	TrackingSpinLock lock;
 
 private:
+	struct HotState {
+		RegionBits                                   hot;
+		std::array<uint8_t, TRACKER_REGION_PAGES>    faults {};
+		std::array<uint32_t, TRACKER_REGION_PAGES>   uploaded {};
+		int64_t                                      window_start = 0;
+		uint32_t                                     epoch        = 0;
+	};
+
+	// Every page stops being hot when the global epoch moves (every 60 s); a page that still
+	// faults turns hot again. The pages stay CPU-dirty until their next upload re-arms them.
+	void SyncHotEpoch() {
+		const auto epoch = g_hot_epoch.load(std::memory_order_relaxed);
+		if (m_hot->epoch != epoch) {
+			m_hot->epoch = epoch;
+			m_hot->hot.Clear();
+		}
+	}
+
+	// Every summary change goes through here; the CPU one is mirrored in the tracker's bitmap at
+	// the same point, before any page protection changes.
+	template <DirtySource source>
+	void StoreSummary(bool value) {
+		GetSummary<source>().store(value, std::memory_order_release);
+		if constexpr (source == DirtySource::Cpu) {
+			if (m_cpu_summary_word != nullptr) {
+				if (value) {
+					m_cpu_summary_word->fetch_or(m_cpu_summary_bit, std::memory_order_acq_rel);
+				} else {
+					m_cpu_summary_word->fetch_and(~m_cpu_summary_bit, std::memory_order_acq_rel);
+				}
+			}
+		}
+	}
+
 	template <bool track, bool is_read>
 	void UpdateProtection() {
-		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
+		// m_read_lift: GPU-dirty pages the CPU may read as guest memory holds them
+		// (BufferCache snapshot reads, KYTY_READ_SNAPSHOT).
+		const auto protection = is_read ? (~m_gpu_dirty | m_read_lift) : m_cpu_dirty;
 		auto&      previous   = is_read ? m_readable : m_writable;
 		auto       mask       = protection ^ previous;
 		if (mask.None()) {
@@ -249,6 +436,24 @@ private:
 		}
 	}
 
+	template <DirtySource source>
+	std::atomic<bool>& GetSummary() {
+		if constexpr (source == DirtySource::Cpu) {
+			return m_cpu_maybe_dirty;
+		} else {
+			return m_gpu_maybe_dirty;
+		}
+	}
+
+	template <DirtySource source>
+	const std::atomic<bool>& GetSummary() const {
+		if constexpr (source == DirtySource::Cpu) {
+			return m_cpu_maybe_dirty;
+		} else {
+			return m_gpu_maybe_dirty;
+		}
+	}
+
 	[[nodiscard]] std::pair<size_t, size_t> GetPageRange(uint64_t vaddr, uint64_t size) const {
 		if (size == 0 || vaddr < m_cpu_addr || vaddr >= m_cpu_addr + TRACKER_REGION_SIZE ||
 		    size > m_cpu_addr + TRACKER_REGION_SIZE - vaddr) {
@@ -265,14 +470,15 @@ private:
 	// Pages that became CPU dirty since ConsumeCpuWritten last visited them.
 	RegionBits   m_cpu_written;
 	RegionBits   m_gpu_dirty;
+	// The constructor fills m_cpu_dirty, so the CPU summary starts true.
+	std::atomic<bool> m_cpu_maybe_dirty {true};
+	std::atomic<bool> m_gpu_maybe_dirty {false};
+	std::atomic<uint64_t>* m_cpu_summary_word = nullptr;
+	uint64_t               m_cpu_summary_bit  = 0;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
-	// A new region starts with every page CPU dirty.
-	std::atomic_bool      m_has_cpu_dirty {true};
-	std::atomic_bool      m_has_gpu_dirty {false};
-	std::atomic<uint64_t> m_cpu_dirty_epoch {1};
-
-	inline static std::atomic<uint64_t> s_cpu_dirty_epoch {0};
+	RegionBits   m_read_lift;
+	std::unique_ptr<HotState> m_hot;
 };
 
 } // namespace Libs::Graphics

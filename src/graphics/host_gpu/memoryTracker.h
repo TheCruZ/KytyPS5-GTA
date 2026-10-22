@@ -2,12 +2,16 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_MEMORYTRACKER_H_
 
 #include "common/assert.h"
+#include "common/logging/log.h"
+#include "common/profiler.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <type_traits>
@@ -16,6 +20,22 @@
 
 namespace Libs::Graphics {
 
+// A/B switch for the clean-region skip (KYTY_TRACKER_SKIP_CLEAN=0 disables it).
+inline const bool g_tracker_skip_clean =
+    std::getenv("KYTY_TRACKER_SKIP_CLEAN") == nullptr || std::getenv("KYTY_TRACKER_SKIP_CLEAN")[0] == '1';
+
+// A/B switch for the per-region bitmap fast path (KYTY_TRACKER_BITMAP=0 disables it).
+inline const bool g_tracker_bitmap =
+    std::getenv("KYTY_TRACKER_BITMAP") == nullptr || std::getenv("KYTY_TRACKER_BITMAP")[0] == '1';
+
+// A/B switch for the dirty-region walk of read-only uploads (KYTY_TRACKER_DIRTY_WALK=0 disables
+// it): a read-only sync whose regions all exist visits only the regions the bitmap marks
+// CPU-dirty, instead of loading every region of the range. The game binds heap-wide V#s (up to
+// 2.7 GB, ~700 regions) many times a draw; one dirty region anywhere sent each of those through
+// every region (~0.3 us a sync, 27 syncs a draw at the Leap Attack prompt).
+inline const bool g_tracker_dirty_walk = std::getenv("KYTY_TRACKER_DIRTY_WALK") == nullptr ||
+                                         std::getenv("KYTY_TRACKER_DIRTY_WALK")[0] == '1';
+
 class MemoryTracker final {
 public:
 	explicit MemoryTracker(PageManager& page_manager);
@@ -23,6 +43,11 @@ public:
 
 	KYTY_CLASS_NO_COPY(MemoryTracker);
 
+	// Lock-free and without touching the regions: every tracker region of the range exists and
+	// none may hold CPU-dirty pages. The regions' own summaries, mirrored one bit per region, so a
+	// buffer spanning hundreds of clean regions is answered from a few words. False is
+	// conservative.
+	[[nodiscard]] bool IsRangeCpuCleanHint(uint64_t vaddr, uint64_t size) const noexcept;
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	// Whether a page of the tracking regions the range touches may be GPU dirty, without taking
@@ -44,7 +69,27 @@ public:
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
+	// KYTY_READ_SNAPSHOT (RegionManager::SetReadLift).
+	void               LiftReads(uint64_t vaddr, uint64_t size);
+	void               RestoreReads(uint64_t vaddr, uint64_t size);
+	// MarkRegionAsGpuModified, atomically skipping the tracker regions that hold CPU-dirty pages
+	// there; false when one did. Pass a page for an all-or-nothing answer.
+	[[nodiscard]] bool TryMarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// Calls func(address, bytes) for each part of the range, one per tracker region, that may
+	// hold CPU-dirty pages (lock-free summaries: false is exact, true is conservative).
+	template <typename Func>
+	void ForEachMaybeCpuDirtyRegion(uint64_t vaddr, uint64_t size, Func&& func) {
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			if (manager->MaybeModified<DirtySource::Cpu>()) {
+				func(manager->GetCpuAddr() + offset, bytes);
+			}
+		});
+	}
+	// Queue after changing ownership; a concurrent drain must not consume an event
+	// before the dirty pages it describes become visible.
+	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] RangeSet TakeBdaSync();
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -60,6 +105,7 @@ public:
 				if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
 					return true;
 				}
+				manager->NoteCpuWrite(manager->GetCpuAddr() + offset, bytes);
 				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 				return false;
 			}();
@@ -198,14 +244,46 @@ public:
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		CheckNotInUploadCallback();
+		if (!is_written && g_tracker_skip_clean && g_tracker_bitmap &&
+		    IsRangeCpuCleanHint(vaddr, size)) {
+			// What the walk below finds for a read-only range whose regions all exist and are
+			// clean: nothing to copy.
+			const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
+			upload_func();
+			s_upload_owner = previous_upload_owner;
+			return;
+		}
+		if (!is_written && g_tracker_skip_clean && g_tracker_bitmap && g_tracker_dirty_walk &&
+		    AllRegionsPresent(vaddr, size)) {
+			// The loop below for a read-only range, with the clean regions skipped by their bitmap
+			// bits rather than by loading each region (the bits mirror the regions' summaries).
+			const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
+			ForEachCpuDirtyRegion(vaddr, size,
+			                      [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				                      manager->lock.lock();
+				                      manager->ForEachModifiedRange<DirtySource::Cpu, true>(
+				                          manager->GetCpuAddr() + offset, bytes, range_func);
+				                      manager->lock.unlock();
+			                      });
+			upload_func();
+			s_upload_owner = previous_upload_owner;
+			return;
+		}
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-			// A read-only use of a region without CPU-dirty pages has nothing to upload (a CPU
-			// write racing with this check is one that lands after the synchronization).
-			if (!is_written && !manager->HasCpuDirty()) {
+			const bool summary_clean = !manager->MaybeModified<DirtySource::Cpu>();
+			if (!is_written && g_tracker_skip_clean && summary_clean) {
 				return;
 			}
 			manager->lock.lock();
+			if (summary_clean && manager->IsModified<DirtySource::Cpu>(offset, bytes)) {
+				static std::atomic<uint32_t> misses = 0;
+				if (misses.fetch_add(1) < 32) {
+					LOGF("Tracker: CPU summary miss region=0x%016" PRIx64 " offset=0x%" PRIx64
+					     " bytes=0x%" PRIx64 " written=%d\n",
+					     manager->GetCpuAddr(), offset, bytes, static_cast<int>(is_written));
+				}
+			}
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
 			                                                      bytes, range_func);
 			if (!is_written) {
@@ -264,10 +342,58 @@ private:
 		return false;
 	}
 
+	// Bits [low, high] of a bitmap word.
+	static uint64_t WordMask(uint64_t low, uint64_t high) noexcept {
+		return high - low == 63 ? ~uint64_t {0} : ((uint64_t {1} << (high - low + 1)) - 1) << low;
+	}
+
+	// Every tracker region of the range exists (regions are never removed once created).
+	[[nodiscard]] bool AllRegionsPresent(uint64_t vaddr, uint64_t size) const noexcept {
+		if (size == 0 || vaddr >= TRACKER_ADDRESS_SIZE || size > TRACKER_ADDRESS_SIZE - vaddr) {
+			return false;
+		}
+		const uint64_t first = vaddr / TRACKER_REGION_SIZE;
+		const uint64_t last  = (vaddr + size - 1) / TRACKER_REGION_SIZE;
+		for (uint64_t word = first / 64; word <= last / 64; word++) {
+			const auto mask = WordMask(word == first / 64 ? first % 64 : 0,
+			                           word == last / 64 ? last % 64 : 63);
+			if ((m_present_regions[word].load(std::memory_order_acquire) & mask) != mask) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	// func(manager, offset, bytes) for the part of the range in each region whose CPU summary
+	// bit is set; the range's regions must all exist (AllRegionsPresent).
+	template <typename Func>
+	void ForEachCpuDirtyRegion(uint64_t vaddr, uint64_t size, Func&& func) {
+		const uint64_t first = vaddr / TRACKER_REGION_SIZE;
+		const uint64_t last  = (vaddr + size - 1) / TRACKER_REGION_SIZE;
+		const uint64_t end   = vaddr + size;
+		for (uint64_t word = first / 64; word <= last / 64; word++) {
+			auto dirty = m_cpu_dirty_regions[word].load(std::memory_order_acquire) &
+			             WordMask(word == first / 64 ? first % 64 : 0,
+			                      word == last / 64 ? last % 64 : 63);
+			while (dirty != 0) {
+				const uint64_t index = word * 64 + static_cast<uint64_t>(std::countr_zero(dirty));
+				dirty &= dirty - 1;
+				const uint64_t region_begin = index * TRACKER_REGION_SIZE;
+				const uint64_t begin        = std::max(vaddr, region_begin);
+				const uint64_t finish       = std::min(end, region_begin + TRACKER_REGION_SIZE);
+				func(m_regions[index].load(std::memory_order_acquire), begin - region_begin,
+				     finish - begin);
+			}
+		}
+	}
+
 	static void    ValidateRange(uint64_t vaddr, uint64_t size);
 	RegionManager* GetOrCreateRegion(uint64_t index);
 
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
+	// One bit per region: the region exists / its CPU summary is set (RegionManager::StoreSummary).
+	std::unique_ptr<std::atomic<uint64_t>[]> m_present_regions;
+	std::unique_ptr<std::atomic<uint64_t>[]> m_cpu_dirty_regions;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;

@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <span>
@@ -19,22 +20,58 @@ struct VulkanImage;
 
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
+struct DiagnosticCheckpoint {
+	uint32_t op        = 0;
+	uint64_t submit_id = 0;
+	uint32_t arg0      = 0;
+	uint32_t arg1      = 0;
+	uint32_t arg2      = 0;
+	uint32_t arg3      = 0;
+	uint64_t arg4      = 0;
+	uint64_t sequence  = 0;
+};
+
+struct GraphicContext;
+
+// Returns a stable marker for vkCmdSetCheckpointNV.
+[[nodiscard]] const DiagnosticCheckpoint*
+RecordDiagnosticCheckpoint(const DiagnosticCheckpoint& checkpoint);
+// After a device loss: VK_EXT_device_fault info, the NVIDIA crash dump written to
+// _device_fault.nv-gpudmp, and the queue's last diagnostic checkpoints.
+void DumpDeviceLossDiagnostics(GraphicContext& graphics);
+
 struct GraphicContext {
 	vk::Instance                       instance                              = nullptr;
 	vk::DebugUtilsMessengerEXT         debug_messenger                       = nullptr;
+	// KYTY_ADDRESS_BINDING_REPORT=1: logs every GPU address range bound or unbound, so a
+	// device-fault address can be matched to the object that owned it.
+	vk::DebugUtilsMessengerEXT         address_binding_messenger             = nullptr;
+	bool                               address_binding_report_enabled        = false;
 	vk::PhysicalDevice                 physical_device                       = nullptr;
 	vk::PhysicalDeviceProperties       physical_device_properties            = {};
 	vk::PhysicalDeviceMemoryProperties physical_device_memory_properties     = {};
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	bool                               external_memory_host_enabled          = false;
+	bool                               diagnostic_checkpoints_enabled        = false;
+	// With --profile, for the host GPU timeline (renderer/gpuProfiler).
+	bool                               host_query_reset_enabled              = false;
+	bool                               calibrated_timestamps_enabled         = false;
+	bool                               device_fault_enabled                  = false;
+	bool                               shader_device_clock_enabled           = false;
 	bool                               compute_subgroup_size_control_enabled = false;
+	// subgroupSizeControl is enabled: the device has more than one subgroup size.
+	bool                               subgroup_size_control_enabled         = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
+	// Out-of-bounds storage buffer reads return zero (VK_EXT_robustness2).
+	bool                               robust_buffer_access2_enabled         = false;
+	bool                               occlusion_query_precise               = false;
 	bool                               conditional_rendering_enabled         = false;
 	// Out-of-bounds storage buffer reads return zero (VK_EXT_robustness2).
 	bool                               robust_buffer_access2_enabled         = false;
@@ -44,6 +81,13 @@ struct GraphicContext {
 	bool                               indirect_draws_enabled                = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
+	// Descriptor indexing for bindless images: runtime arrays indexed non-uniformly, partially
+	// bound and updated after bind.
+	bool                               bindless_enabled                      = false;
+	uint32_t                           bindless_max_sampled_images           = 0;
+	uint32_t                           bindless_max_samplers                 = 0;
+	vk::DescriptorSetLayout            bindless_layout                       = nullptr;
+	vk::DescriptorSet                  bindless_set                          = nullptr;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;
@@ -55,11 +99,12 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
-	// A queue of a transfer-only family (a copy engine that runs beside the graphics one), for
-	// buffer readbacks that must not wait for the work queued on `queue` after the writes they
-	// read. Null without such a family; buffers are then shared by `queue_family` alone.
-	vk::Queue                          readback_queue  = nullptr;
-	uint32_t                           readback_family = static_cast<uint32_t>(-1);
+	// Queue 1 of queue_family when the device has one (BufferCache copy-queue readbacks). Only
+	// the GPU thread submits to it.
+	uint32_t                           queue_count    = 1;
+	vk::Queue                          readback_queue = nullptr;
+	// Frames presented so far: the clock the caches age their entries by.
+	std::atomic<uint64_t>              presented_frames {0};
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;
@@ -103,6 +148,20 @@ struct GraphicContext {
 		return subgroup_size == 64u || compute_subgroup_size_control_enabled;
 	}
 
+	// The subgroup size a graphics stage must require so that one host subgroup is one guest
+	// wave, or 0 when the default already is or the device cannot require it for the stage. On
+	// AMD the default is 64; a wave32 pixel or mesh shader would otherwise share a subgroup with
+	// another wave, and its ballots, lane reads and reductions would mix the two.
+	[[nodiscard]] uint32_t GraphicsSubgroupSize(vk::ShaderStageFlagBits stage,
+	                                            uint32_t                wave_size) const noexcept {
+		if (!subgroup_size_control_enabled || wave_size == subgroup_size ||
+		    !(required_subgroup_size_stages & stage) || wave_size < min_subgroup_size ||
+		    wave_size > max_subgroup_size) {
+			return 0;
+		}
+		return wave_size;
+	}
+
 	[[nodiscard]] vk::DeviceSize StorageMinAlignment() const {
 		const auto alignment = physical_device_properties.limits.minStorageBufferOffsetAlignment;
 		return alignment != 0 ? alignment : 1;
@@ -114,6 +173,28 @@ struct GraphicContext {
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
+	// Memory pressure in bytes, read at most every 250 ms; the caches' collectors lower their
+	// thresholds by it, and DeviceMemoryAtLeast reports true while it is not 0. The larger of:
+	// - the system's free commit below a reserve (KYTY_COMMIT_RESERVE_MB; default 0 = off, see
+	//   MemoryShortfall for why). On Windows every GB of video memory in use is also charged to
+	//   the commit limit (WDDM backs pageable allocations), so a PC with a small page file runs
+	//   out of commit with video memory to spare (ISSUES #21);
+	// - everything the device holds past 90 % of the budget, which KYTY_VRAM_TARGET_MB caps
+	//   (default 14336: the emulator plans for a 16 GB card whatever card it runs on).
+	[[nodiscard]] uint64_t MemoryShortfall() const;
+	// Whether everything the device holds (images, buffers, the driver's own) has reached percent
+	// of the device-local budget, or memory is short (MemoryShortfall). False when the driver
+	// cannot report usage and nothing is short.
+	[[nodiscard]] bool DeviceMemoryAtLeast(uint32_t percent) const {
+		if (MemoryShortfall() != 0) {
+			return true;
+		}
+		if (!CanReportMemoryUsage()) {
+			return false;
+		}
+		const auto budget = GetTotalMemoryBudget();
+		return budget != 0 && GetDeviceMemoryUsage() / 100 >= budget / 100 * percent / 100;
+	}
 
 	struct HeapUsage {
 		uint64_t usage        = 0; // Whole process, as reported by VK_EXT_memory_budget.
@@ -142,6 +223,8 @@ struct VulkanImageState {
 	vk::PipelineStageFlags2 pl_stage    = vk::PipelineStageFlagBits2::eAllCommands;
 	vk::AccessFlags2        access_mask = vk::AccessFlagBits2::eNone;
 	vk::ImageLayout         layout      = vk::ImageLayout::eUndefined;
+	// Set by a guest draw's or dispatch's bindings (KYTY_GUEST_STORAGE_REPEAT, Image::GetBarriers).
+	bool guest = false;
 };
 
 struct VulkanImage {
