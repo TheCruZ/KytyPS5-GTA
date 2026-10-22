@@ -106,8 +106,9 @@ void ReadSet::Add(uint64_t address, const void* data, uint32_t size) {
 		return;
 	}
 	const auto offset = static_cast<uint32_t>(m_bytes.size());
-	m_bytes.resize(m_bytes.size() + size);
-	std::memcpy(m_bytes.data() + offset, data, size);
+	// One copy: resize() zeroed the new bytes first, and a walk adds thousands of reads a frame.
+	const auto* bytes = static_cast<const uint8_t*>(data);
+	m_bytes.insert(m_bytes.end(), bytes, bytes + size);
 	if (!m_ranges.empty()) {
 		auto& last = m_ranges.back();
 		if (last.address + last.size == address && last.offset + last.size == offset) {
