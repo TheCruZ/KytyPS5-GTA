@@ -999,7 +999,12 @@ void* CommandScheduler::AllocateInNewChunk(size_t size, size_t alignment) {
 	}
 	auto offset = (m_chunk->used + alignment - 1) & ~(alignment - 1);
 	if (offset + size > Chunk::Size) {
-		DispatchChunk();
+		// Also a chunk that holds only Stash() copies: the next command reads them, and the
+		// recording thread keeps the last chunks alive for it (dropping it here freed them).
+		if (m_chunk->used != 0) {
+			m_chunks_dispatched++;
+			m_record_queue->Push(std::move(m_chunk));
+		}
 		m_chunk = take();
 		offset  = 0;
 	}
