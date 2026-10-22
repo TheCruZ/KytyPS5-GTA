@@ -31,36 +31,18 @@ class Shader;
 } // namespace HW
 
 struct GraphicContext;
+struct ShaderBufferResource;
+struct ShaderComputeInputInfo;
+struct RenderDepthInfo;
+struct RenderColorInfo;
 struct DrawCallInfo;
 struct DrawEmitInfo;
 struct DrawIndexBufferSource;
+struct DrawRenderState;
 class RenderContext;
 class CommandScheduler;
 class CommandRecorder;
 struct RenderExecutorTestAccess;
-struct IndirectThreadPass;
-
-// An image description derived from a T# and a shader's view of it (see ResolveTexture).
-struct TextureDescDerivation {
-	TextureCache::ImageDesc desc;
-	bool                    shader_conversion = false;
-	vk::Format              pixel_format      = vk::Format::eUndefined;
-	vk::Format              view_format       = vk::Format::eUndefined;
-	uint64_t                size              = 0;
-	// The image the last lookup of a sampled texture with this description found, the
-	// description it was found with and the view acquired for it. Reused while no image on the
-	// pages of the range was registered or unregistered since and the image keeps the state the
-	// acquisition left it in.
-	struct Found {
-		ImageId                 id;
-		TextureCache::ImageDesc desc;
-		vk::ImageView           view            = nullptr;
-		uint64_t                image_set_epoch = 0;
-		ImageLookupState        state;
-		bool                    valid = false;
-	};
-	Found found;
-};
 
 // An image description derived from a T# and a shader's view of it (see ResolveTexture).
 struct TextureDescDerivation {
@@ -210,15 +192,12 @@ private:
 	void Begin();
 	void End() const;
 
-	CommandScheduler&   m_scheduler;
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
 	CommandScheduler&   m_scheduler;
 	// Begun and not submitted yet; m_buffer is its handle when not recorded on a thread.
 	bool                m_open            = false;
 	vk::CommandBuffer   m_buffer          = nullptr;
-	CommandStream*      m_stream          = nullptr;
-	bool                m_open            = false;
 	uint32_t            m_debug_op        = 0;
 	uint64_t            m_debug_submit_id = 0;
 	uint32_t            m_debug_arg0      = 0;
@@ -289,57 +268,6 @@ public:
 	                                        uint32_t index_type, uint64_t index_bytes) const;
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode, bool async_compute);
-	// DISPATCH_INDIRECT with USE_THREAD_DIMENSIONS: converts the thread counts, which GPU work
-	// writes, on the GPU instead of reading them back.
-	void DispatchIndirectThreads(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
-	                             uint32_t mode, bool async_compute);
-
-	// Shader programs and resources of a draw resolved ahead of its execution.
-	struct ResolvedDraw;
-	// Resolve thread: resolves the shader programs of a draw with the given registers ahead of
-	// its execution; null when the draw resolves them itself (tessellation, programs that are not
-	// compiled yet, guest memory that cannot be read ahead). Waits while every resolution is in
-	// use: the execution thread releases them in order.
-	[[nodiscard]] ResolvedDraw* ResolveDrawAhead(const HW::Context&    context,
-	                                             const HW::UserConfig& user_config,
-	                                             const HW::Shader&     shaders,
-	                                             const ShaderIndirectOffsets& indirect_offsets = {});
-	// Resolve thread: the compute program of a DISPATCH_DIRECT with the given registers and
-	// initiator; null when the dispatch resolves it itself. Shares the ring of draw resolutions.
-	[[nodiscard]] ResolvedDraw* ResolveDispatchAhead(const HW::Context& context,
-	                                                 const HW::Shader& shaders,
-	                                                 const uint32_t (&groups)[3], uint32_t mode,
-	                                                 bool async_compute);
-	// Resolve thread: the compute program of a DISPATCH_INDIRECT with the given registers and
-	// initiator, which does not depend on the arguments the dispatch reads when it executes.
-	[[nodiscard]] ResolvedDraw* ResolveIndirectDispatchAhead(const HW::Context& context,
-	                                                         const HW::Shader&  shaders,
-	                                                         uint32_t           mode, uint64_t args_addr,
-	                                                         bool               async_compute);
-	// Execution thread: the program a dispatch resolved ahead, when the guest memory the
-	// resolution read still holds the same bytes.
-	bool TakeResolvedDispatch(ShaderComputeInputInfo& input_info, const ShaderModule*& module);
-	// Execution thread: the next draw uses `resolved` when the guest memory it read still holds
-	// the same bytes.
-	void UseResolvedDraw(ResolvedDraw* resolved) noexcept { m_resolved_draw = resolved; }
-	// Execution thread: the operation that carried `resolved` executed.
-	static void ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept;
-	// Execution thread: the context register snapshot of the operation about to execute (0 for
-	// live registers); operations with the same id see the same context registers.
-	void UseContextId(uint64_t context_id) noexcept { m_context_id = context_id; }
-	// Execution thread: an operation of guest queue `queue` is about to execute. The barrier
-	// after a direct dispatch is deferred to the next operation, unless that is a direct dispatch
-	// of the same queue the guest did not order after it (see DispatchDirect()).
-	void BeginGuestOperation(uint32_t queue, bool dispatch_direct, bool guest_sync);
-	// Records the barrier a direct dispatch deferred, if any.
-	void FlushDeferredDispatchBarrier();
-	// Execution thread: an operation other than a draw is about to execute (see
-	// RenderTargetMemo).
-	void InvalidateRenderTargetMemo() noexcept;
-	// Advances whenever an operation other than a draw executes (see
-	// InvalidateRenderTargetMemo()): within one value only draws executed, so no guest-visible
-	// effect let the guest write the memory they read.
-	[[nodiscard]] uint64_t DrawWindow() const noexcept { return m_draw_window; }
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void PrepareBindingDiagnostics(const ShaderStageRuntime& runtime);
@@ -368,14 +296,6 @@ public:
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
-	// table_candidate rejects (EXIT) a texture whose guest memory cannot be read, for tables
-	// that keep T#s of freed textures, and declines depth/color conversions. examined receives
-	// the guest range before the lookup depends on the texture cache: a failure without it
-	// depends only on the T# and the guest backing.
-	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-	                                            const ShaderRecompiler::IR::DescriptorValue& value,
-	                                            bool        table_candidate = false,
-	                                            GuestRange* examined        = nullptr);
 
 private:
 	// False, with nothing drawn, when the draw's indirect records need CPU counts.
@@ -601,10 +521,11 @@ private:
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_resolved,
 	                                          const DrawCallInfo& draw,
 	                                          uint32_t            render_target_slice_offset,
-	                                          DrawRenderState&    state);
+	                                          DrawRenderState& state);
 	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
-	                         DrawRenderState& state, const DrawEmitInfo& emit,
-	                         const DrawIndexBufferSource& index_source);
+	                         DrawRenderState& state, vk::PrimitiveTopology topology,
+	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
+	                         bool primitive_restart_enable);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
@@ -688,6 +609,8 @@ private:
 	std::vector<uint8_t>                               m_table_flags;
 	uint64_t                              m_draw_window           = 0;
 	uint64_t                              m_context_id            = 0;
+	// The context snapshot whose registers hw_check() last accepted.
+	uint64_t                              m_checked_context_id    = 0;
 	// Resolutions ahead of execution; see ResolveDrawAhead().
 	std::unique_ptr<ResolvedDrawRing, void (*)(ResolvedDrawRing*)> m_resolved_ring {nullptr,
 	                                                                                nullptr};
