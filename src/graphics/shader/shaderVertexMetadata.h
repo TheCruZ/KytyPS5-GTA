@@ -4,6 +4,7 @@
 #include "graphics/shader/shader.h"
 
 #include <span>
+#include <string>
 
 namespace Libs::Graphics {
 
@@ -13,10 +14,9 @@ struct ShaderVertexMetadata {
 	std::span<const ShaderSemantic> input_semantics;
 };
 
-// Reads the vertex metadata as a view into the shader header. Returns nullptr if it is
-// valid, otherwise why it was rejected.
-const char* ShaderReadVertexMetadata(const ShaderMappedData& data, uint32_t max_user_sgprs,
-                                     ShaderVertexMetadata& metadata);
+// Validates the vertex metadata and returns a view into the shader header.
+bool ShaderReadVertexMetadata(const ShaderMappedData& data, uint32_t max_user_sgprs,
+                              ShaderVertexMetadata& metadata, std::string* error);
 
 } // namespace Libs::Graphics
 

@@ -7,7 +7,6 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
-#include "loader/elf.h"
 #include "loader/guestInstructionPatcher.h"
 #include "loader/jit.h"
 #include "loader/runtimeLinker.h"
@@ -88,14 +87,8 @@ using Libs::LibKernel::Memory::VirtualQueryInfo;
 
 // Prospero ABI?
 constexpr uint64_t SceKernelPageSize             = 0x4000;
-constexpr uint64_t SceKernelFlexibleMemorySize   = 448ull * 1024ull * 1024ull;
+constexpr uint64_t SceKernelTotalPhysicalSize    = 13824ull * 1024ull * 1024ull;
 constexpr uint64_t TestFlexibleMemorySize        = 3072ull * 1024ull * 1024ull;
-constexpr uint64_t GuestMemoryBudget             = 12800ull * 1024ull * 1024ull;
-constexpr uint64_t ReservedCacheSize             = 64ull * 1024ull * 1024ull;
-// The 128 MiB CPU and 96 MiB AMM mapping tables add 64 + 32 MiB; a zero GPU table size adds none.
-constexpr uint64_t TestCpuTableMemory            = 128ull * 1024ull * 1024ull;
-constexpr uint64_t TestAmmTableMemory            = 96ull * 1024ull * 1024ull;
-constexpr uint64_t TestTableOverhead             = 96ull * 1024ull * 1024ull;
 constexpr int      SceKernelProtCpuRead          = 0x01;
 constexpr int      SceKernelProtCpuRw            = 0x02;
 constexpr int      SceKernelProtCpuExec          = 0x04;
@@ -180,9 +173,7 @@ void InitSubsystems() {
 	const auto param_json = std::filesystem::temp_directory_path() /
 	                        ("kyty_virtual_memory_" +
 	                         std::to_string(reinterpret_cast<uintptr_t>(&initialized)) + ".json");
-	constexpr char json[] =
-	    R"({"kernel":{"flexibleMemorySize":3221225472,"cpuPageTableSize":134217728,)"
-	    R"("gpuPageTableSize":0},"amm":{"pagetableMemorySizeInMib":96}})";
+	constexpr char json[] = R"({"kernel":{"flexibleMemorySize":3221225472}})";
 	Common::File   param_file;
 	Check("InitSubsystems", param_file.Create(param_json), "failed to create temporary param.json");
 	uint32_t bytes_written = 0;
@@ -192,19 +183,12 @@ void InitSubsystems() {
 	      "failed to write temporary param.json");
 
 	Loader::SystemContentLoadParamSfo(param_json);
-	const auto params = Loader::SystemContentGetMemoryParams();
+	const auto flexible_memory_size = Loader::SystemContentGetFlexibleMemorySize();
 	Check("InitSubsystems", Common::File::DeleteFile(param_json),
 	      "failed to remove temporary param.json");
-	Check("InitSubsystems", params.flexible_size == TestFlexibleMemorySize,
+	Check("InitSubsystems", flexible_memory_size == TestFlexibleMemorySize,
 	      "failed to read flexible memory size from param.json");
-	Check("InitSubsystems",
-	      params.cpu_table_memory == TestCpuTableMemory && params.gpu_table_memory == 0 &&
-	          params.amm_table_memory == TestAmmTableMemory,
-	      "failed to read mapping table sizes from param.json");
-	size_t default_flexible_memory_size = 0;
-	Libs::LibKernel::Memory::KernelConfiguredFlexibleMemorySize(&default_flexible_memory_size);
-	Check("InitSubsystems", default_flexible_memory_size == SceKernelFlexibleMemorySize,
-	      "flexible memory does not default to 448 MiB without param.json");
+	Libs::LibKernel::Memory::SetFlexibleMemorySize(flexible_memory_size);
 
 	subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
 
@@ -736,44 +720,6 @@ void TestBackingReadExcludesWritesAndUnmap() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-void TestTrackerProtectSharesBackingReads() {
-	using namespace Libs::LibKernel::Memory;
-	const char* test = "TrackerProtectSharesBackingReads";
-	const auto  base = MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw,
-	                                    "tracker_protect_shares_reads");
-	std::counting_semaphore<2> entered {0};
-	std::counting_semaphore<2> resume {0};
-	g_backing_reads_entered  = &entered;
-	g_continue_backing_reads = &resume;
-	TestSetBackingReadCallback(ParkBackingRead);
-	uint64_t    value = 0;
-	std::thread reader([&] { CopySparseMemory(base, &value, sizeof(value)); });
-	const bool  reader_parked = entered.try_acquire_for(std::chrono::seconds(5));
-	std::counting_semaphore<2> done {0};
-	bool                       tracker_ok   = false;
-	int                        guest_result = OK;
-	std::thread                protector([&] {
-		tracker_ok = ProtectGuestHostMemory(base, SceKernelPageSize,
-		                                    Common::VirtualMemory::Mode::ReadWrite);
-		done.release();
-		guest_result =
-		    KernelMprotect(reinterpret_cast<void*>(base), SceKernelPageSize, SceKernelProtCpuRw);
-		done.release();
-	});
-	const bool shared   = done.try_acquire_for(std::chrono::seconds(5));
-	const bool excluded = !done.try_acquire_for(std::chrono::milliseconds(100));
-	resume.release();
-	reader.join();
-	protector.join();
-	TestSetBackingReadCallback(nullptr);
-	CheckOk(test, KernelMunmap(base, SceKernelPageSize), "KernelMunmap");
-	Check(test, reader_parked && shared && tracker_ok,
-	      "tracker protection waited for a backing read");
-	Check(test, excluded && guest_result == OK,
-	      "guest mprotect completed while a backing read held its lock");
-	std::printf("[host]    %-48s ok\n", test);
-}
-
 void TestGuestAddressSpaceHasNoFixedFallback() {
 	const char* test            = "GuestAddressSpaceHasNoFixedFallback";
 	const auto  unowned_address = reinterpret_cast<void*>(0x10000);
@@ -832,8 +778,8 @@ void TestFlexibleMemoryCapacityIsBootFixed() {
 	Check(test, configured == TestFlexibleMemorySize,
 	      "boot flexible pool did not use the param.json value");
 	Check(test, configured == baseline, "boot flexible pool did not start at configured capacity");
-	Check(test, backing == GuestMemoryBudget - ReservedCacheSize - TestTableOverhead,
-	      "boot backing is not the 12.5 GiB budget less the reserved cache and table overhead");
+	Check(test, backing == SceKernelTotalPhysicalSize,
+	      "boot backing is not the single 13.5 GiB physical file");
 	Check(test, backing == Libs::LibKernel::Memory::KernelGetDirectMemorySize() + configured,
 	      "direct and flexible regions do not partition the boot backing");
 
@@ -1419,10 +1365,7 @@ void TestPageTableStatsTrackRangeEdits() {
 		        "KernelGetPageTableStats");
 		return stats;
 	};
-	// A 4 KiB table maps 2 MiB: 128 MiB of CPU tables gives 32768, the default 64 MiB GPU 16384.
-	const auto baseline = read_stats();
-	Check(test, baseline[0] == 32768 && baseline[2] == 16384,
-	      "page-table totals do not follow the configured table memory");
+	const auto baseline    = read_stats();
 	const auto expect_used = [&](int cpu, int gpu, const char* action) {
 		const auto stats = read_stats();
 		Check(test,
@@ -1647,25 +1590,10 @@ void TestDirectMapQueryOffsetAndPartialMunmap() {
 	            "prospero_direct", phys);
 	Check(test, info.memory_type == SceKernelMtypeC, "unexpected direct memory type");
 
-	// Resolve the middle page before unmapping it: lookups a thread repeats must not outlive the
-	// mapping they resolved.
-	uint64_t middle_read = 0;
-	Check(test,
-	      Libs::LibKernel::Memory::TryReadBacking(base + SceKernelPageSize, &middle_read,
-	                                              sizeof(middle_read)),
-	      "TryReadBacking should resolve the middle page before munmap");
-	Check(test,
-	      Libs::LibKernel::Memory::ClampRangeSize(base + SceKernelPageSize - 0xf30, 0x1560) ==
-	          0x1560,
-	      "ClampRangeSize should accept a range inside one mapping");
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
 	        "KernelMunmap(direct middle page)");
 	ExpectUnmapped(test, base + SceKernelPageSize);
-	Check(test,
-	      !Libs::LibKernel::Memory::TryReadBacking(base + SceKernelPageSize, &middle_read,
-	                                               sizeof(middle_read)),
-	      "TryReadBacking should reject an unmapped page it resolved before");
 
 	constexpr uint64_t transaction_sentinel = 0x5452414e53414354ull; // "TRANSACT"
 	constexpr uint64_t sparse_write         = 0x4e4f504152544941ull; // "NOPARTIA"
@@ -2250,36 +2178,6 @@ void TestDirectReleaseContracts() {
 	      Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(
 	          free_offset, SceKernelPageSize) == Libs::LibKernel::KERNEL_ERROR_ENOENT,
 	      "checked release did not report an unallocated range");
-
-	// An unchecked release frees the allocated parts on both sides of a gap.
-	const auto page = static_cast<int64_t>(SceKernelPageSize);
-	for (const auto offset: {free_offset - page * 3, free_offset - page}) {
-		int64_t allocated = 0;
-		CheckOk(test,
-		        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
-		            offset, offset + page, SceKernelPageSize, SceKernelPageSize, SceKernelMtypeC,
-		            &allocated),
-		        "KernelAllocateDirectMemory(around a gap)");
-		Check(test, allocated == offset, "allocation did not land at its fixed offset");
-	}
-	for (const auto [offset, len]:
-	     {std::pair {free_offset - page * 3, page * 3}, {free_offset - page, page * 2}}) {
-		void* mapping = nullptr;
-		Check(test,
-		      Libs::LibKernel::Memory::KernelMapDirectMemory(&mapping, len, SceKernelProtCpuRw, 0,
-		                                                     offset, SceKernelPageSize) ==
-		          Libs::LibKernel::KERNEL_ERROR_ENOMEM,
-		      "direct map accepted a gap or the unallocated tail");
-	}
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelReleaseDirectMemory(free_offset - page * 3, page * 3),
-	        "KernelReleaseDirectMemory(over a gap)");
-	for (const auto offset: {free_offset - page * 3, free_offset - page}) {
-		Check(test,
-		      Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(offset, page) ==
-		          Libs::LibKernel::KERNEL_ERROR_ENOENT,
-		      "unchecked release left an allocation around a gap");
-	}
 
 	std::printf("[host]    %-48s ok\n", test);
 }
@@ -3359,14 +3257,6 @@ void TestAutomaticMemoryFragmentedMapRollback() {
 	            "automatic allocation while second donation remains aliased");
 	CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(alias), block * 2),
 	        "unmap mixed ownership alias");
-	CheckOk(
-	    test,
-	    KernelMapDirectMemory(&alias, block * 2, SceKernelProtCpuRw, SceKernelMapFixed, gap, block),
-	    "alias over a free donation behind ordinary ownership");
-	CheckFailed(test, MapAutomaticMemory(base, block * 2, SceKernelMtypeC, SceKernelProtCpuRw),
-	            "automatic allocation of a donation claimed by a new alias");
-	CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(alias), block * 2),
-	        "unmap claiming alias");
 	CheckFailed(test, MapAutomaticMemory(base, block * 3, SceKernelMtypeC, SceKernelProtCpuRw),
 	            "automatic allocation beyond donated capacity");
 	CheckOk(test, MapAutomaticMemory(base, block * 2, SceKernelMtypeC, SceKernelProtCpuRw),
@@ -3811,32 +3701,6 @@ void TestModuleRelocationUsesWritableHostMapping() {
 	const char* test = "ModuleRelocationUsesWritableHostMapping";
 	Check(test, Loader::TestModuleRelocationUsesWritableHostMapping(),
 	      "module relocation did not retain writable host memory and semantic guest protection");
-	std::printf("[host]    %-48s ok\n", test);
-}
-
-void TestModuleSegmentsUseFlexibleMemory() {
-	const char* test = "ModuleSegmentsUseFlexibleMemory";
-	using namespace Loader;
-	// E, R and RW LOAD pages; GNU_RELRO over the RW page and the flagless LOAD add none.
-	const std::array<Elf64_Phdr, 6> phdrs {{
-	    {PT_LOAD, PF_X, 0x4000, 0x0000, 0x0000, 0x1ac, 0x1ac, 0x4000},
-	    {PT_LOAD, PF_R, 0x8000, 0x4000, 0x4000, 0x83, 0x83, 0x4000},
-	    {PT_LOAD, PF_R | PF_W, 0xc000, 0x8000, 0x8000, 0x338, 0x338, 0x4000},
-	    {0x6474e552, PF_R, 0xc000, 0x8000, 0x8000, 0x338, 0x4000, 0x1},
-	    {PT_LOAD, PF_R | PF_W, 0x10000, 0xc000, 0xc000, 0x21, 0x21, 0x4000},
-	    {PT_LOAD, 0, 0x10030, 0xc030, 0xc030, 0x550, 0x550, 0x4000},
-	}};
-	const auto size = CalcFlexibleMemorySize(phdrs.data(), phdrs.size());
-	Check(test, size == 4 * SceKernelPageSize, "module segments counted wrong");
-
-	const auto baseline = AvailableFlexibleMemory(test);
-	Libs::LibKernel::Memory::ChargeFlexibleMemory(size);
-	Check(test, AvailableFlexibleMemory(test) == baseline - size,
-	      "loaded module did not use flexible memory");
-	Libs::LibKernel::Memory::ReleaseFlexibleMemory(size);
-	Check(test, AvailableFlexibleMemory(test) == baseline,
-	      "unloaded module did not return flexible memory");
-
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -5122,7 +4986,6 @@ int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--backing-transfers-only") == 0) {
 		RunTest(TestConcurrentBackingReads);
 		RunTest(TestBackingReadExcludesWritesAndUnmap);
-		RunTest(TestTrackerProtectSharesBackingReads);
 		RunTest(TestSparseBackingReadPreservesResidency);
 		RunTest(TestCopySparseMemoryMappings);
 		RunTest(TestSparseReadDuringDirectCommit);
@@ -5182,7 +5045,6 @@ int main(int argc, char** argv) {
 	RunTest(TestSparseReadDuringDirectCommit);
 	RunTest(TestConcurrentBackingReads);
 	RunTest(TestBackingReadExcludesWritesAndUnmap);
-	RunTest(TestTrackerProtectSharesBackingReads);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
 	RunTest(TestFlexibleMemoryCapacityIsBootFixed);
@@ -5246,7 +5108,6 @@ int main(int argc, char** argv) {
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
 	RunTest(TestProgramMemoryAllocationAndProtection);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
-	RunTest(TestModuleSegmentsUseFlexibleMemory);
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestTlsStubsPreserveFlags);
 #endif

@@ -11,14 +11,14 @@
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
-#include "graphics/host_gpu/renderer/indirectWriteTables.h"
-#include "graphics/host_gpu/renderer/occlusionQueries.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
-#include <array>
+#include <utility>
+#include <span>
 #include <memory>
 #include <shared_mutex>
 #include <span>
@@ -54,40 +54,30 @@ public:
 	SamplerCache&       GetSamplerCache() { return m_sampler_cache; }
 	BufferCache&        GetBufferCache() { return m_buffer_cache; }
 	TextureCache&       GetTextureCache() { return m_texture_cache; }
-	IndirectWriteTables& GetIndirectWriteTables() { return m_indirect_write_tables; }
+	BindlessTable&      GetBindlessTable() { return m_bindless_table; }
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
-	// Before the emulated GPU writes guest memory (labels, WRITE_DATA): resolves a tracked page
-	// as its write fault would, without raising the exception.
-	void PrepareGpuWrite(const void* destination, uint64_t size) noexcept;
-	// Execution thread, before each operation (see PrepareBda()).
-	void NoteOperation(uint64_t submit_id, bool after_wait) noexcept {
-		if (submit_id != m_bda_submit || after_wait) {
-			m_bda_submit = submit_id;
-			m_bda_generation++;
-		}
-	}
-	// A small command-processor write that GPU-owned pages would turn into a readback of all
-	// queued GPU work (see BufferCache::WriteAroundGpuWrites()); false when the caller must
-	// PrepareGpuWrite() and store the bytes itself.
-	[[nodiscard]] bool WriteAroundGpuWrites(void* destination, const void* data, uint64_t size);
+	// Any thread: a read of these bytes faulted on a page protected because the GPU wrote to it,
+	// but none of them is GPU-written, so guest memory already holds their value.
+	[[nodiscard]] bool CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
+	                                     uint64_t size) const noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	// Advances whenever a range is mapped or unmapped.
 	[[nodiscard]] uint64_t MappedRangesVersion() const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
-	void               CacheDmaBases(const ShaderStageRuntime& runtime);
-	// Uploads the CPU writes of the guest memory that the device-address reads of the stages can
-	// reach (see ShaderInfo::dma_windows); false when a stage's reach is not known, and nothing
-	// was uploaded.
-	[[nodiscard]] bool SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* const> stages);
-	// may_write: a shader of the operation may store through device addresses. full_sync: upload
-	// the CPU writes of all cached memory first (SynchronizeDmaFootprint() did not cover the
-	// operation).
-	void               PrepareBda(bool may_write, bool full_sync = true);
+	// UnmapMemory for several ranges with one GPU-thread round trip and one drain (an AMM batch
+	// remaps dozens of ranges; one round trip each made the batch take tens of milliseconds).
+	void               UnmapMemoryRanges(std::span<const std::pair<uint64_t, uint64_t>> ranges);
+	// The host protection of the range was replaced behind the page tracker
+	// (PageManager::ResyncHostProtection): the watched pages get the tracker's protection back.
+	void ResyncHostProtection(uint64_t vaddr, uint64_t size) {
+		m_page_manager.ResyncHostProtection(vaddr, size);
+	}
+	void               PrepareBda();
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -110,9 +100,7 @@ private:
 	PageManager               m_page_manager;
 	BufferCache               m_buffer_cache;
 	TextureCache              m_texture_cache;
-	ImageHeap                 m_image_heap;
-	IndirectWriteTables       m_indirect_write_tables {*this};
-	OcclusionQueries          m_occlusion_queries {*this};
+	BindlessTable             m_bindless_table;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	uint64_t                  m_mapped_ranges_version = 0;
@@ -138,6 +126,8 @@ private:
 	bool                      m_use_scan_pending      = false;
 	uint32_t                  m_use_scan_countdown    = 0;
 	bool                      m_bda_logged = false;
+	uint64_t                  m_bda_synced_epoch      = 0;
+	uint64_t                  m_bda_synced_submission = 0;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

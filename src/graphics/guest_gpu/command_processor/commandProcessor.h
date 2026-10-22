@@ -9,7 +9,7 @@
 
 #include <atomic>
 #include <cstdint>
-#include <memory>
+#include <source_location>
 #include <span>
 #include <vector>
 
@@ -28,9 +28,24 @@ enum class ContextStateOperation : uint32_t {
 	PushClear = 3,
 };
 
+struct IndirectDrawRegisters {
+	uint32_t vertex_offset;
+	uint32_t instance_offset;
+	uint32_t index_offset;
+	// DRAW_INDIRECT_MULTI: the SH register that receives the draw's index within the packet
+	// (starts at zero for each packet); Pm4::SH_NOP for none.
+	uint32_t draw_index;
+};
+
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
+	// Draw prep (KYTY_DRAW_PREP): the submission number of a graphics command stream (0: not
+	// counted), whose draw and dispatch packets are numbered as the scanner numbers them.
+	void SetPrepSeq(uint64_t seq, uint32_t queue) noexcept {
+		m_prep_seq   = seq;
+		m_prep_queue = queue;
+	}
 
 private:
 	friend class CommandProcessor;
@@ -45,6 +60,14 @@ private:
 	bool                      m_chain         = false;
 	bool                      m_suspended     = false;
 	bool                      m_made_progress = false;
+	uint64_t                  m_prep_seq      = 0;
+	uint32_t                  m_prep_queue    = 0;
+	uint32_t                  m_prep_ordinal  = 0;
+	const uint32_t*           m_prep_packet   = nullptr; // the last numbered packet
+	// KYTY_SRT_DEFER: the dispatch packet last suspended for SRT bytes to land, and how often.
+	const uint32_t*           m_deferred_packet = nullptr;
+	uint32_t                  m_defer_count     = 0;
+	uint64_t                  m_deferred_tick   = 0;
 };
 
 class CommandProcessor {
@@ -58,33 +81,29 @@ public:
 	void Reset();
 	void ApplyContextStateOperation(ContextStateOperation operation);
 
-	// Operations of a pipelined GPU go to its execution thread; without one they execute
-	// when they are emitted.
-	void AttachPipeline(GuestGpu* gpu) { m_pipeline = gpu; }
-
-	void BufferInit();
-	void BufferFlush();
-	void BufferFlushIfBatchReady();
-	void BufferWait();
-	// Register writes go through these; queued operations keep snapshots of the old values.
-	HW::Context& GetCtx() {
-		m_ctx_dirty = true;
-		return m_ctx;
-	}
-	HW::UserConfig& GetUcfg() {
-		m_ucfg_dirty = true;
-		return m_ucfg;
-	}
-	HW::Shader& GetShCtx() {
-		m_sh_ctx_dirty = true;
-		return m_sh_ctx;
-	}
+	void            BufferInit();
+	void            BufferFlush();
+	void            BufferWait();
+	// See CommandScheduler::CompleteReleaseMemWrite -- only safe for a RELEASE_MEM that already
+	// wrote its guest-visible value synchronously and scheduled no interrupt callback.
+	void            CompleteReleaseMemWrite();
+	// See CommandScheduler::CompleteReleaseMemInterrupt -- for a RELEASE_MEM that DOES request a
+	// guest interrupt/event; uses a smaller batch bound as a hedge against delaying it.
+	void            CompleteReleaseMemInterrupt();
+	// See CommandScheduler::CompleteDraw -- called after every DrawIndex/DrawAuto.
+	void            CompleteDraw();
+	HW::Context&    GetCtx() { return m_ctx; }
+	HW::UserConfig& GetUcfg() { return m_ucfg; }
+	HW::Shader&     GetShCtx() { return m_sh_ctx; }
 
 	void SetIndexType(uint32_t index_type_and_size);
 	void SetIndexBaseAddress(uint64_t index_base_addr);
 	void SetIndexBufferSize(uint32_t index_buffer_size);
 	void SetDrawIndirectArgsBaseAddress(uint64_t draw_indirect_args_base_addr);
 	void SetDispatchIndirectArgsBaseAddress(uint64_t dispatch_indirect_args_base_addr);
+	[[nodiscard]] uint64_t GetDrawIndirectArgsBaseAddress() const {
+		return m_draw_indirect_args_base_addr;
+	}
 	[[nodiscard]] uint64_t GetDispatchIndirectArgsBaseAddress() const {
 		return m_dispatch_indirect_args_base_addr;
 	}
@@ -101,7 +120,9 @@ public:
 	                uint32_t interrupt_context_id);
 	void Flip(int handle, int index, int flip_mode, int64_t flip_arg);
 	void PrepareCpuFlip(uint64_t request_id);
-	void DeferEopInterrupt(uint32_t interrupt_context_id);
+	void SynchronizeGpu();
+	void EmitGlobalBarrier(std::source_location site = std::source_location::current());
+	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);
 	void DispatchIndirect(uint64_t args_addr, uint32_t mode);
@@ -128,7 +149,10 @@ public:
 
 	template <typename T>
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll, uint32_t wait_op);
-	void MemSemaphore(uint64_t* counter, bool signal, bool write);
+	// A label as the command processor sees it: end-of-pipe writes count once recorded, even
+	// before the CPU can see them (GuestGpu::LabelsAtCompletion).
+	template <typename T>
+	[[nodiscard]] T ReadLabel(const volatile T* addr) const;
 	void WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num, uint32_t write_control);
 	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes);
 	void DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cache_policy,
@@ -145,10 +169,18 @@ public:
 	[[nodiscard]] uint64_t GetSubmitId() const { return m_submit_id; }
 	void                   SetSubmitId(uint64_t submit_id) { m_submit_id = submit_id; }
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
+	[[nodiscard]] RenderContext& GetRenderContext() const { return m_renderer; }
 
 private:
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
+	// KYTY_SRT_DEFER: around a dispatch's RenderExecutor call. EndDispatchDefer suspends the
+	// packet when its SRT refresh was deferred (PipelineCache::SrtDeferRead).
+	// BeginDispatchDefer returns true when the packet is still waiting: it is suspended again and
+	// the dispatch is not attempted.
+	[[nodiscard]] bool BeginDispatchDefer();
+	void               EndDispatchDefer();
+	uint32_t            NumInstances();
 	const void*         IndexAddress(uint32_t first_index) const;
 	static const void*  IndexAddress(uint64_t base, uint32_t type_and_size, uint32_t first_index);
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }

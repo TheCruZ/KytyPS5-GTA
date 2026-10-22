@@ -4,15 +4,17 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
-#include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/host_gpu/renderer/indirectDispatch.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <source_location>
+#include <unordered_set>
 #include <array>
-#include <deque>
 #include <memory>
 #include <optional>
 #include <span>
@@ -34,6 +36,7 @@ struct DrawEmitInfo;
 struct DrawIndexBufferSource;
 class RenderContext;
 class CommandScheduler;
+class CommandRecorder;
 struct RenderExecutorTestAccess;
 struct IndirectThreadPass;
 
@@ -104,6 +107,16 @@ struct DrawAutoArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// DRAW_INDIRECT read on the GPU: the guest address of its DrawIndirectArgs (vertex count,
+	// instance count, start vertex, start instance). The counts above are then unknown on the
+	// CPU; only fast-launch mesh draws come this way.
+	uint64_t         gpu_args_address           = 0;
+	// Nonzero (vertex count known): the instance count is the dword the GPU reads there (the
+	// NUM_INSTANCES a DRAW_INDIRECT read on the GPU left).
+	uint64_t         gpu_instance_count_address = 0;
+	// With gpu_args_address: the user SGPR (index + 1, 0 = none) START_INST_LOC names, which
+	// the shader loads from the arguments' start instance (the CP writes it on hardware).
+	uint32_t         start_instance_sgpr        = 0;
 	DrawIndirectArgs indirect;
 };
 
@@ -144,10 +157,13 @@ public:
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
-	void EndRendering() const;
-	[[nodiscard]] bool IsRendering() const noexcept { return m_rendering; }
+	void EndRendering(std::source_location site = std::source_location::current()) const;
 
-	[[nodiscard]] CommandRecorder Handle() const;
+	// The raw command buffer. With the recording thread (CommandScheduler::EnableRecordingThread)
+	// this first waits until the thread has run everything queued; hot paths use Recorder().
+	[[nodiscard]] vk::CommandBuffer Handle() const;
+	// Records directly, or through the recording thread.
+	[[nodiscard]] CommandRecorder Recorder() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] const HW::Context&    GetRegisters() const noexcept { return *m_registers; }
@@ -173,7 +189,9 @@ private:
 	CommandScheduler&   m_scheduler;
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
-	// Direct recording writes m_buffer; deferred recording appends to m_stream while m_open.
+	CommandScheduler&   m_scheduler;
+	// Begun and not submitted yet; m_buffer is its handle when not recorded on a thread.
+	bool                m_open            = false;
 	vk::CommandBuffer   m_buffer          = nullptr;
 	CommandStream*      m_stream          = nullptr;
 	bool                m_open            = false;
@@ -255,7 +273,25 @@ public:
 	[[nodiscard]] uint64_t DrawWindow() const noexcept { return m_draw_window; }
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
-	void FindBuffers(std::span<PreparedBindings* const> stages, bool find_buffers = true);
+	// Bindless heaps: register the draw's heaps, patch their regions, and once per frame resolve
+	// the keys shaders flagged as pending.
+	void PrepareBindlessHeaps(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
+	void ResolveBindlessRequests();
+	// Engine method (engine-method.md, E2), at the start of a guest submission: the heap entries
+	// the guest wrote since the last one are compared and their keys settled again.
+	void SyncBindlessHeaps();
+	void SyncWrittenBindlessEntries();
+	// E3: settle entries no draw has asked for yet, within the per-submission budget.
+	void SettleBindlessHeaps();
+	bool ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key);
+	// The key's T# changed: release what it was settled to and settle it again.
+	bool ResettleBindlessKey(BindlessTable::Heap& heap, uint32_t key);
+	// Release only: the key is pending again and its image unpinned when nothing else uses it.
+	void ReleaseBindlessKey(BindlessTable::Heap& heap, uint32_t key);
+	// Settles again, within the budget, the keys of a window of each heap whose T# changed since
+	// they were settled; returns how many it resolved.
+	uint32_t RevalidateBindlessKeys(uint32_t budget);
+	void                           FindBuffers(std::span<PreparedBindings* const> stages);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
@@ -280,189 +316,12 @@ private:
 		std::optional<PreparedBindings> pixel;
 	};
 
-	// Bindless table elements resolved for one root image, by T#. Most of a table is unchanged
-	// from dispatch to dispatch, and resolving an element repeats the same texture-cache lookup
-	// while no image in its range was registered or unregistered and the guest backing did not
-	// change. Elements with DCC metadata are resolved again on every use: their lookup
-	// materializes fast clears.
-	struct TableElementResolution {
-		// What every preparation of a table reads comes first, on one cache line: a table names
-		// thousands of elements.
-		// The PrepareBindings() call that last bound the element, and its index there.
-		uint64_t       prepared_stamp = 0;
-		uint32_t       prepared_index = 0;
-		bool           permanent     = false; // Null for the root's view, whatever the memory.
-		bool           volatile_dcc  = false;
-		// A resolved element depends on the guest backing only through whether its data and
-		// metadata are readable: when the backing epoch moves (any map or unmap anywhere,
-		// constantly while a game streams), the element stays valid while that answer holds.
-		bool           backing_checkable = false;
-		bool           backing_readable  = false;
-		uint64_t       image_epoch   = 0;
-		uint64_t       backing_epoch = 0;
-		// The global image-set epoch at which the element was last known valid: while it holds,
-		// no image anywhere changed and the range needs no check.
-		uint64_t       checked_epoch = 0;
-		GuestRange     range; // Guest memory whose images decide the lookup, if any.
-		GuestRange     metadata_range;
-		TableViewMemo  view;
-		TextureBinding texture;
-	};
-	struct TableDescriptorHash {
-		size_t operator()(const std::array<uint32_t, 8>& dwords) const noexcept;
-	};
-	using TableElements =
-	    std::unordered_map<std::array<uint32_t, 8>, TableElementResolution, TableDescriptorHash>;
-	// The element the last preparation of a root found for one slot: a slot whose T# did not
-	// change skips the lookup by T#.
-	struct TableSlot {
-		std::array<uint32_t, 8> dwords {};
-		TableElementResolution* element = nullptr;
-	};
-	struct TableResolution {
-		ShaderRecompiler::IR::ImageResource root;
-		uint64_t                            last_use = 0;
-		TableElements                       elements;
-		std::vector<TableSlot>              slots;
-	};
-
-	// `stamp` identifies the PrepareBindings() call: an element it already resolved is not
-	// resolved again for another slot. `known` is the element of `value`, when the caller has it.
-	[[nodiscard]] TableElementResolution&
-	ResolveTableElement(TableResolution& table, const ShaderRecompiler::IR::DescriptorValue& value,
-	                    uint64_t stamp, TableElementResolution* known = nullptr);
-	[[nodiscard]] TableResolution& FindTableResolution(const ShaderRecompiler::IR::ImageResource& root);
-	[[nodiscard]] bool TableElementBackingReadable(const TableElementResolution& element);
-
-	// The bindless tables a program bound last. GTA V's ray tracing dispatches bind ~16k slots
-	// naming ~8k textures each, and almost all of them stay the same from frame to frame: while
-	// the T#s of every slot are unchanged, a binding of the program revisits only the elements
-	// that an image registration or a guest backing change may have affected, and the elements
-	// whose image is no longer bound as before (see ReuseTableBindings()). The images of the
-	// elements stay pinned in the texture cache meanwhile: they are not touched every binding.
-	struct TableBindingState {
-		struct Range {
-			ShaderRecompiler::IR::ImageResource root;
-			TableResolution*                    resolution = nullptr;
-			uint32_t                            table      = 0;
-			uint32_t                            capacity   = 0;
-		};
-		struct Element {
-			TableElementResolution*               resolution = nullptr;
-			TableResolution*                      table      = nullptr;
-			ShaderRecompiler::IR::DescriptorValue source;
-			uint32_t                              root = 0;
-			// Image the element is pinned to.
-			ImageId                               pinned;
-			// Visited by every binding (DCC metadata), or whenever the guest backing changes
-			// (the element's resolution does not record whether its backing is readable).
-			bool always            = false;
-			bool unchecked_backing = false;
-			// The ranges `spans` holds for the element.
-			GuestRange span_range;
-			GuestRange span_metadata;
-		};
-		// The guest pages (in texture-cache page granularity) of an element's data or metadata.
-		struct PageSpan {
-			uint64_t first   = 0;
-			uint64_t last    = 0;
-			uint32_t element = 0;
-		};
-		std::vector<Range>                   ranges;
-		// The T# of every slot of every range, in binding order.
-		std::vector<ShaderRecompiler::IR::DescriptorValue> values;
-		std::vector<Element>                 elements;
-		// The element of every slot.
-		std::vector<uint32_t>                slots;
-		// The descriptor of every element, and of every slot.
-		std::vector<vk::DescriptorImageInfo> infos;
-		std::vector<vk::DescriptorImageInfo> slot_infos;
-		// The slots of each element: element_slots[element_slot_begin[e] .. [e + 1]).
-		std::vector<uint32_t>                element_slot_begin;
-		std::vector<uint32_t>                element_slots;
-		// The element of each element resolution.
-		std::unordered_map<const TableElementResolution*, uint32_t> element_index;
-		// Element spans by first page; `max_span` is the longest (last - first).
-		std::vector<PageSpan>                spans;
-		uint64_t                             max_span = 0;
-		// Elements visited by every binding, and whenever the guest backing changes.
-		std::vector<uint32_t>                always;
-		std::vector<uint32_t>                unchecked_backing;
-		// Elements marked for a visit by this binding.
-		std::vector<uint64_t>                marks;
-		uint64_t                             mark_stamp = 0;
-		uint64_t                             generation = 0;
-		uint64_t                             set_epoch  = 0;
-		uint64_t                             backing_epoch = 0;
-		bool                                 valid = false;
-	};
-	// Prepares the tables of `prepared` from the program's state when it still applies; false
-	// when the tables must be resolved slot by slot.
-	[[nodiscard]] bool ReuseTableBindings(const ShaderRecompiler::IR::CompiledShaderInfo& program,
-	                                      const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
-	                                      TableBindingState& state, uint64_t stamp,
-	                                      PreparedBindings& prepared);
-	// Marks the elements a change of the image set or of the guest backing since the state's
-	// epochs may affect, and moves the epochs to now.
-	void MarkTableChanges(TableBindingState& state);
-	void MarkTableElement(TableBindingState& state, uint32_t element);
-	void MarkTablePages(TableBindingState& state, uint64_t address, uint64_t size);
-	void RebuildTableSpans(TableBindingState& state);
-	// Adds the spans of an element that joined the state.
-	static void AddTableSpans(TableBindingState& state, uint32_t element);
-	// The slots of each element (element_slot_begin / element_slots) from `slots`.
-	static void IndexTableSlots(TableBindingState& state);
-	// ReuseTableBindings() of tables whose T#s changed in a few slots: binds those slots to the
-	// elements of their new T#s (new elements join the state). False when the state should be
-	// resolved slot by slot again.
-	[[nodiscard]] bool PatchTableSlots(const ShaderRecompiler::IR::CompiledShaderInfo& program,
-	                     const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
-	                     TableBindingState& state, uint64_t stamp);
-	// After CommitBindings() bound the tables: records the descriptors and pins the images.
-	void FinishTableBindings(TableBindingState& state, const PreparedBindings& prepared);
-	void UnpinTableBindings(TableBindingState& state);
-	// RebindImages() of reused tables: visits the elements PrepareBindings() marked and those
-	// whose image is no longer bound as the state records.
-	void RebindReusedTables(PreparedBindings& prepared);
-
-	// ResolveTexture's image descriptions by T# and shader view (see DeriveTextureDesc).
-	struct TextureDescKey {
-		std::array<uint32_t, 8> dwords {};
-		std::array<uint32_t, 5> view {};
-		bool                    operator==(const TextureDescKey&) const = default;
-	};
-	struct TextureDescKeyHash {
-		size_t operator()(const TextureDescKey& key) const noexcept;
-	};
-	[[nodiscard]] static TextureDescKey
-	MakeTextureDescKey(const ShaderRecompiler::IR::ImageResource&   resource,
-	                   const ShaderRecompiler::IR::DescriptorValue& value);
-	// Writes the image and view the last lookup of a description found into `binding`, when
-	// they still hold (see TextureDescDerivation::Found).
-	[[nodiscard]] bool ReuseTextureLookup(TextureDescDerivation& derived, TextureBinding& binding);
-	static constexpr size_t MaxTextureDescs = size_t {1} << 16u;
-	std::unordered_map<TextureDescKey, TextureDescDerivation, TextureDescKeyHash> m_texture_descs;
-	// Bindings point into m_texture_descs until their views are acquired: a full map is cleared
-	// once the bindings of the operation are reset.
-	bool m_clear_texture_descs = false;
-	// Advances when m_texture_descs is cleared (bindings keep pointers into it).
-	uint64_t m_texture_descs_generation = 1;
-
-	// The host sampler for a sampler binding; see NativeSampler().
-	[[nodiscard]] vk::Sampler NativeSampler(const ShaderRecompiler::IR::CompiledShaderInfo& program,
-	                                        uint32_t                                        index,
-	                                        const ShaderRecompiler::IR::DescriptorValue&    value);
-	struct SamplerMemoEntry {
-		std::array<uint32_t, 4> fields {};
-		bool                    integer_border = false;
-		vk::Sampler             sampler        = nullptr;
-	};
-	std::array<SamplerMemoEntry, 256> m_sampler_memo {};
-
-	[[nodiscard]] TextureBinding
-	ResolveTableTexture(const ShaderRecompiler::IR::ImageResource&   root,
-	                    const ShaderRecompiler::IR::DescriptorValue& value,
-	                    GuestRange*                                  examined = nullptr);
+	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
+	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	[[nodiscard]] TextureBinding FindResolvedTexture(
+	    const ShaderRecompiler::IR::ImageResource& resource, const ShaderTextureResource& descriptor,
+	    TextureCache::ImageDesc desc, bool shader_conversion, vk::Format pixel_format,
+	    vk::Format view_format, uint32_t size);
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
@@ -519,72 +378,41 @@ private:
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
-	// CommitBindings(): the image ranges a draw writes (address, size).
-	std::vector<std::pair<uint64_t, uint64_t>> m_written_image_ranges;
-	// CommitBindings(): the buffer ranges the stages of an operation write.
-	struct WrittenBufferRange {
-		uint64_t                address  = 0;
-		uint64_t                size     = 0;
-		const PreparedBindings* writer   = nullptr;
-		uint32_t                resource = 0;
-	};
-	std::vector<WrittenBufferRange> m_written_buffer_ranges;
+	// Bindless heaps already surveyed (base ^ table offset << 48).
+	std::unordered_set<uint64_t>          m_bindless_surveyed;
+
+	void PrepareBindlessSamplers(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
+	void LogWatchedDraw(const DrawCallInfo& draw, const DrawRenderState& state,
+	                    uint32_t index_offset, int32_t base_vertex, uint32_t first_vertex,
+	                    int32_t host_vertex_offset, uint32_t host_first_instance, bool indirect);
+	uint64_t                              m_bindless_frame = UINT64_MAX;
+	std::vector<uint32_t>                 m_bindless_requests;
+	std::vector<std::array<uint32_t, 8>>  m_bindless_window;
+	std::vector<std::pair<uint64_t, uint64_t>> m_bindless_written;
+	std::vector<ImageId>                       m_bindless_changed;
+	uint64_t                                   m_bindless_eager_frame = UINT64_MAX;
+	uint32_t                                   m_bindless_eager_left  = 0;
+	bool                                       m_bindless_eager_device_full = false;
+	uint64_t                                   m_bindless_eager_bytes = 0;
+	// Bindless usage probe (UpdateBindlessUsageProbe): the frame it was armed in (0 = idle), the
+	// first frame the next may start, and the frame the pending feedback snapshot was recorded.
+	uint64_t                              m_bindless_probe_frame      = 0;
+	uint64_t                              m_bindless_next_probe       = 0;
+	uint64_t                              m_bindless_snapshot_frame   = 0;
+	std::vector<ImageId>                  m_bindless_unused;
+	void UpdateBindlessUsageProbe(uint64_t frame, uint64_t snapshot_frame);
+	std::vector<uint32_t>                 m_bindless_srt;
+	std::vector<uint32_t>                 m_verify_srt; // KYTY_SRT_VERIFY: flat SRT with pairs
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
-	// Prepared bindings and slot memos point into the elements: a deque never relocates its
-	// entries (std::unordered_map has no noexcept move, so a growing vector copied the elements
-	// and left those pointers dangling).
-	std::deque<TableResolution>           m_table_resolutions;
-	// Elements a table resolution dropped while prepared bindings may still point into them;
-	// freed by ResetBindings().
-	std::deque<TableElements>             m_retired_table_elements;
-	uint64_t                              m_table_resolution_tick = 0;
-	uint64_t                              m_table_prepare_stamp   = 0;
-	std::vector<vk::DescriptorImageInfo>  m_table_image_infos;
-	// Advances whenever a table resolution drops its elements: table binding states pointing
-	// into them no longer apply.
-	uint64_t                              m_table_generation = 0;
-	std::unordered_map<const void*, TableBindingState> m_table_states;
-	std::vector<std::pair<uint64_t, uint64_t>>         m_table_changes;
-	std::vector<uint32_t>                              m_table_marked;
-	// ReuseTableBindings(): the slots whose T# changed (slot, range, slot in its range).
-	struct ChangedTableSlot {
-		uint32_t slot  = 0;
-		uint32_t range = 0;
-		uint32_t index = 0;
-	};
-	std::vector<ChangedTableSlot>                      m_table_changed_slots;
-	// RebindReusedTables(): the elements whose binding changed, one byte per element.
-	std::vector<uint8_t>                               m_table_flags;
-	// See BeginGuestOperation().
-	uint32_t                                           m_guest_queue             = 0;
-	bool                                               m_deferred_barrier        = false;
-	uint32_t                                           m_deferred_barrier_queue  = 0;
-	bool                                               m_dispatch_chained        = false;
-	// Reused by every draw; see AcquireDrawRenderState().
-	std::unique_ptr<DrawRenderStorage, void (*)(DrawRenderStorage*)> m_draw_state {nullptr,
-	                                                                               nullptr};
-	// Resolutions ahead of execution; see ResolveDrawAhead().
-	std::unique_ptr<ResolvedDrawRing, void (*)(ResolvedDrawRing*)> m_resolved_ring {nullptr,
-	                                                                                nullptr};
-	ResolvedDraw*                                                  m_resolved_draw = nullptr;
-	uint64_t                                                       m_context_id    = 0;
-	// The context snapshot whose registers hw_check() last accepted.
-	uint64_t m_checked_context_id = 0;
-	// The last color-target descriptions per slot; see ResolveRenderColorTarget().
-	std::unique_ptr<ColorTargetMemo, void (*)(ColorTargetMemo*)> m_color_target_memo {nullptr,
-	                                                                                  nullptr};
-	// The last depth-target descriptions; see ResolveRenderDepthTarget().
-	std::unique_ptr<DepthTargetMemo, void (*)(DepthTargetMemo*)> m_depth_target_memo {nullptr,
-	                                                                                  nullptr};
-	// The render targets of the last draw; see RenderTargetMemo.
-	std::unique_ptr<RenderTargetMemo, void (*)(RenderTargetMemo*)> m_render_target_memo {nullptr,
-	                                                                                     nullptr};
-	// Whether the executing draw reused the render targets of the draw before.
-	bool     m_render_targets_reused = false;
-	uint64_t m_draw_window           = 0;
-	std::unique_ptr<IndirectThreadPass, void (*)(IndirectThreadPass*)> m_indirect_thread_pass {
-	    nullptr, nullptr};
+	// Created at the first thread-dimension indirect dispatch.
+	std::unique_ptr<IndirectDispatchGroups> m_indirect_groups;
+	// Created at the first indirect fast-launch mesh draw with counts on the GPU.
+	std::unique_ptr<MeshIndirectArgs>       m_mesh_args;
+	// Ring of VkDrawMeshTasksIndirectCommandEXT for indirect fast-launch mesh draws (16 bytes an
+	// entry); an entry is rewritten only after the ring has gone round, behind its last read.
+	std::unique_ptr<Buffer>                 m_mesh_indirect;
+	uint32_t                                m_mesh_indirect_next = 0;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

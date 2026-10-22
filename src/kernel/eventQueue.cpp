@@ -6,10 +6,12 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "graphics/host_gpu/timeline.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <fmt/format.h>
 #include <limits>
@@ -53,6 +55,12 @@ public:
 	int  GetTriggeredEvents(KernelEvent* ev, int num);
 	int  WaitForEvents(KernelEvent* ev, int num, uint32_t micros);
 	void Close();
+
+	// Guests poll some queues with short timeouts in a tight loop. Only the first
+	// LOGGED_TIMEOUTS consecutive timed-out waits are logged; the rest are counted and reported
+	// by the next wait that receives events.
+	static constexpr uint32_t LOGGED_TIMEOUTS = 4;
+	std::atomic<uint32_t>     consecutive_timeouts {0};
 
 private:
 	void TriggerExpiredTimers(uint64_t now_ns);
@@ -413,13 +421,22 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 
 	EXIT_NOT_IMPLEMENTED(out == nullptr);
 
-	LOGF("\tEqueue wait: %s, caller = 0x%016" PRIx64 ", eq = 0x%016" PRIx64 ", ev = 0x%016" PRIx64
-	     ", num = %d, timo = %s, thread_id = %d\n",
-	     owner->GetName().c_str(), reinterpret_cast<uint64_t>(__builtin_return_address(0)),
-	     static_cast<uint64_t>(eq), reinterpret_cast<uint64_t>(ev), num,
-	     (timo == nullptr ? "inf" : fmt::format("{}", *timo).c_str()),
-	     Common::Thread::GetThreadIdUnique());
+	const bool quiet = owner->consecutive_timeouts.load(std::memory_order_relaxed) >=
+	                   KernelEqueuePrivate::LOGGED_TIMEOUTS;
+	if (!quiet) {
+		LOGF("\tEqueue wait: %s, caller = 0x%016" PRIx64 ", eq = 0x%016" PRIx64
+		     ", ev = 0x%016" PRIx64 ", num = %d, timo = %s, thread_id = %d\n",
+		     owner->GetName().c_str(), reinterpret_cast<uint64_t>(__builtin_return_address(0)),
+		     static_cast<uint64_t>(eq), reinterpret_cast<uint64_t>(ev), num,
+		     (timo == nullptr ? "inf" : fmt::format("{}", *timo).c_str()),
+		     Common::Thread::GetThreadIdUnique());
+	}
 
+	const bool blocking = timo == nullptr || *timo != 0;
+	if (blocking) {
+		Libs::Graphics::Timeline::Mark("eq-wait", static_cast<uint64_t>(eq),
+		                               timo == nullptr ? ~uint64_t {0} : *timo);
+	}
 	if (timo == nullptr) {
 		*out = owner->WaitForEvents(ev, num, 0);
 	}
@@ -431,15 +448,34 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 			*out = owner->WaitForEvents(ev, num, *timo);
 		}
 	}
+	if (blocking) {
+		Libs::Graphics::Timeline::Mark(
+		    "eq-woke", static_cast<uint64_t>(eq),
+		    *out > 0 ? (static_cast<uint64_t>(static_cast<uint32_t>(ev[0].filter)) << 48u) |
+		                   (static_cast<uint64_t>(ev[0].ident) & 0xffffffffffffull)
+		             : 0);
+	}
 
 	if (*out == KERNEL_ERROR_EBADF) {
 		return KERNEL_ERROR_EBADF;
 	}
 	if (*out == 0) {
-		LOGF("\tEqueue wait timedout: %s\n", owner->GetName().c_str());
+		const auto timeouts =
+		    owner->consecutive_timeouts.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (timeouts <= KernelEqueuePrivate::LOGGED_TIMEOUTS) {
+			LOGF("\tEqueue wait timedout: %s%s\n", owner->GetName().c_str(),
+			     timeouts == KernelEqueuePrivate::LOGGED_TIMEOUTS
+			         ? " (further timeouts are counted, not logged)"
+			         : "");
+		}
 		return KERNEL_ERROR_ETIMEDOUT;
 	}
 
+	if (const auto timeouts = owner->consecutive_timeouts.exchange(0, std::memory_order_relaxed);
+	    timeouts > KernelEqueuePrivate::LOGGED_TIMEOUTS) {
+		LOGF("\tEqueue wait: %s, %u timed-out waits were not logged\n", owner->GetName().c_str(),
+		     timeouts - KernelEqueuePrivate::LOGGED_TIMEOUTS);
+	}
 	LOGF("\tEqueue wait received %u events: ident = 0x%016" PRIx64
 	     ", filter = %d, flags = 0x%04" PRIx16 ", fflags = 0x%08" PRIx32 ", data = 0x%016" PRIx64
 	     ", udata = 0x%016" PRIx64 "\n",

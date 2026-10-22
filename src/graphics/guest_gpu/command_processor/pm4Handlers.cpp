@@ -6,6 +6,8 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/videoOut.h"
@@ -19,6 +21,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -51,6 +54,61 @@
 #define KYTY_CP_OP_PARSER(f) uint32_t f(KYTY_CP_OP_PARSER_ARGS)
 
 namespace Libs::Graphics {
+
+// KYTY_TRACE_GS_SLOT_SEQ=<lines>: with KYTY_TRACE_GS_SLOT, every write to that slot, zero
+// included, in command order ([gs-seq] lines), and the draws that see it (renderDraw).
+static int32_t TracedGsSlot() {
+	static const int32_t traced = [] {
+		const char* value = std::getenv("KYTY_TRACE_GS_SLOT");
+		return value != nullptr ? static_cast<int32_t>(std::strtol(value, nullptr, 10)) : -1;
+	}();
+	return traced;
+}
+static std::atomic<int64_t> g_gs_seq_lines {[] {
+	const char* value = std::getenv("KYTY_TRACE_GS_SLOT_SEQ");
+	return value != nullptr ? static_cast<int64_t>(std::strtoll(value, nullptr, 10)) : int64_t {0};
+}()};
+static thread_local GsSlotWriter    t_gs_slot_writer;
+static thread_local const uint32_t* t_sh_indirect_entry = nullptr;
+static thread_local const uint32_t* t_sh_list_entry     = nullptr;
+static std::atomic<uint64_t>        g_gs_seq_counter {0};
+
+// KYTY_TRACE_GS_SLOT_SEQ_AFTER=<seconds>: start the trace that long after the emulator started.
+static const auto g_gs_seq_start = std::chrono::steady_clock::now();
+
+bool TakeGsSlotSeqLine() {
+	if (g_gs_seq_lines.load(std::memory_order_relaxed) <= 0) {
+		return false;
+	}
+	static const auto after = [] {
+		const char* value = std::getenv("KYTY_TRACE_GS_SLOT_SEQ_AFTER");
+		return std::chrono::seconds(value != nullptr ? std::strtoll(value, nullptr, 10) : 0);
+	}();
+	if (std::chrono::steady_clock::now() - g_gs_seq_start < after) {
+		return false;
+	}
+	return g_gs_seq_lines.fetch_sub(1, std::memory_order_relaxed) > 0;
+}
+
+GsSlotWriter GetGsSlotLastWriter() {
+	return t_gs_slot_writer;
+}
+
+static void NoteGsSlotWrite(uint32_t source, const uint32_t* where, uint32_t value, uint32_t start = 0,
+                            uint32_t count = 0) {
+	t_gs_slot_writer = {source, where, value, g_gs_seq_counter.fetch_add(1) + 1, start, count};
+	// KYTY_TRACE_GS_SLOT_VALUE: SET_SH_REG writes are logged only with that value.
+	static const uint32_t only = [] {
+		const char* env = std::getenv("KYTY_TRACE_GS_SLOT_VALUE");
+		return env != nullptr ? static_cast<uint32_t>(std::strtoul(env, nullptr, 16)) : 0u;
+	}();
+	if ((source != 1 || only == 0 || value == only) && TakeGsSlotSeqLine()) {
+		std::fprintf(stderr, "[gs-seq] #%llu %s value=%08x at=%p\n",
+		             static_cast<unsigned long long>(t_gs_slot_writer.seq),
+		             source == 1 ? "set" : source == 2 ? "indirect" : "list", value,
+		             static_cast<const void*>(where));
+	}
+}
 
 namespace {
 
@@ -937,7 +995,9 @@ KYTY_HW_SH_PARSER(HwShSetRegisters) {
 	for (uint32_t i = 0; i < reg_num; i++) {
 		const auto offset = cmd_offset + i;
 		EXIT_NOT_IMPLEMENTED(offset >= Pm4::SH_NUM || g_hw_sh_indirect_func[offset] == nullptr);
+		t_sh_list_entry = &buffer[i];
 		g_hw_sh_indirect_func[offset](cp, offset, buffer[i]);
+		t_sh_list_entry = nullptr;
 	}
 
 	return reg_num;
@@ -1077,6 +1137,35 @@ KYTY_HW_SH_PARSER(HwShSetGsUserSgpr) {
 	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
 	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "gs");
 
+	// KYTY_TRACE_GS_SLOT=<slot>: SET_SH_REG writes that cover that GS user-data slot.
+	if (static const int32_t traced = [] {
+		    const char* value = std::getenv("KYTY_TRACE_GS_SLOT");
+		    return value != nullptr ? static_cast<int32_t>(std::strtol(value, nullptr, 10)) : -1;
+	    }();
+	    traced >= 0 && static_cast<uint32_t>(traced) >= slot &&
+	    static_cast<uint32_t>(traced) < slot + write_num) {
+		static std::atomic<uint32_t> logged {0};
+		const auto value = buffer[static_cast<uint32_t>(traced) - slot];
+		static const uint32_t only = [] {
+			const char* env = std::getenv("KYTY_TRACE_GS_SLOT_VALUE");
+			return env != nullptr ? static_cast<uint32_t>(std::strtoul(env, nullptr, 16)) : 0u;
+		}();
+		if (value != 0 && (only == 0 || value == only) && logged.fetch_add(1) < 64u) {
+			std::string words;
+			for (uint32_t i = 0; i < write_num; i++) {
+				words += fmt::format(" {:08x}", buffer[i]);
+			}
+			std::fprintf(stderr, "[gs-slot] set_sh_reg slot=%u count=%u value=%08x at=%p:%s\n", slot,
+			             write_num, value,
+			             static_cast<const void*>(&buffer[static_cast<uint32_t>(traced) - slot]),
+			             words.c_str());
+		}
+	}
+	if (const auto traced = TracedGsSlot(); traced >= 0 && static_cast<uint32_t>(traced) >= slot &&
+	                                        static_cast<uint32_t>(traced) < slot + write_num) {
+		NoteGsSlotWrite(1, &buffer[static_cast<uint32_t>(traced) - slot],
+		                buffer[static_cast<uint32_t>(traced) - slot], slot, write_num);
+	}
 	for (uint32_t i = 0; i < write_num; i++) {
 		cp.GetShCtx().SetGsUserSgpr(slot + i, buffer[i]);
 	}
@@ -1243,7 +1332,12 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
 	cp.NoteAcquireMem();
 
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0055800 && cmd_id != 0xc0065800);
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0055800 && cmd_id != 0xc0061050 && cmd_id != 0xc0065800);
+	// With KYTY_DISPATCH_SYNC=0 dispatches carry no barriers of their own, so the guest's
+	// acquire (wait for prior writes, invalidate caches) becomes one.
+	if (!DispatchSyncEnabled()) {
+		cp.EmitGlobalBarrier();
+	}
 	return KYTY_PM4_LEN(cmd_id) - 1;
 }
 
@@ -1375,7 +1469,8 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(addr == 0);
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
-	if (cp.ReadDecisionValue<uint32_t>(reinterpret_cast<const volatile void*>(addr)) == 0) {
+	cp.GetRenderContext().GetBufferCache().WaitSharedWrites(addr, sizeof(uint32_t));
+	if (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {
 		return payload_dw + exec_count;
 	}
 
@@ -1409,8 +1504,7 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(function > 6);
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
-	const bool take_then = TestWaitRegMemValue(cp.ReadDecisionValue<uint64_t>(compare_addr),
-	                                           reference, mask, function);
+	const bool take_then = TestWaitRegMemValue(cp.ReadLabel(compare_addr), reference, mask, function);
 	LOGF("\t branch: take=%u then=0x%016" PRIx64 "/%" PRIu32 " else=0x%016" PRIx64 "/%" PRIu32 "\n",
 	     take_then ? 1u : 0u, reinterpret_cast<uint64_t>(then_buffer), then_num_dw,
 	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
@@ -1539,6 +1633,16 @@ KYTY_CP_OP_PARSER(CpOpDrawIndex) {
 		uint32_t max_instance_count = buffer[3];
 		uint32_t instance_count     = buffer[6];
 		uint32_t flags              = buffer[7];
+		// KYTY_LOG_DRAW_INDEX_MULTI=1: the packet's dwords, to learn its unparsed fields.
+		if (static const bool log = std::getenv("KYTY_LOG_DRAW_INDEX_MULTI") != nullptr; log) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1) < 64u) {
+				std::fprintf(stderr,
+				             "[draw-index-multi] %08x %08x %08x %08x %08x %08x %08x %08x\n",
+				             buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5],
+				             buffer[6], buffer[7]);
+			}
+		}
 
 		EXIT_NOT_IMPLEMENTED(instance_count > max_instance_count);
 		EXIT_NOT_IMPLEMENTED((flags & ~0xa0u) != 0);
@@ -1579,8 +1683,15 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 	// The native indexed packet enables the high-half first-index destination in word 3.
 	const IndirectDrawRegisters registers {
 	    buffer[1] & 0xffffu, buffer[2] & 0xffffu,
-	    indexed && (buffer[2] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP, Pm4::SH_NOP};
+	    indexed && (buffer[2] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP,
+	    Pm4::SH_NOP};
 
+	if (static const bool packets = std::getenv("KYTY_TRACE_GS_SLOT_PACKETS") != nullptr;
+	    packets && TracedGsSlot() >= 0 && TakeGsSlotSeqLine()) {
+		std::fprintf(stderr, "[gs-seq] draw-indirect indexed=%d base_vtx_loc=0x%x start_inst_loc=0x%x args=%p\n",
+		             indexed ? 1 : 0, buffer[1] & 0xffffu, buffer[2] & 0xffffu,
+		             reinterpret_cast<const void*>(static_cast<uintptr_t>(data_offset)));
+	}
 	cp.DrawIndirect(data_offset, registers, draw_initiator, indexed);
 
 	return 4;
@@ -1599,17 +1710,26 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 	const auto stride_in_bytes = buffer[7];
 	const auto draw_initiator  = buffer[8];
 	const bool indexed         = (cmd_id == 0xc0083800);
-	// Multi-draw moves the first-index enable to word 4; the destinations stay in 2/3. Word 4
-	// bit 31 enables the subdraw index, written to the register in its low half.
+	EXIT_NOT_IMPLEMENTED((buffer[3] & (1u << 27u)) != 0); // User-VGPR destinations.
+	// Multi-draw moves the first-index enable to word 4; the destinations stay in 2/3. Word 3's
+	// top bit enables the per-packet draw index register.
 	const IndirectDrawRegisters registers {
 	    buffer[1] & 0xffffu, buffer[2] & 0xffffu,
 	    indexed && (buffer[3] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP,
-	    (buffer[3] >> 31u) != 0 ? buffer[3] & 0xffffu : Pm4::SH_NOP};
+	    (buffer[3] & 0x80000000u) != 0 ? buffer[3] & 0xffffu : Pm4::SH_NOP};
 
 	if (count_indirect == 0) {
 		count_addr = nullptr;
 	}
 
+	if (static const bool packets = std::getenv("KYTY_TRACE_GS_SLOT_PACKETS") != nullptr;
+	    packets && TracedGsSlot() >= 0 && TakeGsSlotSeqLine()) {
+		std::fprintf(stderr,
+		             "[gs-seq] draw-indirect-multi indexed=%d base_vtx_loc=0x%x start_inst_loc=0x%x draw_index_loc=0x%x "
+		             "dword3=%08x max=%u\n",
+		             indexed ? 1 : 0, buffer[1] & 0xffffu, buffer[2] & 0xffffu, registers.draw_index, buffer[3],
+		             max_count_or_count);
+	}
 	cp.DrawIndirectMulti(data_offset, max_count_or_count, count_addr, stride_in_bytes,
 	                     registers, draw_initiator, indexed);
 
@@ -1924,7 +2044,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 			EXIT("unknown sh reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
 		}
 
+		t_sh_indirect_entry = indirect_buffer + 1;
 		pfunc(cp, cmd_offset, value);
+		t_sh_indirect_entry = nullptr;
 	}
 
 	return KYTY_PM4_LEN(cmd_id) - 1u;
@@ -2047,16 +2169,122 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0064900);
 
-	// The event type, cache actions and destination cache only order GPU work, which the renderer's
-	// resource barriers already order.
-	cp.ReleaseMem(
-	    (buffer[1] >> 29u) & 0x7u, (buffer[1] >> 24u) & 0x7u,
-	    reinterpret_cast<void*>((buffer[2] & ~0x3u) | (static_cast<uint64_t>(buffer[3]) << 32u)),
-	    buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u), buffer[6] & 0x07ffffffu);
-	if (((buffer[1] >> 24u) & 0x7u) == 0 || ((buffer[1] >> 24u) & 0x7u) == 3) {
-		// A label-only release keeps batching; long batches still start the GPU early.
-		cp.BufferFlushIfBatchReady();
+	uint32_t cache_policy       = (buffer[0] >> 25u) & 0x3u;
+	uint32_t eop_event_type     = buffer[0] & 0x3fu;
+	uint32_t event_index        = (buffer[0] >> 8u) & 0x7u;
+	uint32_t gcr_cntl           = (buffer[0] >> 12u) & 0xfffu;
+	uint32_t release_dst        = (buffer[1] >> 16u) & 0x3u;
+	uint32_t event_write_dest   = 0;
+	uint32_t data_sel           = (buffer[1] >> 29u) & 0x7u;
+	uint32_t interrupt_selector = (buffer[1] >> 24u) & 0x7u;
+	auto*    dst_gpu_addr =
+	    reinterpret_cast<void*>(buffer[2] | (static_cast<uint64_t>(buffer[3]) << 32u));
+	uint64_t value                = buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u);
+	uint32_t interrupt_context_id = buffer[6] & 0x07ffffffu;
+
+	constexpr uint32_t ReleaseMemDstMemory = 0;
+	constexpr uint32_t ReleaseMemDstTcL2   = 1;
+	EXIT_NOT_IMPLEMENTED(release_dst != ReleaseMemDstMemory && release_dst != ReleaseMemDstTcL2);
+	EXIT_NOT_IMPLEMENTED(data_sel != 0 && data_sel != 1 && data_sel != 2 && data_sel != 3 &&
+	                     data_sel != 5);
+
+	LogUnknownReleaseMemGcr(gcr_cntl);
+
+	const bool gl2_writeback = ((gcr_cntl & GcrGl2Writeback) != 0);
+
+	auto trigger_interrupt = [&]() {
+		switch (interrupt_selector) {
+			case 0x00:
+			case 0x03: break;
+			case 0x01:
+			case 0x02:
+			case 0x04:
+				cp.TriggerEopEventAtEndOfPipe(interrupt_context_id);
+				// The event is queued for delivery once this submission's tick completes; see
+				// CompleteReleaseMemInterrupt for the (small) batch bound used here.
+				cp.CompleteReleaseMemInterrupt();
+				break;
+			default: EXIT("unknown release_mem interrupt selector\n");
+		}
+	};
+
+	// Cache actions only order GPU work, which the renderer's resource barriers already order.
+	if (data_sel == 0 || interrupt_selector == 4 ||
+	    (release_dst == ReleaseMemDstMemory && dst_gpu_addr == nullptr)) {
+		trigger_interrupt();
+
+		return 7;
 	}
+
+	auto cache_action = ReleaseMemCacheActionFromGcr(gcr_cntl);
+	cache_policy      = 0;
+
+	if (data_sel == 1) {
+		eop_event_type    = 0x2f;
+		event_index       = 6;
+		auto event_source = 2u;
+
+		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
+		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
+		                      interrupt_selector, interrupt_context_id);
+		if (interrupt_selector == 0x00 || interrupt_selector == 0x03) {
+			// WriteAtEndOfPipe already performed the guest-visible write synchronously above (no
+			// interrupt callback was scheduled for these selectors), so nothing depends on when
+			// the accumulated command buffer actually reaches the GPU -- safe to batch instead of
+			// paying a host vkQueueSubmit for every single fence update.
+			cp.CompleteReleaseMemWrite();
+		} else {
+			// interrupt_selector 0x01/0x02 route through WriteAtEndOfPipe's interrupt path, which
+			// schedules a callback gated on this submission's tick actually completing on the
+			// GPU -- flush now so a guest thread that may be blocked waiting on it isn't stalled
+			// behind a batching window.
+			KYTY_PROFILER_BLOCK("CpOpReleaseMem: BufferFlush");
+			SetSubmitReason("release-mem with interrupt");
+			cp.BufferFlush();
+		}
+
+		return 7;
+	}
+
+	if (data_sel == 5) {
+		if (gl2_writeback) {
+			cache_action = 0;
+		}
+
+		eop_event_type    = 0x2f;
+		event_index       = 6;
+		auto event_source = 1u;
+
+		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
+		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
+		                      interrupt_selector, interrupt_context_id);
+		if (interrupt_selector == 0x01) {
+			KYTY_PROFILER_BLOCK("CpOpReleaseMem: BufferFlush");
+			SetSubmitReason("release-mem timestamp with interrupt");
+			cp.BufferFlush();
+		}
+
+		return 7;
+	}
+
+	const bool keep_native_event_index =
+	    (eop_event_type == 0x04 && cache_action == 0x00) ||
+	    (eop_event_type == 0x2f && event_index == 0x06 && cache_action == 0x38);
+
+	if (data_sel == 2) {
+		if (!keep_native_event_index) {
+			event_index = 0;
+		}
+	} else {
+		EXIT_IF(data_sel != 3);
+		if (!keep_native_event_index) {
+			event_index = 0;
+		}
+		data_sel = 4;
+	}
+
+	cp.WriteAtEndOfPipe64(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
+	                      data_sel, dst_gpu_addr, value, interrupt_selector, interrupt_context_id);
 
 	return 7;
 }
@@ -2145,7 +2373,9 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 		}
 		if (handled) {
 			for (uint32_t i = 0; i < num_values; i++) {
+				t_sh_list_entry = &buffer[1 + i];
 				g_hw_sh_indirect_func[cmd_offset + i](cp, cmd_offset + i, buffer[1 + i]);
+				t_sh_list_entry = nullptr;
 			}
 			return num_values + 1u;
 		}
@@ -3266,7 +3496,27 @@ void GraphicsInitJmpTablesShIndirect() {
 		    };
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_GS_0 + slot] =
 		    [](KYTY_HW_SH_INDIRECT_ARGS) {
-			    cp.GetShCtx().SetGsUserSgpr(cmd_offset - Pm4::SPI_SHADER_USER_DATA_GS_0, value);
+			    auto sgpr = cmd_offset - Pm4::SPI_SHADER_USER_DATA_GS_0;
+			    if (static const int32_t traced = [] {
+				        const char* env = std::getenv("KYTY_TRACE_GS_SLOT");
+				        return env != nullptr ? static_cast<int32_t>(std::strtol(env, nullptr, 10)) : -1;
+			        }();
+			        traced >= 0 && sgpr == static_cast<uint32_t>(traced) && value != 0 &&
+			        [&] {
+				        const char* env = std::getenv("KYTY_TRACE_GS_SLOT_VALUE");
+				        return env == nullptr || std::strtoul(env, nullptr, 16) == value;
+			        }()) {
+				    static std::atomic<uint32_t> logged {0};
+				    if (logged.fetch_add(1) < 64u) {
+					    std::fprintf(stderr, "[gs-slot] indirect slot=%u value=%08x\n", sgpr, value);
+				    }
+			    }
+			    if (TracedGsSlot() >= 0 && sgpr == static_cast<uint32_t>(TracedGsSlot())) {
+				    NoteGsSlotWrite(t_sh_indirect_entry != nullptr ? 2 : 3,
+				                    t_sh_indirect_entry != nullptr ? t_sh_indirect_entry : t_sh_list_entry, value);
+			    }
+			    cp.GetShCtx().SetGsUserSgpr(sgpr, value, cp.GetUserDataMarker());
+			    cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 		    };
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_HS_0 + slot] =
 		    [](KYTY_HW_SH_INDIRECT_ARGS) {

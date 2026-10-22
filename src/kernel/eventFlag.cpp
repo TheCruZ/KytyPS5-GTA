@@ -1,4 +1,5 @@
 #include "kernel/eventFlag.h"
+#include "graphics/host_gpu/timeline.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -287,6 +288,7 @@ int KYTY_SYSV_ABI KernelDeleteEventFlag(KernelEventFlag ef) {
 int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, uint32_t wait_mode,
                                       uint64_t* result_pat, KernelUseconds* timeout) {
 	PRINT_NAME();
+	Libs::Graphics::Timeline::Scope timeline_wait("ef-wait", "ef-woke", reinterpret_cast<uint64_t>(ef));
 
 	if (ef == nullptr) {
 		return KERNEL_ERROR_ESRCH;

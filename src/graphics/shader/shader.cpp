@@ -731,10 +731,40 @@ uint64_t ShaderDeclaredHash(uint64_t shader_addr) {
 	return MappedShaderHash(shader_addr);
 }
 
-std::array<ShaderParams, 3>
-PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
-                            std::array<ShaderVertexInputInfo, 3>& input_info) {
+// Tessellation program pairs the analysis has already rejected, keyed by the registered LS/HS
+// hashes and the tessellation configuration. The analysis is a full decode of both programs;
+// without this a rejected pair is re-analysed on every draw that uses it.
+static std::mutex                   g_rejected_tessellation_mutex;
+static std::unordered_set<uint64_t> g_rejected_tessellation;
+
+static uint64_t TessellationProgramKey(const HW::VertexShaderInfo& regs,
+                                       const HW::ShaderRegisters&  sh) {
+	const uint64_t words[4] = {MappedShaderHash(regs.ls_regs.data_addr),
+	                           MappedShaderHash(regs.hs_regs.data_addr), sh.m_vgtLsHsConfig,
+	                           sh.m_vgtTfParam};
+	return XXH3_64bits(words, sizeof(words));
+}
+
+// KYTY_TESS_ES_USER_BASE=<n>: diagnostic offset of the evaluation shader's user data (default 0).
+static uint32_t TessEvaluationUserBase() {
+	static const uint32_t base = [] {
+		const char* value = std::getenv("KYTY_TESS_ES_USER_BASE");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	}();
+	return base;
+}
+
+bool PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
+                                 std::array<ShaderVertexInputInfo, 3>& input_info,
+                                 std::array<ShaderParams, 3>&          params) {
 	const auto& sh        = context.GetShaderRegisters();
+	const auto  tess_key  = TessellationProgramKey(regs, sh);
+	{
+		std::scoped_lock lock(g_rejected_tessellation_mutex);
+		if (g_rejected_tessellation.contains(tess_key)) {
+			return false;
+		}
+	}
 	const auto [local, local_hash] = ShaderGetMappedData(regs.ls_regs.data_addr, "ShaderGetInputInfoLS():");
 	const auto [control, control_hash] = ShaderGetMappedData(regs.hs_regs.data_addr, "ShaderGetInputInfoHS():");
 	const auto [evaluation, evaluation_hash] = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoTES():");
@@ -747,11 +777,14 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 
 	const auto local_users      = std::span(regs.hs_user_sgpr.value, regs.hs_regs.rsrc2.user_sgpr);
 	const auto evaluation_users = std::span(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr);
-	std::array<ShaderParams, 3> params {
+	params = {
 	    GetShaderParams(regs.ls_regs.data_addr, local_hash, local_users, local),
 	    GetShaderParams(regs.hs_regs.data_addr, control_hash, local_users, control, 8u),
+	    // The evaluation shader's user SGPRs start at s8 (NGG); the recompiler applies that base
+	    // itself (CompileOptions::user_data_base = 8 for vertex-type stages), so the array starts
+	    // at index 0 here. KYTY_TESS_ES_USER_BASE is a diagnostic override.
 	    GetShaderParams(regs.es_regs.data_addr, evaluation_hash, evaluation_users,
-	                    evaluation),
+	                    evaluation, TessEvaluationUserBase()),
 	};
 	// The fused HS back half receives its separate user-data address in s0:s1.
 	// RDNA2 reserves s0:s7 before the native HS user SGPRs.
@@ -779,10 +812,58 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	};
 	EXIT_IF(tess.input_control_points == 0 || tess.input_control_points > 32 ||
 	        tess.output_control_points == 0 || tess.output_control_points > 32);
+	// Reflection decodes both programs; the key also covers the VGT fields cached in tess.
+	const uint64_t layout_key[] = {local_hash, control_hash,
+	                               uint64_t {sh.m_vgtLsHsConfig & 0xfff00u} << 32u | sh.m_vgtTfParam};
+	bool analyzed = false;
+	{
+		std::scoped_lock lock(g_tess_layouts_mutex);
+		const auto       layout_hash = XXH3_64bits(layout_key, sizeof(layout_key));
+		if (const auto found = g_tess_layouts.find(layout_hash); found != g_tess_layouts.end()) {
+			tess     = found->second;
+			analyzed = true;
+		} else {
+			auto analysis = tess;
+			analyzed      = ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code,
+			                                                              params[1].code, analysis);
+			if (analyzed) {
+				g_tess_layouts.emplace(layout_hash, analysis);
+				tess = analysis;
+			}
+		}
+	}
+	if (!analyzed) {
+		// Reported once per pair (the rejection is cached below): the draws are skipped.
+		std::fprintf(stderr,
+		             "[tess] rejected LS 0x%016llx HS 0x%016llx TES 0x%016llx in_cp=%u out_cp=%u "
+		             "domain=%u partitioning=%u topology=%u\n",
+		             static_cast<unsigned long long>(local_hash),
+		             static_cast<unsigned long long>(control_hash),
+		             static_cast<unsigned long long>(evaluation_hash), tess.input_control_points,
+		             tess.output_control_points, tess.domain, tess.partitioning,
+		             tess.output_topology);
+		if (const char* folder = std::getenv("KYTY_DUMP_GAVE_UP"); folder != nullptr) {
+			const std::pair<const char*, const std::span<const uint32_t>*> codes[] = {
+			    {"LS", &params[0].code}, {"HS", &params[1].code}, {"TES", &params[2].code}};
+			const uint64_t hashes[] = {local_hash, control_hash, evaluation_hash};
+			for (int c = 0; c < 3; c++) {
+				char path[512];
+				std::snprintf(path, sizeof(path), "%s/%s_%016llx.bin", folder, codes[c].first,
+				              static_cast<unsigned long long>(hashes[c]));
+				if (FILE* file = std::fopen(path, "wb"); file != nullptr) {
+					std::fwrite(codes[c].second->data(), 4, codes[c].second->size(), file);
+					std::fclose(file);
+				}
+			}
+		}
+		std::scoped_lock lock(g_rejected_tessellation_mutex);
+		g_rejected_tessellation.insert(tess_key);
+		return false;
+	}
 	for (auto& stage: input_info) {
 		stage.tess = tess;
 	}
-	return params;
+	return true;
 }
 
 ShaderParams PrepareProgram(
