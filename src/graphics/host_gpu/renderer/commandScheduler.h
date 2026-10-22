@@ -154,7 +154,7 @@ public:
 	// queued) when the copy would exceed MaxStashBytes.
 	[[nodiscard]] bool RecordPushDescriptors(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
 	                           uint32_t set, uint32_t count, const vk::WriteDescriptorSet* writes) {
-		struct Command final: RecordedCommand {
+		struct alignas(16) Command final: RecordedCommand {
 			Command(vk::PipelineBindPoint point, vk::PipelineLayout pipeline_layout,
 			        uint32_t set_index, uint32_t write_count)
 			    : bind_point(point), layout(pipeline_layout), set(set_index), count(write_count) {}
@@ -168,7 +168,8 @@ public:
 			uint32_t              set;
 			uint32_t              count;
 		};
-		static_assert(sizeof(Command) % alignof(vk::WriteDescriptorSet) == 0);
+		// The writes follow the command: 16-byte aligned for the vector copies.
+		static_assert(sizeof(Command) % 16 == 0);
 		const size_t bytes = DeepWritesBytes(writes, count);
 		if (sizeof(Command) + bytes > MaxStashBytes) {
 			return false;
@@ -345,6 +346,13 @@ private:
 	}
 	// Memory in the current chunk for the recording thread; the common case is a pointer bump.
 	void* Allocate(size_t size, size_t alignment) {
+		// Never less than 16 bytes: the descriptor writes and dynamic states copied into the chunk
+		// are copied with 16-byte vector moves, which at 8-byte alignment cross a cache line one
+		// time in four.
+		constexpr size_t MinAlignment = 16;
+		if (alignment < MinAlignment) {
+			alignment = MinAlignment;
+		}
 		if (m_chunk != nullptr) {
 			const auto offset = (m_chunk->used + alignment - 1) & ~(alignment - 1);
 			if (offset + size <= Chunk::Size) {

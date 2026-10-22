@@ -949,6 +949,7 @@ void CommandScheduler::EnableRecordingThread() {
 
 void* CommandScheduler::AllocateInNewChunk(size_t size, size_t alignment) {
 	EXIT_IF(!m_threaded || size > Chunk::Size);
+	alignment = std::max<size_t>(alignment, 16);
 	const auto take = [this] {
 		// An executed chunk the recording thread handed back, else a new one (not zeroed: its
 		// memory is written before it is read).
