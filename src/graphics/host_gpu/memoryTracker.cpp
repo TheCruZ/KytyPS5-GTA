@@ -13,25 +13,6 @@ MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_man
 	m_cpu_dirty_regions = std::make_unique<std::atomic<uint64_t>[]>(REGION_COUNT / 64);
 }
 
-bool MemoryTracker::IsRangeCpuCleanHint(uint64_t vaddr, uint64_t size) const noexcept {
-	if (size == 0 || vaddr >= TRACKER_ADDRESS_SIZE || size > TRACKER_ADDRESS_SIZE - vaddr) {
-		return false;
-	}
-	const uint64_t first = vaddr / TRACKER_REGION_SIZE;
-	const uint64_t last  = (vaddr + size - 1) / TRACKER_REGION_SIZE;
-	for (uint64_t word = first / 64; word <= last / 64; word++) {
-		const uint64_t low  = word == first / 64 ? first % 64 : 0;
-		const uint64_t high = word == last / 64 ? last % 64 : 63;
-		const uint64_t mask =
-		    high - low == 63 ? ~uint64_t {0} : ((uint64_t {1} << (high - low + 1)) - 1) << low;
-		if ((m_present_regions[word].load(std::memory_order_acquire) & mask) != mask ||
-		    (m_cpu_dirty_regions[word].load(std::memory_order_acquire) & mask) != 0) {
-			return false;
-		}
-	}
-	return true;
-}
-
 MemoryTracker::~MemoryTracker() = default;
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
@@ -120,7 +101,7 @@ RangeSet MemoryTracker::TakeBdaSyncIn(std::span<const std::pair<uint64_t, uint64
 	return taken;
 }
 
-bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
+bool MemoryTracker::IsRegionCpuModifiedLocked(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	if (g_tracker_skip_clean && g_tracker_bitmap && IsRangeCpuCleanHint(vaddr, size)) {
 		return false;
@@ -134,7 +115,7 @@ bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
-bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
+bool MemoryTracker::IsRegionGpuModifiedLocked(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	// Most queries touch regions without GPU-dirty pages: answer those without the locks. The
 	// flag changes under the region lock, so this is the answer the lock would give at some
@@ -158,6 +139,7 @@ void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
+	QueueBdaSync(vaddr, size);
 }
 
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
@@ -230,6 +212,8 @@ void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
+	locks.clear();
+	QueueBdaSync(vaddr, size);
 }
 
 } // namespace Libs::Graphics
