@@ -114,6 +114,9 @@ struct PreparedBindings {
 	const void*                                        last_program          = nullptr;
 	uint64_t                                           last_descs_generation = 0;
 	std::vector<ShaderRecompiler::IR::DescriptorValue> last_images;
+	// The S#s `samplers` were looked up for: the same program with the same S#s gets the same
+	// samplers (the sampler cache keeps them for its lifetime).
+	std::vector<ShaderRecompiler::IR::DescriptorValue> last_samplers;
 	// The description each T# of `last_images` has (null when its lookups are not reused).
 	std::vector<TextureDescDerivation*>                image_descs;
 	// Bindless: flattened-SRT words to patch (offset, region, entries) and the heaps whose
