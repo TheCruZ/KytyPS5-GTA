@@ -278,6 +278,7 @@ void Visit(Io& io, T& v) {
 	io(v.scratch_dwords);
 	io(v.param_export_mask);
 	io(v.has_address_writes);
+	io(v.has_written_buffers);
 	io(v.info);
 	io(v.bindings);
 	io(v.srt_reads_after_buffer_writes);

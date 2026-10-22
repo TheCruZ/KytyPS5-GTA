@@ -14,6 +14,7 @@
 
 #include <array>
 #include <bit>
+#include <deque>
 #include <list>
 #include <memory>
 #include <optional>
@@ -213,7 +214,6 @@ struct ImageResource {
 	bool                          depth_compare     = false;
 	bool                          cube              = false;
 	bool                          r128              = false;
-	bool                          heap              = false; // Resident image heap root or kind.
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
@@ -312,8 +312,6 @@ enum class StageInputKind {
 	LocalInvocationId,
 	LocalInvocationIndex,
 	GlobalInvocationId,
-	BaseVertex,
-	BaseInstance,
 	Parameter,
 	DispatchThreadCount,
 };
@@ -407,12 +405,7 @@ struct StageOutput {
 inline constexpr uint32_t FirstImageBinding           = 1u;
 inline constexpr uint32_t FirstComparisonImageBinding = 22u;
 inline constexpr uint32_t FirstStorageImageBinding    = 29u;
-inline constexpr uint32_t ImageBindingCount           = 50u;
-// Resident image heaps share one sampled-image array at binding 0 of this set. A heap slot
-// word is kind << ImageHeapKindShift | element; element 0 is the null descriptor.
-inline constexpr uint32_t ImageHeapSet                = 1u;
-inline constexpr uint32_t ImageHeapCapacity           = 65536u;
-inline constexpr uint32_t ImageHeapKindShift          = 20u;
+inline constexpr uint32_t ImageBindingCount           = 48u;
 
 enum class DescriptorBindingKind : uint32_t {
 	Buffers  = 0u,
@@ -494,8 +487,8 @@ DescriptorBindingForImage(const ImageResource& image) {
 	constexpr uint32_t SampledUintBinding  = 8u;
 	constexpr uint32_t SampledSintBinding  = 15u;
 	constexpr uint32_t StorageFloatBinding = FirstStorageImageBinding;
-	constexpr uint32_t StorageUintBinding  = StorageFloatBinding + 6u;
-	constexpr uint32_t AtomicUintBinding   = StorageUintBinding + 6u;
+	constexpr uint32_t StorageUintBinding  = StorageFloatBinding + 5u;
+	constexpr uint32_t AtomicUintBinding   = StorageUintBinding + 5u;
 
 	uint32_t base    = 0;
 	bool     sampled = false;
@@ -542,10 +535,10 @@ DescriptorBindingForImage(const ImageResource& image) {
 		case Decoder::ImageDimension::Dim2D: dimension = 2u; break;
 		case Decoder::ImageDimension::Dim2DArray: dimension = 3u; break;
 		case Decoder::ImageDimension::Dim2DMsaa:
-			if (image.atomic) {
+			if (!sampled) {
 				return std::nullopt;
 			}
-			dimension = sampled ? 4u : 5u;
+			dimension = 4u;
 			break;
 		case Decoder::ImageDimension::Dim2DMsaaArray:
 			if (!sampled) {
@@ -653,10 +646,6 @@ struct Bindings {
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
 		return VerifyDword() + (srt_verify ? 4u : 0u);
 	}
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
-		return MemorySizeDword() +
-		       descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)];
-	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
 	}
@@ -717,7 +706,6 @@ struct ShaderInfo {
 	bool                            uses_lds                      = false;
 	bool                            uses_gds                      = false;
 	bool                            uses_flattened_srt            = false;
-	bool                            uses_image_heap               = false;
 	bool                            uses_dispatch_threads         = false;
 	bool                            bvh                           = false;
 	bool                            subgroup_ballot               = false;
@@ -726,7 +714,6 @@ struct ShaderInfo {
 	bool                            subgroup_shuffle              = false;
 	bool                            subgroup_arithmetic           = false;
 	bool                            subgroup_local_invocation_id  = false;
-	bool                            helper_invocation             = false;
 	bool                            compute_derivatives           = false;
 	bool                            image_gather_extended         = false;
 	bool                            function_lds                  = false;
@@ -753,13 +740,6 @@ struct DescriptorSource {
 
 				bool operator==(const CountedRows& other) const = default;
 			};
-			struct MaskRanks {
-				uint32_t source = UINT32_MAX;
-				uint32_t stride = 0; // Byte spacing of the mask words its load can address.
-				uint32_t offset = 0;
-
-				bool operator==(const MaskRanks& other) const = default;
-			};
 			uint32_t source = UINT32_MAX;
 			uint32_t stride = 0;
 			uint32_t offset = 0;
@@ -767,12 +747,10 @@ struct DescriptorSource {
 			uint32_t bit_offset = 0;
 			uint32_t bit_mask = UINT32_MAX;
 			bool global = false;
-			// Four or eight DWORD bitmap words per record; set ranks subtract from the last key.
+			// Four DWORD bitmap words per record; set-bit ranks subtract from the last key.
 			bool bitset = false;
 			std::optional<CountedRows> rows;
 			std::vector<std::pair<uint32_t, uint32_t>> byte_ranges;
-			std::optional<uint32_t> excluded; // A guard keeps this key from the read.
-			std::optional<MaskRanks> ranks;   // Records are the bits some mask word sets.
 
 			bool operator==(const SelectorRead& other) const = default;
 		};
@@ -806,8 +784,7 @@ struct DescriptorSource {
 		// A bindless T# table (entry = key & key_mask): every table entry is a candidate.
 		bool     table_array     = false;
 		Value    key_count;
-		// First selector index, workgroup key base, or first descriptor key for a direct or bitmap
-		// range.
+		// First selector index, or first descriptor key for a direct or bitmap range.
 		Value                 selector_first;
 		Value    selector_mask;
 		std::vector<uint32_t> sources;
@@ -860,7 +837,6 @@ struct ResourceBlock {
 	Value                 condition;
 	std::vector<uint32_t> successors;
 	std::vector<uint32_t> sources;
-	std::vector<uint32_t> images;
 	std::vector<uint32_t> srt_reads;
 };
 
@@ -875,6 +851,9 @@ struct CompiledShaderInfo {
 	uint32_t                      scratch_dwords      = 0;
 	uint32_t                      param_export_mask   = 0;
 	bool                          has_address_writes  = false;
+	// Some info.buffers entry is written: the renderer asks per draw and stage, and shaders that
+	// write no buffer (most of them) then skip the walk over the buffer list.
+	bool                          has_written_buffers = false;
 	ShaderInfo                    info;
 	Bindings                      bindings;
 	// For each flat SRT slot, the written info.buffers that a store or atomic of the shader
@@ -908,8 +887,22 @@ struct CompiledSrtPlan;
 
 struct ResourcePlan {
 	struct SelectorKeys {
+		uint32_t              source = UINT32_MAX;
 		std::vector<uint32_t> values;
 		bool                  resolved = false;
+	};
+
+	struct EvaluationContext {
+		struct Entry {
+			uint64_t value      = 0;
+			uint64_t generation = 0;
+		};
+
+		std::vector<Entry> values;
+		uint64_t           generation = 0;
+		const SrtWalker*    session = nullptr;
+		Value              active_mask;
+		uint8_t            read_policy = 0;
 	};
 
 	ResourcePlan();
@@ -951,12 +944,14 @@ struct ResourcePlan {
 	mutable std::shared_ptr<const CompiledSrtPlan> compiled_srt;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
-	// x86 walker over the retained SRT, descriptor and condition values.
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
-	uint32_t                              srt_user_data = 0; // User-data DWORDs the walker reads.
-	uint32_t                              srt_captures  = 0; // Scratch offset of loaded addresses.
-	// GPU-thread scratch for walker results and material keys.
-	mutable std::vector<uint64_t>           srt_scratch;
+	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
+	mutable std::deque<EvaluationContext> evaluation_contexts;
+	mutable uint32_t                       evaluation_value_count = 0;
+	mutable std::vector<uint8_t>            active_sources;
+	mutable std::vector<uint8_t>            visited_blocks;
+	mutable std::vector<uint8_t>            reachable_blocks;
+	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
 	mutable std::vector<SelectorKeys>       selector_keys;
 };
