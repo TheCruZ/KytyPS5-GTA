@@ -3419,7 +3419,6 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.shader_data_buffer = {};
 	prepared.shared_memory = {};
 	prepared.images.resize(program.info.images.size());
-	prepared.samplers.clear();
 	prepared.shader_data.clear();
 	const bool same_program = prepared.last_program == &program &&
 	                          prepared.last_descs_generation == m_texture_descs_generation;
@@ -3534,10 +3533,16 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			}
 		}
 	});
-	prepared.samplers.reserve(program.info.samplers.size());
-	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
-		prepared.samplers.push_back(NativeSampler(
-		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
+	// The sampler lookups (a hash of five dwords each) repeat for the same program and S#s.
+	if (!same_program || prepared.samplers.size() != program.info.samplers.size() ||
+	    prepared.last_samplers != snapshot.samplers) {
+		prepared.samplers.clear();
+		prepared.samplers.reserve(program.info.samplers.size());
+		for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
+			prepared.samplers.push_back(NativeSampler(
+			    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
+		}
+		prepared.last_samplers = snapshot.samplers;
 	}
 	prepared.last_program          = &program;
 	prepared.last_descs_generation = m_texture_descs_generation;
