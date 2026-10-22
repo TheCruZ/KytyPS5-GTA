@@ -133,6 +133,7 @@ public:
 		if (!InitializeConfig(params->config_data, &result)) {
 			return result;
 		}
+		m_pending.clear();
 
 		return MakeResult();
 	}
@@ -143,6 +144,7 @@ public:
 		m_num_frames              = 0;
 		m_total_decoded_samples   = 0;
 		m_superframe_bytes_remain = 0;
+		m_pending.clear();
 
 		if (m_has_config) {
 			auto result = MakeResult();
@@ -159,25 +161,53 @@ public:
 			return result;
 		}
 
+		// A job may end in the middle of a superframe. The hardware decoder keeps that tail
+		// and reports it consumed, so the guest moves its stream cursor on and supplies the
+		// rest with the next job; a guest that is told "0 consumed" only grows the output
+		// buffer and resubmits the same bytes forever.
+		const size_t pending_size = m_pending.size();
+		if (pending_size != 0) {
+			m_pending.insert(m_pending.end(), static_cast<const uint8_t*>(input),
+			                 static_cast<const uint8_t*>(input) + input_size);
+			input      = m_pending.data();
+			input_size = m_pending.size();
+		}
+		const auto  finish = [&](AjmDecodeResult& done, size_t consumed, bool stash_tail) {
+			if (stash_tail && consumed < input_size) {
+				std::vector<uint8_t> tail(static_cast<const uint8_t*>(input) + consumed,
+				                          static_cast<const uint8_t*>(input) + input_size);
+				m_pending = std::move(tail);
+				consumed  = input_size;
+			} else if (consumed < pending_size) {
+				std::vector<uint8_t> tail(static_cast<const uint8_t*>(input) + consumed,
+				                          static_cast<const uint8_t*>(input) + pending_size);
+				m_pending = std::move(tail);
+			} else {
+				m_pending.clear();
+			}
+			done.input_consumed = consumed > pending_size ? consumed - pending_size : 0;
+			return done;
+		};
+
 		const auto* input_bytes  = static_cast<const uint8_t*>(input);
 		auto*       output_bytes = static_cast<uint8_t*>(output);
 		size_t      input_offset = 0;
+		bool        stash_tail   = false;
 
 		if (m_parse_riff_header && input_size >= 12 &&
 		    AjmFourCcEquals(input_bytes, 'R', 'I', 'F', 'F')) {
 			if (!ParseRiffHeader(input_bytes, input_size, &input_offset, gapless, &result)) {
-				return result;
+				return finish(result, 0, result.result == AJM_RESULT_PARTIAL_INPUT);
 			}
 			if (input_offset >= input_size) {
-				result.input_consumed = input_offset;
-				result.result         = AJM_RESULT_PARTIAL_INPUT;
-				return result;
+				result.result = AJM_RESULT_PARTIAL_INPUT;
+				return finish(result, input_offset, false);
 			}
 		}
 
 		if (!m_is_initialized) {
 			result.result = AJM_RESULT_NOT_INITIALIZED;
-			return result;
+			return finish(result, 0, false);
 		}
 
 		for (;;) {
@@ -193,6 +223,7 @@ public:
 				if (result.frames == 0) {
 					result.result = AJM_RESULT_PARTIAL_INPUT;
 				}
+				stash_tail = true;
 				break;
 			}
 
@@ -243,7 +274,7 @@ public:
 
 		result.total_decoded_samples = m_total_decoded_samples;
 		result.format                = GetFormat();
-		return result;
+		return finish(result, input_offset, stash_tail);
 	}
 
 	void WriteCodecInfo(void* output, size_t output_size,
@@ -638,6 +669,7 @@ private:
 	Atrac9CodecInfo      m_codec_info {};
 	std::vector<uint8_t> m_pcm_buffer;
 	std::vector<uint8_t> m_stream_pcm;
+	std::vector<uint8_t> m_pending;
 };
 
 } // namespace Libs::Audio::Ajm

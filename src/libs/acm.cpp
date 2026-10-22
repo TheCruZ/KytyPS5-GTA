@@ -1,3 +1,4 @@
+#include "common/hackNotice.h"
 #include "libs/acm.h"
 
 #include "common/assert.h"
@@ -93,6 +94,17 @@ int KYTY_SYSV_ABI AcmBatchWait(AcmContextId context, AcmBatchId batch, uint32_t 
 int KYTY_SYSV_ABI AcmBatchJobNotification(AcmBatchInfo* batch_info) {
 	PRINT_NAME();
 	acm_advance_batch(batch_info, 2 * 16);
+	return OK;
+}
+
+// Newer than the SDK 10 headers (NID GTfJ64qFCPw); the game calls it for every audio batch after
+// Start. Like the other commands it records nothing, since batches are not executed.
+int KYTY_SYSV_ABI AcmBatchJobPriority(AcmBatchInfo* batch_info, uint32_t priority) {
+	PRINT_NAME();
+	(void)batch_info;
+	(void)priority;
+	Common::HackNotice::Report("ACM batch command is a no-op", "AcmBatchJobPriority", 0, 0,
+	                           "batches are not executed");
 	return OK;
 }
 

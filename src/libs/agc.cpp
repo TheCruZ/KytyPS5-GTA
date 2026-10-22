@@ -1,3 +1,4 @@
+#include "common/hackNotice.h"
 #include "libs/agc.h"
 
 #include "common/assert.h"
@@ -270,7 +271,28 @@ struct CommandBuffer {
 		return available - reserved_dw;
 	}
 
+	[[nodiscard]] uint64_t GetRawAvailableSizeDW() const {
+		const auto distance = static_cast<int64_t>(reinterpret_cast<uintptr_t>(cursor_down) -
+		                                           reinterpret_cast<uintptr_t>(cursor_up));
+		return distance > 0 ? static_cast<uint64_t>(distance >> 2) : 0u;
+	}
+
 	KYTY_SYSV_ABI bool ReserveDW(uint32_t num_dw) {
+		// The grow callback writes its own packets (Wolverine: an ACQUIRE_MEM when it chains a
+		// new chunk) into the space reserved_dw kept free for it. Charging those to the normal
+		// budget called the callback again from inside itself, until the game thread's stack
+		// overflowed when a new game starts. Inside the callback, the reserve is usable.
+		thread_local CommandBuffer* in_callback = nullptr;
+		if (in_callback == this) {
+			if (num_dw <= GetRawAvailableSizeDW()) {
+				return true;
+			}
+			LOGF_COLOR(Log::Color::Red,
+			           "\t command buffer grow callback ran out of its reserve: requested = %" PRIu32
+			           "\n",
+			           num_dw);
+			return false;
+		}
 		const uint64_t remaining = GetAvailableSizeDW();
 		if (num_dw > remaining) {
 			if (callback == nullptr) {
@@ -282,7 +304,25 @@ struct CommandBuffer {
 				return false;
 			}
 
+			// Callbacks that grow a different buffer may still nest; never let that run away.
+			thread_local uint32_t depth = 0;
+			if (depth >= 8) {
+				Common::HackNotice::Report("AGC command buffer grow callback nested too deep", "CommandBuffer::ReserveDW",
+				                           0, 0, "the reservation fails instead of growing again");
+				std::fprintf(stderr,
+				             "[agc] grow callback nested %u deep: buf=%p num_dw=%u reserved_dw=%u "
+				             "available=%llu\n",
+				             depth, static_cast<void*>(this), num_dw, reserved_dw,
+				             static_cast<unsigned long long>(GetRawAvailableSizeDW()));
+				std::fflush(stderr);
+				return false;
+			}
+			auto* const outer = in_callback;
+			in_callback       = this;
+			depth++;
 			bool result = callback(this, num_dw + reserved_dw, user_data);
+			depth--;
+			in_callback = outer;
 			if (!result) {
 				LOGF_COLOR(Log::Color::Red,
 				           "\t command buffer grow callback failed: requested = %" PRIu32
