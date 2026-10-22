@@ -8,7 +8,6 @@
 #include "common/hackNotice.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
-#include "common/spscQueue.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -58,13 +57,9 @@
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <new>
 #include <optional>
 #include <span>
-#include <thread>
-#include <type_traits>
 #include <unordered_map>
-#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -78,7 +73,7 @@ std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
 	}
 
 	EXIT_IF(!vs_input_info.stage);
-	const auto& program   = vs_input_info.stage.module->info;
+	const auto& program   = *vs_input_info.stage.program;
 	const auto& resources = *vs_input_info.stage.resources;
 	if (index_offset == 0 &&
 	    program.info.vertex_offset_sgpr >= static_cast<int32_t>(program.user_data_base)) {
@@ -218,7 +213,7 @@ static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& col
 	const auto& dc             = ctx.GetDepthControl();
 	const auto& vp             = ctx.GetScreenViewport();
 	const auto& vp0            = vp.viewports[0];
-	const auto& ps_resources   = ps_input_info.stage.module->info.info;
+	const auto& ps_resources   = ps_input_info.stage.program->info;
 	const auto  sampled_images = std::count_if(
 	    ps_resources.images.begin(), ps_resources.images.end(), [](const auto& image) {
 		    return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
@@ -342,7 +337,7 @@ static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, const Comman
 	const auto& ctx = buffer.GetRegisters();
 	const auto&        vp  = ctx.GetScreenViewport();
 	const vk::Extent2D framebuffer_extent {rendering.width, rendering.height};
-	const auto& outputs = vs_input_info.stage.module->info.info.outputs;
+	const auto& outputs = vs_input_info.stage.program->info.outputs;
 	const bool  indexed_viewports =
 	    std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
 		    return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
@@ -425,20 +420,6 @@ static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, const Comman
 		dynamic_state.SetDepthBias(constant_factor, poly_offset.clamp, slope_factor);
 	}
 
-	// Rect lists are drawn without culling.
-	vk::CullModeFlags cull_mode {};
-	if (!Prospero::IsRectList(buffer.GetUserConfig().GetPrimType())) {
-		if (mode.cull_front) {
-			cull_mode |= vk::CullModeFlagBits::eFront;
-		}
-		if (mode.cull_back) {
-			cull_mode |= vk::CullModeFlagBits::eBack;
-		}
-	}
-	dynamic_state.SetCullMode(cull_mode);
-	dynamic_state.SetFrontFace(mode.face ? vk::FrontFace::eClockwise
-	                                     : vk::FrontFace::eCounterClockwise);
-
 	dynamic_state.SetStencilTestEnabled(depth.stencil_test_enable);
 	if (depth.stencil_test_enable) {
 		const auto& front = depth.stencil_front;
@@ -484,16 +465,10 @@ static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
 	return vs.es_regs.data_addr != 0;
 }
 
-struct RenderExecutor::DrawRenderStorage {
-	DrawRenderState state {};
-	// Only tessellation draws write the input infos of the second and third vertex stages.
-	bool tessellation_stages_written = false;
-};
-static_assert(std::is_trivially_destructible_v<DrawRenderState>);
-
-template <typename T>
-static void ValueInitialize(T& object) {
-	::new (static_cast<void*>(std::addressof(object))) T {};
+static bool PixelShaderHasDepthOrCoverageSideEffects(const HW::ShaderRegisters& sh_regs) {
+	const auto& db = sh_regs.db_shader_control;
+	return db.shader_kill_enable || db.shader_z_export_enable || db.shader_mask_export_enable ||
+	       db.shader_dual_export_enable || db.shader_execute_on_noop || sh_regs.AlphaToMask();
 }
 
 struct DrawRenderState {
@@ -989,8 +964,9 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	for (uint32_t i = 0; i < color_count; i++) {
 		auto& target = colors[i];
 		EXIT_IF(!target.image_id);
-		const auto& owner = cache.m_slot_images[target.image_id];
-		if ((!owner.registered && !owner.info.data.Empty()) || owner.binding.needs_rebind) {
+		const auto owner = cache.m_slot_images.try_get(target.image_id);
+		if (owner == nullptr || (!owner->registered && !owner->info.data.Empty()) ||
+		    owner->binding.needs_rebind) {
 			EXIT("color target changed after render-state discovery\n");
 		}
 		const auto image_view = memo != nullptr
@@ -1019,8 +995,8 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.image_layout = layout;
 	}
 	if (depth.image_id) {
-		const auto& owner = cache.m_slot_images[depth.image_id];
-		if (!owner.registered || owner.binding.needs_rebind) {
+		const auto owner = cache.m_slot_images.try_get(depth.image_id);
+		if (owner == nullptr || !owner->registered || owner->binding.needs_rebind) {
 			EXIT("depth target changed after render-state discovery\n");
 		}
 		// A reused acquisition had no depth clear and no HTile clear to consume.
@@ -1150,7 +1126,7 @@ static uint32_t DrawColorOutputMask(const HW::Context& ctx) {
 			output_mask |= 1u << slot;
 		}
 	}
-	return state;
+	return output_mask;
 }
 
 enum class CbColorMode : uint8_t {
@@ -1229,13 +1205,11 @@ static uint64_t VertexBufferDescriptorSize(int binding, const ShaderVertexInputI
 	return size;
 }
 
-// Trivial: draws fill only the entries they use (no 3.5 KiB of zeroing per draw).
 struct VertexBufferRange {
-	uint64_t base_address;
-	uint64_t requested_end;
-	uint64_t acquired_end;
-	Buffer*  buffer;
-	uint64_t buffer_offset;
+	uint64_t                     base_address  = 0;
+	uint64_t                     requested_end = 0;
+	uint64_t                     acquired_end  = 0;
+	std::pair<Buffer*, uint64_t> binding;
 
 	[[nodiscard]] uint64_t RequestedSize() const { return requested_end - base_address; }
 };
@@ -1243,10 +1217,9 @@ struct VertexBufferRange {
 struct PreparedVertexBuffers {
 	static constexpr uint32_t MaxBuffers = ShaderVertexInputInfo::RES_MAX;
 
-	// Entries [0, count) are set.
-	std::array<vk::Buffer, MaxBuffers>     buffers;
-	std::array<vk::DeviceSize, MaxBuffers> offsets;
-	std::array<vk::DeviceSize, MaxBuffers> sizes;
+	std::array<vk::Buffer, MaxBuffers>     buffers {};
+	std::array<vk::DeviceSize, MaxBuffers> offsets {};
+	std::array<vk::DeviceSize, MaxBuffers> sizes {};
 	uint32_t                               count = 0;
 };
 
@@ -1256,18 +1229,23 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX);
 
 	// Collect the non-empty guest vertex ranges.
-	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes;
-	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> ranges;
+	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes {};
+	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> ranges {};
 	uint32_t                                                      range_count = 0;
-	for (int i = 0; i < vs_input_info.buffers_num; i++) {
-		const auto& vertex = vs_input_info.buffers[i];
-		// A buffer only constant-only embedded fetches refer to is never read: bind the null
-		// buffer instead of acquiring whatever its unconsumed descriptor names.
-		bool fetched = false;
-		for (int a = 0; a < vs_input_info.resources_num && !fetched; a++) {
-			fetched = vs_input_info.resources_dst[a].buffer_index == i &&
-			          VertexAttributeFetched(vs_input_info, a);
+	// A buffer only constant-only embedded fetches refer to is never read: bind the null buffer
+	// instead of acquiring whatever its unconsumed descriptor names. One pass over the attributes
+	// marks the buffers some fetched attribute reads (it was buffers x attributes calls a draw).
+	uint32_t fetched_buffers = 0;
+	for (int a = 0; a < vs_input_info.resources_num; a++) {
+		const auto index = vs_input_info.resources_dst[a].buffer_index;
+		if (index >= 0 && index < ShaderVertexInputInfo::RES_MAX &&
+		    ((fetched_buffers >> index) & 1u) == 0 && VertexAttributeFetched(vs_input_info, a)) {
+			fetched_buffers |= 1u << index;
 		}
+	}
+	for (int i = 0; i < vs_input_info.buffers_num; i++) {
+		const auto& vertex  = vs_input_info.buffers[i];
+		const bool  fetched = ((fetched_buffers >> i) & 1u) != 0;
 		const auto size = fetched ? VertexBufferDescriptorSize(i, vs_input_info) : 0;
 		sizes[i]        = size;
 		if (size == 0) {
@@ -1277,7 +1255,7 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 			EXIT("invalid vertex buffer range: addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 			     vertex.addr, size);
 		}
-		ranges[range_count++] = {vertex.addr, vertex.addr + size, 0, nullptr, 0};
+		ranges[range_count++] = {vertex.addr, vertex.addr + size};
 	}
 
 	std::sort(ranges.begin(), ranges.begin() + range_count,
@@ -1286,7 +1264,7 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	          });
 
 	// Merge overlapping or touching ranges before acquiring host buffers.
-	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> merged_ranges;
+	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> merged_ranges {};
 	uint32_t                                                      merged_count = 0;
 	for (uint32_t i = 0; i < range_count; i++) {
 		const auto& range = ranges[i];
@@ -1296,7 +1274,7 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 			    std::max(merged_ranges[merged_count - 1].requested_end, range.requested_end);
 			continue;
 		}
-		merged_ranges[merged_count++] = {range.base_address, range.requested_end, 0, nullptr, 0};
+		merged_ranges[merged_count++] = {range.base_address, range.requested_end};
 	}
 
 	auto& cache = buffer.GetContext().GetBufferCache();
@@ -1306,8 +1284,7 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		const auto size =
 		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
 		range.acquired_end = range.base_address + size;
-		std::tie(range.buffer, range.buffer_offset) =
-		    cache.ObtainBuffer(range.base_address, size, false);
+		range.binding      = cache.ObtainBuffer(range.base_address, size, false);
 	}
 
 	// Rebuild slot bindings, offsetting non-empty slots into their acquired merged range.
@@ -1323,7 +1300,6 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 			}
 			prepared.buffers[i] = null_buffer;
 			prepared.offsets[i] = 0;
-			prepared.sizes[i]   = 0;
 			continue;
 		}
 
@@ -1337,8 +1313,8 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 			     vertex.addr);
 		}
 
-		prepared.buffers[i] = range->buffer->Handle();
-		prepared.offsets[i] = range->buffer_offset + vertex.addr - range->base_address;
+		prepared.buffers[i] = range->binding.first->Handle();
+		prepared.offsets[i] = range->binding.second + vertex.addr - range->base_address;
 		prepared.sizes[i]   = std::min(size, range->acquired_end - vertex.addr);
 	}
 
@@ -2265,52 +2241,18 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	return true;
 }
 
-// Whether a draw may be skipped while the driver compiles its pipeline: the picture is all it
-// changes. Its shaders write no memory, its samples reach no guest occlusion counter and it
-// renders to no linear image (the CPU reads those back, e.g. GTA V's vehicle damage).
-static bool DrawOnlyChangesPicture(RenderContext& context, const DrawRenderState& state,
-                                   std::span<const ShaderVertexInputInfo> vertex_stages) {
-	const auto writes_memory = [](const ShaderStageRuntime& stage) {
-		if (stage.module == nullptr) {
-			return true;
-		}
-		const auto& program = stage.module->info;
-		return program.has_address_writes ||
-		       std::ranges::any_of(program.info.buffers,
-		                           [](const auto& buffer) { return buffer.written; }) ||
-		       std::ranges::any_of(program.info.images,
-		                           [](const auto& image) { return image.written; });
-	};
-	if (context.GetOcclusionQueries().Counting()) {
-		return false;
-	}
-	for (const auto& stage: vertex_stages) {
-		if (writes_memory(stage.stage)) {
-			return false;
-		}
-	}
-	if (state.ps_active && writes_memory(state.ps_input_info.stage)) {
-		return false;
-	}
-	for (uint32_t i = 0; i < state.color_count; i++) {
-		if (!state.colors[i].desc.info.IsTiled()) {
-			return false;
-		}
-	}
-	return !static_cast<bool>(state.depth->image_id) || state.depth->desc.info.IsTiled();
-}
-
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
-                                         const DrawEmitInfo&          emit,
-                                         const DrawIndexBufferSource& index_source) {
-	auto&      ucfg                     = buffer.GetUserConfig();
-	const bool primitive_restart_enable = state.primitive_restart_enable;
+                                         vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
+                                         const DrawIndexBufferSource& index_source,
+	                                     bool primitive_restart_enable) {
+	auto& ucfg = buffer.GetUserConfig();
 	if (CopyDepthToColor(buffer, draw, emit, state)) {
 		return;
 	}
-	const auto vertex_stages = state.VertexStages();
-	const bool mesh_active = state.vertex_info[0].stage.module->info.stage == ShaderType::Mesh;
+	const auto vertex_stages =
+	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
+	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
 	uint32_t   mesh_groups = 0;
 	// Host mesh shaders size their launch from the counts (CanDrawIndirectOnGpu).
 	EXIT_IF(mesh_active && emit.indirect.address != 0);
@@ -2796,11 +2738,8 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		m_checked_context_id = m_context_id;
 	}
 
-	bool  shaders_resolved = false;
-	auto& state = AcquireDrawRenderState(ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch,
-	                                     shaders_resolved, args.indirect.offsets);
-	state.indirect_offsets = args.indirect.offsets;
-	if (!GetDrawTopology(ucfg, state.topology)) {
+	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
+	if (!GetDrawTopology(ucfg, topology)) {
 		return true;
 	}
 
@@ -2834,8 +2773,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		const auto* src = static_cast<const uint8_t*>(args.index_addr);
 		expanded_indices.resize(args.index_count);
 		for (uint32_t i = 0; i < args.index_count; i++) {
-			expanded_indices[i] =
-			    state.primitive_restart_enable && src[i] == 0xffu ? 0xffffu : src[i];
+			expanded_indices[i] = primitive_restart && src[i] == 0xffu ? 0xffffu : src[i];
 		}
 		index_source.host_data = expanded_indices.data();
 		index_source.size      = expanded_indices.size() * sizeof(uint16_t);
@@ -3009,11 +2947,8 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto,
 	                         args.vertex_count, args.instance_count, args.first_instance};
 
-	bool  shaders_resolved = false;
-	auto& state = AcquireDrawRenderState(ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch,
-	                                     shaders_resolved, args.indirect.offsets);
-	state.indirect_offsets = args.indirect.offsets;
-	if (!GetDrawTopology(ucfg, state.topology)) {
+	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
+	if (!GetDrawTopology(ucfg, topology)) {
 		ResetBindings();
 		return true;
 	}
@@ -3104,7 +3039,7 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	const bool rect_list = Prospero::IsRectList(ucfg.GetPrimType());
 	if (rect_list && state.vertex_info[0].buffers_num == 0 &&
-	    state.vertex_info[0].stage.module->info.param_export_mask == 0 &&
+	    state.vertex_info[0].stage.program->param_export_mask == 0 &&
 	    state.ps_input_info.input_num != 0) {
 		if (graphics_debug_dump_enabled()) {
 			LOGF("DrawIndexAuto: skipping rect-list draw with no VS param exports and PS inputs: "
