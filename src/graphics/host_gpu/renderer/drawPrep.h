@@ -57,8 +57,23 @@ public:
 		m_bytes.clear();
 	}
 	void Add(uint64_t address, const void* data, uint32_t size);
+	// The backing pages a validation looked up. The read sets of one draw (its stages' and the
+	// resolution's own) read many of the same pages: they share one cache.
+	struct PageCache {
+		static constexpr size_t Slots = 64;
+		// A zero page is empty (guest memory starts above it): the cache starts zeroed.
+		struct Page {
+			uint64_t       page    = 0;
+			const uint8_t* backing = nullptr;
+		};
+		std::array<Page, Slots> pages {};
+	};
 	// GPU thread: every range is still clean for a backing read and holds the recorded bytes.
-	[[nodiscard]] bool Validate() const;
+	[[nodiscard]] bool Validate() const {
+		PageCache cache;
+		return Validate(cache);
+	}
+	[[nodiscard]] bool Validate(PageCache& cache) const;
 	[[nodiscard]] size_t RangeCount() const { return m_ranges.size(); }
 
 private:

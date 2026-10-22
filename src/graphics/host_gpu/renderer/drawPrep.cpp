@@ -121,23 +121,36 @@ void ReadSet::Add(uint64_t address, const void* data, uint32_t size) {
 // Page by page: a page that is GPU-clean as a whole is compared straight from its backing bytes
 // (one dirty-range query per page, as the walk's page cache does); otherwise the range's bytes are
 // read with the exact clean read.
-bool ReadSet::Validate() const {
+// Most ranges are a few descriptors long: compare them inline, not through memcmp.
+static bool EqualBytes(const uint8_t* actual, const uint8_t* expected, uint64_t size) {
+	if (size > 64) {
+		return std::memcmp(actual, expected, size) == 0;
+	}
+	for (; size >= 8; size -= 8, actual += 8, expected += 8) {
+		uint64_t left = 0, right = 0;
+		std::memcpy(&left, actual, sizeof(left));
+		std::memcpy(&right, expected, sizeof(right));
+		if (left != right) {
+			return false;
+		}
+	}
+	for (; size != 0; size--, actual++, expected++) {
+		if (*actual != *expected) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool ReadSet::Validate(PageCache& cache) const {
 	KYTY_PROFILER_BLOCK("DrawPrep::Validate");
 	constexpr uint64_t PageSize = 4096;
-	struct Page {
-		uint64_t       page    = UINT64_MAX;
-		const uint8_t* backing = nullptr;
-	};
-	std::array<Page, 8> pages {};
-	size_t              next = 0;
-	const auto map = [&](uint64_t page) {
-		for (const auto& entry: pages) {
-			if (entry.page == page) {
-				return entry.backing;
-			}
+	auto&              pages    = cache.pages;
+	const auto         map      = [&](uint64_t page) {
+		auto& slot = pages[(page / PageSize) % pages.size()];
+		if (slot.page != page) {
+			slot = {page, LibKernel::Memory::FindGpuCleanBacking(page, PageSize)};
 		}
-		auto& slot = pages[next++ % pages.size()];
-		slot       = {page, LibKernel::Memory::FindGpuCleanBacking(page, PageSize)};
 		return slot.backing;
 	};
 	thread_local std::vector<uint8_t> current;
@@ -149,7 +162,7 @@ bool ReadSet::Validate() const {
 			const uint64_t page    = address & ~(PageSize - 1u);
 			const uint64_t in_page = std::min<uint64_t>(left, page + PageSize - address);
 			if (const auto* backing = map(page); backing != nullptr) {
-				if (std::memcmp(backing + (address - page), expected, in_page) != 0) {
+				if (!EqualBytes(backing + (address - page), expected, in_page)) {
 					return false;
 				}
 			} else {

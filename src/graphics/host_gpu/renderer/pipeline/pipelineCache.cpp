@@ -1351,11 +1351,13 @@ bool GuestReadLog::StillValid() const {
 		}
 		g_validate_stage.Log(n);
 	}
-	if (!m_own.Validate()) {
+	// The sets of one draw read many of the same pages: look each one up once.
+	DrawPrep::ReadSet::PageCache pages;
+	if (!m_own.Validate(pages)) {
 		return false;
 	}
 	for (uint32_t i = 0; i < m_set_count; i++) {
-		if (!m_sets[i]->Validate()) {
+		if (!m_sets[i]->Validate(pages)) {
 			return false;
 		}
 	}
