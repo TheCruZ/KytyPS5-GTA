@@ -1313,8 +1313,9 @@ bool FlipQueue::Flip(uint32_t micros) {
 		if (layer_count != 0) {
 			m_presenter.Present(std::span(layers.data(), layer_count));
 		}
-		if (record_flip) {
-			Graphics::PerformanceOverlayRecordFlip(flip_width, flip_height);
+		Profiler::MarkFrame();
+		if (requests[0].cfg->bus == 0) {
+			Graphics::PerformanceOverlayRecordFlip(requests[0].cfg->width, requests[0].cfg->height);
 		}
 		due = lock_ports();
 	}

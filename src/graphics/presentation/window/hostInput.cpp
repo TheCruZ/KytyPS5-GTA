@@ -2,6 +2,13 @@
 
 #include <SDL3/SDL.h>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -12,10 +19,14 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
+#include <chrono>
+#include <cstdio>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -145,6 +156,30 @@ struct MouseJoystickState {
 MouseJoystickState g_mouse;
 SDL_Window*        g_mouse_window   = nullptr;
 uint64_t           g_cursor_hide_at = 0;
+
+#ifdef _WIN32
+UINT g_diagnostic_key_message = 0;
+
+bool SDLCALL DiagnosticInputMessage(void* userdata, MSG* message) {
+	auto* window = static_cast<SDL_Window*>(userdata);
+	const auto hwnd = static_cast<HWND>(SDL_GetPointerProperty(
+	    SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+	if (message->message != g_diagnostic_key_message || message->hwnd != hwnd) {
+		return true;
+	}
+	if (message->lParam != 0 && message->lParam != 1) {
+		return false;
+	}
+	SDL_Event event {};
+	event.type = message->lParam != 0 ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+	event.key.windowID = SDL_GetWindowID(window);
+	event.key.key = static_cast<SDL_Keycode>(message->wParam);
+	event.key.scancode = SDL_GetScancodeFromKey(event.key.key, nullptr);
+	event.key.down = message->lParam != 0;
+	SDL_PushEvent(&event);
+	return false;
+}
+#endif
 
 struct MouseTouchPadState {
 	bool     enabled        = false;
@@ -550,6 +585,74 @@ void DefaultKeyboardInput(int key_code, bool down) {
 	}
 }
 
+// KYTY_AUTO_INPUT="<seconds>:<button>[*<count>],...": scripted pad presses for unattended test
+// runs (getting from the title screen into a save without anyone at the keyboard). Seconds count
+// from the first input poll; each press holds the button 150 ms, repeated presses 600 ms apart.
+// Buttons: cross, circle, square, triangle, up, down, left, right, options, l1, r1.
+void StartAutoInput() {
+	static bool started = false;
+	if (started) {
+		return;
+	}
+	started            = true;
+	const char* script = std::getenv("KYTY_AUTO_INPUT");
+	if (script == nullptr || script[0] == '\0') {
+		return;
+	}
+	struct Press {
+		double   at;
+		uint32_t button;
+		int      count;
+	};
+	std::vector<Press> presses;
+	std::string        text(script);
+	size_t             at = 0;
+	while (at < text.size()) {
+		const auto end   = text.find(',', at);
+		const auto item  = text.substr(at, end == std::string::npos ? std::string::npos : end - at);
+		const auto colon = item.find(':');
+		if (colon != std::string::npos) {
+			std::string name  = item.substr(colon + 1);
+			int         count = 1;
+			if (const auto star = name.find('*'); star != std::string::npos) {
+				count = std::max(1, std::atoi(name.c_str() + star + 1));
+				name  = name.substr(0, star);
+			}
+			uint32_t button = 0;
+			if (name == "cross") button = Controller::PAD_BUTTON_CROSS;
+			if (name == "circle") button = Controller::PAD_BUTTON_CIRCLE;
+			if (name == "square") button = Controller::PAD_BUTTON_SQUARE;
+			if (name == "triangle") button = Controller::PAD_BUTTON_TRIANGLE;
+			if (name == "up") button = Controller::PAD_BUTTON_UP;
+			if (name == "down") button = Controller::PAD_BUTTON_DOWN;
+			if (name == "left") button = Controller::PAD_BUTTON_LEFT;
+			if (name == "right") button = Controller::PAD_BUTTON_RIGHT;
+			if (name == "options") button = Controller::PAD_BUTTON_OPTIONS;
+			if (name == "l1") button = Controller::PAD_BUTTON_L1;
+			if (name == "r1") button = Controller::PAD_BUTTON_R1;
+			if (button != 0) {
+				presses.push_back({std::atof(item.substr(0, colon).c_str()), button, count});
+			}
+		}
+		if (end == std::string::npos) break;
+		at = end + 1;
+	}
+	std::thread([presses = std::move(presses)] {
+		const auto start = std::chrono::steady_clock::now();
+		for (const auto& press: presses) {
+			std::this_thread::sleep_until(start + std::chrono::milliseconds(
+			                                          static_cast<int64_t>(press.at * 1000.0)));
+			for (int i = 0; i < press.count; i++) {
+				std::fprintf(stderr, "[auto-input] %.1f s: button 0x%x\n", press.at, press.button);
+				SetButton(press.button, true);
+				std::this_thread::sleep_for(std::chrono::milliseconds(150));
+				SetButton(press.button, false);
+				std::this_thread::sleep_for(std::chrono::milliseconds(450));
+			}
+		}
+	}).detach();
+}
+
 void MouseToJoystick(float delta_x, float delta_y) {
 	const double distance = std::hypot(delta_x, delta_y);
 	const double scale =
@@ -743,12 +846,29 @@ void HostInputDisconnectGamepad(int id) {
 void HostInputInit(SDL_Window* window) {
 	GetInputMap();
 	g_mouse_window = window;
+	StartAutoInput();
 	if (Config::HideCursorEnabled()) {
 		g_cursor_hide_at = SDL_GetTicks() + CURSOR_IDLE_HIDE_MS;
 	}
+#ifdef _WIN32
+	// Opt-in local automation follows the normal key mapping without stealing focus.
+	const char* diagnostic_input = std::getenv("KYTY_DIAGNOSTIC_INPUT");
+	if (diagnostic_input != nullptr && std::string_view(diagnostic_input) == "1") {
+		g_diagnostic_key_message = RegisterWindowMessageW(L"Kyty.Diagnostic.Key");
+		if (g_diagnostic_key_message != 0) {
+			SDL_SetWindowsMessageHook(DiagnosticInputMessage, window);
+		}
+	}
+#endif
 }
 
 void HostInputShutdown() {
+#ifdef _WIN32
+	if (g_diagnostic_key_message != 0) {
+		SDL_SetWindowsMessageHook(nullptr, nullptr);
+		g_diagnostic_key_message = 0;
+	}
+#endif
 	g_pad_trigger_pressed.clear();
 	HostInputSetTouchPadMode(false);
 	int gamepad_touch_id = -1;
