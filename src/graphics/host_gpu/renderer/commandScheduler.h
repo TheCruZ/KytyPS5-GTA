@@ -148,6 +148,37 @@ public:
 		void* memory = Allocate(sizeof(Command), alignof(Command));
 		Link(new (memory) Command(state, &graphics));
 	}
+	// Queues vkCmdPushDescriptorSetKHR with the writes, and the info arrays they point to, copied
+	// right behind the command in one reservation (Stash() of each array would reserve once for
+	// the writes and once more for every info array, ~10 reservations a draw). False (nothing is
+	// queued) when the copy would exceed MaxStashBytes.
+	[[nodiscard]] bool RecordPushDescriptors(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
+	                           uint32_t set, uint32_t count, const vk::WriteDescriptorSet* writes) {
+		struct Command final: RecordedCommand {
+			Command(vk::PipelineBindPoint point, vk::PipelineLayout pipeline_layout,
+			        uint32_t set_index, uint32_t write_count)
+			    : bind_point(point), layout(pipeline_layout), set(set_index), count(write_count) {}
+			void Execute(vk::CommandBuffer command) override {
+				command.pushDescriptorSetKHR(
+				    bind_point, layout, set, count,
+				    reinterpret_cast<const vk::WriteDescriptorSet*>(this + 1));
+			}
+			vk::PipelineBindPoint bind_point;
+			vk::PipelineLayout    layout;
+			uint32_t              set;
+			uint32_t              count;
+		};
+		static_assert(sizeof(Command) % alignof(vk::WriteDescriptorSet) == 0);
+		const size_t bytes = DeepWritesBytes(writes, count);
+		if (sizeof(Command) + bytes > MaxStashBytes) {
+			return false;
+		}
+		void* memory  = Allocate(sizeof(Command) + bytes, alignof(Command));
+		auto* command = new (memory) Command(bind_point, layout, set, count);
+		CopyDeepWrites(reinterpret_cast<std::byte*>(command + 1), writes, count);
+		Link(command);
+		return true;
+	}
 	// Copies count elements into memory that stays valid until the recording thread has run the
 	// next command recorded after this call (threaded only).
 	template <typename T>
@@ -267,6 +298,49 @@ private:
 		}
 		if (done < bytes) {
 			std::memcpy(to + done, from + done, bytes - done);
+		}
+	}
+	// The bytes of the writes and of the image, buffer and texel buffer view arrays they point to.
+	static size_t DeepWritesBytes(const vk::WriteDescriptorSet* writes, uint32_t count) {
+		size_t bytes = sizeof(vk::WriteDescriptorSet) * count;
+		for (uint32_t i = 0; i < count; i++) {
+			const auto& write = writes[i];
+			if (write.pImageInfo != nullptr) {
+				bytes += sizeof(vk::DescriptorImageInfo) * write.descriptorCount;
+			}
+			if (write.pBufferInfo != nullptr) {
+				bytes += sizeof(vk::DescriptorBufferInfo) * write.descriptorCount;
+			}
+			if (write.pTexelBufferView != nullptr) {
+				bytes += sizeof(vk::BufferView) * write.descriptorCount;
+			}
+		}
+		return bytes;
+	}
+	// Writes the copy of the writes at block (DeepWritesBytes() bytes, 8-aligned); the copy's
+	// arrays follow the writes.
+	static void CopyDeepWrites(std::byte* block, const vk::WriteDescriptorSet* writes,
+	                           uint32_t count) {
+		static_assert(sizeof(vk::DescriptorImageInfo) % 8 == 0 &&
+		              sizeof(vk::DescriptorBufferInfo) % 8 == 0 && sizeof(vk::BufferView) % 8 == 0);
+		auto* copy = reinterpret_cast<vk::WriteDescriptorSet*>(block);
+		CopyStash(copy, writes, sizeof(vk::WriteDescriptorSet) * count);
+		std::byte* cursor = block + sizeof(vk::WriteDescriptorSet) * count;
+		const auto take = [&cursor](const auto* source, size_t elements) {
+			using T = std::remove_cv_t<std::remove_pointer_t<decltype(source)>>;
+			if (source == nullptr || elements == 0) {
+				return static_cast<const T*>(nullptr);
+			}
+			auto* destination = reinterpret_cast<T*>(cursor);
+			CopyStash(destination, source, sizeof(T) * elements);
+			cursor += sizeof(T) * elements;
+			return static_cast<const T*>(destination);
+		};
+		for (uint32_t i = 0; i < count; i++) {
+			auto& write = copy[i];
+			write.pImageInfo       = take(write.pImageInfo, write.descriptorCount);
+			write.pBufferInfo      = take(write.pBufferInfo, write.descriptorCount);
+			write.pTexelBufferView = take(write.pTexelBufferView, write.descriptorCount);
 		}
 	}
 	// Memory in the current chunk for the recording thread; the common case is a pointer bump.
