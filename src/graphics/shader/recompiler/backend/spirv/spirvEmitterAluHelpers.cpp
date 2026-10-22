@@ -1,4 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -112,6 +115,19 @@ static uint32_t EmitMinMaxF32(EmitterState& state, uint32_t lhs, uint32_t rhs, u
 	              numeric);
 }
 
+bool HostFlushesF32Denorms(const EmitterState& state) {
+	if (!state.float_controls || !GetDenormFlushToZero32()) {
+		return false;
+	}
+	if (state.program.stage == ShaderType::Compute) {
+		// MODE.FP_DENORM bits 4-5: 0 flushes FP32 denormals.
+		return state.input_info.compute != nullptr && (state.input_info.compute->float_mode & 0x30u) == 0;
+	}
+	return true;
+}
+
+// V_MIN/V_MAX_F32 are IEEE minNum/maxNum: a NaN operand yields the other operand, and -0 orders
+// below +0.
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
 	if (state.profile.native_float_min_max) {
 		const auto result = state.builder.AllocateId();
@@ -151,6 +167,24 @@ uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c)
 }
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
+	if (HostFlushesF32Denorms(state)) {
+		// DenormFlushToZero: the operation consuming or producing the value flushes it.
+		return value;
+	}
+	return EmitFlushF32DenormAlways(state, value);
+}
+
+uint32_t EmitFlushF32DenormAlways(EmitterState& state, uint32_t value) {
+	// Experiment (2026-10-17): KYTY_DENORM_FLUSH=0 leaves FP32 denormals to the host instead of
+	// flushing them in software around every MAD, conversion and flushing compare (about half
+	// the instructions of the heaviest shaders).
+	static const bool software_flush = [] {
+		const char* v = std::getenv("KYTY_DENORM_FLUSH");
+		return v == nullptr || v[0] != '0';
+	}();
+	if (!software_flush) {
+		return value;
+	}
 	// x * 0 keeps the sign of a denormal; NaN and infinity fail the ordered compare.
 	const auto magnitude = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), magnitude, GlslStd450(state),

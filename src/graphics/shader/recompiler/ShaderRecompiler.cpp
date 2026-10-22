@@ -1067,6 +1067,24 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		unsupported_result.decoded_dump = std::move(decoded_dump);
 		return unsupported_result;
 	}
+	// A subgroup larger than a host mesh workgroup runs in passes, cut at its barriers.
+	if (options.stage == ShaderType::Mesh && options.input_info.vertex != nullptr &&
+	    options.input_info.vertex->mesh.passes > 1u) {
+		if (const auto* reason = Spirv::MeshPassesUnsupported(ir); reason != nullptr) {
+			if (!options.non_fatal) {
+				EXIT("%s failed hash=0x%016" PRIx64 ": mesh passes: %s\n",
+				     GetDumpLabel(options), options.shader_hash, reason);
+			}
+			DumpGaveUpCode(options, code);
+			ReportGaveUp(options, phases, reason);
+			LOGF("%s gave up hash=0x%016" PRIx64 ": %u mesh passes, but %s\n",
+			     GetDumpLabel(options), options.shader_hash, options.input_info.vertex->mesh.passes,
+			     reason);
+			TranslateResult unsupported_result;
+			unsupported_result.unsupported = true;
+			return unsupported_result;
+		}
+	}
 	TranslateResult result;
 	result.program = std::move(ir);
 	if (options.dump_ir) {
@@ -1153,7 +1171,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash);
 	auto spirv = Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, *options.profile,
-	                                options.emit_debug_info);
+	                                options.emit_debug_info, options.robust_buffer_access2);
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash,

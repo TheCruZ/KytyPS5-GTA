@@ -136,7 +136,7 @@ uint32_t EmitFloatCompare32(ValueEmitContext& ctx, const IR::Inst& inst) {
 			                                  ? bits & 0x80000000u : bits);
 		}
 		const auto id = ctx.Arg(inst, index);
-		return flush ? EmitFlushF32DenormToSignedZero(ctx.state, id) : id;
+		return flush ? EmitFlushF32DenormAlways(ctx.state, id) : id;
 	};
 	return EmitNative<opcode, IR::Type::U1>(ctx.state, operand(0), operand(1));
 }
@@ -213,7 +213,9 @@ inline constexpr auto EmitSendmsg      = EmitVoid;
 inline constexpr auto EmitTtraceData   = EmitVoid;
 inline constexpr auto EmitInstPrefetch = EmitVoid;
 void                  EmitBarrier(EmitterState& state);
+void                  EmitWaveLdsBarrier(EmitterState& state);
 void                  EmitStoreCompletion(EmitterState& state);
+void                  EmitShaderTrap(EmitterState& state, uint32_t pc, uint32_t code);
 void                  EmitDataCacheInvalidate(EmitterState& state);
 void                  EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst);
@@ -240,6 +242,7 @@ uint32_t              EmitGetAttributeF16(ValueEmitContext& ctx, const IR::Inst&
 uint32_t              EmitGetInterpolationParameter(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetShaderBase(ValueEmitContext& ctx);
+uint32_t              EmitReadClockRealtime64(ValueEmitContext& ctx);
 inline constexpr auto EmitGetSrtResource     = EmitVoid;
 inline constexpr auto EmitGetBufferResource  = EmitGetSrtResource;
 uint32_t              EmitGetBufferResourceIndex(ValueEmitContext& ctx, const IR::Inst& inst);

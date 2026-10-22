@@ -73,6 +73,15 @@ struct ImageDefinition {
 	uint32_t sampled_type = 0;
 };
 
+// KYTY_NO_FLOAT_CONTROLS: shaders built without SignedZeroInfNanPreserve (spirvEmitterModule.cpp).
+bool FloatControlsDisabled(uint64_t shader_hash);
+
+// Bindless images or samplers and buffers bound with a GPU-sized record count read the flattened
+// SRT even when no other resource does (spirvEmitterModule.cpp).
+bool BindlessOrGpuSizedSrt(const IR::Program& program);
+
+struct ValueEmitContext;
+
 struct EmitterState {
 	EmitterState(IR::Program& program_, ShaderStageInputInfo input_info_, const Profile& profile_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
@@ -108,10 +117,32 @@ struct EmitterState {
 	std::array<uint32_t, IR::NumTessellationAttributes> tess_variables {};
 	uint32_t                                         tess_inner_variable = 0;
 
+	// SignedZeroInfNanPreserve for 32-bit floats: NaN-aware GLSL.std.450 operations (NMin, NMax,
+	// OpIsNan) then have the defined results the guest's IEEE instructions need.
+	const bool float_controls = !FloatControlsDisabled(program.shader_hash);
+	// OpReadClockKHR (S_MEMREALTIME) is used: needs the shader clock capability.
+	bool                                             shader_clock            = false;
+	// Dwords the function-scope LDS array of a non-compute stage needs, from bounds on every
+	// LDS address; 0 when some address is unbounded (the default size is then used).
+	uint32_t                                         function_lds_dwords     = 0;
 	uint32_t                                         lane_count              = 1;
+	// Execution scope of the barriers that keep one guest wave's LDS accesses in order across
+	// host invocations (WaveLdsScope in SpirvEmitter.cpp); 0 when none are emitted.
+	uint32_t                                         wave_lds_scope          = 0;
 	uint32_t                                         lane_half               = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
+	// Each buffer binding's bound range in bytes (BufferLengthDword in the shader data).
+	std::vector<uint32_t>                            memory_dword_lengths;
+	// Write bitmap (Bindings::write_tracking): the bitmap's device address, each memory
+	// binding's guest base (u64 ids; a base of 0 is not tracked in that draw), and whether the
+	// instruction being emitted writes memory.
+	uint32_t                                         write_bitmap_address    = 0;
+	std::vector<uint32_t>                            write_track_bases;
+	bool                                             emitting_write          = false;
+	// The instruction EmitDirectInstruction is emitting, and its lane (gpu_records_ssa bounds).
+	const IR::Inst*                                  emitting_inst           = nullptr;
+	ValueEmitContext*                                emitting_ctx            = nullptr;
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
@@ -130,6 +161,21 @@ struct EmitterState {
 	uint32_t                                         lds_u64_variable        = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};
 	std::array<ImageDefinition, IR::ImageBindingCount> images {};
+	// Bindless images: set-1 runtime arrays by image type, the key -> slot translation buffer,
+	// and the slot EmitImage computed for the instruction being emitted (0 when none).
+	std::map<uint32_t, uint32_t>                     bindless_image_variables;
+	uint32_t                                         bindless_translation_variable = 0;
+	uint32_t                                         bindless_feedback_variable    = 0;
+	uint32_t                                         bindless_slot                 = 0;
+	// The raw translation entry behind bindless_slot (BindlessSlotArrayFlag marks a 2D or 2D-array
+	// texture a 3D image instruction samples).
+	uint32_t                                         bindless_translation_raw      = 0;
+	// While image_override_index names a resource, ImageResourceAt() returns image_override for
+	// it: the same instruction emitted against another view type of its texture.
+	uint32_t                                         image_override_index          = UINT32_MAX;
+	IR::ImageResource                                image_override {};
+	uint32_t                                         bindless_sampler_variable     = 0;
+	uint32_t                                         bindless_sampler_slot         = 0;
 	uint32_t                   sampler_variable                      = 0;
 	uint32_t                   sampler_type                          = 0;
 	uint32_t                   sampler_pointer_type                  = 0;
@@ -139,10 +185,23 @@ struct EmitterState {
 	uint32_t                   mesh_primitive_data                   = 0;
 	uint32_t                   mesh_primitives                       = 0;
 	uint32_t                   mesh_cull                             = 0;
+	uint32_t                   mesh_zero_position_mask               = 0;
+	uint32_t                   mesh_zero_position_words              = 0;
+	// A subgroup larger than the host workgroup runs in mesh_passes passes (ShaderMeshInputInfo):
+	// mesh_pass_variable holds the current pass, and the guest program is cut at its barriers
+	// into mesh_segment_funcs, each called once per pass.
+	uint32_t                   mesh_passes                           = 1;
+	uint32_t                   mesh_pass_variable                    = 0;
+	std::vector<uint32_t>      mesh_segment_funcs;
 	uint32_t                   entry_label                           = 0;
 	uint32_t                   current_label                         = 0;
 	const IR::Block*           current_block                         = nullptr;
 	uint32_t                   pixel_valid_mask_variable             = 0;
+	// KYTY_LOOP_GUARD_HASHES: a per-invocation count of loop-exit decisions; past the limit every
+	// loop exit is taken, so a loop whose trip count comes from bad data ends instead of hanging
+	// the GPU (structured loops; the dispatcher has its own bound).
+	uint32_t                   loop_guard_variable                   = 0;
+	std::vector<const IR::Block*> loop_guard_merges;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
@@ -182,6 +241,29 @@ uint32_t TypePhysicalU32Pointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
 uint32_t TypeU32ArrayPointer(EmitterState& state, spv::StorageClass storage_class, uint32_t dwords);
 uint32_t TypeU32ElementPointer(EmitterState& state, spv::StorageClass storage_class);
+
+// Diagnostics: KYTY_PROBE_RECT is set and KYTY_PROBE_PC names this non-pixel shader, so it
+// appends its probed values to the bindless feedback buffer (EmitProbeAppend).
+inline bool ProbeAppendWanted(const EmitterState& state) {
+	static const uint64_t hash = [] {
+		const char* probe = std::getenv("KYTY_PROBE_PC");
+		return probe != nullptr && std::getenv("KYTY_PROBE_RECT") != nullptr
+		           ? std::strtoull(probe, nullptr, 16)
+		           : 0ull;
+	}();
+	return hash != 0 && hash == state.program.shader_hash && state.program.stage != ShaderType::Pixel;
+}
+
+// A bindless sampled 3D image: its key may name a 2D or 2D-array texture instead.
+inline bool BindlessVolumeMayBeArray(const IR::ImageResource& image) {
+	return image.bindless && !image.cube && image.resource_class == IR::ImageResourceClass::Sampled &&
+	       image.dimension == Decoder::ImageDimension::Dim3D;
+}
+
+inline const IR::ImageResource& ImageResourceAt(const EmitterState& state, uint32_t index) {
+	return index == state.image_override_index ? state.image_override
+	                                           : state.program.info.images.at(index);
+}
 
 inline void EmitLabel(EmitterState& state, uint32_t label) {
 	state.current_label = label;
@@ -283,6 +365,7 @@ struct ImageSampleLayout {
 	uint32_t lod    = NoImageComponent;
 	uint32_t grad_x = NoImageComponent;
 	uint32_t grad_y = NoImageComponent;
+	uint32_t clamp  = NoImageComponent; // IMAGE_SAMPLE*_CL minimum LOD, the last component
 };
 
 struct F32Class {
@@ -369,6 +452,7 @@ void     EmitMeshEntryPoint(EmitterState& state);
 void     EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index = 0);
 uint32_t MeshPrimitivePointer(EmitterState& state);
+uint32_t MeshLaneSlot(EmitterState& state);
 
 DppTargetLane EmitDppPermTargetLane(EmitterState& state, uint32_t subid, uint32_t control,
                                     uint32_t lane_bits);
@@ -406,6 +490,11 @@ uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
 uint32_t EmitPushDataLoad(EmitterState& state, uint32_t index);
 
+// A thread-dimension compute dispatch whose counts the shader reads from GPU memory.
+[[nodiscard]] bool DispatchDimensionsIndirect(const EmitterState& state);
+// Guest DMA, or DispatchDimensionsIndirect: the module uses physical storage buffer pointers.
+[[nodiscard]] bool UsesPhysicalAddresses(const EmitterState& state);
+
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem);
 
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
@@ -413,6 +502,7 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resource);
 
 void EmitMemoryOffsets(EmitterState& state);
+void EmitSrtVerify(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);
 void EnsureLdsStorage(EmitterState& state);
@@ -426,6 +516,8 @@ struct MemoryResourceAccess {
 	uint32_t              element_bits     = 32;
 	bool                  non_uniform      = false;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
+	// Write-tracked binding, while a writing instruction is emitted: its guest base (u64 id).
+	uint32_t              write_base       = 0;
 };
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
@@ -436,7 +528,8 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         state,
                                                         const IR::MemoryInfo& mem,
                                                         BufferDefinition& buffer,
-                                                        uint32_t array_index = 0);
+                                                        uint32_t array_index = 0,
+                                                        uint32_t element_bits = 32);
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index);
@@ -518,7 +611,13 @@ uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask);
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value);
 
+inline constexpr auto EmitTruncF32Value = EmitGlsl<GLSLstd450Trunc, IR::Type::F32, uint32_t>;
+
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value);
+// The software flush even under DenormFlushToZero (compare operands, which the mode leaves).
+uint32_t EmitFlushF32DenormAlways(EmitterState& state, uint32_t value);
+// Whether this shader declares DenormFlushToZero for 32-bit floats (SetDenormFlushToZero32).
+bool     HostFlushesF32Denorms(const EmitterState& state);
 
 uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signed_zero);
 

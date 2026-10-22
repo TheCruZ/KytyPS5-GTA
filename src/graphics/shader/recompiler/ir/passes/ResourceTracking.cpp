@@ -4784,7 +4784,7 @@ private:
 
 	void Collect(Inst& inst) {
 		const auto op           = inst.GetOpcode();
-		if (op == ValueOpcode::BvhIntersect) {
+		if (op == ValueOpcode::BvhIntersect || op == ValueOpcode::ShaderTrap) {
 			m_info.uses_dma = true;
 			return;
 		}

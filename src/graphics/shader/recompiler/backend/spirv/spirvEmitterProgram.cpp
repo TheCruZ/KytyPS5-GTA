@@ -1,12 +1,15 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include "common/assert.h"
+#include "common/hackNotice.h"
 
 #include <algorithm>
 #include <bit>
 #include <functional>
 #include <optional>
+#include <set>
 #include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -129,7 +132,42 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = ctx.Def(block->condition);
+			auto condition = ctx.Def(block->condition);
+			auto& st       = ctx.state;
+			if (st.loop_guard_variable != 0 && ctx.half == 0) {
+				const bool true_exits = std::ranges::find(st.loop_guard_merges, term.true_block) !=
+				                        st.loop_guard_merges.end();
+				const bool false_exits = std::ranges::find(st.loop_guard_merges, term.false_block) !=
+				                         st.loop_guard_merges.end();
+				if (true_exits != false_exits) {
+					// Count the decision; past the limit, take the exit. KYTY_LOOP_GUARD_LIMIT
+					// (default 65536) sets the limit (part of the shader cache key via getenv).
+					static const uint32_t LoopGuardLimit = [] {
+						const char* value = std::getenv("KYTY_LOOP_GUARD_LIMIT");
+						const auto  limit = value != nullptr ? std::strtoul(value, nullptr, 10) : 0ul;
+						return limit != 0ul ? static_cast<uint32_t>(limit) : (1u << 16u);
+					}();
+					const auto         count          = st.builder.AllocateId();
+					st.builder.AddFunction(spv::OpLoad, TypeU32(st), count, st.loop_guard_variable);
+					const auto next = st.builder.AllocateId();
+					st.builder.AddFunction(spv::OpIAdd, TypeU32(st), next, count, ConstantU32(st, 1u));
+					st.builder.AddFunction(spv::OpStore, st.loop_guard_variable, next);
+					const auto exhausted = st.builder.AllocateId();
+					st.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(st), exhausted, next,
+					                       ConstantU32(st, LoopGuardLimit));
+					const auto guarded = st.builder.AllocateId();
+					if (true_exits) {
+						st.builder.AddFunction(spv::OpLogicalOr, TypeBool(st), guarded, condition,
+						                       exhausted);
+					} else {
+						const auto keep = st.builder.AllocateId();
+						st.builder.AddFunction(spv::OpLogicalNot, TypeBool(st), keep, exhausted);
+						st.builder.AddFunction(spv::OpLogicalAnd, TypeBool(st), guarded, condition,
+						                       keep);
+					}
+					condition = guarded;
+				}
+			}
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
 			                              true_block->Definition(), false_block->Definition());
@@ -241,6 +279,19 @@ void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 		ctx.Define(inst, ctx.other_half->Result(inst));
 		return;
 	}
+	// Write bitmap: storage-buffer element pointers made for this instruction mark their pages.
+	const auto access = IR::BufferAccessOf(inst.GetOpcode());
+	struct WriteScope {
+		EmitterState& state;
+		~WriteScope() {
+			state.emitting_write = false;
+			state.emitting_inst  = nullptr;
+			state.emitting_ctx   = nullptr;
+		}
+	} write_scope {ctx.state};
+	ctx.state.emitting_inst = &inst;
+	ctx.state.emitting_ctx  = &ctx;
+	ctx.state.emitting_write = access == IR::BufferAccess::Write || access == IR::BufferAccess::Atomic;
 	switch (op) {
 #define VALUE_OPCODE(name, ...)                                                                    \
 	case IR::ValueOpcode::name: return Invoke(Emit##name, ctx, inst);
@@ -295,6 +346,10 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 	ctx.state.current_block = block;
 	EmitLabel(ctx.state, block->Definition());
 	bool emitted_non_phi = false;
+	// Wave LDS ordering (WaveLdsScope): a barrier separates an LDS write from the next LDS access
+	// and a read from the next write. The block may be entered right after a write.
+	bool lds_written = true;
+	bool lds_read    = false;
 	for (const auto& inst: *block) {
 		if (inst.GetOpcode() == IR::ValueOpcode::Phi) {
 			if (emitted_non_phi) {
@@ -302,6 +357,22 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 			}
 		} else {
 			emitted_non_phi = true;
+		}
+		if (ctx.state.wave_lds_scope != 0) {
+			const auto access = IR::SharedAccessOf(inst.GetOpcode());
+			if (inst.GetOpcode() == IR::ValueOpcode::Barrier) {
+				lds_written = false;
+				lds_read    = false;
+			} else if (access != IR::SharedAccess::None) {
+				const bool writes = access != IR::SharedAccess::Read;
+				if (lds_written || (writes && lds_read)) {
+					EmitWaveLdsBarrier(ctx.state);
+					lds_written = false;
+					lds_read    = false;
+				}
+				lds_written |= writes;
+				lds_read |= access != IR::SharedAccess::Write;
+			}
 		}
 		for (uint32_t half = 0; half < ctx.state.lane_count; half++) {
 			auto& lane          = half == 0 ? ctx : *ctx.other_half;
@@ -347,6 +418,285 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 	PatchStructuredPhis(ctx, structured);
 }
 
+// A guest barrier where a mesh subgroup that runs in passes is cut (see EmitMeshEntryPoint).
+struct MeshSplit {
+	size_t block    = 0; // index in program.blocks
+	size_t position = 0; // the barrier's position in that block
+};
+
+// The program's barriers as split points, or why the program cannot run in passes. A barrier
+// qualifies at the top level only: no edge bypasses or re-enters its block and no loop or
+// selection spans it, so the code before it is a whole region. The guest must also not end
+// before its last barrier, which would leave a later segment running for a finished wave.
+const char* FindMeshSplits(const IR::Program& program, std::vector<MeshSplit>& splits) {
+	splits.clear();
+	if (program.dispatcher_fallback) {
+		return "the control flow needs the dispatcher";
+	}
+	const auto count = program.blocks.size();
+	std::unordered_map<const IR::Block*, size_t> index_of;
+	for (size_t i = 0; i < count; i++) {
+		index_of.emplace(program.blocks[i], i);
+	}
+	const auto index = [&](const IR::Block* block) {
+		const auto found = index_of.find(block);
+		return found == index_of.end() ? SIZE_MAX : found->second;
+	};
+	// Successors in program order; a block whose terminator returns (as the structured emitter
+	// treats it) is an exit.
+	std::vector<std::vector<size_t>> successors(count);
+	std::vector<bool>                exits(count, false);
+	for (size_t i = 0; i < count; i++) {
+		const auto* info = program.blocks[i];
+		const auto& term = info->terminator;
+		if (term.kind == CFG::TerminatorKind::Branch && index(term.true_block) != SIZE_MAX) {
+			successors[i] = {index(term.true_block)};
+		} else if (term.kind == CFG::TerminatorKind::ConditionalBranch &&
+		           index(term.true_block) != SIZE_MAX && index(term.false_block) != SIZE_MAX &&
+		           !info->condition.IsEmpty()) {
+			successors[i] = {index(term.true_block), index(term.false_block)};
+		} else if (term.kind == CFG::TerminatorKind::IndirectBranch ||
+		           term.kind == CFG::TerminatorKind::Unsupported) {
+			return "an indirect branch";
+		} else {
+			exits[i] = true;
+		}
+	}
+	const auto top_level = [&](size_t k) {
+		for (size_t i = 0; i < count; i++) {
+			for (const auto j: successors[i]) {
+				if ((i < k && j > k) || (i >= k && j <= k)) {
+					return false;
+				}
+			}
+			const auto& term = program.blocks[i]->terminator;
+			if (i < k && ((term.merge_block != nullptr && index(term.merge_block) > k) ||
+			              (term.loop_header && index(term.continue_block) >= k))) {
+				return false;
+			}
+		}
+		return true;
+	};
+	for (size_t k = 0; k < count; k++) {
+		size_t position = 0;
+		for (const auto& inst: *program.blocks[k]) {
+			if (inst.GetOpcode() == IR::ValueOpcode::Barrier) {
+				if (!top_level(k)) {
+					return "a barrier inside a loop or branch";
+				}
+				splits.push_back({k, position});
+			}
+			position++;
+		}
+	}
+	for (size_t i = 0; !splits.empty() && i < splits.back().block; i++) {
+		if (exits[i]) {
+			return "the program can end before a barrier";
+		}
+	}
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			// Scratch lives in Function variables, which do not outlive a segment.
+			if (IR::AddressOpcodeInfoOf(inst.GetOpcode()).access != IR::AddressAccess::None &&
+			    program.memory_info.at(inst.Flags<IR::MemoryFlags>().index).kind ==
+			        IR::ResourceKind::Scratch) {
+				return "scratch memory";
+			}
+		}
+	}
+	return nullptr;
+}
+
+// Which values cross a split: each is kept in a Private array with one element per lane of each
+// pass, stored at the end of the segment that defines it and loaded by every later segment that
+// uses it.
+struct MeshSegmentPlan {
+	std::vector<MeshSplit>                              splits;
+	std::unordered_map<const IR::Inst*, uint32_t>       spills;
+	std::vector<std::vector<const IR::Inst*>>           stores;
+	std::vector<std::vector<const IR::Inst*>>           loads;
+};
+
+MeshSegmentPlan PlanMeshSegments(EmitterState& state, std::vector<MeshSplit> splits) {
+	const auto&     program = state.program;
+	MeshSegmentPlan plan;
+	plan.splits = std::move(splits);
+	plan.stores.resize(plan.splits.size() + 1);
+	plan.loads.resize(plan.splits.size() + 1);
+	std::unordered_map<const IR::Inst*, uint32_t> segment_of;
+	std::vector<uint32_t>                         terminator_segment(program.blocks.size());
+	uint32_t                                      segment = 0;
+	size_t                                        next    = 0;
+	for (size_t block = 0; block < program.blocks.size(); block++) {
+		size_t position = 0;
+		for (const auto& inst: *program.blocks[block]) {
+			if (next < plan.splits.size() && plan.splits[next].block == block &&
+			    plan.splits[next].position == position) {
+				segment++;
+				next++;
+			}
+			segment_of.emplace(&inst, segment);
+			position++;
+		}
+		terminator_segment[block] = segment;
+	}
+	std::set<std::pair<const IR::Inst*, uint32_t>> visited;
+	std::function<void(IR::Value, uint32_t)>       use = [&](IR::Value value, uint32_t user) {
+        value            = value.Resolve();
+        const auto* inst = value.TryInstruction();
+        if (inst == nullptr || !visited.emplace(inst, user).second) {
+            return;
+        }
+        const auto found = segment_of.find(inst);
+        if (found == segment_of.end() || found->second >= user) {
+            return;
+        }
+        if (TypeId(state, inst->GetType()) == 0) {
+            // A handle the emitter reads through its producer: the producer's operands are
+            // what the user's segment loads.
+            for (size_t index = 0; index < inst->NumArgs(); index++) {
+                use(inst->Arg(index), user);
+            }
+            return;
+        }
+        if (!plan.spills.contains(inst)) {
+            const auto slots  = state.lane_count * state.mesh_passes;
+            const auto array  = state.builder.Type(spv::OpTypeArray, TypeId(state, inst->GetType()),
+                                                   ConstantU32(state, slots));
+            plan.spills.emplace(inst, state.builder.DefineGlobalVariable(
+                                          TypePointer(state, spv::StorageClassPrivate, array),
+                                          spv::StorageClassPrivate));
+            plan.stores[found->second].push_back(inst);
+        }
+        plan.loads[user].push_back(inst);
+	};
+	for (size_t block = 0; block < program.blocks.size(); block++) {
+		for (const auto& inst: *program.blocks[block]) {
+			for (size_t index = 0; index < inst.NumArgs(); index++) {
+				use(inst.Arg(index), segment_of.at(&inst));
+			}
+		}
+		const auto* info = program.blocks[block];
+		if (!info->condition.IsEmpty()) {
+			use(info->condition, terminator_segment[block]);
+		}
+		if (!info->indirect_target.IsEmpty()) {
+			use(info->indirect_target, terminator_segment[block]);
+		}
+	}
+	return plan;
+}
+
+// The element of a crossing value's array for this lane in the current pass.
+uint32_t MeshSpillPointer(ValueEmitContext& lane, uint32_t variable, const IR::Inst& inst) {
+	auto&      state = lane.state;
+	const auto pass  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), pass, state.mesh_pass_variable);
+	const auto slot = Binary(state, spv::OpIAdd, TypeU32(state),
+	                         Binary(state, spv::OpIMul, TypeU32(state), pass,
+	                                ConstantU32(state, state.lane_count)),
+	                         ConstantU32(state, lane.half));
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain,
+	                          TypePointer(state, spv::StorageClassPrivate,
+	                                      TypeId(state, inst.GetType())),
+	                          pointer, variable, slot);
+	return pointer;
+}
+
+// The guest program as one function per segment between its barriers. Each segment emits its
+// blocks once; the block a barrier cuts continues under a fresh label in the next segment.
+void EmitMeshSegmentFunctions(ValueEmitContext& ctx, const MeshSegmentPlan& plan) {
+	auto&       state   = ctx.state;
+	const auto& program = state.program;
+	size_t      block   = 0;
+	size_t      start   = 0;
+	for (size_t segment = 0; segment <= plan.splits.size(); segment++) {
+		const auto function = state.builder.AllocateId();
+		state.mesh_segment_funcs.push_back(function);
+		state.builder.AddFunction(spv::OpFunction, TypeVoid(state), function,
+		                          spv::FunctionControlMaskNone, TypeFunction(state));
+		EmitLabel(state, state.builder.AllocateId());
+		for (uint32_t half = 0; half < state.lane_count; half++) {
+			auto& lane = half == 0 ? ctx : *ctx.other_half;
+			if (lane.scratch_u32_variable != 0) {
+				lane.scratch_u32_variable = state.builder.AllocateId();
+				state.builder.AddFunction(
+				    spv::OpVariable, TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+				    lane.scratch_u32_variable, spv::StorageClassFunction);
+			}
+		}
+		if (state.gds_variable != 0) {
+			state.gds_length = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), state.gds_length,
+			                          state.gds_variable, 0);
+		}
+		EmitMemoryOffsets(state);
+		for (const auto* inst: plan.loads[segment]) {
+			for (uint32_t half = 0; half < state.lane_count; half++) {
+				auto&      lane  = half == 0 ? ctx : *ctx.other_half;
+				const auto value = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpLoad, TypeId(state, inst->GetType()), value,
+				                          MeshSpillPointer(lane, plan.spills.at(inst), *inst));
+				inst->SetDefinition(lane.half, value);
+			}
+		}
+		StructuredFunctionState structured;
+		if (start == 0) {
+			state.builder.AddFunction(spv::OpBranch, program.blocks[block]->Definition());
+		} else {
+			const auto resume = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpBranch, resume);
+			EmitLabel(state, resume);
+		}
+		const auto* end = segment < plan.splits.size() ? &plan.splits[segment] : nullptr;
+		while (block < program.blocks.size()) {
+			const auto* ir_block = program.blocks[block];
+			state.current_block  = ir_block;
+			if (start == 0) {
+				EmitLabel(state, ir_block->Definition());
+			}
+			const auto stop     = end != nullptr && end->block == block ? end->position : SIZE_MAX;
+			size_t     position = 0;
+			for (const auto& inst: *ir_block) {
+				if (position >= start && position < stop &&
+				    inst.GetOpcode() != IR::ValueOpcode::Barrier) {
+					for (uint32_t half = 0; half < state.lane_count; half++) {
+						state.lane_half = half;
+						if (half == 0 || inst.GetOpcode() != IR::ValueOpcode::MeshAllocate) {
+							EmitStructuredInstruction(half == 0 ? ctx : *ctx.other_half, structured,
+							                          inst);
+						}
+					}
+					state.lane_half = 0;
+				}
+				position++;
+			}
+			if (stop != SIZE_MAX) {
+				start = stop + 1;
+				break;
+			}
+			structured.block_exit_labels.emplace(ir_block, state.current_label);
+			EmitStructuredTerminator(ctx, ir_block);
+			block++;
+			start = 0;
+		}
+		if (end != nullptr) {
+			for (const auto* inst: plan.stores[segment]) {
+				for (uint32_t half = 0; half < state.lane_count; half++) {
+					auto& lane = half == 0 ? ctx : *ctx.other_half;
+					state.builder.AddFunction(spv::OpStore,
+					                          MeshSpillPointer(lane, plan.spills.at(inst), *inst),
+					                          lane.Def(IR::Value(const_cast<IR::Inst*>(inst))));
+				}
+			}
+			state.builder.AddFunction(spv::OpReturn);
+		}
+		PatchStructuredPhis(ctx, structured);
+		state.builder.AddFunction(spv::OpFunctionEnd);
+	}
+}
+
 void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher) {
 	auto&       state = ctx.state;
 	const auto* entry = state.program.blocks.front();
@@ -364,9 +714,27 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	const auto next_pc = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpPhi, TypeU32(state), pc, initial_pc, initial_parent, next_pc,
 	                          dispatcher.continue_label);
-	const auto done = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), done, pc,
+	// Safety net: a guest loop whose trip count comes from bad data (a blur radius read
+	// from a buffer an unemulated pass left unwritten) hung the GPU until the driver reset it.
+	// Leave the dispatcher after a bounded number of block transitions instead: the invocation's
+	// results are wrong, the device survives.
+	constexpr uint32_t MaxDispatcherTransitions = 4096;
+	Common::HackNotice::ReportTranslation(
+	    "block dispatcher leaves after a bounded number of transitions", "SPIR-V dispatcher",
+	    state.program.shader_hash, MaxDispatcherTransitions,
+	    "armed: an invocation that needs more block transitions ends with wrong results");
+	const auto         iteration                = state.builder.AllocateId();
+	const auto         next_iteration           = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpPhi, TypeU32(state), iteration, ConstantU32(state, 0u),
+	                          initial_parent, next_iteration, dispatcher.continue_label);
+	const auto finished = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), finished, pc,
 	                          ConstantU32(ctx.state, UINT32_MAX));
+	const auto exhausted = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), exhausted, iteration,
+	                          ConstantU32(state, MaxDispatcherTransitions));
+	const auto done = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), done, finished, exhausted);
 	state.builder.AddFunction(spv::OpLoopMerge, dispatcher.merge_label, dispatcher.continue_label,
 	                          spv::LoopControlMaskNone);
 	state.builder.AddFunction(spv::OpBranchConditional, done, dispatcher.merge_label,
@@ -399,6 +767,8 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	state.builder.AddFunction(next_pc_words);
 	state.builder.AddFunction(spv::OpBranch, dispatcher.continue_label);
 	EmitLabel(state, dispatcher.continue_label);
+	state.builder.AddFunction(spv::OpIAdd, TypeU32(state), next_iteration, iteration,
+	                          ConstantU32(state, 1u));
 	state.builder.AddFunction(spv::OpBranch, dispatcher.header_label);
 	EmitLabel(state, dispatcher.merge_label);
 	EmitReturn(ctx);
@@ -683,10 +1053,39 @@ void EmitProgram(EmitterState& state) {
 			high.scratch_u32_variable = state.builder.AllocateId();
 		}
 	}
+	if (state.mesh_passes > 1u) {
+		// TranslateProgram gave up on programs that cannot be cut.
+		std::vector<MeshSplit> splits;
+		if (const auto* reason = FindMeshSplits(program, splits); reason != nullptr) {
+			ctx.Fail(reason);
+		}
+		EmitMeshSegmentFunctions(ctx, PlanMeshSegments(state, std::move(splits)));
+		EmitMeshEntryPoint(state);
+		return;
+	}
+	if (static const char* guard_list = std::getenv("KYTY_LOOP_GUARD_HASHES");
+	    guard_list != nullptr && !state.program.dispatcher_fallback &&
+	    std::string_view(guard_list).find(fmt::format("{:016x}", state.program.shader_hash)) !=
+	        std::string_view::npos) {
+		for (const auto* block: program.blocks) {
+			if (block->terminator.loop_header && block->terminator.merge_block != nullptr) {
+				state.loop_guard_merges.push_back(block->terminator.merge_block);
+			}
+		}
+		if (!state.loop_guard_merges.empty()) {
+			state.loop_guard_variable = state.builder.AllocateId();
+		}
+	}
 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state),
 	                          state.mesh_guest_func != 0 ? state.mesh_guest_func : state.main_func,
 	                          spv::FunctionControlMaskNone, TypeFunction(state));
 	EmitLabel(state, state.entry_label);
+	if (state.loop_guard_variable != 0) {
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.loop_guard_variable, spv::StorageClassFunction,
+		                          ConstantU32(state, 0u));
+	}
 	if (state.program.info.function_lds) {
 		state.builder.AddFunction(
 		    spv::OpVariable,
@@ -747,6 +1146,7 @@ void EmitProgram(EmitterState& state) {
 		                                     ConstantU32(state, LdsDwordCount(state)));
 	}
 	EmitMemoryOffsets(state);
+	EmitSrtVerify(state);
 	if (program.blocks.empty()) {
 		EmitReturn(ctx);
 	} else if (state.program.dispatcher_fallback) {
@@ -762,3 +1162,12 @@ void EmitProgram(EmitterState& state) {
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
+
+namespace Libs::Graphics::ShaderRecompiler::Spirv {
+
+const char* MeshPassesUnsupported(const IR::Program& program) {
+	std::vector<Emitter::MeshSplit> splits;
+	return Emitter::FindMeshSplits(program, splits);
+}
+
+} // namespace Libs::Graphics::ShaderRecompiler::Spirv
