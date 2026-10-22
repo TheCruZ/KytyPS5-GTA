@@ -42,14 +42,14 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 }
 
 // KYTY_DRAW_FLUSH_INTERVAL=N overrides CompleteDraw()'s periodic non-blocking flush interval.
-// Defaults to 16 -- validated against real gameplay, where it cut the fraction of the main thread
-// spent in MasterSemaphore::Wait from dominating the frame to under 10%. Explicitly setting it to
-// 0 disables the flush entirely, same as before this had a default.
+// Defaults to 128 draws (about 46 submissions a frame in GTA V; 16 meant about 370, whose
+// submission boundaries cost the host GPU ~3 ms a frame and the recording thread ~4 ms). Setting
+// it to 0 disables the periodic flush; submissions then still follow end-of-pipe events.
 uint32_t DrawFlushInterval() {
 	static const uint32_t interval = [] {
 		const char* v = std::getenv("KYTY_DRAW_FLUSH_INTERVAL");
 		if (v == nullptr) {
-			return 16u;
+			return 128u;
 		}
 		return static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
 	}();
