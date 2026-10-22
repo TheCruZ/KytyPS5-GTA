@@ -261,7 +261,7 @@ static uint64_t WriteBitmapMinBytesForBinding() {
 	return bytes;
 }
 
-static vk::DescriptorBufferInfo
+[[clang::always_inline]] static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
                     const ShaderRecompiler::IR::BufferResource&    resource,
                     const ShaderRecompiler::IR::BufferWriteExtent* extent, uint32_t& buffer_offset,
@@ -3768,18 +3768,23 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto shift = (index % 4u) * 8u;
 		prepared.shader_data[dword] |= offset << shift;
 	};
+	// The range a uniform view of a buffer gets, the same for every buffer of the call.
+	const vk::DeviceSize uniform_range = std::min<vk::DeviceSize>(
+	    ShaderRecompiler::IR::UniformBufferBytes,
+	    m_context.GetGraphics().GetPhysicalDeviceProperties().limits.maxUniformBufferRange);
 	for (const auto& resource: program.info.buffers) {
 		const auto index = resource.descriptor_index;
 		if (index == UINT32_MAX) continue;
 		uint32_t buffer_offset = 0;
 		uint64_t tracked_base  = 0;
+		// Only a buffer the shader writes has a store extent.
 		const auto resource_index = static_cast<uint32_t>(&resource - program.info.buffers.data());
+		const auto* extent        = resource.written && resource_index < snapshot.buffer_write_extents.size()
+		                                ? &snapshot.buffer_write_extents[resource_index]
+		                                : nullptr;
 		prepared.buffers[index] = NativeStorageBuffer(
-		    m_context, prepared.buffer_sources[index], resource,
-		    resource_index < snapshot.buffer_write_extents.size()
-		        ? &snapshot.buffer_write_extents[resource_index]
-		        : nullptr,
-		    buffer_offset, write_tracking && resource.write_tracked, tracked_base);
+		    m_context, prepared.buffer_sources[index], resource, extent, buffer_offset,
+		    write_tracking && resource.write_tracked, tracked_base);
 		if (write_tracking) {
 			const auto dword                     = layout.WriteTrackDword() + 2u + 2u * index;
 			prepared.shader_data[dword]          = static_cast<uint32_t>(tracked_base);
@@ -3795,10 +3800,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		        ? 0u
 		        : static_cast<uint32_t>(prepared.buffers[index].range);
 		if (resource.uniform_index != UINT32_MAX) {
-			auto view  = prepared.buffers[index];
-			view.range = std::min<vk::DeviceSize>(
-			    {view.range, ShaderRecompiler::IR::UniformBufferBytes,
-			     m_context.GetGraphics().GetPhysicalDeviceProperties().limits.maxUniformBufferRange});
+			auto view                                        = prepared.buffers[index];
+			view.range                                       = std::min(view.range, uniform_range);
 			prepared.uniform_buffers[resource.uniform_index] = view;
 		}
 	}
