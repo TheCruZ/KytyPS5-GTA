@@ -107,6 +107,9 @@ SrtRuntime CleanRuntime(SrtRuntime runtime);
 // walked. KYTY_SRT_CONDITIONS_WAIT=1 restores waiting.
 bool SrtEvaluatingCondition();
 bool SrtConditionsNoWait();
+// The calling thread reads GPU-written condition bytes exactly (waiting for the GPU) whatever
+// KYTY_SRT_CONDITIONS_WAIT says: a program's first use, which happens once.
+void SrtSetConditionsWait(bool wait);
 // The same for other values the host only uses to narrow what it does (buffer write extents):
 // a failed evaluation falls back to the conservative answer.
 void SrtSetEvaluatingCondition(bool evaluating);

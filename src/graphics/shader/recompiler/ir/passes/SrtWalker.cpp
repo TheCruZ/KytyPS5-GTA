@@ -456,12 +456,18 @@ void SrtNoteConditionRefusal() {
 	t_condition_refusals++;
 }
 
+static thread_local bool t_conditions_wait = false;
+
 bool SrtConditionsNoWait() {
 	static const bool no_wait = [] {
 		const char* value = std::getenv("KYTY_SRT_CONDITIONS_WAIT");
 		return value == nullptr || value[0] != '1';
 	}();
-	return no_wait;
+	return no_wait && !t_conditions_wait;
+}
+
+void SrtSetConditionsWait(bool wait) {
+	t_conditions_wait = wait;
 }
 
 void CompileSrtWalker(ResourcePlan& program) {
