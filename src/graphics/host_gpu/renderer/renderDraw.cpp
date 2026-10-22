@@ -1232,15 +1232,20 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes {};
 	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> ranges {};
 	uint32_t                                                      range_count = 0;
-	for (int i = 0; i < vs_input_info.buffers_num; i++) {
-		const auto& vertex = vs_input_info.buffers[i];
-		// A buffer only constant-only embedded fetches refer to is never read: bind the null
-		// buffer instead of acquiring whatever its unconsumed descriptor names.
-		bool fetched = false;
-		for (int a = 0; a < vs_input_info.resources_num && !fetched; a++) {
-			fetched = vs_input_info.resources_dst[a].buffer_index == i &&
-			          VertexAttributeFetched(vs_input_info, a);
+	// A buffer only constant-only embedded fetches refer to is never read: bind the null buffer
+	// instead of acquiring whatever its unconsumed descriptor names. One pass over the attributes
+	// marks the buffers some fetched attribute reads (it was buffers x attributes calls a draw).
+	uint32_t fetched_buffers = 0;
+	for (int a = 0; a < vs_input_info.resources_num; a++) {
+		const auto index = vs_input_info.resources_dst[a].buffer_index;
+		if (index >= 0 && index < ShaderVertexInputInfo::RES_MAX &&
+		    ((fetched_buffers >> index) & 1u) == 0 && VertexAttributeFetched(vs_input_info, a)) {
+			fetched_buffers |= 1u << index;
 		}
+	}
+	for (int i = 0; i < vs_input_info.buffers_num; i++) {
+		const auto& vertex  = vs_input_info.buffers[i];
+		const bool  fetched = ((fetched_buffers >> i) & 1u) != 0;
 		const auto size = fetched ? VertexBufferDescriptorSize(i, vs_input_info) : 0;
 		sizes[i]        = size;
 		if (size == 0) {
