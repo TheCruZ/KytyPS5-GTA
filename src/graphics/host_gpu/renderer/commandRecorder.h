@@ -522,12 +522,12 @@ public:
 			state.Commit(graphics, m_direct);
 			return;
 		}
-		const auto* context  = &graphics;
-		DynamicState snapshot = state;
-		state.dirty_state    = {};
-		m_scheduler->Record([snapshot, context](vk::CommandBuffer command) mutable {
-			snapshot.Commit(*context, command);
-		});
+		if (!state.AnyDirty()) {
+			// Nothing changed since the previous draw: the recording thread would commit nothing.
+			return;
+		}
+		m_scheduler->RecordDynamicState(state, graphics);
+		state.ClearCommittedDirty();
 	}
 
 private:

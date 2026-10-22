@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <emmintrin.h>
 #include <source_location>
 #include <chrono>
 #include <condition_variable>
@@ -132,13 +133,20 @@ public:
 	void Record(F&& fn) {
 		using Command = TypedCommand<std::decay_t<F>>;
 		void* memory  = Allocate(sizeof(Command), alignof(Command));
-		auto* command = new (memory) Command(std::forward<F>(fn));
-		if (m_chunk->last != nullptr) {
-			m_chunk->last->next = command;
-		} else {
-			m_chunk->first = command;
-		}
-		m_chunk->last = command;
+		Link(new (memory) Command(std::forward<F>(fn)));
+	}
+	// Queues state.Commit(graphics, command) for the recording thread with the state copied once,
+	// straight into the chunk (a closure would copy its capture twice more).
+	void RecordDynamicState(const DynamicState& state, const GraphicContext& graphics) {
+		struct Command final: RecordedCommand {
+			Command(const DynamicState& source, const GraphicContext* context)
+			    : state(source), graphics(context) {}
+			void Execute(vk::CommandBuffer command) override { state.Commit(*graphics, command); }
+			DynamicState          state;
+			const GraphicContext* graphics;
+		};
+		void* memory = Allocate(sizeof(Command), alignof(Command));
+		Link(new (memory) Command(state, &graphics));
 	}
 	// Copies count elements into memory that stays valid until the recording thread has run the
 	// next command recorded after this call (threaded only).
@@ -148,7 +156,7 @@ public:
 			return nullptr;
 		}
 		auto* copy = static_cast<T*>(Allocate(sizeof(T) * count, alignof(T)));
-		std::memcpy(static_cast<void*>(copy), data, sizeof(T) * count);
+		CopyStash(copy, data, sizeof(T) * count);
 		return copy;
 	}
 	// Waits until the recording thread has run every queued command, and returns the command
@@ -237,7 +245,50 @@ private:
 		RecordedCommand* first = nullptr;
 		RecordedCommand* last  = nullptr;
 	};
-	void* Allocate(size_t size, size_t alignment);
+	// What a draw stashes is a few dozen descriptor writes and infos of 24 or 64 bytes: copied
+	// inline, as a call into memcpy costs more than the copy.
+	static void CopyStash(void* destination, const void* source, size_t bytes) {
+		if (bytes > 256) {
+			std::memcpy(destination, source, bytes);
+			return;
+		}
+		auto*       to   = static_cast<uint8_t*>(destination);
+		const auto* from = static_cast<const uint8_t*>(source);
+		size_t      done = 0;
+		for (; done + 16 <= bytes; done += 16) {
+			_mm_storeu_si128(reinterpret_cast<__m128i*>(to + done),
+			                 _mm_loadu_si128(reinterpret_cast<const __m128i*>(from + done)));
+		}
+		if (done + 8 <= bytes) {
+			uint64_t word = 0;
+			std::memcpy(&word, from + done, sizeof(word));
+			std::memcpy(to + done, &word, sizeof(word));
+			done += 8;
+		}
+		if (done < bytes) {
+			std::memcpy(to + done, from + done, bytes - done);
+		}
+	}
+	// Memory in the current chunk for the recording thread; the common case is a pointer bump.
+	void* Allocate(size_t size, size_t alignment) {
+		if (m_chunk != nullptr) {
+			const auto offset = (m_chunk->used + alignment - 1) & ~(alignment - 1);
+			if (offset + size <= Chunk::Size) {
+				m_chunk->used = offset + size;
+				return m_chunk->storage + offset;
+			}
+		}
+		return AllocateInNewChunk(size, alignment);
+	}
+	void* AllocateInNewChunk(size_t size, size_t alignment);
+	void  Link(RecordedCommand* command) {
+		if (m_chunk->last != nullptr) {
+			m_chunk->last->next = command;
+		} else {
+			m_chunk->first = command;
+		}
+		m_chunk->last = command;
+	}
 	void  DispatchChunk();
 	void  RecordingThread(std::stop_token stop);
 	void  StopRecordingThread();

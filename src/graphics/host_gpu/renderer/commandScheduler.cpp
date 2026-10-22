@@ -947,7 +947,7 @@ void CommandScheduler::EnableRecordingThread() {
 	m_record_thread = std::jthread([this](std::stop_token stop) { RecordingThread(stop); });
 }
 
-void* CommandScheduler::Allocate(size_t size, size_t alignment) {
+void* CommandScheduler::AllocateInNewChunk(size_t size, size_t alignment) {
 	EXIT_IF(!m_threaded || size > Chunk::Size);
 	const auto take = [this] {
 		// An executed chunk the recording thread handed back, else a new one (not zeroed: its

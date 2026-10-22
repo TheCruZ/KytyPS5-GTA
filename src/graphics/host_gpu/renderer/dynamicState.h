@@ -98,6 +98,37 @@ struct DynamicState {
 	/// Invalidates all dynamic state to be flushed into the next command buffer.
 	void Invalidate() { std::memset(&dirty_state, 0xFF, sizeof(dirty_state)); }
 
+	/// Whether Commit() has anything to record. The compare op and the depth bounds stay pending
+	/// (and do not count) while their test is disabled: Commit() skips them until it is enabled.
+	[[nodiscard]] bool AnyDirty() const {
+		auto pending = dirty_state;
+		if (!depth_test_enabled) {
+			pending.depth_compare_op = false;
+		}
+		if (!depth_bounds_test_enabled) {
+			pending.depth_bounds = false;
+		}
+		std::array<uint8_t, sizeof(dirty_state)> bytes {};
+		std::memcpy(bytes.data(), &pending, sizeof(pending));
+		for (const auto byte: bytes) {
+			if (byte != 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/// Clears the dirty bits after a copy of this state went to Commit(), keeping the ones Commit()
+	/// skips while their test is disabled (clearing them lost a compare op or depth bounds set
+	/// before the test was enabled).
+	void ClearCommittedDirty() {
+		const bool compare_op = dirty_state.depth_compare_op && !depth_test_enabled;
+		const bool bounds     = dirty_state.depth_bounds && !depth_bounds_test_enabled;
+		dirty_state           = {};
+		dirty_state.depth_compare_op = compare_op;
+		dirty_state.depth_bounds     = bounds;
+	}
+
 	void SetViewports(std::span<const vk::Viewport> viewports_) {
 		EXIT_IF(viewports_.size() > viewports.size());
 		if (!std::ranges::equal(std::span(viewports).first(num_viewports), viewports_)) {
