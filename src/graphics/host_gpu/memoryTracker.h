@@ -47,9 +47,42 @@ public:
 	// none may hold CPU-dirty pages. The regions' own summaries, mirrored one bit per region, so a
 	// buffer spanning hundreds of clean regions is answered from a few words. False is
 	// conservative.
-	[[nodiscard]] bool IsRangeCpuCleanHint(uint64_t vaddr, uint64_t size) const noexcept;
-	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool IsRangeCpuCleanHint(uint64_t vaddr, uint64_t size) const noexcept {
+		if (size == 0 || vaddr >= TRACKER_ADDRESS_SIZE || size > TRACKER_ADDRESS_SIZE - vaddr) {
+			return false;
+		}
+		const uint64_t first = vaddr / TRACKER_REGION_SIZE;
+		const uint64_t last  = (vaddr + size - 1) / TRACKER_REGION_SIZE;
+		for (uint64_t word = first / 64; word <= last / 64; word++) {
+			const uint64_t low  = word == first / 64 ? first % 64 : 0;
+			const uint64_t high = word == last / 64 ? last % 64 : 63;
+			const uint64_t mask =
+			    high - low == 63 ? ~uint64_t {0} : ((uint64_t {1} << (high - low + 1)) - 1) << low;
+			if ((m_present_regions[word].load(std::memory_order_acquire) & mask) != mask ||
+			    (m_cpu_dirty_regions[word].load(std::memory_order_acquire) & mask) != 0) {
+				return false;
+			}
+		}
+		return true;
+	}
+	// The two queries most draws ask for the ranges of their constant buffers: answered inline from
+	// the lock-free summaries (every region present and none dirty / none GPU dirty); the rest
+	// takes the region locks. A range outside the tracked address space always takes the slow
+	// path, which validates it.
+	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
+		if (g_tracker_skip_clean && g_tracker_bitmap && IsRangeCpuCleanHint(vaddr, size)) {
+			return false;
+		}
+		return IsRegionCpuModifiedLocked(vaddr, size);
+	}
+	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
+		if (!MayBeGpuModified(vaddr, size)) {
+			return false;
+		}
+		return IsRegionGpuModifiedLocked(vaddr, size);
+	}
+	[[nodiscard]] bool IsRegionCpuModifiedLocked(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool IsRegionGpuModifiedLocked(uint64_t vaddr, uint64_t size);
 	// Whether a page of the tracking regions the range touches may be GPU dirty, without taking
 	// their locks: false means the range can be read directly.
 	[[nodiscard]] bool MayBeGpuModified(uint64_t vaddr, uint64_t size) const {

@@ -280,7 +280,7 @@ private:
 	// Shared buffers (KYTY_SHARED_BUFFERS=1): a small buffer the game threads keep reading back is
 	// replaced by one over the guest's own memory (VK_EXT_external_memory_host), so GPU writes land
 	// in guest memory and the reads no longer wait for downloads. GPU thread only.
-	[[nodiscard]] bool IsShared(uint64_t vaddr, uint64_t size) const {
+	[[nodiscard]] [[clang::always_inline]] bool IsShared(uint64_t vaddr, uint64_t size) const {
 		return !m_shared_ranges.Empty() && m_shared_ranges.Intersects(vaddr, size);
 	}
 	// A game-thread readback of this buffer: votes for sharing it, and shares it at enough votes.

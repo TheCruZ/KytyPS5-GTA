@@ -1903,7 +1903,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
-	buffer.last_use_tick = m_scheduler.CurrentTick();
+	if (const auto tick = m_scheduler.CurrentTick(); buffer.last_use_tick != tick) {
+		buffer.last_use_tick = tick;
+	}
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (plain_read) {
 		*memo = {.vaddr        = vaddr,
