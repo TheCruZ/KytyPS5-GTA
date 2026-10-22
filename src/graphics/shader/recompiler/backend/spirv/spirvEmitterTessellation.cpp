@@ -1,6 +1,8 @@
+#include "common/hackNotice.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -29,12 +31,16 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto pointer = state.builder.AllocateId();
 	if (kind == Attribute::Factor) {
 		EXIT_NOT_IMPLEMENTED(!inst.Arg(1).IsImmediate());
-		const auto index = inst.Arg(1).U32() / 4u;
-		const auto outer = index < 3u;
-		EXIT_NOT_IMPLEMENTED(index >= 4u);
+		// The factor ring holds the outer factors, then the inner ones: tri 3 + 1, quad 4 + 2,
+		// isoline 2 + 0.
+		const auto index       = inst.Arg(1).U32() / 4u;
+		const auto outer_count = tess.domain == 2u ? 4u : tess.domain == 1u ? 3u : 2u;
+		const auto inner_count = tess.domain == 2u ? 2u : tess.domain == 1u ? 1u : 0u;
+		const auto outer       = index < outer_count;
+		EXIT_NOT_IMPLEMENTED(index >= outer_count + inner_count);
 		state.builder.AddFunction(spv::OpAccessChain, TypePointer(state, storage, TypeF32(state)),
 		                          pointer, outer ? variable : state.tess_inner_variable,
-		                          ConstantU32(state, outer ? index : index - 3u));
+		                          ConstantU32(state, outer ? index : index - outer_count));
 		return pointer;
 	}
 	auto address = ctx.Arg(inst, 1);
@@ -52,7 +58,7 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                  EmitBinaryU32(state, spv::OpShiftRightLogical, offset, ConstantU32(state, 2)),
 	                  ConstantU32(state, 3));
 	const auto type = TypePointer(state, storage, TypeU32(state));
-	if (kind == Attribute::LocalOutput || patch) {
+	if (kind == Attribute::LocalOutput || kind == Attribute::PatchOutput) {
 		state.builder.AddFunction(spv::OpAccessChain, type, pointer, variable, attribute,
 		                          component);
 	} else {
@@ -117,10 +123,11 @@ void DefineTessellationInterfaces(EmitterState& state) {
 			state.builder.AddAnnotation(spv::OpDecorate, state.tess_inner_variable,
 			                            spv::DecorationPatch);
 		} else {
-			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationLocation,
-			                            patch ? (tess.hs_stride + 15u) / 16u : 0u);
+			state.builder.AddAnnotation(
+			    spv::OpDecorate, variable, spv::DecorationLocation,
+			    kind == Attribute::PatchOutput ? (tess.hs_stride + 15u) / 16u : 0u);
 		}
-		if (kind == Attribute::Factor || patch) {
+		if (kind == Attribute::Factor || kind == Attribute::PatchOutput) {
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationPatch);
 		}
 	}
@@ -128,20 +135,37 @@ void DefineTessellationInterfaces(EmitterState& state) {
 
 void DefineTessellationExecutionModes(EmitterState& state) {
 	const auto& tess = state.input_info.vertex->tess;
-	// CxVgtTfParam: triangles, integer or fractional-odd partitioning, clockwise output.
-	EXIT_NOT_IMPLEMENTED(tess.domain != 1u ||
-	                     (tess.partitioning != 0u && tess.partitioning != 2u) ||
-	                     tess.output_topology != 2u);
+	// VGT_TF_PARAM: TYPE 0 isoline, 1 tri, 2 quad; PARTITIONING 0 integer, 1 pow2,
+	// 2 fractional odd, 3 fractional even; TOPOLOGY 0 point, 1 line, 2 tri CW, 3 tri CCW.
+	// Wolverine's terrain is a quad domain with fractional-even spacing.
+	EXIT_NOT_IMPLEMENTED(tess.domain > 2u || tess.partitioning > 3u || tess.output_topology > 3u);
 	state.builder.RequireCapability(spv::CapabilityTessellation);
 	if (state.program.stage == ShaderType::TessellationControl) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputVertices,
 		                               tess.output_control_points);
 	} else {
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeTriangles);
-		state.builder.AddExecutionMode(
-		    state.main_func, tess.partitioning == 0u ? spv::ExecutionModeSpacingEqual
-		                                             : spv::ExecutionModeSpacingFractionalOdd);
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeVertexOrderCw);
+		state.builder.AddExecutionMode(state.main_func,
+		                               tess.domain == 2u   ? spv::ExecutionModeQuads
+		                               : tess.domain == 1u ? spv::ExecutionModeTriangles
+		                                                   : spv::ExecutionModeIsolines);
+		state.builder.AddExecutionMode(state.main_func,
+		                               tess.partitioning == 2u   ? spv::ExecutionModeSpacingFractionalOdd
+		                               : tess.partitioning == 3u ? spv::ExecutionModeSpacingFractionalEven
+		                                                         : spv::ExecutionModeSpacingEqual);
+		if (tess.partitioning == 1u || tess.output_topology == 1u) {
+			Common::HackNotice::ReportTranslation(
+			    "tessellation power-of-two partitioning or line output approximated",
+			    "SPIR-V tessellation", state.program.shader_hash,
+			    tess.partitioning | (tess.output_topology << 8u),
+			    "power-of-two partitioning is emitted as equal spacing, and a line topology adds no execution mode");
+		}
+		if (tess.output_topology == 0u) {
+			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModePointMode);
+		} else if (tess.output_topology >= 2u) {
+			state.builder.AddExecutionMode(state.main_func, tess.output_topology == 2u
+			                                                    ? spv::ExecutionModeVertexOrderCw
+			                                                    : spv::ExecutionModeVertexOrderCcw);
+		}
 	}
 }
 
@@ -161,6 +185,27 @@ void EmitSetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto floating = ctx.state.builder.AllocateId();
 			ctx.state.builder.AddFunction(spv::OpBitcast, TypeF32(ctx.state), floating, value);
 			value = floating;
+			// KYTY_TESS_FORCE_FACTOR=<f>: every tessellation factor becomes f (diagnostic).
+			static const float forced = [] {
+				const char* env = std::getenv("KYTY_TESS_FORCE_FACTOR");
+				return env != nullptr ? static_cast<float>(std::atof(env)) : 0.0f;
+			}();
+			if (forced > 0.0f) value = ConstantF32(ctx.state, forced);
+			// KYTY_TESS_FACTOR_FIX=<f>: a NaN or non-positive factor becomes f (diagnostic).
+			static const float fix = [] {
+				const char* env = std::getenv("KYTY_TESS_FACTOR_FIX");
+				return env != nullptr ? static_cast<float>(std::atof(env)) : 0.0f;
+			}();
+			if (fix > 0.0f && forced <= 0.0f) {
+				auto&      b        = ctx.state.builder;
+				const auto positive = b.AllocateId();
+				b.AddFunction(spv::OpFOrdGreaterThan, TypeBool(ctx.state), positive, value,
+				              ConstantF32(ctx.state, 0.0f));
+				const auto fixed = b.AllocateId();
+				b.AddFunction(spv::OpSelect, TypeF32(ctx.state), fixed, positive, value,
+				              ConstantF32(ctx.state, fix));
+				value = fixed;
+			}
 		}
 		ctx.state.builder.AddFunction(spv::OpStore, TessellationPointer(ctx, inst), value);
 	});
