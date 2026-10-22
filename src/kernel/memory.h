@@ -5,6 +5,10 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <span>
+#include <utility>
+#include <vector>
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -132,10 +136,78 @@ int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// Diagnostics: the virtual mappings of the direct memory behind a range (aliases included).
+std::vector<std::pair<uint64_t, uint64_t>> FindDirectMemoryAliases(uint64_t vaddr, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// GPU thread: some byte of [vaddr, vaddr + size) was written by GPU work into a buffer, so the
+// GPU holds it and a host read would wait for the GPU.
+[[nodiscard]] bool     IsGpuBufferWritten(uint64_t vaddr, uint64_t size);
+// GPU thread: starts the download of the GPU-written bytes of [vaddr, vaddr + size) without
+// waiting for it (KYTY_SRT_DEFER). Returns the scheduler tick whose completion (and priority
+// operations) publish them, or 0 when nothing is pending and an ordinary read may proceed.
+[[nodiscard]] uint64_t StartGpuBufferReadback(uint64_t vaddr, uint64_t size);
+// GPU thread: the value of a dword as of an earlier, already completed copy (it never waits; 0
+// before the first copy lands), and a new copy of its current value is recorded (KYTY_GPU_SIZED_DYNAMIC).
+[[nodiscard]] uint32_t PeekGpuDword(uint64_t vaddr);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
+// GPU thread: the backing bytes of [vaddr, vaddr + size) when one mapping holds them and no GPU
+// work has written any of them, else nullptr. Current until the GPU thread marks them
+// GPU-written or the guest remaps them.
+[[nodiscard]] const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size);
+// Lets the calling thread make the GPU thread's clean-backing queries (FindGpuCleanBacking,
+// TryReadGpuCleanBacking) while the GPU thread waits for it and makes only the same read-only
+// queries itself: the stage-preparation helper (pipelineCache.cpp, StagePrepWorker).
+void SetGpuReadDelegate(bool delegate);
+// GPU thread or delegate: copies [vaddr, vaddr + size) from the backing store when no GPU work has
+// written any of it. Never downloads, faults or waits; false otherwise.
+[[nodiscard]] bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// Any thread, for a read that faulted at fault_vaddr on a page protected because the GPU wrote to
+// it: reads [vaddr, vaddr + size) from the backing store when none of those bytes is GPU-written.
+bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size);
+// Crash diagnostics: prints the guest mapping, the host state and the recent guest mapping changes
+// at an address whose fault nothing handled.
+void DescribeUnhandledFault(uint64_t vaddr);
+// The GPU side of unmapping these ranges, all at once, ahead of the remaps that follow (an AMM
+// batch). The remaps' own unmaps then find the ranges no longer GPU-mapped and skip the GPU.
+void PrepareGpuUnmap(std::span<const std::pair<uint64_t, uint64_t>> ranges);
+
+// Diagnostics: this thread's running totals of time in the GPU side of maps and unmaps.
+struct MapCost {
+	uint64_t gpu_map_ns   = 0;
+	uint64_t gpu_unmap_ns = 0;
+	uint64_t gpu_unmaps   = 0;
+	uint64_t lock_wait_ns = 0; // waiting for the memory-operation lock (KernelMapDirectMemory2)
+	uint64_t replace_ns   = 0; // replacing the old mapping with a reservation
+	uint64_t backing_ns   = 0; // host mapping of the backing view
+	uint64_t steps[8] {};      // can-map, query, physical map, find, publish (to the end of the
+	                           // map), set physical type, set range type
+	uint64_t munmap_ns = 0;    // KernelMunmap, all of it
+	uint64_t munmaps   = 0;
+	uint64_t unmap_steps[6] {}; // lock wait, query, backing unmap, owner (physical/flexible/pooled)
+	                            // release, range table, free callback
+	uint64_t splits      = 0; // partial unmaps of a host view: count, bytes mapped again, time
+	uint64_t split_bytes = 0;
+	uint64_t split_ns    = 0;
+	uint64_t resync_ns   = 0; // page-tracker protection of the parts mapped again
+	uint64_t commit_ns       = 0; // host backing: committing the section, mapping views, protecting them
+	uint64_t commit_bytes    = 0;
+	uint64_t mapview_ns      = 0;
+	uint64_t mapviews        = 0;
+	uint64_t view_protect_ns = 0;
+};
+MapCost MapCostSnapshot();
+
+// Another module's part of that report (the AMM engine's queued maps).
+void SetUnhandledFaultHook(void (*hook)(uint64_t vaddr));
+
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+// Like ClampRangeSize, but 0 for a range that starts outside committed memory instead of EXIT.
+[[nodiscard]] uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size);
+// Whether every byte of the range is committed guest memory, by the kernel's own table of guest
+// mappings (what sceKernelVirtualQuery reports), without asking the host. An empty range is, and
+// so is every range before the kernel's memory is set up (unit tests).
+[[nodiscard]] bool     IsCommittedRange(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;

@@ -134,6 +134,14 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool intege
 	sampler_info.compareOp               = static_cast<vk::CompareOp>(r.DepthCompareFunc());
 	sampler_info.minLod                  = min_lod;
 	sampler_info.maxLod                  = max_lod;
+	// KYTY_FORCE_MIP0=1: diagnostic, every sampler reads only the top mip (is a surface flat
+	// because of the LOD it samples at?).
+	static const bool force_mip0 = std::getenv("KYTY_FORCE_MIP0") != nullptr;
+	if (force_mip0) {
+		sampler_info.minLod     = 0.0f;
+		sampler_info.maxLod     = 0.0f;
+		sampler_info.mipLodBias = 0.0f;
+	}
 	sampler_info.borderColor             = border;
 	sampler_info.unnormalizedCoordinates = (r.ForceUnormCoords() ? VK_TRUE : VK_FALSE);
 

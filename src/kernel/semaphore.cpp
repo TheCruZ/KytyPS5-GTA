@@ -1,4 +1,5 @@
 #include "kernel/semaphore.h"
+#include "graphics/host_gpu/timeline.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -287,6 +288,7 @@ int KYTY_SYSV_ABI KernelDeleteSema(KernelSema sem) {
 }
 
 int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time) {
+	Libs::Graphics::Timeline::Scope timeline_wait("sema-wait", "sema-woke", reinterpret_cast<uint64_t>(sem));
 	if (sem == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}

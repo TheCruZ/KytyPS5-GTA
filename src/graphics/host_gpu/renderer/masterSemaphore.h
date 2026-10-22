@@ -30,6 +30,8 @@ public:
 
 	void Refresh();
 	void Wait(uint64_t tick);
+	// Waits at most timeout_ns for the GPU to reach tick; true when it has.
+	bool WaitFor(uint64_t tick, uint64_t timeout_ns);
 
 private:
 	GraphicContext&       m_graphics;

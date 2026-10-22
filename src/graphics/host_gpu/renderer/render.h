@@ -4,12 +4,17 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/indirectDispatch.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <source_location>
+#include <unordered_set>
 #include <array>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -33,6 +38,7 @@ struct DrawIndexBufferSource;
 struct DrawRenderState;
 class RenderContext;
 class CommandScheduler;
+class CommandRecorder;
 struct RenderExecutorTestAccess;
 
 enum class CommandBufferDebugOp : uint32_t {
@@ -75,6 +81,16 @@ struct DrawAutoArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// DRAW_INDIRECT read on the GPU: the guest address of its DrawIndirectArgs (vertex count,
+	// instance count, start vertex, start instance). The counts above are then unknown on the
+	// CPU; only fast-launch mesh draws come this way.
+	uint64_t         gpu_args_address           = 0;
+	// Nonzero (vertex count known): the instance count is the dword the GPU reads there (the
+	// NUM_INSTANCES a DRAW_INDIRECT read on the GPU left).
+	uint64_t         gpu_instance_count_address = 0;
+	// With gpu_args_address: the user SGPR (index + 1, 0 = none) START_INST_LOC names, which
+	// the shader loads from the arguments' start instance (the CP writes it on hardware).
+	uint32_t         start_instance_sgpr        = 0;
 	DrawIndirectArgs indirect;
 };
 
@@ -115,9 +131,13 @@ public:
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
-	void EndRendering() const;
+	void EndRendering(std::source_location site = std::source_location::current()) const;
 
+	// The raw command buffer. With the recording thread (CommandScheduler::EnableRecordingThread)
+	// this first waits until the thread has run everything queued; hot paths use Recorder().
 	[[nodiscard]] vk::CommandBuffer Handle() const;
+	// Records directly, or through the recording thread.
+	[[nodiscard]] CommandRecorder Recorder() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
@@ -137,6 +157,9 @@ private:
 
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
+	CommandScheduler&   m_scheduler;
+	// Begun and not submitted yet; m_buffer is its handle when not recorded on a thread.
+	bool                m_open            = false;
 	vk::CommandBuffer   m_buffer          = nullptr;
 	uint32_t            m_debug_op        = 0;
 	uint64_t            m_debug_submit_id = 0;
@@ -165,6 +188,24 @@ public:
 	                      uint32_t mode, bool async_compute);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
+	// Bindless heaps: register the draw's heaps, patch their regions, and once per frame resolve
+	// the keys shaders flagged as pending.
+	void PrepareBindlessHeaps(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
+	void ResolveBindlessRequests();
+	// Engine method (engine-method.md, E2), at the start of a guest submission: the heap entries
+	// the guest wrote since the last one are compared and their keys settled again.
+	void SyncBindlessHeaps();
+	void SyncWrittenBindlessEntries();
+	// E3: settle entries no draw has asked for yet, within the per-submission budget.
+	void SettleBindlessHeaps();
+	bool ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key);
+	// The key's T# changed: release what it was settled to and settle it again.
+	bool ResettleBindlessKey(BindlessTable::Heap& heap, uint32_t key);
+	// Release only: the key is pending again and its image unpinned when nothing else uses it.
+	void ReleaseBindlessKey(BindlessTable::Heap& heap, uint32_t key);
+	// Settles again, within the budget, the keys of a window of each heap whose T# changed since
+	// they were settled; returns how many it resolved.
+	uint32_t RevalidateBindlessKeys(uint32_t budget);
 	void                           FindBuffers(std::span<PreparedBindings* const> stages);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
@@ -184,6 +225,10 @@ private:
 
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	[[nodiscard]] TextureBinding FindResolvedTexture(
+	    const ShaderRecompiler::IR::ImageResource& resource, const ShaderTextureResource& descriptor,
+	    TextureCache::ImageDesc desc, bool shader_conversion, vk::Format pixel_format,
+	    vk::Format view_format, uint32_t size);
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
@@ -222,8 +267,41 @@ private:
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
+	// Bindless heaps already surveyed (base ^ table offset << 48).
+	std::unordered_set<uint64_t>          m_bindless_surveyed;
+
+	void PrepareBindlessSamplers(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
+	void LogWatchedDraw(const DrawCallInfo& draw, const DrawRenderState& state,
+	                    uint32_t index_offset, int32_t base_vertex, uint32_t first_vertex,
+	                    int32_t host_vertex_offset, uint32_t host_first_instance, bool indirect);
+	uint64_t                              m_bindless_frame = UINT64_MAX;
+	std::vector<uint32_t>                 m_bindless_requests;
+	std::vector<std::array<uint32_t, 8>>  m_bindless_window;
+	std::vector<std::pair<uint64_t, uint64_t>> m_bindless_written;
+	std::vector<ImageId>                       m_bindless_changed;
+	uint64_t                                   m_bindless_eager_frame = UINT64_MAX;
+	uint32_t                                   m_bindless_eager_left  = 0;
+	bool                                       m_bindless_eager_device_full = false;
+	uint64_t                                   m_bindless_eager_bytes = 0;
+	// Bindless usage probe (UpdateBindlessUsageProbe): the frame it was armed in (0 = idle), the
+	// first frame the next may start, and the frame the pending feedback snapshot was recorded.
+	uint64_t                              m_bindless_probe_frame      = 0;
+	uint64_t                              m_bindless_next_probe       = 0;
+	uint64_t                              m_bindless_snapshot_frame   = 0;
+	std::vector<ImageId>                  m_bindless_unused;
+	void UpdateBindlessUsageProbe(uint64_t frame, uint64_t snapshot_frame);
+	std::vector<uint32_t>                 m_bindless_srt;
+	std::vector<uint32_t>                 m_verify_srt; // KYTY_SRT_VERIFY: flat SRT with pairs
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	// Created at the first thread-dimension indirect dispatch.
+	std::unique_ptr<IndirectDispatchGroups> m_indirect_groups;
+	// Created at the first indirect fast-launch mesh draw with counts on the GPU.
+	std::unique_ptr<MeshIndirectArgs>       m_mesh_args;
+	// Ring of VkDrawMeshTasksIndirectCommandEXT for indirect fast-launch mesh draws (16 bytes an
+	// entry); an entry is rewritten only after the ring has gone round, behind its last read.
+	std::unique_ptr<Buffer>                 m_mesh_indirect;
+	uint32_t                                m_mesh_indirect_next = 0;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

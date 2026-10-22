@@ -2,10 +2,14 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 
+#include <atomic>
+#include <cinttypes>
 #include <cstring>
 #include <numeric>
 #include <vk_mem_alloc.h>
@@ -77,13 +81,44 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
-	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
-	    &native_buffer, &m_allocation, &allocation_result));
+	const auto        create        = [&](const VmaAllocationCreateInfo& create_info) {
+        return static_cast<vk::Result>(vmaCreateBuffer(
+            graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &create_info,
+            &native_buffer, &m_allocation, &allocation_result));
+	};
+	auto result = create(allocation_info);
+	if (result != vk::Result::eSuccess) {
+		// The heap it prefers is out of budget: video memory, on a 4-8 GB card, for the game's
+		// large buffers. As images do (GraphicContext::CreateImage), take system memory and pay in
+		// bandwidth rather than stop; then the preferred heap past its budget, which the driver
+		// may still serve by paging. Only when both fail is the session out of memory.
+		auto spill           = allocation_info;
+		spill.usage          = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		spill.preferredFlags = 0;
+		const auto first     = result;
+		result               = create(spill);
+		const char* where    = "system memory";
+		if (result != vk::Result::eSuccess) {
+			auto over  = allocation_info;
+			over.flags &= ~static_cast<VmaAllocationCreateFlags>(VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT);
+			result     = create(over);
+			where      = "the preferred heap past its budget";
+		}
+		static std::atomic<uint32_t> spills {0};
+		if (spills.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("Buffer spilled (%s): %" PRIu64 " MB, usage %d, first attempt %s -> %s\n", where,
+			     size >> 20u, static_cast<int>(usage), vk::to_string(first).c_str(),
+			     vk::to_string(result).c_str());
+		}
+	}
 	if (result != vk::Result::eSuccess) {
 		graphics.LogMemoryBudget();
+		EXIT("Out of memory: a %" PRIu64 " MB GPU buffer fits neither in video memory nor in system "
+		     "memory (%s). The VMA heap lines above give usage and budget. Close other programs; on "
+		     "a card with little video memory lower the resolution; if Windows' commit limit is "
+		     "reached, enlarge the page file.\n",
+		     size >> 20u, vk::to_string(result).c_str());
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_buffer = native_buffer;
 	if (with_bda) {
@@ -102,7 +137,110 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 }
 
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
+               void* host_pointer, vk::BufferUsageFlags flags, uint64_t size, ImportHostMemory)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal),
+      m_cpu_address(cpu_address), m_size(size) {
+	const auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;
+	if (!graphics.external_memory_host_enabled || d.vkGetMemoryHostPointerPropertiesEXT == nullptr ||
+	    host_pointer == nullptr || size == 0) {
+		return;
+	}
+	const auto device = static_cast<VkDevice>(graphics.device);
+	VkMemoryHostPointerPropertiesEXT host_props {};
+	host_props.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;
+	if (d.vkGetMemoryHostPointerPropertiesEXT(device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+	                                          host_pointer, &host_props) != VK_SUCCESS ||
+	    host_props.memoryTypeBits == 0) {
+		return;
+	}
+	VkExternalMemoryBufferCreateInfo external {};
+	external.sType       = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+	external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+	VkBufferCreateInfo info {};
+	info.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	info.pNext       = &external;
+	info.size        = size;
+	info.usage       = static_cast<VkBufferUsageFlags>(flags);
+	info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	VkBuffer buffer  = VK_NULL_HANDLE;
+	if (d.vkCreateBuffer(device, &info, nullptr, &buffer) != VK_SUCCESS) {
+		return;
+	}
+	VkMemoryRequirements requirements {};
+	d.vkGetBufferMemoryRequirements(device, buffer, &requirements);
+	const auto& memory = graphics.physical_device_memory_properties;
+	const auto  types  = requirements.memoryTypeBits & host_props.memoryTypeBits;
+	uint32_t    type   = UINT32_MAX;
+	for (uint32_t i = 0; i < memory.memoryTypeCount; i++) {
+		if ((types & (1u << i)) != 0) {
+			type = i;
+			break;
+		}
+	}
+	if (type == UINT32_MAX || requirements.size > size) {
+		d.vkDestroyBuffer(device, buffer, nullptr);
+		return;
+	}
+	VkImportMemoryHostPointerInfoEXT import {};
+	import.sType        = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
+	import.handleType   = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+	import.pHostPointer = host_pointer;
+	VkMemoryAllocateFlagsInfo allocate_flags {};
+	allocate_flags.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+	allocate_flags.pNext = &import;
+	allocate_flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+	VkMemoryAllocateInfo allocate {};
+	allocate.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	allocate.pNext           = &allocate_flags;
+	allocate.allocationSize  = size;
+	allocate.memoryTypeIndex = type;
+	VkDeviceMemory device_memory = VK_NULL_HANDLE;
+	if (d.vkAllocateMemory(device, &allocate, nullptr, &device_memory) != VK_SUCCESS) {
+		d.vkDestroyBuffer(device, buffer, nullptr);
+		return;
+	}
+	if (d.vkBindBufferMemory(device, buffer, device_memory, 0) != VK_SUCCESS) {
+		d.vkFreeMemory(device, device_memory, nullptr);
+		d.vkDestroyBuffer(device, buffer, nullptr);
+		return;
+	}
+	m_buffer   = vk::Buffer(buffer);
+	m_imported = device_memory;
+	m_coherent = (static_cast<VkMemoryPropertyFlags>(memory.memoryTypes[type].propertyFlags) &
+	              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+	if (flags & vk::BufferUsageFlagBits::eShaderDeviceAddress) {
+		vk::BufferDeviceAddressInfo address_info {};
+		address_info.buffer = m_buffer;
+		m_device_address    = graphics.device.getBufferAddress(address_info);
+	}
+}
+
+void Buffer::ReleaseImport() noexcept {
+	if (m_imported == VK_NULL_HANDLE) {
+		return;
+	}
+	const auto& d      = VULKAN_HPP_DEFAULT_DISPATCHER;
+	const auto  device = static_cast<VkDevice>(m_graphics->device);
+	if (m_buffer != nullptr) {
+		d.vkDestroyBuffer(device, static_cast<VkBuffer>(m_buffer), nullptr);
+	}
+	d.vkFreeMemory(device, m_imported, nullptr);
+	m_buffer         = nullptr;
+	m_imported       = VK_NULL_HANDLE;
+	m_device_address = 0;
+}
+
 Buffer::~Buffer() {
+	if (m_imported != VK_NULL_HANDLE) {
+		const auto& d      = VULKAN_HPP_DEFAULT_DISPATCHER;
+		const auto  device = static_cast<VkDevice>(m_graphics->device);
+		if (m_buffer != nullptr) {
+			d.vkDestroyBuffer(device, static_cast<VkBuffer>(m_buffer), nullptr);
+		}
+		d.vkFreeMemory(device, m_imported, nullptr);
+		return;
+	}
 	if (m_buffer != nullptr) {
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
@@ -175,7 +313,7 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	if (static_cast<bool>((source_before | destination_before) & host_access)) {
 		before_stage |= vk::PipelineStageFlagBits::eHost;
 	}
-	const auto native = command.Handle();
+	const auto native = command.Recorder();
 	native.pipelineBarrier(before_stage, vk::PipelineStageFlagBits::eTransfer,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, before, 0, nullptr);
 	const vk::BufferCopy copy {source_offset, destination_offset, size};
@@ -201,7 +339,7 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	const auto before =
 	    Barrier(offset, size, vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
 	            vk::AccessFlagBits::eTransferWrite);
-	const auto native = command.Handle();
+	const auto native = command.Recorder();
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
 	                       0, nullptr, 1, &before, 0, nullptr);
@@ -320,9 +458,16 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
 		if (!Scheduler().IsFree(watch.tick) && !allow_wait) {
 			return false;
 		}
-		Scheduler().Wait(watch.tick);
-		if (Usage() == MemoryUsage::Download) {
-			Scheduler().WaitPriorityOperations(watch.tick);
+		// Profiling-only zone: a stream-buffer ring wrap forcing the CPU to wait for the GPU to
+		// finish with the memory it's about to reclaim. Scheduler().IsFree() above is the fast,
+		// non-blocking path -- only reaching Wait() itself means the GPU genuinely hasn't caught
+		// up yet.
+		{
+			KYTY_PROFILER_BLOCK("StreamBuffer::WaitPendingOperations (ring wrap wait)");
+			Scheduler().Wait(watch.tick);
+			if (Usage() == MemoryUsage::Download) {
+				Scheduler().WaitPriorityOperations(watch.tick);
+			}
 		}
 		wait_bound = watch.upper_bound;
 		++wait_cursor;
