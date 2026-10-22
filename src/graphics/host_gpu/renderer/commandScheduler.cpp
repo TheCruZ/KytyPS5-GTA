@@ -979,19 +979,20 @@ void CommandScheduler::EnableRecordingThread() {
 	// QueueSubmit then takes the tick Submit() allocated, as for the queue thread.
 	m_async_submit  = true;
 	m_threaded      = true;
+	m_record_queue  = std::make_unique<ChunkQueue>(64);
+	m_free_chunks   = std::make_unique<ChunkQueue>(64);
 	m_record_thread = std::jthread([this](std::stop_token stop) { RecordingThread(stop); });
 }
 
 void* CommandScheduler::Allocate(size_t size, size_t alignment) {
 	EXIT_IF(!m_threaded || size > Chunk::Size);
 	const auto take = [this] {
-		std::lock_guard lock(m_record_mutex);
-		if (m_free_chunks.empty()) {
-			return std::make_unique<Chunk>();
+		// An executed chunk the recording thread handed back, else a new one (not zeroed: its
+		// memory is written before it is read).
+		if (auto recycled = m_free_chunks->TryPop()) {
+			return std::move(*recycled);
 		}
-		auto chunk = std::move(m_free_chunks.back());
-		m_free_chunks.pop_back();
-		return chunk;
+		return std::unique_ptr<Chunk>(new Chunk);
 	};
 	if (m_chunk == nullptr) {
 		m_chunk = take();
@@ -1010,12 +1011,8 @@ void CommandScheduler::DispatchChunk() {
 	if (m_chunk == nullptr || m_chunk->first == nullptr) {
 		return;
 	}
-	{
-		std::lock_guard lock(m_record_mutex);
-		m_record_queue.push_back(std::move(m_chunk));
-		m_chunks_dispatched++;
-	}
-	m_record_available.notify_one();
+	m_chunks_dispatched++;
+	m_record_queue->Push(std::move(m_chunk));
 }
 
 vk::CommandBuffer CommandScheduler::DrainRecording() {
@@ -1024,7 +1021,6 @@ vk::CommandBuffer CommandScheduler::DrainRecording() {
 	}
 	KYTY_PROFILER_FUNCTION();
 	DispatchChunk();
-	std::unique_lock lock(m_record_mutex);
 	m_drains++;
 	Profiler::Add(Profiler::Counter::RecordingDrains);
 	// KYTY_RECORD_DRAIN_STACKS=1: which raw Handle() sites make the GPU thread wait (a host stack
@@ -1034,29 +1030,24 @@ vk::CommandBuffer CommandScheduler::DrainRecording() {
 		LOGF("Recording thread drain %" PRIu64 ":\n%s", m_drains,
 		     Common::HostBacktrace().c_str());
 	}
-	m_record_executed.wait(lock, [this] { return m_chunks_executed == m_chunks_dispatched; });
+	m_chunks_executed.WaitFor(m_chunks_dispatched);
 	return m_worker_buffer;
 }
 
-void CommandScheduler::RecordingThread(std::stop_token stop) {
+void CommandScheduler::RecordingThread(std::stop_token /*stop*/) {
 	KYTY_PROFILER_THREAD("GpuRecord");
 	Common::Sampler::RegisterCurrentThread("record");
-	Common::PreferPerformanceCores("Vulkan recording thread");
-	Common::RaiseGpuThreadPriority();
+	// Its own physical core, like the other stages: the thread now spins between chunks, and on
+	// the SMT sibling of the execution thread's core it would slow it down.
+	Config::ConfigureGpuStageThread(Config::GpuStageThread::Recording);
 	// A command's stashed arrays may sit in up to two chunks before its own: executed chunks are
 	// recycled only after the next two have run.
 	std::deque<std::unique_ptr<Chunk>> retained;
-	for (;;) {
-		std::unique_ptr<Chunk> chunk;
-		{
-			std::unique_lock lock(m_record_mutex);
-			// A stop request still runs the queued chunks: their ticks may already be waited on.
-			if (!m_record_available.wait(lock, stop, [this] { return !m_record_queue.empty(); })) {
-				return;
-			}
-			chunk = std::move(m_record_queue.front());
-			m_record_queue.pop_front();
-		}
+	uint64_t                           executed = 0;
+	// Pop() returns nothing once the ring was stopped and holds no more chunks: stopping still
+	// runs the queued chunks, whose ticks may already be waited on.
+	while (auto popped = m_record_queue->Pop()) {
+		auto chunk = std::move(*popped);
 		for (auto* command = chunk->first; command != nullptr;) {
 			auto* next = command->next;
 			command->Execute(m_worker_buffer);
@@ -1067,19 +1058,13 @@ void CommandScheduler::RecordingThread(std::stop_token stop) {
 		chunk->last  = nullptr;
 		chunk->used  = 0;
 		retained.push_back(std::move(chunk));
-		std::unique_ptr<Chunk> recycled;
 		if (retained.size() > 2) {
-			recycled = std::move(retained.front());
+			// A full ring of free chunks frees this one instead.
+			auto recycled = std::move(retained.front());
 			retained.pop_front();
+			(void)m_free_chunks->TryPush(recycled);
 		}
-		{
-			std::lock_guard lock(m_record_mutex);
-			if (recycled != nullptr) {
-				m_free_chunks.push_back(std::move(recycled));
-			}
-			m_chunks_executed++;
-		}
-		m_record_executed.notify_all();
+		m_chunks_executed.Advance(++executed);
 	}
 }
 
@@ -1091,13 +1076,8 @@ void CommandScheduler::ReportRecording() {
 	if (now - m_record_report_time < std::chrono::seconds(5)) {
 		return;
 	}
-	uint64_t chunks = 0;
-	uint64_t drains = 0;
-	{
-		std::lock_guard lock(m_record_mutex);
-		chunks = m_chunks_dispatched;
-		drains = m_drains;
-	}
+	const uint64_t chunks = m_chunks_dispatched;
+	const uint64_t drains = m_drains;
 	LOGF("Recording thread (5 s): %" PRIu64 " command buffers, %" PRIu64 " chunks, %" PRIu64
 	     " drains\n",
 	     m_record_report_buffers, chunks - m_record_report_chunks, drains - m_record_report_drains);
@@ -1112,8 +1092,7 @@ void CommandScheduler::StopRecordingThread() {
 		return;
 	}
 	(void)DrainRecording();
-	m_record_thread.request_stop();
-	m_record_available.notify_all();
+	m_record_queue->Stop();
 	m_record_thread.join();
 	LOGF("Recording thread: %" PRIu64 " chunks, %" PRIu64 " drains\n", m_chunks_dispatched,
 	     m_drains);

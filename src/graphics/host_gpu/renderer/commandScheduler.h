@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_COMMANDSCHEDULER_H_
 
 #include "common/common.h"
+#include "common/spscQueue.h"
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/dynamicState.h"
 #include "graphics/host_gpu/renderer/hostCopyQueue.h"
@@ -314,19 +315,18 @@ private:
 	std::mutex                   m_submit_mutex;
 	std::condition_variable_any  m_submit_available;
 	std::jthread                 m_submit_thread;
-	// Recording thread. m_threaded and m_chunk belong to the producer (the GPU thread); the queue,
-	// free list and counters to m_record_mutex; m_worker_buffer to the recording thread (read by
-	// the producer only after a drain).
+	// Recording thread. m_threaded, m_chunk, m_chunks_dispatched and m_drains belong to the
+	// producer (the GPU thread); m_worker_buffer to the recording thread (read by the producer only
+	// after a drain). The chunks go to the recording thread through a lock-free ring and come back
+	// through another: neither side makes a system call while the other one is busy.
+	using ChunkQueue = Common::SpscQueue<std::unique_ptr<Chunk>>;
 	bool                                m_threaded = false;
 	std::unique_ptr<HostCopyQueue>      m_host_copies;
 	std::unique_ptr<Chunk>              m_chunk;
-	std::mutex                          m_record_mutex;
-	std::condition_variable_any         m_record_available;
-	std::condition_variable             m_record_executed;
-	std::deque<std::unique_ptr<Chunk>>  m_record_queue;
-	std::vector<std::unique_ptr<Chunk>> m_free_chunks;
+	std::unique_ptr<ChunkQueue>         m_record_queue;
+	std::unique_ptr<ChunkQueue>         m_free_chunks;
+	Common::ProgressCounter             m_chunks_executed;
 	uint64_t                            m_chunks_dispatched = 0;
-	uint64_t                            m_chunks_executed   = 0;
 	uint64_t                            m_drains            = 0;
 	vk::CommandBuffer                   m_worker_buffer     = nullptr;
 	uint64_t                            m_record_report_buffers = 0;
