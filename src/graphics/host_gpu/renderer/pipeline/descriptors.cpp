@@ -4133,7 +4133,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		uint64_t                                descriptor_size    = 0;
 		bool                                    bounded  = false;
 	};
-	std::vector<WrittenRange> written_ranges;
+	// Reused between calls: draws with scalar reads gathered their ranges into a fresh vector,
+	// whose allocation, growth copies and release cost ~2 % of the execution thread.
+	static thread_local std::vector<WrittenRange> written_ranges;
+	written_ranges.clear();
 	bool                      written_gathered = false;
 	for (const auto* reader: prepared_bindings) {
 		const auto& reads = reader->runtime->resources->specialization_reads;
