@@ -1283,6 +1283,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 		if (layer_count != 0) {
 			m_presenter.Present(std::span(layers.data(), layer_count));
 		}
+		Profiler::MarkFrame();
 		if (requests[0].cfg->bus == 0) {
 			Graphics::PerformanceOverlayRecordFlip(requests[0].cfg->width, requests[0].cfg->height);
 		}

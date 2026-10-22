@@ -5,8 +5,11 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <array>
+#include <chrono>
+#include <cstdio>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <renderdoc_app.h>
 #include <string>
@@ -157,6 +160,30 @@ static void StartCapture() {
 }
 
 void RenderDocOnGuestFlip(RenderContext& renderer) {
+	// KYTY_FPS_LOG=1: guest flips per second, every 5 s, to stderr (for scripted runs).
+	if (static const bool fps_log = std::getenv("KYTY_FPS_LOG") != nullptr; fps_log) {
+		static auto     window_start = std::chrono::steady_clock::now();
+		static uint32_t flips        = 0;
+		flips++;
+		const auto now     = std::chrono::steady_clock::now();
+		const auto elapsed = std::chrono::duration<double>(now - window_start).count();
+		if (elapsed >= 5.0) {
+			std::fprintf(stderr, "[fps] %.2f\n", flips / elapsed);
+			flips        = 0;
+			window_start = now;
+		}
+	}
+	// KYTY_RENDERDOC_TRIGGER=<file>: the file's appearance requests a capture (it is deleted),
+	// for captures timed by a script instead of the F1 key.
+	if (static const char* trigger = std::getenv("KYTY_RENDERDOC_TRIGGER");
+	    trigger != nullptr && g_api != nullptr &&
+	    g_state.load(std::memory_order_acquire) == RenderDocState::Idle) {
+		std::error_code error;
+		if (std::filesystem::exists(trigger, error)) {
+			std::filesystem::remove(trigger, error);
+			RenderDocRequestCapture();
+		}
+	}
 	const auto state = g_state.load(std::memory_order_acquire);
 	if (g_api == nullptr || state == RenderDocState::Idle) {
 		return;
