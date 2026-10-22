@@ -10,6 +10,8 @@
 #include <cstring>
 #include <type_traits>
 #include <utility>
+#include <span>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -53,7 +55,17 @@ public:
 	[[nodiscard]] uint16_t  F16Bits() const;
 	[[nodiscard]] float     F32Value() const;
 
+	// The shader disk cache (shaderDiskCache.cpp): an immediate's bits, zero-extended from its
+	// type's width (0 for an empty value), and the immediate of a type made from them again.
+	// FromImmediateBits fails on a type no immediate has, or bits wider than the type.
+	[[nodiscard]] uint64_t ImmediateBits() const;
+	[[nodiscard]] static bool FromImmediateBits(Type type, uint64_t bits, Value& result);
+
 	bool operator==(const Value& other) const;
+	// Both name the same instruction (without resolving identities); inline, for hot paths.
+	[[nodiscard]] bool SameInstruction(const Value& other) const noexcept {
+		return type == Type::Opaque && other.type == Type::Opaque && inst == other.inst;
+	}
 
 private:
 	Type type = Type::Void;
@@ -138,8 +150,17 @@ public:
 	void AddPhiOperand(Block* predecessor, Value value);
 	void ReplaceUsesWith(Value replacement, bool preserve = true);
 	void Invalidate();
-	// Drops the arguments without updating their use lists, for teardown that destroys both sides.
-	void DropArgs();
+	// Detaches without maintaining other instructions' use lists: only when every instruction
+	// that refers to this one is destroyed with it (Program::~Program).
+	void DropForDestruction();
+	// RemoveIdentities: ReplaceUsesWith(replacement, false) for an instruction about to be erased,
+	// leaving its own entries in its arguments' use lists; the caller drops those for every
+	// removed instruction at once (DropRemovedUses), which keeps every list in the same order.
+	// Uses by instructions already in `removed` (erased) are skipped. Arguments go to `touched`.
+	void ReplaceUsesForRemoval(Value replacement, const std::unordered_set<const Inst*>& removed,
+	                           std::vector<Inst*>& touched);
+	static void DropRemovedUses(std::span<Inst* const>              touched,
+	                            const std::unordered_set<const Inst*>& removed);
 
 	template <typename T>
 	requires(sizeof(T) <= sizeof(uint64_t) && std::is_trivially_copyable_v<T>)
@@ -164,6 +185,10 @@ private:
 	void AddUse(Inst* used, size_t operand);
 	void RemoveUse(Inst* used, size_t operand);
 	void ClearArgs();
+	// The operand slot itself, whatever storage the arity uses; no use-list bookkeeping.
+	Value& ArgSlot(size_t index);
+	// Back to empty inline storage without touching any use list.
+	void ResetArgStorage();
 
 	static constexpr uint8_t InlineArity = 4;
 	static constexpr uint8_t PhiArity = UINT8_MAX;
@@ -185,7 +210,16 @@ private:
 
 static_assert(sizeof(Inst) <= 120, "Inst operand and backend storage unintentionally increased");
 
-// Called per operand by the IR passes and the resource walker; inline, as the build has no LTO.
+// The accessors the IR passes and the resource walker call for every operand, inline: out of
+// line they were a fifth of the GPU thread's resource walk (calls, no LTO).
+inline bool Value::IsEmpty() const {
+	return type == Type::Void;
+}
+
+inline bool Value::IsImmediate() const {
+	return type != Type::Opaque;
+}
+
 inline bool Value::IsIdentity() const {
 	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
 }
@@ -194,36 +228,17 @@ inline bool Value::IsPhi() const {
 	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Phi;
 }
 
-inline Value Value::Resolve() const {
-	// Identity chains are followed iteratively; the walker resolves every operand it visits.
-	Value value = *this;
-	while (value.IsIdentity()) {
-		value = value.inst->Arg(0);
-	}
-	return value;
+inline Inst* Value::TryInstruction() const {
+	return type == Type::Opaque ? inst : nullptr;
 }
 
 inline Inst* Value::ResolveInstruction() const {
 	EXIT_IF(type != Type::Opaque);
-	// An identity may forward an immediate: fail fast as the recursive form did.
-	const auto value = Resolve();
-	EXIT_IF(value.type != Type::Opaque);
-	return value.inst;
+	return IsIdentity() ? inst->Arg(0).ResolveInstruction() : inst;
 }
 
-inline bool Value::U1() const {
-	EXIT_IF(type != Type::U1);
-	return imm_u1;
-}
-
-inline uint8_t Value::U8() const {
-	EXIT_IF(type != Type::U8);
-	return imm_u8;
-}
-
-inline uint16_t Value::U16() const {
-	EXIT_IF(type != Type::U16);
-	return imm_u16;
+inline Value Value::Resolve() const {
+	return IsIdentity() ? inst->Arg(0).Resolve() : *this;
 }
 
 inline uint32_t Value::U32() const {
@@ -231,56 +246,8 @@ inline uint32_t Value::U32() const {
 	return imm_u32;
 }
 
-inline uint64_t Value::U64() const {
-	EXIT_IF(type != Type::U64);
-	return imm_u64;
-}
-
-inline uint16_t Value::F16Bits() const {
-	EXIT_IF(type != Type::F16);
-	return imm_u16;
-}
-
-inline float Value::F32Value() const {
-	EXIT_IF(type != Type::F32);
-	return std::bit_cast<float>(imm_u32);
-}
-
-inline size_t Inst::NumArgs() const {
-	return num_args == PhiArity ? phi_args.size() : num_args;
-}
-
-inline bool Value::operator==(const Value& other) const {
-	if (type != other.type) {
-		return false;
-	}
-	switch (type) {
-		case Type::Void: return true;
-		case Type::Opaque: return inst == other.inst;
-		case Type::ScalarReg: return scalar_reg == other.scalar_reg;
-		case Type::VectorReg: return vector_reg == other.vector_reg;
-		case Type::U1: return imm_u1 == other.imm_u1;
-		case Type::U8: return imm_u8 == other.imm_u8;
-		case Type::U16:
-		case Type::F16: return imm_u16 == other.imm_u16;
-		case Type::U32:
-		case Type::F32: return imm_u32 == other.imm_u32;
-		case Type::U64: return imm_u64 == other.imm_u64;
-		default: return false;
-	}
-}
-
-template <typename Self>
-auto& Inst::ArgSlot(Self& self, size_t index) {
-	EXIT_IF(index >= self.NumArgs());
-	if (self.num_args <= InlineArity) {
-		return self.fixed_args[index];
-	}
-	return self.num_args == PhiArity ? self.phi_args[index].second : self.large_args[index];
-}
-
-inline Value Inst::Arg(size_t index) const {
-	return ArgSlot(*this, index);
+inline ValueOpcode Inst::GetOpcode() const {
+	return opcode;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

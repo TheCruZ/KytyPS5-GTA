@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 

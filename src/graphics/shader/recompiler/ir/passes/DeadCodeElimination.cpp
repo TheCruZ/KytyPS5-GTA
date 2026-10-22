@@ -2,7 +2,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
-#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -17,6 +17,11 @@ void RemoveIdentities(Program& program) {
 		block->condition       = block->condition.Resolve();
 		block->indirect_target = block->indirect_target.Resolve();
 	}
+	// Each identity's uses move to its argument in program order, as before; its own entry in the
+	// argument's use list is dropped for all identities at once at the end. Removing it one by
+	// one searched and shifted lists that grow with every identity folded into the same value.
+	std::unordered_set<const Inst*> removed;
+	std::vector<Inst*>              touched;
 	for (auto* block: program.blocks) {
 		auto& instructions = block->Instructions();
 		for (auto inst = instructions.begin(); inst != instructions.end();) {
@@ -25,10 +30,12 @@ void RemoveIdentities(Program& program) {
 				continue;
 			}
 			const auto replacement = inst->Arg(0);
-			inst->ReplaceUsesWith(replacement, false);
+			inst->ReplaceUsesForRemoval(replacement, removed, touched);
+			removed.insert(&*inst);
 			inst = instructions.erase(inst);
 		}
 	}
+	Inst::DropRemovedUses(touched, removed);
 }
 
 void EliminateDeadCode(const BlockList& blocks) {
@@ -108,7 +115,6 @@ bool IsLaneLocal(ValueOpcode op) {
 		case ValueOpcode::ConvertU8U32:
 		case ValueOpcode::ConvertU32U8:
 		case ValueOpcode::ConvertF32F16:
-		case ValueOpcode::ConvertF32F16Lane:
 		case ValueOpcode::ConvertF16F32:
 		case ValueOpcode::ConvertS32F32:
 		case ValueOpcode::ConvertU32F32:
@@ -140,7 +146,6 @@ bool IsLaneLocal(ValueOpcode op) {
 		case ValueOpcode::SelectU1:
 		case ValueOpcode::SelectU32:
 		case ValueOpcode::SelectF32:
-		case ValueOpcode::SelectF64:
 		case ValueOpcode::IAdd32:
 		case ValueOpcode::IAdd64:
 		case ValueOpcode::ISub32:
@@ -238,21 +243,6 @@ bool IsLaneLocal(ValueOpcode op) {
 		case ValueOpcode::FPMax32:
 		case ValueOpcode::FPMin64:
 		case ValueOpcode::FPMax64:
-		case ValueOpcode::PackedFPAdd16x2:
-		case ValueOpcode::PackedFPMul16x2:
-		case ValueOpcode::PackedFPFma16x2:
-		case ValueOpcode::PackedFPMin16x2:
-		case ValueOpcode::PackedFPMax16x2:
-		case ValueOpcode::FPAdd16:
-		case ValueOpcode::FPSub16:
-		case ValueOpcode::FPMul16:
-		case ValueOpcode::FPFma16:
-		case ValueOpcode::FPMin16:
-		case ValueOpcode::FPMax16:
-		case ValueOpcode::FPAbs16:
-		case ValueOpcode::FPNeg16:
-		case ValueOpcode::ExtractF16Lane:
-		case ValueOpcode::InsertF16Lane:
 		case ValueOpcode::FPMinTri32:
 		case ValueOpcode::FPMaxTri32:
 		case ValueOpcode::FPMedTri32:
@@ -373,7 +363,7 @@ uint32_t EliminateMaskedSelects(const BlockList& blocks) {
 					}
 					const auto conditions = found->second.conditions;
 					const bool select = op == ValueOpcode::SelectU1 || op == ValueOpcode::SelectU32 ||
-					                    op == ValueOpcode::SelectF32 || op == ValueOpcode::SelectF64;
+					                    op == ValueOpcode::SelectF32;
 					for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
 						if (select && arg == 1) {
 							// The new value is only chosen where the condition is set.
@@ -404,7 +394,7 @@ uint32_t EliminateMaskedSelects(const BlockList& blocks) {
 		for (auto& inst: *block) {
 			const auto op = inst.GetOpcode();
 			if (op != ValueOpcode::SelectU1 && op != ValueOpcode::SelectU32 &&
-			    op != ValueOpcode::SelectF32 && op != ValueOpcode::SelectF64) {
+			    op != ValueOpcode::SelectF32) {
 				continue;
 			}
 			const auto found = demands.find(&inst);

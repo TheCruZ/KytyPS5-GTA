@@ -123,9 +123,10 @@ std::string ImageSampleFlagsToString(uint32_t flags) {
 }
 
 std::string FormatMimg(const Instruction& inst) {
-	const char*            sampled_name = MimgSampledOpcodeName(inst.opcode_id);
+	const char* sample_name =
+	    inst.opcode == Opcode::IMAGE_SAMPLE ? MimgSampleOpcodeName(inst.opcode_id) : nullptr;
 	const std::string_view name =
-	    sampled_name != nullptr ? sampled_name : magic_enum::enum_name(inst.opcode);
+	    sample_name != nullptr ? sample_name : magic_enum::enum_name(inst.opcode);
 	std::string text =
 	    fmt::format("0x{:08x}: {} {}, {}, {}, {} ; dmask=0x{:x} image_dim={}", inst.pc, name,
 	                OperandToString(inst.dst).c_str(), OperandToString(inst.src0).c_str(),
@@ -137,10 +138,22 @@ std::string FormatMimg(const Instruction& inst) {
 	if (inst.image_r128) {
 		text += " r128=1";
 	}
-	if (sampled_name != nullptr) {
-		text += fmt::format(" sample_flags={} addr_components={}",
-		                    ImageSampleFlagsToString(inst.image_sample_flags).c_str(),
-		                    inst.image_address_components);
+	switch (inst.opcode) {
+		case Opcode::IMAGE_SAMPLE:
+		case Opcode::IMAGE_GATHER4_L:
+		case Opcode::IMAGE_GATHER4_LZ:
+		case Opcode::IMAGE_GATHER4_C:
+		case Opcode::IMAGE_GATHER4_C_L:
+		case Opcode::IMAGE_GATHER4_C_LZ:
+		case Opcode::IMAGE_GATHER4_LZ_O:
+		case Opcode::IMAGE_GATHER4_C_O:
+		case Opcode::IMAGE_GATHER4_C_LZ_O:
+		case Opcode::IMAGE_GATHER4H:
+			text += fmt::format(" sample_flags={} addr_components={}",
+			                    ImageSampleFlagsToString(inst.image_sample_flags).c_str(),
+			                    inst.image_address_components);
+			break;
+		default: break;
 	}
 	if (inst.image_nsa_dwords != 0) {
 		text += fmt::format(" nsa_dwords={} nsa_addr=", inst.image_nsa_dwords);
@@ -245,10 +258,10 @@ void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
 		case 126u: operand.kind = OperandKind::ExecLo; return;
 		case 127u: operand.kind = OperandKind::ExecHi; return;
 		case 235u: operand.kind = OperandKind::SharedBase; return;
-		case 236u: operand.kind = OperandKind::SharedLimit; return;
 		case 237u: operand.kind = OperandKind::PrivateBase; return;
-		case 238u: operand.kind = OperandKind::PrivateLimit; return;
 		case 239u: operand.kind = OperandKind::PopsExitingWaveId; return;
+		case 236u: operand.kind = OperandKind::SharedLimit; return;
+		case 238u: operand.kind = OperandKind::PrivateLimit; return;
 		case 248u:
 			operand.kind      = OperandKind::FloatInlineConstant;
 			operand.value = std::bit_cast<uint32_t>(0.15915494309189535f);
@@ -257,7 +270,10 @@ void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
 		case 252u: operand.kind = OperandKind::ExecZ; return;
 		case 253u: operand.kind = OperandKind::Scc; return;
 		case 255u: operand.kind = OperandKind::LiteralConstant; return;
-		default: EXIT("unsupported scalar source operand 0x%08x at pc 0x%08x", code, pc);
+		default:
+			operand.kind  = OperandKind::Unsupported;
+			operand.value = code;
+			return;
 	}
 }
 
@@ -277,7 +293,10 @@ void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand) {
 		case 125u: operand.kind = OperandKind::Null; return;
 		case 126u: operand.kind = OperandKind::ExecLo; return;
 		case 127u: operand.kind = OperandKind::ExecHi; return;
-		default: EXIT("unsupported scalar destination operand 0x%08x at pc 0x%08x", code, pc);
+		default:
+			operand.kind  = OperandKind::Unsupported;
+			operand.value = code;
+			return;
 	}
 }
 
@@ -352,26 +371,36 @@ Family GetInstructionFamily(uint32_t word) {
 void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst) {
 	const uint32_t pc = word_index * sizeof(uint32_t);
 	switch (GetInstructionFamily(code[word_index])) {
-		case Family::SOP1: DecodeSop1(pc, code, word_index, inst); return;
-		case Family::SOP2: DecodeSop2(pc, code, word_index, inst); return;
-		case Family::SOPK: DecodeSopk(pc, code, word_index, inst); return;
-		case Family::SOPC: DecodeSopc(pc, code, word_index, inst); return;
-		case Family::SOPP: DecodeSopp(pc, code, word_index, inst); return;
-		case Family::VOP1: DecodeVop1(pc, code, word_index, inst); return;
-		case Family::VOP2: DecodeVop2(pc, code, word_index, inst); return;
-		case Family::VOP3: DecodeVop3(pc, code, word_index, inst); return;
-		case Family::VOP3P: DecodeVop3p(pc, code, word_index, inst); return;
-		case Family::VOPC: DecodeVopc(pc, code, word_index, inst); return;
-		case Family::VINTRP: DecodeVintrp(pc, code, word_index, inst); return;
-		case Family::SMEM: DecodeSmem(pc, code, word_index, inst); return;
-		case Family::MUBUF: DecodeMubuf(pc, code, word_index, inst); return;
-		case Family::MTBUF: DecodeMtbuf(pc, code, word_index, inst); return;
-		case Family::FLAT: DecodeFlat(pc, code, word_index, inst); return;
-		case Family::DS: DecodeDs(pc, code, word_index, inst); return;
-		case Family::MIMG: DecodeMimg(pc, code, word_index, inst); return;
-		case Family::EXP: DecodeExp(pc, code, word_index, inst); return;
+		case Family::SOP1: DecodeSop1(pc, code, word_index, inst); break;
+		case Family::SOP2: DecodeSop2(pc, code, word_index, inst); break;
+		case Family::SOPK: DecodeSopk(pc, code, word_index, inst); break;
+		case Family::SOPC: DecodeSopc(pc, code, word_index, inst); break;
+		case Family::SOPP: DecodeSopp(pc, code, word_index, inst); break;
+		case Family::VOP1: DecodeVop1(pc, code, word_index, inst); break;
+		case Family::VOP2: DecodeVop2(pc, code, word_index, inst); break;
+		case Family::VOP3: DecodeVop3(pc, code, word_index, inst); break;
+		case Family::VOP3P: DecodeVop3p(pc, code, word_index, inst); break;
+		case Family::VOPC: DecodeVopc(pc, code, word_index, inst); break;
+		case Family::VINTRP: DecodeVintrp(pc, code, word_index, inst); break;
+		case Family::SMEM: DecodeSmem(pc, code, word_index, inst); break;
+		case Family::MUBUF: DecodeMubuf(pc, code, word_index, inst); break;
+		case Family::MTBUF: DecodeMtbuf(pc, code, word_index, inst); break;
+		case Family::FLAT: DecodeFlat(pc, code, word_index, inst); break;
+		case Family::DS: DecodeDs(pc, code, word_index, inst); break;
+		case Family::MIMG: DecodeMimg(pc, code, word_index, inst); break;
+		case Family::EXP: DecodeExp(pc, code, word_index, inst); break;
 		default:
 			EXIT("unknown RDNA2 instruction family at pc 0x%08x, raw=0x%08x", pc, code[word_index]);
+	}
+	if (inst.opcode == Opcode::UNSUPPORTED) {
+		return;
+	}
+	for (const Operand* operand:
+	     {&inst.dst, &inst.dst2, &inst.src0, &inst.src1, &inst.src2, &inst.src3}) {
+		if (operand->kind == OperandKind::Unsupported) {
+			SetUnsupported(inst, inst.family, inst.opcode_id, "scalar operand is not implemented");
+			return;
+		}
 	}
 }
 
@@ -557,7 +586,6 @@ std::string InstructionToString(const Instruction& inst) {
 			                                               OperandToString(inst.src0).c_str()));
 		case Opcode::S_BARRIER:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_barrier", inst.pc));
-		case Opcode::S_DCACHE_INV:
 		case Opcode::BUFFER_GL0_INV:
 		case Opcode::BUFFER_GL1_INV:
 			return fmt::format("0x{:08x}: {}", inst.pc, magic_enum::enum_name(inst.opcode));
@@ -604,7 +632,15 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_LOAD_MIP:
 		case Opcode::IMAGE_GET_RESINFO:
 		case Opcode::IMAGE_GET_LOD:
-		case Opcode::IMAGE_GATHER4: return WithUnsupportedReason(inst, FormatMimg(inst));
+		case Opcode::IMAGE_GATHER4_L:
+		case Opcode::IMAGE_GATHER4_LZ:
+		case Opcode::IMAGE_GATHER4_C:
+		case Opcode::IMAGE_GATHER4_C_L:
+		case Opcode::IMAGE_GATHER4_C_LZ:
+		case Opcode::IMAGE_GATHER4_LZ_O:
+		case Opcode::IMAGE_GATHER4_C_O:
+		case Opcode::IMAGE_GATHER4_C_LZ_O:
+		case Opcode::IMAGE_GATHER4H: return WithUnsupportedReason(inst, FormatMimg(inst));
 		case Opcode::S_LOAD_DWORD:
 		case Opcode::S_LOAD_DWORDX2:
 		case Opcode::S_LOAD_DWORDX4:
@@ -665,7 +701,6 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_ATOMIC_SUB:
 		case Opcode::BUFFER_ATOMIC_SMIN:
 		case Opcode::BUFFER_ATOMIC_UMIN:
-		case Opcode::BUFFER_ATOMIC_UMIN_X2:
 		case Opcode::BUFFER_ATOMIC_SMAX:
 		case Opcode::BUFFER_ATOMIC_UMAX:
 		case Opcode::BUFFER_ATOMIC_AND:
@@ -682,7 +717,6 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::FLAT_LOAD_USHORT:
 		case Opcode::FLAT_LOAD_SSHORT:
 		case Opcode::FLAT_LOAD_SHORT_D16:
-		case Opcode::FLAT_LOAD_SHORT_D16_HI:
 		case Opcode::FLAT_LOAD_DWORD:
 		case Opcode::FLAT_LOAD_DWORDX2:
 		case Opcode::FLAT_LOAD_DWORDX3:

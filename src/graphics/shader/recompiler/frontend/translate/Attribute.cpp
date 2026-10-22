@@ -3,6 +3,7 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
@@ -57,7 +58,12 @@ void Translator::TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32
 			source = Format::ResolveFormattedSource(
 			    format, GetDstSel(resource.DstSelXYZW(), component));
 			if (source.kind == Format::FormattedSourceKind::Invalid) {
-				EXIT("invalid formatted vertex input %u at pc 0x%08x", attribute, inst.pc);
+				EXIT("invalid formatted vertex input %u at pc 0x%08x: component=%u format=%u "
+				     "selector=%u descriptor=%08x,%08x,%08x,%08x",
+				     attribute, inst.pc, component, static_cast<unsigned>(resource.RawFormat()),
+				     static_cast<unsigned>(GetDstSel(resource.DstSelXYZW(), component)),
+				     resource.fields[0],
+				     resource.fields[1], resource.fields[2], resource.fields[3]);
 			}
 		}
 		IR::Value value;
@@ -72,6 +78,85 @@ void Translator::TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32
 		WriteOperand(OffsetOperand(inst.dst, component), value);
 	}
 }
+
+void Translator::ForceDestination(const Decoder::Instruction& inst,
+                                  const std::vector<uint32_t>& values) {
+	for (uint32_t component = 0; component < values.size(); component++) {
+		WriteRawU32(OffsetOperand(inst.dst, component), IR::U32(IR::Value(values[component])));
+	}
+}
+
+void Translator::ForceVectorRegisters(uint32_t first, const std::vector<uint32_t>& values) {
+	Decoder::Operand reg;
+	reg.kind = Decoder::OperandKind::Vgpr;
+	reg.reg  = first;
+	for (uint32_t component = 0; component < values.size(); component++) {
+		WriteRawU32(OffsetOperand(reg, component), IR::U32(IR::Value(values[component])));
+	}
+}
+
+const ProbePc& ProbePcSetting() {
+	static const ProbePc setting = [] {
+		ProbePc result;
+		const char* value = std::getenv("KYTY_PROBE_PC");
+		if (value == nullptr) {
+			return result;
+		}
+		char* end   = nullptr;
+		result.hash = std::strtoull(value, &end, 16);
+		if (end != nullptr && *end == '@') {
+			result.pc = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+		}
+		if (end != nullptr && end[0] == ':') {
+			end++;
+			while (end != nullptr &&
+			       (end[0] == 'v' || end[0] == 'u' || end[0] == 's' || end[0] == 'U' || end[0] == 'S' ||
+			        end[0] == 'r') &&
+			       result.count < 3u) {
+				result.kinds[result.count]   = end[0];
+				result.vgprs[result.count++] = static_cast<uint32_t>(std::strtoul(end + 1, &end, 10));
+				if (end != nullptr && *end == ',') {
+					end++;
+				}
+			}
+		}
+		return result;
+	}();
+	return setting;
+}
+
+void Translator::ProbeCopy(const ProbePc& probe) {
+	std::array<IR::U32, 3> values;
+	for (uint32_t i = 0; i < 3u; i++) {
+		const uint32_t   at = std::min(i, probe.count - 1u);
+		Decoder::Operand source;
+		// r<n>: scalar register n's raw bits (a float constant, read back with KYTY_PROBE_RECT).
+		const bool scalar = probe.kinds[at] == 's' || probe.kinds[at] == 'S' || probe.kinds[at] == 'r';
+		source.kind = scalar ? Decoder::OperandKind::Sgpr : Decoder::OperandKind::Vgpr;
+		source.reg  = probe.vgprs[at];
+		if (scalar && (source.reg == 106u || source.reg == 107u)) {
+			source.kind = source.reg == 106u ? Decoder::OperandKind::VccLo : Decoder::OperandKind::VccHi;
+			source.reg  = 0;
+		}
+		values[i]   = ReadRawU32(source);
+		if (probe.kinds[at] != 'v' && probe.kinds[at] != 'r') {
+			const auto as_float = ir.Emit(IR::ValueOpcode::ConvertF32U32, {values[i]});
+			// Lower case: 1/8 per unit; upper case (U/S): one unit is full brightness.
+			const float scale =
+			    (probe.kinds[at] == 'U' || probe.kinds[at] == 'S') ? 1.0f : 0.125f;
+			const auto scaled =
+			    ir.Emit(IR::ValueOpcode::FPMul32, {as_float, IR::Value::F32(scale)});
+			values[i] = IR::U32(ir.Emit(IR::ValueOpcode::BitCastU32F32, {scaled}));
+		}
+	}
+	for (uint32_t i = 0; i < 3u; i++) {
+		Decoder::Operand target;
+		target.kind = Decoder::OperandKind::Vgpr;
+		target.reg  = ProbeVgpr + i;
+		WriteRawU32(target, values[i]);
+	}
+}
+
 
 void Translator::V_INTERP_P2_F32(const Decoder::Instruction& inst) {
 	const auto value = ir.Emit(IR::ValueOpcode::GetAttribute,
@@ -106,9 +191,53 @@ void Translator::EXP(const Decoder::Instruction& inst) {
 	for (uint32_t source = 0; source < std::min(inst.src_count, 4u); source++) {
 		components[source] = ReadRawU32(PlainOperand(SourceAt(inst, source)));
 	}
+	// Diagnostics: KYTY_FORCE_EXPORT=<shader hash>:<target>:<component>:<value> (all hex)
+	// exports a constant dword in place of one component, to bisect a wrong draw.
+	struct ForcedExport {
+		uint64_t hash      = 0;
+		uint32_t target    = 0;
+		uint32_t component = 0;
+		uint32_t value     = 0;
+	};
+	static const ForcedExport forced = [] {
+		ForcedExport result;
+		const char*  value = std::getenv("KYTY_FORCE_EXPORT");
+		if (value != nullptr) {
+			char* end        = nullptr;
+			result.hash      = std::strtoull(value, &end, 16);
+			result.target    = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+			result.component = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+			result.value     = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+		}
+		return result;
+	}();
+	if (forced.hash != 0 && forced.hash == program.shader_hash &&
+	    forced.target == inst.exp.target && forced.component < 4u) {
+		components[forced.component] = IR::Value(forced.value);
+	}
+	const auto& probe = ProbePcSetting();
+	// Pixel shaders export the probed registers as MRT0; other stages as parameter 0 (the host
+	// reads them back with KYTY_PROBE_RECT, which appends each vertex's values).
+	const bool  probed = probe.hash != 0 && probe.hash == program.shader_hash &&
+	                    (program.stage == ShaderType::Pixel ? inst.exp.target == 0u
+	                                                        : inst.exp.target == 0x20u);
+	if (probed) {
+		for (uint32_t i = 0; i < 3u; i++) {
+			Decoder::Operand source;
+			source.kind   = Decoder::OperandKind::Vgpr;
+			source.reg    = ProbeVgpr + i;
+			components[i] = ReadRawU32(source);
+		}
+		components[3] = IR::Value(program.stage == ShaderType::Pixel ? 0x3f800000u : 0u);
+	}
 	const auto data = ir.Emit(IR::ValueOpcode::CompositeConstructU32x4,
 	                          {components[0], components[1], components[2], components[3]});
-	ir.Emit(IR::ValueOpcode::SetAttribute, {data, ir.GetExec()}, AddExportInfo(inst));
+	const auto flags = AddExportInfo(inst);
+	if (probed) {
+		program.export_info[flags.index].compr = false;
+		program.export_info[flags.index].en    = 0xfu;
+	}
+	ir.Emit(IR::ValueOpcode::SetAttribute, {data, ir.GetExec()}, flags);
 }
 
 void Translator::EmitInterpolation(const Decoder::Instruction& inst) {

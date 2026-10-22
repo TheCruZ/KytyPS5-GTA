@@ -60,8 +60,6 @@ enum class Opcode {
 	S_FF1_I32_B64,
 	S_FLBIT_I32_B32,
 	S_FLBIT_I32_B64,
-	S_FLBIT_I32,
-	S_FLBIT_I32_I64,
 	S_BITREPLICATE_B64_B32,
 	S_QUADMASK_B64,
 	S_GETPC_B64,
@@ -543,8 +541,8 @@ enum class Opcode {
 	S_BUFFER_LOAD_DWORDX4,
 	S_BUFFER_LOAD_DWORDX8,
 	S_BUFFER_LOAD_DWORDX16,
+	// SMEM 0x25: no address, writes the 64-bit real-time counter to SDST.
 	S_MEMREALTIME,
-	S_DCACHE_INV,
 	BUFFER_LOAD_FORMAT_X,
 	BUFFER_LOAD_FORMAT_XY,
 	BUFFER_LOAD_FORMAT_XYZ,
@@ -597,7 +595,6 @@ enum class Opcode {
 	BUFFER_ATOMIC_SUB,
 	BUFFER_ATOMIC_SMIN,
 	BUFFER_ATOMIC_UMIN,
-	BUFFER_ATOMIC_UMIN_X2,
 	BUFFER_ATOMIC_SMAX,
 	BUFFER_ATOMIC_UMAX,
 	BUFFER_ATOMIC_AND,
@@ -614,7 +611,6 @@ enum class Opcode {
 	FLAT_LOAD_USHORT,
 	FLAT_LOAD_SSHORT,
 	FLAT_LOAD_SHORT_D16,
-	FLAT_LOAD_SHORT_D16_HI,
 	FLAT_LOAD_DWORD,
 	FLAT_LOAD_DWORDX2,
 	FLAT_LOAD_DWORDX3,
@@ -710,7 +706,15 @@ enum class Opcode {
 	IMAGE_ATOMIC_FMIN,
 	IMAGE_ATOMIC_FMAX,
 	IMAGE_SAMPLE,
-	IMAGE_GATHER4,
+	IMAGE_GATHER4_L,
+	IMAGE_GATHER4_LZ,
+	IMAGE_GATHER4_C,
+	IMAGE_GATHER4_C_L,
+	IMAGE_GATHER4_C_LZ,
+	IMAGE_GATHER4_LZ_O,
+	IMAGE_GATHER4_C_O,
+	IMAGE_GATHER4_C_LZ_O,
+	IMAGE_GATHER4H,
 	V_INTERP_P1_F32,
 	V_INTERP_P2_F32,
 	V_INTERP_MOV_F32,
@@ -766,6 +770,9 @@ enum class OperandKind {
 	PrivateLimit,
 	Null,
 	Vgpr,
+	// A special register the recompiler does not model;
+	// DecodeInstruction turns the instruction into UNSUPPORTED, so the shader gives up.
+	Unsupported,
 };
 
 enum ImageSampleFlag : uint32_t {

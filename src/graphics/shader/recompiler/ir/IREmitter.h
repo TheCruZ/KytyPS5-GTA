@@ -52,6 +52,8 @@ public:
 
 	F32 BitCastF32(U32 value);
 	U32 BitCastU32(F32 value);
+	F16 BitCastF16(U32 value);
+	U32 BitCastU32(F16 value);
 	U64 ConstructU64(U32 low, U32 high);
 	U32 CompositeExtract(Value composite, uint32_t index);
 
