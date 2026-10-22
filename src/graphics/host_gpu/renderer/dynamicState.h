@@ -2,7 +2,6 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DYNAMICSTATE_H_
 
 #include "common/assert.h"
-#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -53,9 +52,6 @@ struct DynamicState {
 		bool stencil_back_write_mask    : 1;
 		bool stencil_back_compare_mask  : 1;
 
-		bool cull_mode  : 1;
-		bool front_face : 1;
-
 		bool blend_constants       : 1;
 		bool color_write_enables   : 1;
 		bool line_width            : 1;
@@ -90,9 +86,6 @@ struct DynamicState {
 	uint32_t   stencil_back_write_mask {};
 	uint32_t   stencil_back_compare_mask {};
 
-	vk::CullModeFlags cull_mode {};
-	vk::FrontFace     front_face {};
-
 	std::array<float, 4>                               blend_constants {};
 	std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> color_write_enables {};
 	uint32_t                                           num_color_write_enables {};
@@ -100,10 +93,41 @@ struct DynamicState {
 	vk::ImageAspectFlags                               feedback_loop_aspects {};
 
 	/// Commits the dynamic state to the provided command buffer.
-	void Commit(const GraphicContext& graphics, CommandRecorder cmdbuf);
+	void Commit(const GraphicContext& graphics, vk::CommandBuffer cmdbuf);
 
 	/// Invalidates all dynamic state to be flushed into the next command buffer.
 	void Invalidate() { std::memset(&dirty_state, 0xFF, sizeof(dirty_state)); }
+
+	/// Whether Commit() has anything to record. The compare op and the depth bounds stay pending
+	/// (and do not count) while their test is disabled: Commit() skips them until it is enabled.
+	[[nodiscard]] bool AnyDirty() const {
+		auto pending = dirty_state;
+		if (!depth_test_enabled) {
+			pending.depth_compare_op = false;
+		}
+		if (!depth_bounds_test_enabled) {
+			pending.depth_bounds = false;
+		}
+		std::array<uint8_t, sizeof(dirty_state)> bytes {};
+		std::memcpy(bytes.data(), &pending, sizeof(pending));
+		for (const auto byte: bytes) {
+			if (byte != 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/// Clears the dirty bits after a copy of this state went to Commit(), keeping the ones Commit()
+	/// skips while their test is disabled (clearing them lost a compare op or depth bounds set
+	/// before the test was enabled).
+	void ClearCommittedDirty() {
+		const bool compare_op = dirty_state.depth_compare_op && !depth_test_enabled;
+		const bool bounds     = dirty_state.depth_bounds && !depth_bounds_test_enabled;
+		dirty_state           = {};
+		dirty_state.depth_compare_op = compare_op;
+		dirty_state.depth_bounds     = bounds;
+	}
 
 	void SetViewports(std::span<const vk::Viewport> viewports_) {
 		EXIT_IF(viewports_.size() > viewports.size());
@@ -225,20 +249,6 @@ struct DynamicState {
 		if (stencil_back_compare_mask != back_compare_mask) {
 			stencil_back_compare_mask             = back_compare_mask;
 			dirty_state.stencil_back_compare_mask = true;
-		}
-	}
-
-	void SetCullMode(const vk::CullModeFlags cull_mode_) {
-		if (cull_mode != cull_mode_) {
-			cull_mode             = cull_mode_;
-			dirty_state.cull_mode = true;
-		}
-	}
-
-	void SetFrontFace(const vk::FrontFace front_face_) {
-		if (front_face != front_face_) {
-			front_face             = front_face_;
-			dirty_state.front_face = true;
 		}
 	}
 
