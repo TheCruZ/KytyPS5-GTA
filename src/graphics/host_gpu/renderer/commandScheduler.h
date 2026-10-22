@@ -25,17 +25,13 @@
 
 #include <queue>
 #include <thread>
-#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
 
 class CommandScheduler {
 public:
-	// With deferred_recording, command buffers are recorded into a CommandStream and a thread of
-	// the scheduler replays them into Vulkan command buffers and submits them in order.
-	CommandScheduler(RenderContext& context, GraphicContext& graphics,
-	                 bool deferred_recording = false);
+	CommandScheduler(RenderContext& context, GraphicContext& graphics);
 	~CommandScheduler();
 	KYTY_CLASS_NO_COPY(CommandScheduler);
 
@@ -158,7 +154,7 @@ public:
 	// queued) when the copy would exceed MaxStashBytes.
 	[[nodiscard]] bool RecordPushDescriptors(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
 	                           uint32_t set, uint32_t count, const vk::WriteDescriptorSet* writes) {
-		struct Command final: RecordedCommand {
+		struct alignas(16) Command final: RecordedCommand {
 			Command(vk::PipelineBindPoint point, vk::PipelineLayout pipeline_layout,
 			        uint32_t set_index, uint32_t write_count)
 			    : bind_point(point), layout(pipeline_layout), set(set_index), count(write_count) {}
@@ -172,7 +168,8 @@ public:
 			uint32_t              set;
 			uint32_t              count;
 		};
-		static_assert(sizeof(Command) % alignof(vk::WriteDescriptorSet) == 0);
+		// The writes follow the command: 16-byte aligned for the vector copies.
+		static_assert(sizeof(Command) % 16 == 0);
 		const size_t bytes = DeepWritesBytes(writes, count);
 		if (sizeof(Command) + bytes > MaxStashBytes) {
 			return false;
@@ -207,23 +204,8 @@ public:
 	bool                           WaitFor(uint64_t tick, uint64_t timeout_ns);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] DynamicState&    GetDynamicState() noexcept { return m_dynamic_state; }
-	// The last tick whose command buffer reached vkQueueSubmit: with deferred recording, a tick
-	// the execution thread already submitted may still wait for the recording thread.
-	[[nodiscard]] uint64_t SubmittedTick() const noexcept {
-		return m_submitted_tick.load(std::memory_order_acquire);
-	}
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
-	// Copies of guest data into the stream buffer that the execution thread hands off, with
-	// deferred recording (null otherwise). Submissions wait for the copies recorded before them;
-	// the owner of the scheduler drains them before any guest-visible effect.
-	[[nodiscard]] HostCopyQueue* HostCopies() noexcept { return m_host_copies.get(); }
-	// Called before each submission, while its command buffer still takes commands.
-	using SubmitHook = void (*)(void* userdata, CommandBuffer& command);
-	void SetSubmitHook(SubmitHook hook, void* userdata) noexcept {
-		m_submit_hook      = hook;
-		m_submit_hook_data = userdata;
-	}
 
 private:
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
@@ -243,8 +225,6 @@ private:
 		static constexpr size_t GrowStep = 4;
 
 		size_t Grow();
-		// A command buffer the GPU finished with, marked busy until `busy_until`.
-		size_t Acquire(uint64_t busy_until);
 
 		GraphicContext&                m_graphics;
 		MasterSemaphore&               m_master;
@@ -366,6 +346,13 @@ private:
 	}
 	// Memory in the current chunk for the recording thread; the common case is a pointer bump.
 	void* Allocate(size_t size, size_t alignment) {
+		// Never less than 16 bytes: the descriptor writes and dynamic states copied into the chunk
+		// are copied with 16-byte vector moves, which at 8-byte alignment cross a cache line one
+		// time in four.
+		constexpr size_t MinAlignment = 16;
+		if (alignment < MinAlignment) {
+			alignment = MinAlignment;
+		}
 		if (m_chunk != nullptr) {
 			const auto offset = (m_chunk->used + alignment - 1) & ~(alignment - 1);
 			if (offset + size <= Chunk::Size) {
@@ -405,9 +392,6 @@ private:
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;
-	const bool                   m_deferred;
-	CommandChunkQueue            m_chunk_queue;
-	CommandStream                m_stream;
 	CommandBuffer                m_command;
 	uint32_t                     m_recorded_release_mem_writes     = 0;
 	uint32_t                     m_recorded_release_mem_interrupts = 0;

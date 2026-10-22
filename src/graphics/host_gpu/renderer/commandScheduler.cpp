@@ -20,7 +20,6 @@
 #include <deque>
 #include <mutex>
 #include <optional>
-#include <tuple>
 
 namespace Libs::Graphics {
 
@@ -115,7 +114,7 @@ vk::CommandBuffer CommandScheduler::CommandPool::Commit(uint64_t tick) {
 	}
 
 	m_hint = (*found + 1) % m_ticks.size();
-	return *found;
+	return m_buffers[*found];
 }
 
 bool CommandScheduler::InDeferredOperation() noexcept {
@@ -269,11 +268,6 @@ void CommandScheduler::Shutdown() {
 		Submit();
 	}
 	m_master.Wait(CurrentTick() - 1);
-	if (m_recording_thread.joinable()) {
-		// Every recorded submission has completed.
-		m_chunk_queue.Stop();
-		m_recording_thread.join();
-	}
 	PopPendingOperations();
 	DrainPriorityOperations();
 	m_priority_thread.request_stop();
@@ -519,18 +513,9 @@ void CommandScheduler::PopPendingOperations() {
 		PendingOperation operation;
 		{
 			std::lock_guard lock(m_operation_mutex);
-			if (m_pending_operations.empty()) {
+			if (m_pending_operations.empty() ||
+			    !m_master.IsFree(m_pending_operations.front().tick)) {
 				return;
-			}
-			if (!m_master.IsFree(m_pending_operations.front().tick)) {
-				if (refreshed) {
-					return;
-				}
-				m_master.Refresh();
-				refreshed = true;
-				if (!m_master.IsFree(m_pending_operations.front().tick)) {
-					return;
-				}
 			}
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
@@ -626,36 +611,17 @@ void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, 
 		}
 		return;
 	}
-	if (g_deferred_callback_scheduler == this) {
-		lock.unlock();
-		operation();
-		return;
+	if (g_deferred_callback_scheduler != this) {
+		m_operation_available.wait(lock,
+		                           [this] { return m_operation_state == OperationState::Closed; });
 	}
-	m_operation_available.wait(lock,
-	                           [this] { return m_operation_state == OperationState::Closed; });
 	lock.unlock();
 	operation();
 }
 
-void CommandScheduler::QueuePriorityOperation(Common::UniqueFunction<void>&& operation) {
-	CheckActive();
-	EXIT_IF(!operation);
-	std::unique_lock lock(m_operation_mutex);
-	if (m_operation_state == OperationState::Open) {
-		m_priority_operations.push({std::move(operation), CurrentTick()});
-		lock.unlock();
-		m_operation_available.notify_one();
-		return;
-	}
-	if (g_deferred_callback_scheduler == this) {
-		lock.unlock();
-		operation();
-		return;
-	}
-	m_operation_available.wait(lock,
-	                           [this] { return m_operation_state == OperationState::Closed; });
-	lock.unlock();
-	operation();
+bool CommandScheduler::HasPendingPriorityOperations() {
+	std::lock_guard lock(m_operation_mutex);
+	return !m_priority_operations.empty() || m_priority_active;
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
@@ -766,9 +732,6 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
-	if (m_submit_hook != nullptr) {
-		m_submit_hook(m_submit_hook_data, m_command);
-	}
 
 	if (!m_threaded) {
 		m_gpu_timer->End(m_command.Handle(), m_timer_slot);
@@ -986,6 +949,7 @@ void CommandScheduler::EnableRecordingThread() {
 
 void* CommandScheduler::AllocateInNewChunk(size_t size, size_t alignment) {
 	EXIT_IF(!m_threaded || size > Chunk::Size);
+	alignment = std::max<size_t>(alignment, 16);
 	const auto take = [this] {
 		// An executed chunk the recording thread handed back, else a new one (not zeroed: its
 		// memory is written before it is read).
