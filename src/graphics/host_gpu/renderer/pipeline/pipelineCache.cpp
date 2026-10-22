@@ -2704,7 +2704,18 @@ struct PipelineCache::ProgramCache {
 		    .read_specialization_memory = ReadRecorded,
 		    .float_image_atomics        = Config::FloatImageAtomicsEnabled(),
 		};
-		// No map_clean_page: every read goes through the recorder.
+		// Dwords of GPU-clean pages are read straight from the page cache and recorded here, without
+		// the callback chain of ReadRecorded (a resolution reads ~20 dwords per draw); any other
+		// read goes through the recorder as before.
+		runtime.map_clean_page = +[](void* userdata, uint64_t page) {
+			return static_cast<GuestPageReadCache*>(userdata)->Map(page);
+		};
+		runtime.page_userdata = &reader.cache;
+		runtime.page_shift    = 12;
+		runtime.note_read     = +[](void* userdata, uint64_t address, uint32_t word) {
+			static_cast<DrawPrep::ReadSet*>(userdata)->Add(address, &word, sizeof(word));
+		};
+		runtime.note_userdata = &result.reads;
 		result.workgroup_counts = {};
 		result.workgroup_size   = {};
 		result.gpu_fills        = false;
