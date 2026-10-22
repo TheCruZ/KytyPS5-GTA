@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/cache/gpuDirtySeq.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -1346,8 +1347,63 @@ bool GuestReadLog::Read(uint64_t address, void* data, uint64_t size) {
 	return true;
 }
 
+bool ValidateStageEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_VALIDATE_STAGE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+namespace {
+struct ValidateStageCounters {
+	std::atomic<uint64_t> calls {0};
+	std::atomic<uint64_t> early {0};        // answered from the validation stage's verdict
+	std::atomic<uint64_t> seq_moved {0};    // the stage's "valid" verdict is older than a GPU write
+	std::atomic<uint64_t> pre_invalid {0};  // the stage found the reads changed or dirty
+	std::atomic<uint64_t> unchecked {0};    // the stage had not checked this resolution yet
+
+	// KYTY_VALIDATE_STAGE_LOG=1: the counters, every 16384 checks.
+	void Log(uint64_t n) {
+		static const bool enabled = std::getenv("KYTY_VALIDATE_STAGE_LOG") != nullptr;
+		if (!enabled || n % 16384u != 0u) {
+			return;
+		}
+		std::fprintf(stderr,
+		             "[validate-stage] %llu checks: %llu answered by the stage, %llu stage verdicts "
+		             "older than a GPU write, %llu stage failures, %llu unchecked\n",
+		             static_cast<unsigned long long>(n),
+		             static_cast<unsigned long long>(early.load()),
+		             static_cast<unsigned long long>(seq_moved.load()),
+		             static_cast<unsigned long long>(pre_invalid.load()),
+		             static_cast<unsigned long long>(unchecked.load()));
+	}
+};
+ValidateStageCounters g_validate_stage;
+} // namespace
+
 bool GuestReadLog::StillValid() const {
-	if (m_failed || !m_own.Validate()) {
+	if (m_failed) {
+		return false;
+	}
+	if (ValidateStageEnabled()) {
+		const auto n     = g_validate_stage.calls.fetch_add(1, std::memory_order_relaxed) + 1;
+		const auto state = m_pre_state.load(std::memory_order_acquire);
+		if (state == PreValid) {
+			if (m_pre_seq.load(std::memory_order_relaxed) == GpuDirtySeq()) {
+				g_validate_stage.early.fetch_add(1, std::memory_order_relaxed);
+				g_validate_stage.Log(n);
+				return true;
+			}
+			g_validate_stage.seq_moved.fetch_add(1, std::memory_order_relaxed);
+		} else if (state == PreInvalid) {
+			g_validate_stage.pre_invalid.fetch_add(1, std::memory_order_relaxed);
+		} else {
+			g_validate_stage.unchecked.fetch_add(1, std::memory_order_relaxed);
+		}
+		g_validate_stage.Log(n);
+	}
+	if (!m_own.Validate()) {
 		return false;
 	}
 	for (uint32_t i = 0; i < m_set_count; i++) {
@@ -1356,6 +1412,17 @@ bool GuestReadLog::StillValid() const {
 		}
 	}
 	return true;
+}
+
+void GuestReadLog::PreValidate() {
+	// The sequence first: a byte that turns GPU-written during the check moves it past this value.
+	const auto seq = GpuDirtySeq();
+	bool       ok  = !m_failed && m_own.Validate();
+	for (uint32_t i = 0; ok && i < m_set_count; i++) {
+		ok = m_sets[i]->Validate();
+	}
+	m_pre_seq.store(seq, std::memory_order_relaxed);
+	m_pre_state.store(ok ? PreValid : PreInvalid, std::memory_order_release);
 }
 
 std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPipelineKey& key) const {

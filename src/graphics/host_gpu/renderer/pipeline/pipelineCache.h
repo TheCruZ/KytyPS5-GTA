@@ -35,6 +35,9 @@ namespace Libs::Graphics {
 // thread resolves the shader programs of draws and dispatches ahead of execution
 // (ProgramResolution), instead of preparing only their SRT walks (DrawPrep).
 [[nodiscard]] bool ProgramResolutionEnabled();
+// A thread between the resolve and execution threads checks the guest reads of each resolution a
+// few operations before execution (GuestReadLog::PreValidate); KYTY_VALIDATE_STAGE=0 turns it off.
+[[nodiscard]] bool ValidateStageEnabled();
 
 // Guest memory that a resolution ahead of execution read. The execution thread repeats the reads
 // before it uses the resolution: guest memory may have changed in between (operations that
@@ -50,6 +53,7 @@ public:
 		m_set_count   = 0;
 		m_failed      = false;
 		m_gpu_written = false;
+		m_pre_state.store(PreNone, std::memory_order_relaxed);
 	}
 	// Reads the bytes of the backing store no GPU work has written, and records them. False (and
 	// the log fails) when the range cannot be read that way.
@@ -69,6 +73,10 @@ public:
 	[[nodiscard]] bool MayHaveReadGpuWrites() const { return m_gpu_written; }
 	// Execution thread: whether every read still gives the recorded bytes.
 	[[nodiscard]] bool StillValid() const;
+	// Validation stage (KYTY_VALIDATE_STAGE): the check StillValid() makes, run a few operations
+	// before the execution thread needs it. StillValid() then answers from it as long as no bytes
+	// became GPU-written since (GpuDirtySeq()), and checks again itself otherwise.
+	void PreValidate();
 
 private:
 	DrawPrep::ReadSet                                m_own;
@@ -76,6 +84,9 @@ private:
 	uint32_t                                         m_set_count   = 0;
 	bool                                             m_failed      = false;
 	bool                                             m_gpu_written = false;
+	static constexpr uint8_t PreNone = 0, PreValid = 1, PreInvalid = 2;
+	std::atomic<uint8_t>                             m_pre_state {PreNone};
+	std::atomic<uint64_t>                            m_pre_seq {0};
 };
 
 // Storage of the shader programs a draw resolved ahead of its execution: the stage results the

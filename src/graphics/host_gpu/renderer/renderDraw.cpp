@@ -569,6 +569,10 @@ void RenderExecutor::ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept {
 	resolved->busy.store(false, std::memory_order_release);
 }
 
+void RenderExecutor::PreValidateResolvedDraw(ResolvedDraw* resolved) {
+	resolved->programs.reads.PreValidate();
+}
+
 template <typename T>
 static void ValueInitialize(T& object) {
 	::new (static_cast<void*>(std::addressof(object))) T {};

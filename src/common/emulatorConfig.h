@@ -108,6 +108,8 @@ struct ConfigOptions {
 	uint32_t               trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled            = false;
 	bool                   playgo_hack_enabled         = false;
+	bool                   occlusion_queries_enabled   = true;
+	bool                   async_pipelines_enabled     = true;
 	bool                   bindless_images_enabled     = false;
 	bool                   float_image_atomics_enabled = true;
 	// Guest shaders whose draws and dispatches are skipped: hex hashes, comma-separated.
@@ -201,7 +203,8 @@ enum class GpuStageThread : uint32_t {
 	Execution        = 1,
 	Recording        = 2,
 	Resolve          = 3,
-	HostCopy         = 4
+	HostCopy         = 4,
+	Validate         = 5
 };
 // Applies the priority and affinity of `stage` to the calling thread.
 void ConfigureGpuStageThread(GpuStageThread stage);
