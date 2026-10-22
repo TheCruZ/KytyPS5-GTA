@@ -163,6 +163,9 @@ private:
 	struct MetaDataInfo {
 		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
 		std::bitset<8192> clear_mask;
+		// The depth image that last acquired this HTile range. A superseded image at the same
+		// address must not drop the state its successor already consumed when it is freed.
+		ImageId owner;
 	};
 
 	struct OverlapResult {

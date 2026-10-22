@@ -444,7 +444,12 @@ void TextureCache::DeleteImage(ImageId id) {
 	}
 	m_download_images.erase(id);
 	if (image->info.metadata.kind == ImageMetadataKind::Htile) {
-		m_surface_metas.erase(image->info.metadata.range.address);
+		// A newer image at the same HTile address may already own the state: dropping it would make
+		// that image clear its depth again in the middle of the frame.
+		const auto meta = m_surface_metas.find(image->info.metadata.range.address);
+		if (meta != m_surface_metas.end() && (!meta->second.owner || meta->second.owner == id)) {
+			m_surface_metas.erase(meta);
+		}
 	}
 	UnregisterImage(id);
 	// Also between guest command buffers (a guest unmap runs there): command buffers submitted
@@ -2040,6 +2045,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc, I
 		if (inserted && image.info.htile_initial_clear) {
 			metadata->second.clear_mask.set();
 		}
+		metadata->second.owner = id;
 	}
 	RefreshImage(id);
 	CommitGpuWrite(image);
