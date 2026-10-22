@@ -32,6 +32,31 @@ namespace Libs::Graphics {
 // few operations before execution (GuestReadLog::PreValidate); KYTY_VALIDATE_STAGE=0 turns it off.
 [[nodiscard]] bool ValidateStageEnabled();
 
+// The backing bytes of the guest pages one evaluation reads, found once per page (the definitions
+// are in pipelineCache.cpp). Only pages with no GPU-written byte are cached: a page that is not
+// clean stays on the exact path. Valid for one resolution: within it nothing marks a cached page
+// GPU-written, and the execution thread checks the pages again before it uses the resolution.
+struct GuestPageReadCache {
+	static constexpr size_t Capacity = 16;
+	struct Entry {
+		uint64_t       page;
+		const uint8_t* backing;
+	};
+	std::array<Entry, Capacity> entries;
+	size_t                      count = 0;
+	size_t                      next  = 0;
+
+	void Reset() {
+		count = 0;
+		next  = 0;
+	}
+	// The page's backing bytes when it is GPU-clean, else null (SrtRuntime::map_clean_page).
+	const uint8_t* Map(uint64_t page);
+	// True when the page is GPU-clean and the bytes were copied from its backing.
+	bool Read(uint64_t address, std::span<uint32_t> values);
+	bool ReadBytes(uint64_t address, void* data, uint64_t size);
+};
+
 // Guest memory that a resolution ahead of execution read. The execution thread repeats the reads
 // before it uses the resolution: guest memory may have changed in between (operations that
 // execute before the draw write it), and ahead of execution GPU-owned bytes cannot be read. The
@@ -47,7 +72,10 @@ public:
 		m_failed      = false;
 		m_gpu_written = false;
 		m_pre_state.store(PreNone, std::memory_order_relaxed);
+		m_pages.Reset();
 	}
+	// The pages this resolution read, shared by its stages' walks and its vertex fetch reads.
+	[[nodiscard]] GuestPageReadCache& PageCache() { return m_pages; }
 	// Reads the bytes of the backing store no GPU work has written, and records them. False (and
 	// the log fails) when the range cannot be read that way.
 	bool Read(uint64_t address, void* data, uint64_t size);
@@ -73,6 +101,7 @@ public:
 
 private:
 	DrawPrep::ReadSet                                m_own;
+	GuestPageReadCache                               m_pages;
 	std::array<const DrawPrep::ReadSet*, MaxSets>    m_sets {};
 	uint32_t                                         m_set_count   = 0;
 	bool                                             m_failed      = false;

@@ -145,56 +145,38 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 // lock, two map lookups and the GPU-dirty range queries (a third of the GPU thread in the
 // jungle). Only pages with no GPU-written byte are cached; within one synchronous evaluation on
 // the GPU thread nothing marks them GPU-written. A page that is not clean stays on the exact path.
-struct GuestPageReadCache {
-	static constexpr size_t Capacity = 16;
-	struct Entry {
-		uint64_t       page    = 0;
-		const uint8_t* backing = nullptr;
-	};
-	std::array<Entry, Capacity> entries {};
-	size_t                      count = 0;
-	size_t                      next  = 0;
+} // namespace
 
-	// The page's backing bytes when it is GPU-clean, else null (SrtRuntime::map_clean_page).
-	const uint8_t* Map(uint64_t page) {
-		for (size_t i = 0; i < count; i++) {
-			if (entries[i].page == page) {
-				return entries[i].backing;
-			}
+const uint8_t* GuestPageReadCache::Map(uint64_t page) {
+	for (size_t i = 0; i < count; i++) {
+		if (entries[i].page == page) {
+			return entries[i].backing;
 		}
-		auto& slot = count < Capacity ? entries[count++] : entries[next++ % Capacity];
-		slot       = {.page    = page,
-		              .backing = Libs::LibKernel::Memory::FindGpuCleanBacking(page, TRACKER_PAGE_SIZE)};
-		return slot.backing;
 	}
+	auto& slot = count < Capacity ? entries[count++] : entries[next++ % Capacity];
+	slot       = {.page    = page,
+	              .backing = Libs::LibKernel::Memory::FindGpuCleanBacking(page, TRACKER_PAGE_SIZE)};
+	return slot.backing;
+}
 
-	// True when the page is GPU-clean and the bytes were copied from its backing.
-	bool Read(uint64_t address, std::span<uint32_t> values) {
-		const auto page = Common::AlignDown(address, TRACKER_PAGE_SIZE);
-		if (Common::AlignDown(address + values.size_bytes() - 1, TRACKER_PAGE_SIZE) != page) {
-			return false;
-		}
-		const Entry* entry = nullptr;
-		for (size_t i = 0; i < count; i++) {
-			if (entries[i].page == page) {
-				entry = &entries[i];
-				break;
-			}
-		}
-		if (entry == nullptr) {
-			auto& slot = count < Capacity ? entries[count++] : entries[next++ % Capacity];
-			slot       = {.page    = page,
-			              .backing = Libs::LibKernel::Memory::FindGpuCleanBacking(page,
-			                                                                     TRACKER_PAGE_SIZE)};
-			entry      = &slot;
-		}
-		if (entry->backing == nullptr) {
-			return false;
-		}
-		std::memcpy(values.data(), entry->backing + (address - page), values.size_bytes());
-		return true;
+bool GuestPageReadCache::ReadBytes(uint64_t address, void* data, uint64_t size) {
+	const auto page = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+	if (Common::AlignDown(address + size - 1, TRACKER_PAGE_SIZE) != page) {
+		return false;
 	}
-};
+	const auto* backing = Map(page);
+	if (backing == nullptr) {
+		return false;
+	}
+	std::memcpy(data, backing + (address - page), size);
+	return true;
+}
+
+bool GuestPageReadCache::Read(uint64_t address, std::span<uint32_t> values) {
+	return ReadBytes(address, values.data(), values.size_bytes());
+}
+
+namespace {
 
 bool UsesShaderClock(const ShaderRecompiler::IR::Program& program) {
 	for (auto* block: program.blocks) {
@@ -1284,6 +1266,10 @@ bool GuestReadLog::Read(uint64_t address, void* data, uint64_t size) {
 	// every thread and needs no validation entry.
 	if (address < 0x40000u) {
 		std::memset(data, 0, size);
+		return true;
+	}
+	if (m_pages.ReadBytes(address, data, size)) {
+		m_own.Add(address, data, static_cast<uint32_t>(size));
 		return true;
 	}
 	if (!Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, data, size)) {
@@ -2642,7 +2628,7 @@ struct PipelineCache::ProgramCache {
 
 	// The probe reader (bytes no GPU work has written, nothing else), recording what it read.
 	struct RecordingReader {
-		GuestPageReadCache  cache;
+		GuestPageReadCache* cache  = nullptr;
 		DrawPrep::ReadSet*  reads  = nullptr;
 		bool                failed = false;
 		uint64_t            hash   = 0;
@@ -2652,7 +2638,7 @@ struct PipelineCache::ProgramCache {
 	// certificate cannot cover a read it did not record.
 	static bool ReadRecorded(void* userdata, uint64_t address, std::span<uint32_t> values) {
 		auto& reader = *static_cast<RecordingReader*>(userdata);
-		if (!ReadShaderGuestMemoryProbe(&reader.cache, address, values) &&
+		if (!ReadShaderGuestMemoryProbe(reader.cache, address, values) &&
 		    !SrtVerifyRead(address, values)) {
 			reader.failed = true;
 			// KYTY_FPS_LOG: the first refused reads of each shader, and why.
@@ -2679,8 +2665,9 @@ struct PipelineCache::ProgramCache {
 
 	// Scanner thread: the SRT refresh Get would run for these inputs, into `result`.
 	template <typename InputInfo>
+	// `shared_cache`: the page cache of the resolution this stage belongs to (see GuestReadLog).
 	bool ScanStage(const ShaderParams& params, const InputInfo& input_info, ShaderType stage,
-	               DrawPrep::StageResult& result) {
+	               DrawPrep::StageResult& result, GuestPageReadCache* shared_cache = nullptr) {
 		result.ok = false;
 		thread_local ProgramKey key;
 		auto*                   entry = FindForScan(params, input_info, stage, key);
@@ -2695,7 +2682,10 @@ struct PipelineCache::ProgramCache {
 		result.shader_base = params.Base();
 		result.user_data.assign(user_data.begin(), user_data.end());
 		result.reads.Clear();
-		RecordingReader                  reader {.reads = &result.reads, .hash = params.hash};
+		GuestPageReadCache               local_cache;
+		RecordingReader                  reader {.cache = shared_cache != nullptr ? shared_cache : &local_cache,
+		                                         .reads = &result.reads,
+		                                         .hash  = params.hash};
 		ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
@@ -2710,7 +2700,7 @@ struct PipelineCache::ProgramCache {
 		runtime.map_clean_page = +[](void* userdata, uint64_t page) {
 			return static_cast<GuestPageReadCache*>(userdata)->Map(page);
 		};
-		runtime.page_userdata = &reader.cache;
+		runtime.page_userdata = reader.cache;
 		runtime.page_shift    = 12;
 		runtime.note_read     = +[](void* userdata, uint64_t address, uint32_t word) {
 			static_cast<DrawPrep::ReadSet*>(userdata)->Add(address, &word, sizeof(word));
@@ -2787,7 +2777,7 @@ struct PipelineCache::ProgramCache {
 		auto& result = ahead.results[ahead.stages];
 		// SWAPPC programs link the functions they call from guest memory: the execution thread
 		// resolves them (ScanStage finds no entry for them).
-		if (!ScanStage(params, input_info, stage, result)) {
+		if (!ScanStage(params, input_info, stage, result, &ahead.reads.PageCache())) {
 			ahead.reads.Fail();
 			return {};
 		}
