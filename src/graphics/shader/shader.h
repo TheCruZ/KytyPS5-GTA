@@ -101,7 +101,27 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	uint32_t max_primitives       = 0;
 	uint32_t provoking_vertex     = 0;
 	bool     fast_launch          = false;
+	// A subgroup larger than a host mesh workgroup may be (VK_EXT_mesh_shader limits) runs its
+	// waves in this many sequential passes of equal size, each on the whole workgroup.
+	uint32_t passes               = 1;
 
+	[[nodiscard]] constexpr uint32_t Waves() const {
+		return (threads_num[0] * threads_num[1] * threads_num[2] + wave_size - 1u) / wave_size;
+	}
+	// Host invocations for all waves at once: a wave64 on a 32-wide subgroup takes 32.
+	[[nodiscard]] constexpr uint32_t HostThreads() const {
+		return Waves() * (host_subgroup_size < wave_size ? host_subgroup_size : wave_size);
+	}
+	// The fewest passes of whole waves whose invocations fit max_invocations; 0 when none do.
+	[[nodiscard]] constexpr uint32_t PassesFor(uint32_t max_invocations) const {
+		const auto waves = Waves();
+		for (uint32_t count = 1; count <= waves; count++) {
+			if (waves % count == 0 && HostThreads() / count <= max_invocations) {
+				return count;
+			}
+		}
+		return waves == 0 ? 1u : 0u;
+	}
 	[[nodiscard]] constexpr uint32_t InputPrimitiveSize() const {
 		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {
 			case Prospero::PrimitiveType::kPointList: return 1u;
@@ -172,6 +192,9 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
 	bool               lds_storage                = false;
+	// DispatchThreadCount is read from GPU memory: the shader data holds the device address of
+	// the three counts (DISPATCH_INDIRECT with the thread-dimension initiator).
+	bool               dispatch_dimensions_indirect = false;
 	int                thread_ids_num             = 0;
 	int                workgroup_register         = 0;
 	bool               tg_size_en                 = false;
@@ -191,6 +214,8 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       ps_perspective_sample_vgpr   = UINT32_MAX;
 	uint32_t                                       ps_perspective_centroid_vgpr = UINT32_MAX;
 	uint8_t                                        target_output_mode[8]        = {};
+	uint32_t                                       target_uint_mask             = 0;
+	uint32_t                                       target_sint_mask             = 0;
 	uint32_t                                       target_shader_mask           = UINT32_MAX;
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
 	uint8_t                                        target_packed_unorm_mask      = 0;
@@ -330,16 +355,24 @@ struct Shader {
 };
 
 struct ShaderMappedData {
+	static constexpr uint32_t MaxInputSemantics = 32;
+
 	Prospero::ShaderBinaryType type {};
 	ShaderUserData* user_data           = nullptr;
 	ShaderSemantic* input_semantics     = nullptr;
 	uint32_t        num_input_semantics = 0;
 	uint32_t        code_size_bytes     = 0;
 	uint32_t        scratch_size_dwords = 0;
+	// The semantics table copied out of the guest header at registration. The header shares
+	// a page with memory the GPU writes each frame, and reading it per draw faults and
+	// drains the pipeline.
+	std::array<ShaderSemantic, MaxInputSemantics> input_semantics_snapshot {};
 };
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+// The guest hash the shader binary declares (a content hash when it declares none).
+uint64_t ShaderDeclaredHash(uint64_t shader_addr);
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
