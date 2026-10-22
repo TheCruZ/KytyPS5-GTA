@@ -185,6 +185,11 @@ private:
 	const bool                      m_resolving;
 	Common::SpscQueue<GpuOperation> m_operations;
 	Common::SpscQueue<GpuOperation> m_resolved;
+	// KYTY_VALIDATE_STAGE: operations pass a validation thread between the resolve and the
+	// execution threads, which checks their resolutions' guest reads a few operations ahead of
+	// execution.
+	const bool                      m_validating;
+	Common::SpscQueue<GpuOperation> m_validated;
 	Common::ProgressCounter         m_executed;
 	uint64_t                        m_emitted = 0;
 	// Command processor thread: a ring of the writes of operations that may not have executed
@@ -208,6 +213,8 @@ private:
 	GpuRegisterState                m_neutral_state;
 	std::jthread                    m_executor;
 	std::jthread                    m_resolver;
+	std::jthread                    m_validator;
+	void                            ValidateThread();
 
 	std::jthread m_thread;
 

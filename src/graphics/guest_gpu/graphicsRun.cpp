@@ -241,6 +241,7 @@ GuestGpu::GuestGpu(RenderContext& renderer)
       m_pipelined((Config::GpuPipelineStages() & Config::GPU_PIPELINE_COMMAND_PROCESSOR) != 0),
       m_resolving(m_pipelined && (Config::GpuPipelineStages() & Config::GPU_PIPELINE_RESOLVE) != 0),
       m_operations(OperationQueueSize), m_resolved(ResolvedQueueSize),
+      m_validating(m_resolving && ValidateStageEnabled()), m_validated(ValidatedQueueSize),
       m_neutral_state {&m_neutral_context, &m_neutral_user_config, &m_neutral_shaders} {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
@@ -261,6 +262,9 @@ GuestGpu::GuestGpu(RenderContext& renderer)
 		m_executor = std::jthread([this] { ExecutionThread(); });
 		if (m_resolving) {
 			m_resolver = std::jthread([this] { ResolveThread(); });
+		}
+		if (m_validating) {
+			m_validator = std::jthread([this] { ValidateThread(); });
 		}
 	} else if (DrawPrep::Enabled()) {
 		// Frank's scanner prepares draws ahead of a single GPU thread; the pipeline resolves ahead
@@ -640,7 +644,9 @@ void GuestGpu::ExecutionThread() {
 	// waiter now and then and before sleeping.
 	constexpr uint32_t NotifyInterval = 16;
 	uint32_t           unnotified     = 0;
-	auto&              operations     = m_resolving ? m_resolved : m_operations;
+	auto&              operations     = m_validating ? m_validated
+	                                   : m_resolving ? m_resolved
+	                                                 : m_operations;
 	for (;;) {
 		if (m_urgent_pending.load(std::memory_order_relaxed) != 0) {
 			RunUrgentCommands();
@@ -742,6 +748,38 @@ void GuestGpu::ResolveThread() {
 	m_resolved.Stop();
 }
 
+// Validation stage (KYTY_VALIDATE_STAGE=0 turns it off). Checks, for each resolved draw or dispatch, that the guest bytes its resolution
+// read still hold (GuestReadLog::PreValidate), no earlier than ValidateAhead operations before the
+// execution thread gets to it: guest memory may change until the guest sees an effect of the
+// operations in front of it, so the later the check the closer it is to the one execution makes.
+// The execution thread takes the verdict only while no bytes became GPU-written since (the
+// GPU-dirty sequence); otherwise it checks again as before.
+void GuestGpu::ValidateThread() {
+	KYTY_PROFILER_THREAD("Thread_GpuValidate");
+	Config::ConfigureGpuStageThread(Config::GpuStageThread::Validate);
+	LibKernel::Memory::SetGpuReadDelegate(true);
+	for (;;) {
+		auto operation = m_resolved.TryPop();
+		if (!operation) {
+			operation = m_resolved.Pop();
+			if (!operation) {
+				break;
+			}
+		}
+		if (operation->resolved != nullptr) {
+			const auto ahead = ValidateAhead();
+			for (Common::SpinWait wait; operation->sequence > m_executed.Load() + ahead;) {
+				if (!wait.Spin()) {
+					std::this_thread::yield();
+				}
+			}
+			RenderExecutor::PreValidateResolvedDraw(operation->resolved);
+		}
+		m_validated.Push(std::move(*operation));
+	}
+	m_validated.Stop();
+}
+
 void GuestGpu::ResolveAhead(GpuOperation& operation) {
 	auto& executor = m_renderer.GetRenderExecutor();
 	// The register snapshots stay valid until the operation executed.
@@ -818,6 +856,9 @@ void GuestGpu::StopExecution() {
 	m_operations.Stop();
 	if (m_resolver.joinable()) {
 		m_resolver.join();
+	}
+	if (m_validator.joinable()) {
+		m_validator.join();
 	}
 	if (m_executor.joinable()) {
 		m_executor.join();

@@ -254,6 +254,8 @@ public:
 	void UseResolvedDraw(ResolvedDraw* resolved) noexcept { m_resolved_draw = resolved; }
 	// Execution thread: the operation that carried `resolved` executed.
 	static void ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept;
+	// Validation thread: checks the guest reads of `resolved` ahead of the execution thread.
+	static void PreValidateResolvedDraw(ResolvedDraw* resolved);
 	// The context snapshot the operation about to execute reads (0: the live registers).
 	void UseContextId(uint64_t id) noexcept { m_context_id = id; }
 	KYTY_CLASS_NO_COPY(RenderExecutor);

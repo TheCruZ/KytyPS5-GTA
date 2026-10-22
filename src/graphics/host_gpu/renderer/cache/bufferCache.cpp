@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
+#include "graphics/host_gpu/renderer/cache/gpuDirtySeq.h"
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -2346,6 +2348,7 @@ void BufferCache::ProcessBitmapCopy(BitmapCopy& copy) {
 		    "a game read between the write and here may have seen the old bytes (KYTY_WRITE_PREDICT)");
 		for (const auto page: marked) {
 			m_gpu_modified_ranges.Add(page, WriteBitmapPage);
+			NoteGpuDirtyAdded();
 			m_bitmap_written.Add(page, WriteBitmapPage);
 			m_bitmap_tracked.Add(page, WriteBitmapPage);
 		}
@@ -2875,6 +2878,7 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 			{
 				std::unique_lock lock(m_dirty_ranges_mutex);
 				m_gpu_modified_ranges.Add(vaddr, size);
+				NoteGpuDirtyAdded();
 			}
 			WatchGpuWriteDiag(vaddr, size, true);
 			m_scheduler.DeferOperation([this, begin, bytes, tick] {
@@ -2929,6 +2933,7 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 			m_bitmap_tracked.Subtract(first, last - first);
 		}
 		m_gpu_modified_ranges.Add(vaddr, size);
+		NoteGpuDirtyAdded();
 	}
 	NoteGpuWriteTick(vaddr, size);
 	NoteEagerWrite(vaddr, size);
@@ -3193,6 +3198,7 @@ void BufferCache::WaitSharedWrites(uint64_t vaddr, uint64_t size) {
 		if (mark && m_memory_tracker.TryMarkRegionAsGpuModified(first, last - first)) {
 			std::unique_lock lock(m_dirty_ranges_mutex);
 			m_gpu_modified_ranges.Add(first, last - first);
+			NoteGpuDirtyAdded();
 			m_bitmap_tracked.Add(first, last - first);
 			for (auto page = first; page < last; page += WriteBitmapPage) {
 				if (m_predict_seen.try_emplace(page, m_bitmap_era).second) {
@@ -3728,6 +3734,7 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 			    const auto first = std::max(page, start);
 			    const auto last  = std::min(page + bytes, finish);
 			    m_gpu_modified_ranges.Add(first, last - first);
+			    NoteGpuDirtyAdded();
 		    });
 	}
 }
