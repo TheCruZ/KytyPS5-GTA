@@ -651,8 +651,9 @@ void GuestGpu::ExecutionThread() {
 		if (m_urgent_pending.load(std::memory_order_relaxed) != 0) {
 			RunUrgentCommands();
 		}
-		auto operation = operations.TryPop();
-		if (!operation) {
+		// In place: an operation is a few hundred bytes, and every hop of the pipeline moved it.
+		GpuOperation* operation = operations.Front();
+		if (operation == nullptr) {
 			m_executed.Notify();
 			unnotified = 0;
 			// Work deferred to a GPU tick (readbacks published to guest memory, releases, the
@@ -664,7 +665,16 @@ void GuestGpu::ExecutionThread() {
 			auto& queries   = m_renderer.GetOcclusionQueries();
 			if (scheduler.HasPendingOperations() || queries.HasPendingDumps()) {
 				const auto begin = std::chrono::steady_clock::now();
-				for (;;) {
+				for (uint32_t round = 0;; round++) {
+					if ((round & 7u) != 0) {
+						// Between the polls: only look for an operation.
+						operation = operations.Front();
+						if (operation != nullptr) {
+							break;
+						}
+						Common::SpinPause();
+						continue;
+					}
 					if (queries.HasPendingDumps()) {
 						// Give the GPU the command buffer holding the dump, then publish the
 						// counters once it finishes it (not at the next dump or flip).
@@ -678,8 +688,8 @@ void GuestGpu::ExecutionThread() {
 					if (m_urgent_pending.load(std::memory_order_relaxed) != 0) {
 						break;
 					}
-					operation = operations.TryPop();
-					if (operation ||
+					operation = operations.Front();
+					if (operation != nullptr ||
 					    (!scheduler.HasPendingOperations() && !queries.HasPendingDumps())) {
 						break;
 					}
@@ -690,21 +700,21 @@ void GuestGpu::ExecutionThread() {
 						std::this_thread::sleep_for(std::chrono::microseconds(200));
 					}
 				}
-				if (!operation && m_urgent_pending.load(std::memory_order_relaxed) != 0) {
+				if (operation == nullptr && m_urgent_pending.load(std::memory_order_relaxed) != 0) {
 					continue;
 				}
 			}
-			if (!operation) {
-				operation = operations.Pop();
+			if (operation == nullptr) {
+				operation = operations.WaitFront();
 			}
-			if (!operation) {
+			if (operation == nullptr) {
 				break;
 			}
 		}
 		operation->processor->Execute(*operation);
 		const auto sequence = operation->sequence;
 		// Destroy the callback before the command processor may reuse what it references.
-		operation.reset();
+		operations.PopFront();
 		m_executed.Publish(sequence);
 		if (++unnotified >= NotifyInterval) {
 			m_executed.Notify();

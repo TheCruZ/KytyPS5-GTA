@@ -245,6 +245,39 @@ public:
 		return Take(head);
 	}
 
+	// Consumer: the oldest element where it lies in the ring, or null when the ring is empty. The
+	// element stays (and its slot stays taken) until PopFront(); a large element is not moved.
+	[[nodiscard]] T* Front() {
+		const auto head = m_head.load(std::memory_order_relaxed);
+		if (m_consumer_tail == head) {
+			m_consumer_tail = m_tail.load(std::memory_order_acquire);
+			if (m_consumer_tail == head) {
+				return nullptr;
+			}
+		}
+		return Element(head);
+	}
+	// As Front(), waiting for an element; null once Stop() was called and the ring is empty.
+	[[nodiscard]] T* WaitFront() {
+		const auto head = m_head.load(std::memory_order_relaxed);
+		if (m_consumer_tail == head) {
+			m_consumer_tail = m_tail.load(std::memory_order_acquire);
+			if (m_consumer_tail == head && !WaitForElement(head)) {
+				return nullptr;
+			}
+		}
+		return Element(head);
+	}
+	// Consumer: destroys the element Front() or WaitFront() returned and releases its slot.
+	void PopFront() {
+		const auto head = m_head.load(std::memory_order_relaxed);
+		Element(head)->~T();
+		m_head.store(head + 1, std::memory_order_release);
+		if (++m_unchecked_pops >= CheckInterval) {
+			WakeProducer();
+		}
+	}
+
 	// Returns nothing when the ring is empty.
 	[[nodiscard]] std::optional<T> TryPop() {
 		const auto head = m_head.load(std::memory_order_relaxed);
