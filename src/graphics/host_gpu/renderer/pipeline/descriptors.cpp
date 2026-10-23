@@ -498,15 +498,15 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	if (resource_ok && descriptor_ok && encoding_ok && format_ok && size != 0) {
 		return;
 	}
-	EXIT("unsupported storage texture: resource=%d descriptor=%d encoding=%d format=%d "
-	     "class=%u numeric=%u dimension=%u mip_mode=%u atomic=%d compare=%d "
+	EXIT("unsupported storage texture: shader=0x%016" PRIx64 " resource=%d descriptor=%d encoding=%d "
+	     "format=%d class=%u numeric=%u dimension=%u mip_mode=%u atomic=%d compare=%d "
 	     "base_level=%u last_level=%u max_mip=%u min_lod=%u base_array=%u bc=%u msaa=%d "
 	     "depth_tile_bpe=%u swizzle_ok=%d "
 	     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
 	     " extent=%ux%ux%u type=%u format=%u tile=%u swizzle=0x%03x read=%d written=%d "
 	     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
-	     resource_ok, descriptor_ok, encoding_ok, format_ok,
-	     static_cast<uint32_t>(resource.resource_class),
+	     static_cast<uint64_t>(BufferCache::s_diag_shader_hash), resource_ok, descriptor_ok,
+	     encoding_ok, format_ok, static_cast<uint32_t>(resource.resource_class),
 	     static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(resource.dimension),
 	     static_cast<uint32_t>(resource.mip_mode), resource.atomic, resource.depth_compare,
 	     descriptor.BaseLevel(), descriptor.LastLevel(), descriptor.MaxMip(), descriptor.MinLod(),
