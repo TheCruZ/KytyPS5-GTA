@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cstdio>
+#include <exception>
 #include <filesystem>
 #include <string_view>
 #include <utility>
@@ -562,7 +563,25 @@ static void ApplyFrankOptionDefaults(RunOptions& options) {
 	(void)ParseEnum(std::string("Performance"), options.config.shader_optimization_type);
 }
 
+// An exception no one catches (a worker thread of the program cache, for one) ends the process
+// with 0xC0000409 and no message: name the exception first.
+static void ReportUncaughtException() {
+	try {
+		if (const auto exception = std::current_exception(); exception != nullptr) {
+			std::rethrow_exception(exception);
+		}
+		std::fprintf(stderr, "terminate called without an active exception\n");
+	} catch (const std::exception& error) {
+		std::fprintf(stderr, "terminate: uncaught exception: %s\n", error.what());
+	} catch (...) {
+		std::fprintf(stderr, "terminate: uncaught exception of an unknown type\n");
+	}
+	std::fflush(stderr);
+	std::abort();
+}
+
 static int Main(int argc, char* argv[]) {
+	std::set_terminate(ReportUncaughtException);
 	ApplyFrankEnvironmentDefaults();
 	VirtualMemory::Init();
 	InitializeThreads();
