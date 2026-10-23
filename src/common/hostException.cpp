@@ -82,8 +82,79 @@ bool InitializeThreadSignalStack() {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
+// A stack overflow kills the process with no trace in the log. Report the faulting address and
+// the code addresses found on the stack (emulator-relative "e+", guest "g:") to stderr, using as
+// little stack as possible: the handler runs on what is left of it.
+static char g_overflow_report[16384];
+static void ReportStackOverflow(const CONTEXT* context) noexcept {
+	static std::atomic_bool reported {false};
+	if (reported.exchange(true)) {
+		return;
+	}
+	const auto base = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+	const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+	const auto* nt  = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+	const auto  end = base + nt->OptionalHeader.SizeOfImage;
+	size_t      at  = 0;
+	auto        put = [&](const char* text) {
+        while (*text != '\0' && at + 1 < sizeof(g_overflow_report)) g_overflow_report[at++] = *text++;
+	};
+	auto hex = [&](uint64_t value) {
+		char digits[17];
+		for (int i = 15; i >= 0; i--) {
+			digits[i] = "0123456789abcdef"[value & 15u];
+			value >>= 4u;
+		}
+		digits[16] = '\0';
+		put(digits);
+	};
+	put("[stack-overflow] rip=");
+	const auto rip = context->Rip;
+	if (rip >= base && rip < end) {
+		put("e+");
+		hex(rip - base);
+	} else {
+		hex(rip);
+	}
+	put(" rsp=");
+	hex(context->Rsp);
+	put(" frames:");
+	const auto* stack = reinterpret_cast<const uint64_t*>(context->Rsp);
+	MEMORY_BASIC_INFORMATION region {};
+	VirtualQuery(stack, &region, sizeof(region));
+	const auto region_end =
+	    reinterpret_cast<uint64_t>(region.BaseAddress) + static_cast<uint64_t>(region.RegionSize);
+	int shown = 0;
+	for (uint64_t i = 0; i < 8192 && shown < 160; i++) {
+		if (context->Rsp + (i + 1) * 8 > region_end) {
+			break;
+		}
+		const auto value = stack[i];
+		if (value >= base && value < end) {
+			put(" e+");
+			hex(value - base);
+			shown++;
+		} else if (value >= 0x800000000ull && value < 0x1000000000ull) {
+			put(" g:");
+			hex(value);
+			shown++;
+		}
+	}
+	put("\n");
+	DWORD written = 0;
+	WriteFile(GetStdHandle(STD_ERROR_HANDLE), g_overflow_report, static_cast<DWORD>(at), &written,
+	          nullptr);
+	WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), g_overflow_report, static_cast<DWORD>(at), &written,
+	          nullptr);
+}
+
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	auto* exception_record = exception->ExceptionRecord;
+
+	if (exception_record->ExceptionCode == EXCEPTION_STACK_OVERFLOW) {
+		ReportStackOverflow(exception->ContextRecord);
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
 
 	if (exception_record->ExceptionCode == DBG_PRINTEXCEPTION_C ||
 	    exception_record->ExceptionCode == DBG_PRINTEXCEPTION_WIDE_C) {
