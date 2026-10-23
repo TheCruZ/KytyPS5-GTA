@@ -16,6 +16,8 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(readback_tiled_images);
 	KYTY_CFG_SET(sync_raw_image_buffers);
 	KYTY_CFG_SET(tessellation_enabled);
+	KYTY_CFG_SET(bindless_images_enabled);
+	KYTY_CFG_SET(skip_shader_hashes);
 	KYTY_CFG_SET(occlusion_queries_enabled);
 	KYTY_CFG_SET(shader_cache_enabled);
 	KYTY_CFG_SET(async_pipelines_enabled);
@@ -69,6 +71,8 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(readback_tiled_images);
 	KYTY_CFG_GET(sync_raw_image_buffers);
 	KYTY_CFG_GET(tessellation_enabled);
+	KYTY_CFG_GET(bindless_images_enabled);
+	KYTY_CFG_GET(skip_shader_hashes);
 	// On by default, also in configurations saved before the fork turned it on.
 	occlusion_queries_enabled = s.value("occlusion_queries_enabled", true).toBool();
 	shader_cache_enabled = s.value("shader_cache_enabled", shader_cache_enabled).toBool();

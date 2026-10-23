@@ -3,6 +3,7 @@
 #include "common/dateTime.h"
 #include "common/debug.h"
 #include "common/file.h"
+#include "common/hackNotice.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -14,12 +15,59 @@
 #include <cstdio>
 #include <filesystem>
 #include <string_view>
+#include <utility>
 #include <vector>
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 
+#if defined(KYTY_PGO_GENERATE)
+#include <chrono>
+#include <cstdlib>
+#include <string>
+#include <system_error>
+#include <thread>
+
+// compiler-rt profile runtime (instrumented builds, CMake KYTY_PGO_GENERATE).
+extern "C" void __llvm_profile_set_filename(const char*);
+extern "C" int  __llvm_profile_write_file(void);
+#endif
+
 using namespace Common;
 using namespace Emulator;
+
+#if defined(KYTY_PGO_GENERATE)
+// The profile runtime writes its counters only at a normal exit, but the run scripts may stop the
+// emulator with TerminateProcess. With KYTY_PGO_FILE=<file.profraw>, a thread writes them every
+// KYTY_PGO_DUMP_SECONDS (default 20) to <file>.tmp and renames that over <file>, so the file always
+// holds the last complete dump.
+static void StartPgoDumps() {
+	const char* file = std::getenv("KYTY_PGO_FILE");
+	if (file == nullptr || *file == '\0') {
+		::printf("PGO: instrumented build without KYTY_PGO_FILE: no profile is written\n");
+		return;
+	}
+	const char* seconds_text = std::getenv("KYTY_PGO_DUMP_SECONDS");
+	const int   seconds =
+	    (seconds_text != nullptr && std::atoi(seconds_text) > 0) ? std::atoi(seconds_text) : 20;
+	static const std::string target = file;
+	static const std::string temp   = target + ".tmp";
+	::printf("PGO: writing the profile to %s every %d s\n", target.c_str(), seconds);
+	std::thread([seconds]() {
+		for (uint32_t dump = 1;; dump++) {
+			std::this_thread::sleep_for(std::chrono::seconds(seconds));
+			__llvm_profile_set_filename(temp.c_str());
+			const int       written = __llvm_profile_write_file();
+			std::error_code error;
+			if (written == 0) {
+				std::filesystem::rename(temp, target, error);
+			}
+			::printf("PGO: dump %u %s\n", dump,
+			         written != 0 ? "failed to write" : (error ? "failed to rename" : "written"));
+			::fflush(stdout);
+		}
+	}).detach();
+}
+#endif
 
 static std::string GetBuildString() {
 	Date date = Date::FromMacros(std::string(__DATE__));
@@ -82,12 +130,17 @@ static void PrintUsage() {
 	::printf("  --gpu-assisted-validation            Bounds-check shader accesses on the GPU.\n"
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation                  Enable shader validation.\n");
-	::printf("  --shader-cache                       Keep compiled shaders and pipelines between boots.\n");
 	::printf("  --no-tessellation                    Skip tessellation patches instead of drawing them.\n");
-	::printf("  --no-occlusion-queries               Read occlusion queries as always visible.\n");
-	::printf(
-	    "  --no-async-pipelines                 Wait for new pipelines instead of skipping the\n"
-	    "                                       draws that need them while they compile.\n");
+	::printf("  --vulkan-validation-fatal            Exit on the first validation error (default);\n"
+	         "  --no-vulkan-validation-fatal         log errors and continue instead.\n");
+	::printf("  --bindless                           Sample heap-indexed images through bindless arrays.\n");
+	::printf("  --no-float-image-atomics             Skip shaders that run integer image atomics on R32\n"
+	         "                                       float images (they run by default).\n");
+	::printf("  --skip-shaders <hash,...>            Skip the draws and dispatches of these guest shaders\n"
+	         "                                       (hex hashes, as logged).\n");
+	::printf("  --gpu-pipeline <0|1|mask>            Emulated GPU stages on their own threads.\n"
+	         "                                       0: all inline, 1: all (default). The\n"
+	         "                                       KYTY_GPU_PIPELINE variable overrides it.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
@@ -233,7 +286,13 @@ static constexpr Flag FLAGS[] = {
     {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},
     {"--playgo-hack", &ConfigOptions::playgo_hack_enabled},
     {"--skip-notice-screen", &ConfigOptions::skip_notice_screen},
-    {"--pad-haptic-rumble", &ConfigOptions::pad_haptic_rumble},
+    {"--no-tessellation", &ConfigOptions::tessellation_enabled, false},
+    {"--bindless", &ConfigOptions::bindless_images_enabled},
+    {"--float-image-atomics", &ConfigOptions::float_image_atomics_enabled},
+    {"--no-float-image-atomics", &ConfigOptions::float_image_atomics_enabled, false},
+    {"--vulkan-validation-fatal", &ConfigOptions::vulkan_validation_fatal},
+    {"--no-vulkan-validation-fatal", &ConfigOptions::vulkan_validation_fatal, false},
+    {"--trophy-notifications", &ConfigOptions::trophy_enabled},
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
     {"--redzone", &ConfigOptions::red_zone_protection_enabled},
     {"--no-redzone", &ConfigOptions::red_zone_protection_enabled, false},
@@ -254,6 +313,13 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 		if (const auto* flag = std::ranges::find(FLAGS, arg, &Flag::name); flag != std::end(FLAGS)) {
 			options.config.*flag->field = flag->value;
+			// The boolean options used to take an explicit value: keep accepting `--flag false`.
+			if (i + 1 < argc && (std::string_view(argv[i + 1]) == "true" ||
+			                     std::string_view(argv[i + 1]) == "false")) {
+				i++;
+				options.config.*flag->field =
+				    (std::string_view(argv[i]) == "true") == flag->value;
+			}
 			continue;
 		}
 
@@ -387,6 +453,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid keyboard player: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--skip-shaders") {
+			options.config.skip_shader_hashes = value;
 		} else if (arg == "--present-mode") {
 			if (!ParseEnum(value, options.config.present_mode)) {
 				::printf("invalid present mode: %s\n", value.c_str());
@@ -453,12 +521,75 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
 }
 
+// KytyPS5-Frank: the settings tuned on Marvel's Wolverine are the defaults. Each environment
+// variable already set (to anything) wins; KYTY_FRANK_DEFAULTS=0 leaves all of them unset and the
+// command line options at KytyPS5's defaults.
+static bool FrankDefaultsEnabled() {
+	const char* value = std::getenv("KYTY_FRANK_DEFAULTS");
+	return value == nullptr || value[0] != '0';
+}
+
+static void ApplyFrankEnvironmentDefaults() {
+	if (!FrankDefaultsEnabled()) {
+		return;
+	}
+	static constexpr std::pair<const char*, const char*> Defaults[] = {
+	    {"KYTY_BINDLESS_EVICT", "0"},
+	    {"KYTY_BINDLESS_SLOT_REUSE", "0"},
+	    {"KYTY_SHARED_BUFFERS", "1"},
+	    {"KYTY_WRITE_BITMAP", "1"},
+	    // Ray traversal (dc76e1223a9bf673) loops without end on our side: a 2048-step cap.
+	    {"KYTY_LOOP_GUARD_HASHES", "dc76e1223a9bf673"},
+	    {"KYTY_LOOP_GUARD_LIMIT", "2048"},
+	    // No barriers between dispatches the game's command stream does not order.
+	    {"KYTY_DISPATCH_RUNS", "1"},
+	    // No NVIDIA crash-diagnostic markers per draw and dispatch (they serialize the GPU).
+	    {"KYTY_NV_CHECKPOINTS", "0"},
+	    {"KYTY_SRT_DEFER", "1"},
+	    // GPU-driven mesh draws convert their counts in batches, not one dispatch, two drains and
+	    // a rendering restart each (jungle median 18.5 -> 20.5-22.3 fps).
+	    {"KYTY_MESH_ARGS_RUNS", "1"},
+	};
+	for (const auto& [name, value]: Defaults) {
+		if (std::getenv(name) == nullptr) {
+			Common::HackNotice::NoteStartupDefault(std::string(name) + "=" + value);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			_putenv_s(name, value);
+#else
+			setenv(name, value, 0);
+#endif
+		}
+	}
+}
+
+static void ApplyFrankOptionDefaults(RunOptions& options) {
+	if (!FrankDefaultsEnabled()) {
+		return;
+	}
+	Common::HackNotice::NoteStartupDefault(
+	    "bindless images, tessellation, linear image readback, red zone protection, "
+	    "shader optimization Performance (options)");
+	options.config.bindless_images_enabled = true;
+	options.config.tessellation_enabled    = true;
+	options.config.readback_linear_images  = true;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	options.config.red_zone_protection_enabled = true;
+#endif
+	(void)ParseEnum(std::string("Performance"), options.config.shader_optimization_type);
+}
+
 static int Main(int argc, char* argv[]) {
+	ApplyFrankEnvironmentDefaults();
 	VirtualMemory::Init();
 	InitializeThreads();
+#if defined(KYTY_PGO_GENERATE)
+	// After the address-space reservations: the thread's stack must not land in the guest range.
+	StartPgoDumps();
+#endif
 
 	RunOptions options;
 	bool       show_help = false;
+	ApplyFrankOptionDefaults(options);
 
 	if (argc < 2) {
 		PrintUsage();

@@ -1,3 +1,4 @@
+#include "common/hackNotice.h"
 #include "emulator.h"
 
 #include "common/abi.h"
@@ -96,6 +97,7 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	subsystems.Initialize<Config::Lifecycle>();
 	Config::Load(cfg);
 	subsystems.Initialize<Log::Lifecycle>();
+	Common::HackNotice::ReportStartupDefaults();
 
 	if (Common::File::IsFileExisting(param_json)) {
 		Loader::SystemContentLoadParamSfo(param_json);

@@ -199,6 +199,62 @@ option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
 config_compiler_and_linker()
 
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
+
+# Profile-guided optimization (clang and clang-cl), after Jetsku's U59 build. Use a separate build
+# directory for each step:
+# 1. KYTY_PGO_GENERATE=ON builds an instrumented emulator. Run it with KYTY_PGO_FILE=<x.profraw>:
+#    it writes its counters every KYTY_PGO_DUMP_SECONDS (default 20) to that file (main.cpp), so a
+#    run stopped with TerminateProcess keeps its last complete dump.
+# 2. llvm-profdata merge -o <x.profdata> <dumps>, with the llvm-profdata of the compiler's version.
+# 3. KYTY_PGO_USE=<x.profdata> builds the optimized emulator.
+# Only Kyty's own targets (declared below) get the flags: third-party code a training run does not
+# exercise (the SPIR-V optimizer, ...) keeps its normal optimization instead of being treated as
+# cold. They are compile options, not CMAKE_CXX_FLAGS.
+option(KYTY_PGO_GENERATE "Instrumented build for profile-guided optimization (clang)" OFF)
+set(KYTY_PGO_USE "" CACHE FILEPATH "llvm-profdata output to optimize with (clang; empty: none)")
+set(KYTY_PGO_RUNTIME "" CACHE FILEPATH "clang_rt.profile-x86_64.lib (clang-cl; empty: search)")
+if(KYTY_PGO_GENERATE OR KYTY_PGO_USE)
+	if(NOT CLANG)
+		message(FATAL_ERROR "KYTY_PGO_GENERATE/KYTY_PGO_USE need clang or clang-cl")
+	endif()
+	if(KYTY_PGO_GENERATE AND KYTY_PGO_USE)
+		message(FATAL_ERROR "KYTY_PGO_GENERATE and KYTY_PGO_USE are separate builds")
+	endif()
+endif()
+if(KYTY_PGO_GENERATE)
+	add_compile_options(-fprofile-instr-generate)
+	add_compile_definitions(KYTY_PGO_GENERATE=1)
+	if(KYTY_CLANG_CL)
+		# lld-link is called directly, so the profile runtime has to be named. Some clang-cl
+		# distributions do not ship it; the one of Visual Studio's LLVM of the same major version
+		# works too (KYTY_PGO_RUNTIME).
+		set(kyty_profile_runtime "${KYTY_PGO_RUNTIME}")
+		if(NOT kyty_profile_runtime)
+			cmake_path(GET CMAKE_CXX_COMPILER PARENT_PATH kyty_llvm_bin)
+			file(GLOB kyty_profile_runtime "${kyty_llvm_bin}/../lib/clang/*/lib/windows/clang_rt.profile-x86_64.lib")
+		endif()
+		if(NOT kyty_profile_runtime)
+			message(FATAL_ERROR "KYTY_PGO_GENERATE: clang_rt.profile-x86_64.lib not found next to ${CMAKE_CXX_COMPILER}; set KYTY_PGO_RUNTIME")
+		endif()
+		list(GET kyty_profile_runtime 0 kyty_profile_runtime)
+		link_libraries("${kyty_profile_runtime}")
+		# clang 19 also asks for the runtime by its new name (clang_rt.profile.lib), which the
+		# older-layout runtimes do not have; the one named above provides the same symbols.
+		add_link_options("/NODEFAULTLIB:clang_rt.profile.lib")
+	else()
+		add_link_options(-fprofile-instr-generate)
+	endif()
+	message(STATUS "PGO: instrumented build (run with KYTY_PGO_FILE=<file.profraw>)")
+elseif(KYTY_PGO_USE)
+	if(NOT EXISTS "${KYTY_PGO_USE}")
+		message(FATAL_ERROR "KYTY_PGO_USE: ${KYTY_PGO_USE} does not exist")
+	endif()
+	# No warnings for sources without profile data (launcher, tests) or per function.
+	add_compile_options("-fprofile-instr-use=${KYTY_PGO_USE}" -Wno-profile-instr-unprofiled
+	                    -Wno-profile-instr-out-of-date -Wno-backend-plugin)
+	message(STATUS "PGO: optimizing with ${KYTY_PGO_USE}")
+endif()
+
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 
 file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
@@ -334,6 +390,22 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${dispatch_indirect_groups_shader_header}")
+
+set(mesh_indirect_args_shader_source "${gpu_tiler_shader_dir}/mesh_indirect_args.comp")
+set(mesh_indirect_args_shader_spv "${gpu_tiler_generated_dir}/mesh_indirect_args.spv")
+set(mesh_indirect_args_shader_header "${gpu_tiler_generated_dir}/mesh_indirect_args_spv.h")
+add_custom_command(
+	OUTPUT "${mesh_indirect_args_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${mesh_indirect_args_shader_spv}" "${mesh_indirect_args_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${mesh_indirect_args_shader_spv}
+	        -DOUTPUT=${mesh_indirect_args_shader_header}
+	        -DSYMBOL=MESH_INDIRECT_ARGS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${mesh_indirect_args_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${mesh_indirect_args_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
@@ -484,6 +556,19 @@ function(configure_macos_guest_address_space target)
 endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
+# Offline batch translation of shaders extracted from game files; a tool, not a test.
+add_kyty_full_emulator_test(shader_batch_tool "${KYTY_TESTS_DIR}/ShaderBatchTool.cpp")
+if(KYTY_CLANG_CL)
+	# Symbols for the stack it prints when a shader crashes it.
+	target_link_options(shader_batch_tool PRIVATE "/DEBUG:FULL"
+		"/PDB:${CMAKE_CURRENT_BINARY_DIR}/shader_batch_tool.pdb")
+endif()
+# Times the driver's compile of SPIR-V modules, offline; a tool, not a test.
+add_executable(pipeline_build_timer EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineBuildTimer.cpp")
+target_link_libraries(pipeline_build_timer Vulkan::Headers)
+# Checks the emitter's float min/max on the GPU (tests/data/float_minmax_check.spvasm); a tool.
+add_executable(float_minmax_check EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/FloatMinMaxCheck.cpp")
+target_link_libraries(float_minmax_check Vulkan::Headers)
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
@@ -494,7 +579,7 @@ add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
-target_link_libraries(scalar_provenance_tests fmt::fmt xbyak::xbyak)
+target_link_libraries(scalar_provenance_tests fmt::fmt common xbyak::xbyak)
 target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
 target_compile_definitions(scalar_provenance_tests PRIVATE KYTY_HACK_NOTICE_STDOUT=1)
 
@@ -525,6 +610,16 @@ add_executable(avplayer_file_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(avplayer_file_tests common FFmpeg::ffmpeg ZArchive::zarchive)
 target_include_directories(avplayer_file_tests PRIVATE ${inc_headers})
+
+if (WIN32)
+	# Guest loads from protected pages, completed by the instruction emulator (Windows contexts).
+	add_executable(x64_load_emulation_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/X64LoadEmulationTests.cpp"
+		"${KYTY_SOURCE_DIR}/loader/x64InstructionEmulator.cpp"
+	)
+	target_link_libraries(x64_load_emulation_tests common Zydis::Zydis)
+	target_include_directories(x64_load_emulation_tests PRIVATE ${inc_headers})
+endif()
 
 add_executable(vdecsw_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/VdecswTests.cpp"
@@ -586,9 +681,10 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
-target_link_libraries(resource_materialization_tests fmt::fmt xbyak::xbyak)
+target_link_libraries(resource_materialization_tests fmt::fmt xbyak::xbyak Tracy::TracyClient)
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
 target_compile_definitions(resource_materialization_tests PRIVATE KYTY_HACK_NOTICE_STDOUT=1)
+
 
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceTrackingTests.cpp"
@@ -740,6 +836,12 @@ if(NOT KYTY_CLANG_CL)
 			virtual_memory_allocation_tests)
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
 	endforeach()
+	# Resource tracking gives a shader up by throwing (Fail, caught in TrackResources); utils.cmake
+	# turns exceptions off for clang and GCC, while clang-cl builds have them on (/EHsc). Every
+	# target that compiles the file, the emulator included, needs them on.
+	set_source_files_properties(
+		"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp"
+		PROPERTIES COMPILE_OPTIONS -fexceptions)
 endif()
 
 if(BUILD_TESTING)
@@ -763,6 +865,9 @@ if(BUILD_TESTING)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
 	add_test(NAME trophy_system COMMAND $<TARGET_FILE:trophy_system_tests>)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
+	if (WIN32)
+		add_test(NAME x64_load_emulation COMMAND $<TARGET_FILE:x64_load_emulation_tests>)
+	endif()
 	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
@@ -883,6 +988,9 @@ if(BUILD_TESTING)
 		save_data_dialog_tests
 		http_uri_parse_tests
 	)
+	if (WIN32)
+		add_dependencies(kyty_tests x64_load_emulation_tests)
+	endif()
 endif()
 
 # Test Darwin signal-context restoration for SSE4a instructions.
