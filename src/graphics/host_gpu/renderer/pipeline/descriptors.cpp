@@ -367,15 +367,15 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	if (resource_ok && descriptor_ok && encoding_ok && format_ok && size != 0) {
 		return;
 	}
-	EXIT("unsupported storage texture: resource=%d descriptor=%d encoding=%d format=%d "
-	     "class=%u numeric=%u dimension=%u mip_mode=%u atomic=%d compare=%d "
+	EXIT("unsupported storage texture: shader=0x%016" PRIx64 " resource=%d descriptor=%d encoding=%d "
+	     "format=%d class=%u numeric=%u dimension=%u mip_mode=%u atomic=%d compare=%d "
 	     "base_level=%u last_level=%u max_mip=%u min_lod=%u base_array=%u bc=%u msaa=%d "
 	     "depth_tile_bpe=%u swizzle_ok=%d "
 	     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
 	     " extent=%ux%ux%u type=%u format=%u tile=%u swizzle=0x%03x read=%d written=%d "
 	     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
-	     resource_ok, descriptor_ok, encoding_ok, format_ok,
-	     static_cast<uint32_t>(resource.resource_class),
+	     Common::HackNotice::CurrentShaderSlot(), resource_ok, descriptor_ok,
+	     encoding_ok, format_ok, static_cast<uint32_t>(resource.resource_class),
 	     static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(resource.dimension),
 	     static_cast<uint32_t>(resource.mip_mode), resource.atomic, resource.depth_compare,
 	     descriptor.BaseLevel(), descriptor.LastLevel(), descriptor.MaxMip(), descriptor.MinLod(),
@@ -1563,6 +1563,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	EXIT_IF(!runtime);
 	const auto& program  = runtime.module->info;
 	const auto& snapshot = *runtime.resources;
+	// Names the program in notices and errors of the resolution below.
+	const Common::HackNotice::ScopedShader shader_scope(program.shader_hash);
 	prepared.runtime = &runtime;
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = {};
@@ -1822,6 +1824,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = prepared.runtime->module->info;
 	const auto& snapshot = *prepared.runtime->resources;
+	const Common::HackNotice::ScopedShader shader_scope(program.shader_hash);
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
