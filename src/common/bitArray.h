@@ -275,6 +275,12 @@ public:
 		return *this;
 	}
 
+	[[nodiscard]] constexpr BitArray operator|(const BitArray& other) const {
+		auto result = *this;
+		result |= other;
+		return result;
+	}
+
 	[[nodiscard]] constexpr BitArray operator~() const {
 		auto result = *this;
 		for (auto& word: result.m_data) {

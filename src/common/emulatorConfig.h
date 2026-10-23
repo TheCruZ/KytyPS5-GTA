@@ -98,6 +98,7 @@ struct ConfigOptions {
 	bool                   profiler_enabled            = false;
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   gpu_assisted_validation_enabled = false;
+	bool                   vulkan_validation_fatal     = true;
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = true;
 	bool                   readback_tiled_images       = false;
@@ -109,6 +110,10 @@ struct ConfigOptions {
 	uint32_t               trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled            = false;
 	bool                   playgo_hack_enabled         = false;
+	bool                   bindless_images_enabled     = false;
+	bool                   float_image_atomics_enabled = true;
+	// Guest shaders whose draws and dispatches are skipped: hex hashes, comma-separated.
+	std::string            skip_shader_hashes;
 	bool                   skip_notice_screen          = false;
 	uint32_t               gpu_pipeline_stages         = GPU_PIPELINE_ALL;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -168,6 +173,7 @@ bool ProfilerEnabled();
 bool SpirvDebugPrintfEnabled();
 
 bool GpuAssistedValidationEnabled();
+bool VulkanValidationFatal();
 
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
@@ -178,6 +184,9 @@ bool OcclusionQueriesEnabled();
 // Draws whose new pipeline the driver is still compiling are skipped instead of waiting for it.
 bool AsyncPipelinesEnabled();
 bool TrophyEnabled();
+bool BindlessImagesEnabled();
+const std::string& GetSkipShaderHashes();
+bool FloatImageAtomicsEnabled();
 uint32_t GetTrophyDurationSeconds();
 bool PlayGoHackEnabled();
 bool SkipNoticeScreen();

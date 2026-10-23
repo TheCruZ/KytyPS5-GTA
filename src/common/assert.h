@@ -5,7 +5,7 @@
 #include "common/logging/log.h"
 
 #include <cstdlib>
-#include <stdexcept>
+#include <string>
 #include <string_view>
 
 namespace Common {
@@ -45,6 +45,10 @@ int  DbgExitIfHandler(char const* expr, char const* file, int line);
 int  DbgNotImplementedHandler(char const* expr, char const* file, int line);
 void DbgExit(int status);
 #endif
+
+// Symbolised host call stack of the calling thread (Windows), empty elsewhere. Every fatal
+// report includes it; use it directly where a non-fatal oddity needs its caller named.
+std::string HostBacktrace();
 
 } // namespace Common
 

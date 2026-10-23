@@ -43,6 +43,9 @@ target_link_libraries(common
 		ZArchive::zarchive
 		nlohmann_json::nlohmann_json
 )
+if (WIN32)
+	target_link_libraries(common PRIVATE dbghelp winmm psapi)
+endif()
 if(APPLE)
 	# hostStats.cpp reads GPU utilization from the IOAccelerator registry entries.
 	target_link_libraries(common PRIVATE "-framework CoreFoundation" "-framework IOKit")
