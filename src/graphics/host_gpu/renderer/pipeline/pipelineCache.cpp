@@ -518,6 +518,7 @@ ShaderModule PipelineCache::BuildModule(const ProgramKey&                       
 	    .function_code  = {function_code.begin(), function_code.end()},
 	};
 	EXIT_IF(module.module == nullptr);
+	module.spirv_words = static_cast<uint32_t>(result.spirv.size());
 	// The inputs of these come from the stage's static key.
 	if (key.stage == ShaderType::Vertex || key.stage == ShaderType::Local) {
 		module.vertex_formats = VertexInputFormats(*options.input_info.vertex, module.info);
@@ -1540,6 +1541,44 @@ const ShaderModule* PipelineCache::GetComputeProgramAhead(const HW::ComputeShade
 	return GetAhead(params, input_info, push_data_cursor, ahead);
 }
 
+// Pipelines whose stages are this small (SPIR-V words, all stages) compile on the execution
+// thread: a few milliseconds, and their draws are never skipped. A skipped draw is lost for good
+// when the game draws it once into a cached layer: Wolverine's title UI drew its logo once, during
+// the cold-start compile backlog, and the logo stayed missing.
+constexpr uint64_t PipelineSyncWords = 12000;
+// Draws without depth test or write whose vertex shaders total at most this many SPIR-V words
+// also compile on the execution thread, whatever the pixel shader's size: those are UI and 2D
+// layer draws, which a game may also draw only once. On cold starts Wolverine's frosted title
+// panels lost their blur (PS 0x09161b28ae4039bb, 80k words) and showed as dark boxes. Stencil
+// does not count: UI libraries clip their panels with stencil masks.
+constexpr uint64_t PipelineSyncUiVsWords = 8000;
+// How long a draw waits for a pipeline it has just queued before it is skipped: a pipeline the
+// driver has cached finishes within it.
+constexpr std::chrono::milliseconds PipelineWait {20};
+// Color targets at most this many pixels wide and high hold glyphs, icons and cached layers.
+constexpr uint32_t SmallTargetSync = 1024;
+
+// Glyphs, icons and other cached layers are drawn once into small offscreen targets, and a draw
+// skipped while its pipeline compiles is lost for good: Wolverine's Leap Attack prompt lost
+// letters ("L p Att k") in every new game whose session compiled them, and on a cold cache the
+// main menu showed only some letters and the screen-reader notice lost its black background.
+bool SmallColorTargetDraw(const HW::Context& context) {
+	constexpr uint32_t limit = SmallTargetSync;
+	const auto mask  = context.GetRenderTargetMask();
+	bool       found = false;
+	for (uint32_t slot = 0; slot < 8; slot++) {
+		const auto& target = context.GetRenderTarget(slot);
+		if (((mask >> (slot * 4u)) & 0x0fu) == 0 || target.base.addr == 0) {
+			continue;
+		}
+		if (target.attrib2.width + 1u > limit || target.attrib2.height + 1u > limit) {
+			return false;
+		}
+		found = true;
+	}
+	return found;
+}
+
 PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
                                                             const DrawRenderState& state,
                                                             bool                   allow_async) {
@@ -1730,8 +1769,24 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		m_last_graphics_pipeline = &found->second;
 		return &found->second;
 	}
+	if (allow_async) {
+		// Small pipelines, and UI or layer draws, compile at once (PipelineSyncWords).
+		uint64_t vertex_words = 0;
+		for (uint32_t i = 0; i < 3u; i++) {
+			if (stages[i] != nullptr) {
+				vertex_words += stages[i]->spirv_words;
+			}
+		}
+		const uint64_t spirv_words =
+		    vertex_words + (stages[3] != nullptr ? stages[3]->spirv_words : 0u);
+		const bool layer_draw = !depth.depth_test_enable && !depth.depth_write_enable &&
+		                        vertex_words <= PipelineSyncUiVsWords;
+		allow_async = spirv_words > PipelineSyncWords && !layer_draw;
+	}
 	if (!m_async_threads.empty()) {
 		std::unique_lock lock(m_async_mutex);
+		// Set when this draw queues the pipeline: it waits that long before it is skipped.
+		std::optional<std::chrono::steady_clock::time_point> wait_until;
 		for (;;) {
 			if (auto node = m_async_ready.extract(key); !node.empty()) {
 				lock.unlock();
@@ -1750,10 +1805,18 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 				m_async_pending_graphics.insert(key);
 				lock.unlock();
 				QueueAsyncPipeline({.key = key, .stages = stages});
-				return nullptr;
+				wait_until = std::chrono::steady_clock::now() + PipelineWait;
+				lock.lock();
+				continue;
 			}
 			if (allow_async) {
-				return nullptr;
+				if (!wait_until || std::chrono::steady_clock::now() >= *wait_until) {
+					return nullptr;
+				}
+				lock.unlock();
+				std::this_thread::yield();
+				lock.lock();
+				continue;
 			}
 			// A draw that cannot be skipped creates the pipeline itself while it is still queued
 			// (the queue may hold many pipelines of skipped draws), or waits for the thread
