@@ -17,6 +17,7 @@
 #include <span>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #define XXH_INLINE_ALL
 #include <xxhash.h>
@@ -903,45 +904,76 @@ private:
 		           ? native->src0.reg : UINT32_MAX;
 	}
 
+	// Walks in the order of a recursive walk, on an explicit stack: large inlined shaders can
+	// have descriptor dependencies thousands of instructions deep.
 	void CollectScalarRead(Value value, uint32_t use_pc) {
-		value = value.Resolve();
-		if (value.IsImmediate()) return;
-		auto* inst = value.TryInstruction();
-		if (inst == nullptr) Fail(use_pc, "invalid typed planning value");
-		const auto cycle = std::ranges::find(m_srt_visiting, inst);
-		if (cycle != m_srt_visiting.end()) {
-			if (std::any_of(cycle, m_srt_visiting.end(), [](const Inst* value) {
-				return value->GetOpcode() == ValueOpcode::Phi;
-			})) return;
-			Fail(use_pc, "cyclic typed planning value without a phi");
+		struct Frame {
+			Inst*             inst   = nullptr;
+			uint32_t          use_pc = 0;
+			const MemoryInfo* memory = nullptr;
+			DescriptorSource  source;
+			size_t            next = 0;
+		};
+		std::vector<Frame>                      stack;
+		std::unordered_map<const Inst*, size_t> visiting;
+		const auto enter = [&](Value dependency, uint32_t dependency_pc) {
+			dependency = dependency.Resolve();
+			if (dependency.IsImmediate()) return;
+			auto* inst = dependency.TryInstruction();
+			if (inst == nullptr) Fail(dependency_pc, "invalid typed planning value");
+			if (const auto cycle = visiting.find(inst); cycle != visiting.end()) {
+				if (std::any_of(stack.begin() + static_cast<std::ptrdiff_t>(cycle->second),
+				                stack.end(), [](const Frame& frame) {
+					                return frame.inst->GetOpcode() == ValueOpcode::Phi;
+				                }))
+					return;
+				Fail(dependency_pc, "cyclic typed planning value without a phi");
+			}
+			if (m_srt_visited.contains(inst)) return;
+			Frame    frame {inst, dependency_pc};
+			uint32_t memory_index = 0;
+			frame.memory          = ScalarReadMemory(*inst, memory_index);
+			if (frame.memory != nullptr) {
+				const auto* handle = inst->Arg(0).Resolve().TryInstruction();
+				const auto  width  = frame.memory->kind == ResourceKind::ScalarBuffer ? 4u : 2u;
+				if (handle == nullptr || handle->GetOpcode() != (width == 4u
+				                                                     ? ValueOpcode::GetBufferResource
+				                                                     : ValueOpcode::GetAddressResource))
+					Fail(dependency_pc, "scalar read has an invalid resource handle");
+				MakeSource(*handle, width, false, false, ScalarReadBase(*inst), frame.source,
+				           inst->Flags<MemoryFlags>().pc);
+			}
+			visiting.emplace(inst, stack.size());
+			stack.push_back(std::move(frame));
+		};
+		enter(value, use_pc);
+		while (!stack.empty()) {
+			// A read's descriptor words, used at the read, then its other operands; the operands
+			// of any other instruction. enter() may grow the stack, so `frame` is not used after it.
+			auto&        frame = stack.back();
+			const size_t words = frame.memory == nullptr                             ? 0u
+			                     : frame.memory->kind == ResourceKind::ScalarBuffer ? 4u
+			                                                                        : 2u;
+			const size_t first = frame.memory != nullptr ? 1u : 0u;
+			if (frame.next < words + (frame.inst->NumArgs() - first)) {
+				const auto index = frame.next++;
+				if (index < words) {
+					enter(frame.source.dwords[index], frame.inst->Flags<MemoryFlags>().pc);
+				} else {
+					enter(frame.inst->Arg(first + (index - words)), frame.use_pc);
+				}
+				continue;
+			}
+			auto*      inst = frame.inst;
+			const bool read = frame.memory != nullptr;
+			visiting.erase(inst);
+			stack.pop_back();
+			m_srt_visited.insert(inst);
+			if (!read) continue;
+			const auto offset = inst->Arg(1).Resolve();
+			if (!offset.IsImmediate() || offset.GetType() != Type::U32) continue;
+			m_scalar_reads.push_back(inst);
 		}
-		if (std::ranges::find(m_srt_visited, inst) != m_srt_visited.end()) return;
-		m_srt_visiting.push_back(inst);
-		uint32_t memory_index = 0;
-		const auto* memory = ScalarReadMemory(*inst, memory_index);
-		DescriptorSource source;
-		if (memory != nullptr) {
-			const auto* handle = inst->Arg(0).Resolve().TryInstruction();
-			const auto width = memory->kind == ResourceKind::ScalarBuffer ? 4u : 2u;
-			if (handle == nullptr || handle->GetOpcode() !=
-			        (width == 4u ? ValueOpcode::GetBufferResource : ValueOpcode::GetAddressResource))
-				Fail(use_pc, "scalar read has an invalid resource handle");
-			MakeSource(*handle, width, false, false, ScalarReadBase(*inst), source,
-			           inst->Flags<MemoryFlags>().pc);
-			for (uint32_t word = 0; word < width; ++word)
-				CollectScalarRead(source.dwords[word], inst->Flags<MemoryFlags>().pc);
-			for (size_t arg = 1; arg < inst->NumArgs(); ++arg)
-				CollectScalarRead(inst->Arg(arg), use_pc);
-		} else {
-			for (size_t arg = 0; arg < inst->NumArgs(); ++arg)
-				CollectScalarRead(inst->Arg(arg), use_pc);
-		}
-		m_srt_visiting.pop_back();
-		m_srt_visited.push_back(inst);
-		if (memory == nullptr) return;
-		const auto offset = inst->Arg(1).Resolve();
-		if (!offset.IsImmediate() || offset.GetType() != Type::U32) return;
-		m_scalar_reads.push_back(inst);
 	}
 
 	void PlanScalarReads() {
@@ -4762,8 +4794,7 @@ private:
 	ShaderStageInputInfo                       m_input;
 	std::vector<Program::ScalarWrite>          m_scalar_writes;
 	std::vector<ResolvedHandle>                m_resolved_handles;
-	std::vector<const Inst*>                   m_srt_visiting;
-	std::vector<const Inst*>                   m_srt_visited;
+	std::unordered_set<const Inst*>            m_srt_visited;
 	std::vector<Inst*>                         m_scalar_reads;
 	ShaderInfo                                 m_info;
 	std::vector<DescriptorSource>              m_sources;
