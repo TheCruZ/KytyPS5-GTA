@@ -790,25 +790,56 @@ struct TarjanState {
 	std::vector<StronglyConnectedComponent> components;
 };
 
-void TarjanVisit(TarjanState& state, uint32_t block_id) {
-	state.index[block_id]   = state.next_index;
-	state.lowlink[block_id] = state.next_index;
-	state.next_index++;
-	state.stack.push_back(block_id);
-	state.on_stack[block_id] = true;
+void TarjanFinish(TarjanState& state, uint32_t block_id);
 
-	const auto* block = state.graph->FindBlock(block_id);
-	if (block != nullptr) {
-		for (auto succ: block->successors) {
-			if (state.index[succ] == UINT32_MAX) {
-				TarjanVisit(state, succ);
-				state.lowlink[block_id] = std::min(state.lowlink[block_id], state.lowlink[succ]);
-			} else if (state.on_stack[succ]) {
-				state.lowlink[block_id] = std::min(state.lowlink[block_id], state.index[succ]);
+// Iterative: the recursive form went one host stack frame deep per block on a path, and a long
+// shader (Wolverine's new-game opening) overflowed the translation thread's stack. Same visit
+// order, same components, in the same order.
+void TarjanVisit(TarjanState& state, uint32_t root) {
+	struct Frame {
+		uint32_t block;
+		size_t   next;
+	};
+	std::vector<Frame> frames;
+	const auto         enter = [&](uint32_t block_id) {
+        state.index[block_id]   = state.next_index;
+        state.lowlink[block_id] = state.next_index;
+        state.next_index++;
+        state.stack.push_back(block_id);
+        state.on_stack[block_id] = true;
+        frames.push_back({block_id, 0});
+	};
+	enter(root);
+	while (!frames.empty()) {
+		const auto  block_id   = frames.back().block;
+		const auto* block      = state.graph->FindBlock(block_id);
+		bool        descended  = false;
+		if (block != nullptr) {
+			while (frames.back().next < block->successors.size()) {
+				const auto succ = block->successors[frames.back().next++];
+				if (state.index[succ] == UINT32_MAX) {
+					enter(succ);
+					descended = true;
+					break;
+				}
+				if (state.on_stack[succ]) {
+					state.lowlink[block_id] = std::min(state.lowlink[block_id], state.index[succ]);
+				}
 			}
 		}
+		if (descended) {
+			continue;
+		}
+		frames.pop_back();
+		TarjanFinish(state, block_id);
+		if (!frames.empty()) {
+			const auto parent     = frames.back().block;
+			state.lowlink[parent] = std::min(state.lowlink[parent], state.lowlink[block_id]);
+		}
 	}
+}
 
+void TarjanFinish(TarjanState& state, uint32_t block_id) {
 	if (state.lowlink[block_id] != state.index[block_id]) {
 		return;
 	}
