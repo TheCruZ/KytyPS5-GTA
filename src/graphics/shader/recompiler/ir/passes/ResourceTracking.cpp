@@ -3497,6 +3497,12 @@ private:
 			    }) &&
 			    std::ranges::all_of(address->Uses(), [&](const Use& use) {
 				    return std::ranges::find(plan.reads, use.user) != plan.reads.end();
+			    }) &&
+			    // The table binding only samples and queries its elements.
+			    std::ranges::all_of(handle.Uses(), [](const Use& use) {
+				    const auto op = use.user->GetOpcode();
+				    return ImageOpcodeInfoOf(op).access == ImageAccess::None ||
+				           op == ValueOpcode::ImageSampleRaw || op == ValueOpcode::ImageQueryDimensions;
 			    });
 			if (table_array) {
 				indirect.table_offset    = static_cast<uint32_t>(table_base);
