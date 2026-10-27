@@ -125,6 +125,7 @@ struct ShaderParams;
 class CommandBuffer;
 
 namespace HW {
+class Context;
 class UserConfig;
 class Shader;
 } // namespace HW
@@ -221,7 +222,14 @@ struct ShaderModule {
 	std::vector<RectListParameter>               rect_parameters;
 	// Indirect mesh draw: a task shader reads the records and launches the groups.
 	bool                                         mesh_task = false;
+	// The size of the module's SPIR-V: small pipelines compile at once (GetGraphicsPipeline).
+	uint32_t                                     spirv_words = 0;
 };
+
+// Whether every color target the draw writes is at most 1024 pixels wide and
+// high (default 1024; 0 = off): glyph atlases and cached UI layers, which a game draws once.
+// Such draws are never skipped while their pipeline compiles.
+[[nodiscard]] bool SmallColorTargetDraw(const HW::Context& context);
 
 // A draw's depth target and its first color_count color targets.
 struct DrawTargets {

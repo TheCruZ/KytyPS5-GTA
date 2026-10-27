@@ -1681,7 +1681,8 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	auto* const pipeline_ptr = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    buffer, state, *m_draw_targets,
 	    Config::AsyncPipelinesEnabled() &&
-	        DrawOnlyChangesPicture(m_context, state, *m_draw_targets, vertex_stages));
+	        DrawOnlyChangesPicture(m_context, state, *m_draw_targets, vertex_stages) &&
+	        !SmallColorTargetDraw(buffer.GetRegisters()));
 	if (pipeline_ptr == nullptr) {
 		// Skipped until a background thread created the pipeline.
 		return;
