@@ -213,6 +213,12 @@ add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty
 option(KYTY_PGO_GENERATE "Instrumented build for profile-guided optimization (clang)" OFF)
 set(KYTY_PGO_USE "" CACHE FILEPATH "llvm-profdata output to optimize with (clang; empty: none)")
 set(KYTY_PGO_RUNTIME "" CACHE FILEPATH "clang_rt.profile-x86_64.lib (clang-cl; empty: search)")
+# KYTY_PGO: the profile kept in the repository, pgo/gtav.profdata (GTA V Performance and Fidelity,
+# recorded with LLVM 22.1.8; an older compiler cannot read it). KYTY_PGO_USE, when set, wins.
+option(KYTY_PGO "Optimize with pgo/gtav.profdata (clang)" OFF)
+if(KYTY_PGO AND NOT KYTY_PGO_USE AND NOT KYTY_PGO_GENERATE)
+	set(KYTY_PGO_USE "${CMAKE_CURRENT_SOURCE_DIR}/pgo/gtav.profdata")
+endif()
 if(KYTY_PGO_GENERATE OR KYTY_PGO_USE)
 	if(NOT CLANG)
 		message(FATAL_ERROR "KYTY_PGO_GENERATE/KYTY_PGO_USE need clang or clang-cl")
