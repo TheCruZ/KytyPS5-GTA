@@ -33574,8 +33574,16 @@ TestCase ScalarBranchRestoresInactiveLanes(u32 wave_size, u32 threads, bool uppe
   return test;
 }
 
+// S_MEMREALTIME counts at 100 MHz: the host clock is divided by the whole divisor nearest to it.
+static_assert(ShaderRecompiler::Spirv::DeviceClockDivisor(1000) == 10);   // NVIDIA, 1 GHz
+static_assert(ShaderRecompiler::Spirv::DeviceClockDivisor(10000) == 1);   // AMD, 100 MHz
+static_assert(ShaderRecompiler::Spirv::DeviceClockDivisor(1250) == 8);    // 800 MHz
+static_assert(ShaderRecompiler::Spirv::DeviceClockDivisor(52083) == 1);   // 19.2 MHz
+static_assert(ShaderRecompiler::Spirv::DeviceClockDivisor(1) == 1024);
+static_assert(ShaderRecompiler::Spirv::DeviceClockDivisor(0) == 1);
+
 // Each case spins until S_MEMREALTIME advances 64 ticks, capped at 2^20 reads, and stores
-// min(delta, 64). The profile period picks the host clock shift.
+// min(delta, 64). The profile period picks the host clock divisor.
 std::vector<TestCase> ScalarMemRealtimeCases() {
   using O = ShaderOpcode;
   namespace D = ShaderRecompiler::Decoder;
@@ -33608,14 +33616,18 @@ std::vector<TestCase> ScalarMemRealtimeCases() {
     ShaderProfile profile;
     std::vector<std::string> required, forbidden;
   } variants[] = {
-      {"ScalarMemRealtimeShiftsNanosecondClock",
+      {"ScalarMemRealtimeDividesNanosecondClockBy10",
        {.maintenance8 = true, .device_clock_period_ps = 1000},
+       {"OpUDiv %ulong", "%ulong_10\n"},
+       {"OpShiftRightLogical %ulong"}},
+      {"ScalarMemRealtimeShiftsPowerOfTwoDivisor",
+       {.maintenance8 = true, .device_clock_period_ps = 1250},
        {"OpShiftRightLogical %ulong", "%uint_3\n"},
-       {}},
+       {"OpUDiv %ulong"}},
       {"ScalarMemRealtimeKeeps100MHzClock",
        {.maintenance8 = true, .device_clock_period_ps = 10000},
        {"OpReadClockKHR %ulong %uint_1"},
-       {"OpShiftRightLogical %ulong"}}};
+       {"OpShiftRightLogical %ulong", "OpUDiv %ulong"}}};
   std::vector<TestCase> tests;
   for (const auto &variant : variants) {
     TestCase test{variant.name, code, {}, {64},
