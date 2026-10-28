@@ -118,6 +118,14 @@ vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture, uint32_t el
 	return {nullptr, view, texture.layout};
 }
 
+// A depth image a table names may be the depth target of a later draw, which samples it in the
+// attachment layout: such elements are visited by every binding, so their descriptors follow the
+// layout and AcquireRenderTargets() sees them.
+static bool DepthTableElement(TextureCache& texture_cache, const TextureBinding& texture) {
+	if (!texture.image_id) return false;
+	return texture_cache.GetImage(texture.image_id).info.IsDepth();
+}
+
 static Prospero::ImageType TextureType(const ShaderTextureResource& descriptor) {
 	const auto type = descriptor.Type();
 	return type == Prospero::ImageType::kCube ? Prospero::ImageType::kColor2DArray : type;
@@ -1257,7 +1265,7 @@ bool RenderExecutor::PatchTableSlots(const ShaderRecompiler::IR::CompiledShaderI
 			state.elements.push_back({.resolution = element, .table = &resolution, .source = value,
 			                          .root = roots.at(changed.range)});
 			auto& entry = state.elements.back();
-			if (element->volatile_dcc) {
+			if (element->volatile_dcc || DepthTableElement(texture_cache, element->texture)) {
 				state.always.push_back(index);
 			} else if (!element->permanent && !element->backing_checkable) {
 				state.unchecked_backing.push_back(index);
@@ -1309,7 +1317,7 @@ void RenderExecutor::FinishTableBindings(TableBindingState& state,
 	for (uint32_t index = 0; index < state.elements.size(); index++) {
 		auto&       element    = state.elements[index];
 		const auto& resolution = *element.resolution;
-		if (resolution.volatile_dcc) {
+		if (resolution.volatile_dcc || DepthTableElement(texture_cache, resolution.texture)) {
 			state.always.push_back(index);
 		} else if (!resolution.permanent && !resolution.backing_checkable) {
 			state.unchecked_backing.push_back(index);
