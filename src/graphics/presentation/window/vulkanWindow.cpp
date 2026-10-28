@@ -2,6 +2,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/hackNotice.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -17,6 +18,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
@@ -641,6 +643,24 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (shader_clock_extension && shader_clock.shaderDeviceClock) {
 		graphics.device_clock_period_ps = static_cast<uint32_t>(
 		    std::lround(graphics.physical_device_properties.limits.timestampPeriod * 1000.0f));
+	}
+	if (graphics.device_clock_period_ps != 0u) {
+		// S_MEMREALTIME divides the device clock by the whole divisor nearest the guest's 100 MHz.
+		const double rate_hz = 1e12 / static_cast<double>(graphics.device_clock_period_ps);
+		const auto   divisor =
+		    ShaderRecompiler::Spirv::DeviceClockDivisor(graphics.device_clock_period_ps);
+		const double effective_hz = rate_hz / static_cast<double>(divisor);
+		LOGF("Vulkan shader device clock: period %u ps, S_MEMREALTIME divisor %u (%.2f MHz)\n",
+		     graphics.device_clock_period_ps, divisor, effective_hz / 1e6);
+		if (effective_hz < 99e6 || effective_hz > 101e6) {
+			// The device clock is not a whole multiple of 100 MHz: the guest's counter runs at the
+			// nearest rate the divisor allows.
+			Common::HackNotice::Report(
+			    "S_MEMREALTIME runs at a rate other than 100 MHz", "VulkanCreateDevice", 0, divisor,
+			    fmt::format("device clock {:.0f} MHz divided by {}: guest timeouts expire sooner or "
+			                "later",
+			                rate_hz / 1e6, divisor));
+		}
 	}
 	graphics.conditional_rendering_enabled =
 	    conditional_rendering_extension && conditional_rendering.conditionalRendering;

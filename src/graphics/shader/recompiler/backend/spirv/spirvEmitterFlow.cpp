@@ -938,10 +938,18 @@ uint32_t EmitReadRealtimeClock(ValueEmitContext& ctx, const IR::Inst& inst) {
 	state.builder.RequireCapability(spv::CapabilityShaderClockKHR);
 	const auto clock =
 	    Unary(state, spv::OpReadClockKHR, TypeU64(state), ConstantU32(state, spv::ScopeDevice));
-	// S_MEMREALTIME counts at 100 MHz. Shift the host clock by the most bits that keep its tick at
-	// most 15000 ps (2/3 of 100 MHz): 1 GHz shifts by 3 to 125 MHz; 100 MHz and slower stay.
-	const uint32_t shift = std::bit_width(7500u / period);
-	return EmitShiftRightLogical64(ctx, clock, IR::Value(shift));
+	// S_MEMREALTIME counts at 100 MHz. Divide the host clock down to the nearest whole fraction of
+	// that rate: by 10 for a 1 GHz clock, not at all for a 100 MHz one. Guest timeouts and frame
+	// pacers compare differences of this counter against intervals in 100 MHz ticks.
+	const uint32_t divisor = DeviceClockDivisor(period);
+	if (divisor == 1u) {
+		return clock;
+	}
+	if (std::has_single_bit(divisor)) {
+		return EmitShiftRightLogical64(ctx, clock,
+		                               IR::Value(static_cast<uint32_t>(std::countr_zero(divisor))));
+	}
+	return Binary(state, spv::OpUDiv, TypeU64(state), clock, ConstantU64(state, divisor));
 }
 
 void EmitUnreachable(ValueEmitContext& ctx, const IR::Inst& inst) {
