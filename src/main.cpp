@@ -506,6 +506,7 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 // An exception no one catches (a worker thread of the program cache, for one) ends the process
 // with 0xC0000409 and no message: name the exception first.
 static void ReportUncaughtException() {
+#if defined(__cpp_exceptions)
 	try {
 		if (const auto exception = std::current_exception(); exception != nullptr) {
 			std::rethrow_exception(exception);
@@ -516,6 +517,9 @@ static void ReportUncaughtException() {
 	} catch (...) {
 		std::fprintf(stderr, "terminate: uncaught exception of an unknown type\n");
 	}
+	#else
+		std::fprintf(stderr, "terminate called\n");
+	#endif
 	std::fflush(stderr);
 	std::abort();
 }
