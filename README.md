@@ -120,6 +120,10 @@ V#s are now upstream).
 instead of always reading visible (the sun's lens flare showed through trees and light glows
 through walls). Counters reach the game by the next frame, so water reflections (Michael's pool)
 no longer flicker.
+- **Red Dead Redemption water reflections**: the sea in the opening boat cutscene no longer loses its
+reflection in about one frame of three. The game reads the previous frame's occlusion counters as soon
+as the GPU has finished that frame; the counters are now written to its memory at that point instead of
+later.
 - **Black smoke and particles**: smoke (Michael's cigar in Father/Son) and small particles render
 translucent instead of black. The game clears the particle depth target (R16 float) with a fast
 register clear that was ignored, so depth of field blurred the particles dark (decoding the
@@ -296,10 +300,8 @@ changed from Fidelity to Performance mid-game. Hard to reproduce.
 - **Brief black flash right after entering the game**: a few seconds after the player gets control,
 some parts of the image turn black for a single frame and then render correctly. Rarely (if ever)
 noticeable later in the session. Something similar seems to happen in Demon's Souls.
-- **Red Dead Redemption: flickering water reflections**: the water's reflection is missing in some
-frames and present in others.
-- **Red Dead Redemption: brief animation hitches**: every few seconds animations seem to pause or
-slow down for an instant and then continue normally.
+- **Red Dead Redemption: brief animation hitches**: animations sometimes seem to pause or slow down
+for an instant and then continue normally, more noticeably below 50 fps.
 - **AMD GPUs**: the log warns "format Bc5UnormBlock does not support storage access;
 block-compressed textures written by the guest will not render".
 - **Performance**: Performance mode runs at 60-120 fps in the city,

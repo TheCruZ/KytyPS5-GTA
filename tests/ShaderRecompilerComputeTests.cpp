@@ -2519,11 +2519,11 @@ public:
     uint64_t samples = 0;
     Require(name, "pending", queries.HasPendingDumps() && !read(0, samples),
             "counters were published before the GPU finished");
+    const auto dump_tick = scheduler.CurrentTick();
     scheduler.Finish();
-    // Without a frame boundary, counters wait until the GPU's progress is queried.
-    Require(name, "known progress only", queries.HasPendingDumps(),
-            "counters were published without querying the GPU's progress");
-    queries.PublishCompleted(true);
+    // As on the console, the counters reach guest memory once the GPU got past the dumps,
+    // without a frame boundary or a later dump: a completion queued with each dump writes them.
+    scheduler.WaitPriorityOperations(dump_tick);
     Require(name, "published", !queries.HasPendingDumps(),
             "a dump did not reach guest memory after the GPU finished");
     const uint64_t full = uint64_t{size} * size;

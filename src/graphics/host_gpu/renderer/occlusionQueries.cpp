@@ -55,8 +55,11 @@ OcclusionQueries::~OcclusionQueries() {
 
 void OcclusionQueries::BeginQuery(const CommandRecorder& recorder) {
 	EXIT_IF(m_query_active || !m_rendering);
-	if (!m_segments.AllocateSlot(m_active_slot)) {
-		return;
+	{
+		std::lock_guard lock(m_mutex);
+		if (!m_segments.AllocateSlot(m_active_slot)) {
+			return;
+		}
 	}
 	recorder.beginQuery(m_pool, m_active_slot, m_control);
 	m_query_active = true;
@@ -96,9 +99,12 @@ void OcclusionQueries::OnFrame() {
 	// frame of the water without reflections and waves. Wait for the GPU to finish the
 	// dumps of earlier frames before this frame's flip (it usually already has).
 	uint64_t tick = 0;
-	for (const auto& pending: m_pending) {
-		if (pending.frame < m_frame) {
-			tick = std::max(tick, pending.tick);
+	{
+		std::lock_guard lock(m_mutex);
+		for (const auto& pending: m_pending) {
+			if (pending.frame < m_frame) {
+				tick = std::max(tick, pending.tick);
+			}
 		}
 	}
 	auto& scheduler = m_context.GetCommandScheduler();
@@ -110,7 +116,8 @@ void OcclusionQueries::OnFrame() {
 }
 
 void OcclusionQueries::PublishCompleted(bool refresh) {
-	auto& master = m_context.GetCommandScheduler().GetMasterSemaphore();
+	auto&           master = m_context.GetCommandScheduler().GetMasterSemaphore();
+	std::lock_guard lock(m_mutex);
 	while (!m_pending.empty()) {
 		if (!master.IsFree(m_pending.front().tick)) {
 			if (!refresh) {
@@ -127,6 +134,7 @@ void OcclusionQueries::PublishCompleted(bool refresh) {
 }
 
 void OcclusionQueries::OnUnmap(uint64_t address, uint64_t size) {
+	std::lock_guard lock(m_mutex);
 	for (auto& pending: m_pending) {
 		if (pending.dump.address < address + size &&
 		    address < pending.dump.address + OcclusionCounters::DumpSize) {
@@ -142,8 +150,17 @@ void OcclusionQueries::Dump(CommandScheduler& scheduler, uint64_t address) {
 	if (m_query_active) {
 		EndQuery(recorder);
 	}
-	m_pending.push_back(
-	    {.dump = m_segments.OnDump(address), .tick = scheduler.CurrentTick(), .frame = m_frame});
+	const auto tick = scheduler.CurrentTick();
+	{
+		std::lock_guard lock(m_mutex);
+		m_pending.push_back({.dump = m_segments.OnDump(address), .tick = tick, .frame = m_frame});
+	}
+	// The GPU writes the counters when it gets past the dump. Queued now, the completion runs
+	// before those of any later operation: a guest that learns the GPU finished this work (a
+	// suspend point, a flip) finds them in memory, as on the console. An unmap of the counters
+	// waits for it.
+	scheduler.DeferPriorityOperation([this] { PublishCompleted(true); }, address,
+	                                 OcclusionCounters::DumpSize);
 	PublishCompleted(false);
 	if (m_segments.Counting() && buffer.IsRendering()) {
 		EXIT_IF(!m_rendering);
