@@ -480,7 +480,9 @@ std::vector<bool> ReachesCall(const Decoder::Program& program, const std::map<ui
 bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
                     const std::vector<CallSite>& sites, const std::set<uint32_t>& dependencies,
                     const ShaderCodeReader& read, uint32_t wave_size,
-                    std::vector<uint32_t>& expanded, std::string& reason) {
+                    std::vector<uint32_t>& expanded, std::string& reason,
+                    std::vector<InlinedCallBody>* bodies = nullptr) {
+	if (bodies != nullptr) bodies->clear();
 	const auto&              program = analysis.program;
 	std::map<uint32_t, Call> calls;
 	for (const auto& site: sites) {
@@ -552,6 +554,7 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 			const uint64_t        return_pc = base + inst.pc + inst.word_count * 4u;
 			std::vector<uint32_t> returns;
 			auto                  emit_target = [&](const CallTarget& target) -> bool {
+				const auto body_begin = static_cast<uint32_t>(result.size());
 				EmitMove(result, call.return_reg, static_cast<uint32_t>(return_pc));
 				EmitMove(result, call.return_reg + 1u, static_cast<uint32_t>(return_pc >> 32u));
 				std::map<uint32_t, uint32_t>               local_pc;
@@ -573,6 +576,9 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 				for (const auto& [at, target]: branches) {
 					relocations.emplace_back(at, local_pc.at(target));
 				}
+				if (bodies != nullptr)
+					bodies->push_back({body_begin * 4u, static_cast<uint32_t>(result.size()) * 4u,
+					                   target.address});
 				return true;
 			};
 			if (call.dynamic) {
@@ -704,6 +710,7 @@ struct ShaderFunctionExpander::Impl {
 		bool                  ok = false;
 		std::string           reason;
 		std::vector<uint32_t> code;
+		std::vector<InlinedCallBody> bodies;
 	};
 	struct Shader {
 		uint64_t               code_hash = 0;
@@ -718,6 +725,7 @@ struct ShaderFunctionExpander::Impl {
 	static constexpr size_t MaxExpansions = 8;
 
 	std::unordered_map<uint64_t, Shader> shaders; // by code address
+	std::vector<InlinedCallBody>         bodies;  // of the last expansion
 	std::vector<uint32_t>                scratch;
 
 	bool StillReads(const Expansion& expansion, const ShaderCodeReader& read) {
@@ -734,6 +742,10 @@ struct ShaderFunctionExpander::Impl {
 };
 
 ShaderFunctionExpander::ShaderFunctionExpander(): m_impl(std::make_unique<Impl>()) {}
+
+const std::vector<InlinedCallBody>& ShaderFunctionExpander::Bodies() const {
+	return m_impl->bodies;
+}
 ShaderFunctionExpander::~ShaderFunctionExpander() = default;
 
 bool ShaderFunctionExpander::HasCalls(std::span<const uint32_t> code) const {
@@ -798,6 +810,7 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 		    m_impl->StillReads(expansion, read)) {
 			expanded = expansion.code;
 			reason   = expansion.reason;
+			m_impl->bodies = expansion.bodies;
 			return expansion.ok;
 		}
 	}
@@ -813,7 +826,8 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 		return ok;
 	};
 	expansion.ok = BuildExpansion(analysis, base, expansion.sites, dependencies, recording,
-	                              wave_size, expansion.code, expansion.reason);
+	                              wave_size, expansion.code, expansion.reason, &expansion.bodies);
+	m_impl->bodies = expansion.bodies;
 	MergeReads(expansion.reads);
 	expanded = expansion.code;
 	reason   = expansion.reason;

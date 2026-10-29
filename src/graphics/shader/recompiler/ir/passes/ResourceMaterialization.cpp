@@ -8,6 +8,7 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
+#include <optional>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -610,6 +611,134 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		return failed("candidate", fmt::format("candidate_offset={:#x} {}={} stride={} step={}",
 		    offset & ~uint64_t {3}, key_kind, key, indirect.table_stride, step));
 	};
+	if (indirect.pointer_table && indirect.pointer_table->buffer) {
+		// Records named by the rows of a pointer table hold the V# of a descriptor table. The
+		// mapping searches the first word of that V# (the shader keys on the word it reads) for
+		// the block of its table's elements: [count, ordinal of element 0, 1, ...]. Rows name few
+		// distinct records, and records may share one table.
+		const auto& pointer = *indirect.pointer_table;
+		if (!WalkedDescriptor(program, indirect.table_source, table_value) ||
+		    !DecodeBufferDescriptor(table_value, table)) return false;
+		table_base = table.Base48();
+		table_size = table.GetSize();
+		descriptors[resource_index] = {.dword_count = dword_count};
+		const uint64_t first = uint64_t {indirect.table_offset & ~3u} + (indirect.table_immediate & ~3u);
+		const uint64_t rows = table_size >= first + 8u
+		    ? (table_size - first - 8u) / indirect.table_stride + 1u : 0u;
+		std::vector<uint32_t> words(table_size / 4u);
+		if (rows != 0u && !ReadScalarTable(table_base, table_size, 0u, runtime, words))
+			return read_failed("pointer table read", 0u, 0u, table_base, 0u, table_size);
+		// Only rows that name the reading function hold records of its layout. The function's
+		// address is in one other aligned pointer slot of the row.
+		const auto row_word = [&](uint64_t row, uint64_t byte) {
+			const auto word = (row * indirect.table_stride + byte) / 4u;
+			return (uint64_t {words[word + 1u]} << 32u) | words[word];
+		};
+		std::optional<uint64_t> function_slot;
+		if (pointer.function != 0u) {
+			for (uint64_t slot = 0; slot + 8u <= indirect.table_stride && !function_slot; slot += 8u) {
+				if (slot == (indirect.table_immediate & ~7u)) continue;
+				for (uint64_t row = 0; row < rows; ++row) {
+					if (((indirect.table_offset & ~3u) + row * indirect.table_stride + slot + 8u) > table_size) break;
+					if ((row_word(row, (indirect.table_offset & ~3u) + slot) & AddressMask) ==
+					    (pointer.function & AddressMask)) {
+						function_slot = slot;
+						break;
+					}
+				}
+			}
+			if (!function_slot) return failed("record function", fmt::format("function={:#x}", pointer.function));
+		}
+		std::vector<uint64_t> records;
+		for (uint64_t row = 0; row < rows; ++row) {
+			if (function_slot &&
+			    ((indirect.table_offset & ~3u) + row * indirect.table_stride + *function_slot + 8u > table_size ||
+			     (row_word(row, (indirect.table_offset & ~3u) + *function_slot) & AddressMask) !=
+			         (pointer.function & AddressMask))) continue;
+			const auto word = (first + row * indirect.table_stride) / 4u;
+			const auto record = ((uint64_t {words[word + 1u]} << 32u) | words[word]) & AddressMask;
+			if (record != 0u) records.push_back(record);
+		}
+		std::ranges::sort(records);
+		records.erase(std::unique(records.begin(), records.end()), records.end());
+		std::vector<std::pair<uint32_t, uint32_t>> entries; // V# first word, block offset.
+		std::vector<std::array<uint32_t, 4>> tables;           // the V# of each entry
+		std::vector<uint32_t> blocks;
+		for (const auto record: records) {
+			DescriptorValue record_table {.dword_count = 4u};
+			if (!ReadScalarTable(record, UINT64_MAX, pointer.offset, runtime,
+			                     std::span(record_table.dwords).first(4u)))
+				return read_failed("record table read", 0u, 0u, record, pointer.offset, 16u);
+			const std::array<uint32_t, 4> table_words {record_table.dwords[0], record_table.dwords[1],
+			                                           record_table.dwords[2], record_table.dwords[3]};
+			if (std::ranges::find(tables, table_words) != tables.end()) continue;
+			ShaderBufferResource elements;
+			if (!DecodeBufferDescriptor(record_table, elements)) return false;
+			const uint64_t element_base = elements.Base48();
+			const uint64_t element_size = elements.GetSize();
+			const uint64_t count = pointer.element_stride == 0u ? 1u
+			    : element_size >= pointer.element_offset + descriptor_bytes
+			        ? (element_size - pointer.element_offset - descriptor_bytes) / pointer.element_stride + 1u
+			        : 0u;
+			if (count > MaxIndirectDescriptorProbes)
+				return failed("record table elements", fmt::format("record={:#x} count={}", record, count));
+			const auto block = static_cast<uint32_t>(blocks.size());
+			blocks.push_back(static_cast<uint32_t>(count));
+			for (uint32_t element = 0; element < count; ++element) {
+				const auto offset = pointer.element_offset + uint64_t {element} * pointer.element_stride;
+				DescriptorValue candidate {.dword_count = dword_count};
+				if (element_base != 0u && offset + descriptor_bytes <= element_size &&
+				    !ReadScalarTable(element_base, element_size, offset, runtime,
+				                     std::span(candidate.dwords).first(read_dwords)))
+					return read_failed("record descriptor read", 0u, element, element_base, offset, descriptor_bytes);
+				if (!normalize(candidate)) return normalization_failed(offset, element, pointer.element_stride, "element");
+				blocks.push_back(intern_candidate(candidate));
+			}
+			entries.emplace_back(table_words[0], block);
+			tables.push_back(table_words);
+		}
+		// Every element null: the root's null descriptor serves every key.
+		if (descriptors.size() == children_begin) return true;
+		std::ranges::sort(entries);
+		for (size_t i = 1; i < entries.size(); ++i) {
+			if (entries[i].first == entries[i - 1u].first)
+				return failed("record tables", "two record tables share the first word of their V#");
+		}
+		if (entries.empty()) return true;
+		const bool stable_layout = g_stable_indirect_layouts.load(std::memory_order_relaxed);
+		const auto key_capacity  = !stable_layout ? entries.size() : std::max<size_t>(
+		    program.stage == ShaderType::Compute ? g_compute_indirect_keys.load(std::memory_order_relaxed)
+		                                         : MinIndirectMappingCapacity,
+		    std::bit_ceil(entries.size()));
+		const auto mapping_offset = snapshot.flattened_srt.size();
+		const auto blocks_offset  = mapping_offset + 1u + key_capacity * 2u;
+		snapshot.flattened_srt.resize(blocks_offset + blocks.size(), 0u);
+		snapshot.flattened_srt[mapping_offset] = static_cast<uint32_t>(entries.size());
+		for (size_t entry = 0; entry < entries.size(); ++entry) {
+			snapshot.flattened_srt[mapping_offset + 1u + entry * 2u] = entries[entry].first;
+			// A block's flattened SRT word; 0 (no block) never names one.
+			snapshot.flattened_srt[mapping_offset + 2u + entry * 2u] =
+			    static_cast<uint32_t>(blocks_offset + entries[entry].second);
+		}
+		std::ranges::copy(blocks, snapshot.flattened_srt.begin() + static_cast<std::ptrdiff_t>(blocks_offset));
+		if (std::is_same_v<Specialization, ResourceSpecialization::Image> && stable_layout) {
+			const auto children = descriptors.size() - children_begin;
+			const auto total    = std::max<size_t>(
+                program.stage == ShaderType::Compute
+                    ? g_compute_indirect_images.load(std::memory_order_relaxed)
+                    : 1u,
+                std::bit_ceil(children + 1u));
+			for (auto padded = children; padded + 1u < total; ++padded) {
+				descriptors.push_back(descriptors.back());
+				specializations.push_back(specializations.back());
+			}
+		}
+		auto& root                      = specializations[resource_index];
+		root.indirect_root              = resource_index;
+		root.indirect_mapping_offset    = static_cast<uint32_t>(mapping_offset);
+		root.indirect_search_iterations = std::bit_width(key_capacity);
+		return true;
+	}
 	if (sources.empty()) {
 		if (selector == nullptr) keys.clear();
 		DescriptorValue material_value;

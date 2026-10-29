@@ -884,10 +884,19 @@ struct Instruction {
 	std::string_view unsupported_reason;
 };
 
+// The code an inlined call target occupies in an expanded program, by byte pc, and its address.
+struct InlinedCallBody {
+	uint32_t begin   = 0;
+	uint32_t end     = 0;
+	uint64_t address = 0;
+};
+
 struct Program {
 	std::span<const uint32_t> code;
 	std::vector<Instruction>  instructions;
 	bool                     has_swap_pc = false;
+	// Set on programs expanded by ShaderFunctionExpander.
+	std::vector<InlinedCallBody> call_bodies;
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.
