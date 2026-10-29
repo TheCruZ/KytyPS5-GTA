@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/guest_gpu/psrShaders.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -1665,10 +1666,11 @@ void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 	}
 }
 
-uint64_t CommandProcessor::ComputeShaderHash(uint64_t data_addr) {
-	auto [it, inserted] = m_cs_hashes.try_emplace(data_addr, 0);
-	if (inserted || it->second == 0) {
-		it->second = ShaderMappedHash(data_addr);
+Psr::Shader CommandProcessor::ComputePsrShader(uint64_t data_addr) {
+	// The library's shaders live in the game's executable: their addresses never change.
+	auto [it, inserted] = m_cs_psr_shaders.try_emplace(data_addr, Psr::Shader::None);
+	if (inserted) {
+		it->second = Psr::IdentifyShader(data_addr);
 	}
 	return it->second;
 }
@@ -1805,19 +1807,12 @@ bool CommandProcessor::HleTlasDispatch(uint64_t data_addr) {
 	if (data_addr == 0 || !m_renderer.GetNativeRayTracing().Enabled()) {
 		return false;
 	}
-	static constexpr std::array<uint64_t, 18> Stage {
-	    0x9df701ab41f8ed18ull, 0xfd3e8ce83c905301ull, 0x6a90ea743851af30ull,
-	    0x41d7bf8caa1d5b8eull, 0x245c614a852e8fb8ull, 0xe8ca52f5a7dabd9eull, 0xfd8a9f53fe5fe1d8ull,
-	    0x8609fe7579224c92ull, 0x6a66cd538ab9e139ull, 0x0e7bdeda7768b057ull, 0xbf128e4c6211fd8full,
-	    0xdb80ac5caa3f3500ull, 0xd8f2a760e26e9f63ull, 0x9dff695420f6e999ull, 0x17037cff5e02eeb8ull,
-	    0xb71ef7c579835a0dull, 0x7c7ec90f3e50e469ull, 0x54ec6ec2689fd4c4ull};
-	constexpr uint64_t ListShader  = 0x9df701ab41f8ed18ull;
-	constexpr uint64_t LastShader  = 0x54ec6ec2689fd4c4ull;
-	const auto hash = ComputeShaderHash(data_addr);
-	// Some of the stage's shaders (sorts, scans) also serve other passes: only the dispatches
+	using Psr::Shader;
+	const auto shader = ComputePsrShader(data_addr);
+	// Some of the stage's shaders (sorts, scans) also serve other builds: only the dispatches
 	// from the stage's first list (used only there) to the end of its last build are the TLAS
 	// builds. Other shaders run meanwhile (the stage reads nothing they write).
-	if (std::ranges::find(Stage, hash) == Stage.end()) {
+	if (!Psr::IsTopLevelBuildShader(shader)) {
 		return false;
 	}
 	const auto& user = GetShCtx().GetCs().cs_user_sgpr.value;
@@ -1845,7 +1840,7 @@ bool CommandProcessor::HleTlasDispatch(uint64_t data_addr) {
 		return false;
 	}
 	if (!m_hle_tlas_window) {
-		if (hash != ListShader) {
+		if (shader != Shader::MortonComputeBoundingBoxForInstances) {
 			return false;
 		}
 		if (!native(list())) {
@@ -1859,7 +1854,7 @@ bool CommandProcessor::HleTlasDispatch(uint64_t data_addr) {
 	if (shader == Shader::MortonComputeBoundingBoxForInstances) {
 		m_hle_tlas_builds.push_back(list());
 	}
-	if (hash != LastShader) {
+	if (shader != Shader::CollapseToQbvhSimpleTop) {
 		return true;
 	}
 	if (m_hle_tlas_finished < m_hle_tlas_builds.size()) {

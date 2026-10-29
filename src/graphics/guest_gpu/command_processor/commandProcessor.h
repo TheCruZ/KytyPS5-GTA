@@ -6,6 +6,7 @@
 #include "graphics/guest_gpu/command_processor/gpuOperation.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pssr.h"
+#include "graphics/guest_gpu/psrShaders.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
@@ -125,8 +126,8 @@ public:
 	// is dropped.
 	bool HleBlasDispatch(uint64_t data_addr);
 	void EmitHleRefit();
-	// The program hash of the compute shader at `data_addr`.
-	uint64_t ComputeShaderHash(uint64_t data_addr);
+	// The sce::Psr shader at `data_addr` (see psrShaders.h).
+	Psr::Shader ComputePsrShader(uint64_t data_addr);
 	// Reads guest memory the CP decides on (WAIT_REG_MEM, COND_EXEC, predication, branches) as a
 	// serial GPU would: after the earlier operations that write it.
 	void ReadDecisionMemory(const volatile void* address, void* value, size_t size);

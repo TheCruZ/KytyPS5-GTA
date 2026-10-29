@@ -28,6 +28,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -42,6 +43,8 @@ namespace Libs::Graphics {
 struct ShaderMapData: ShaderMappedData {
 	ShaderVertexMetadata vertex;
 	const char*          vertex_error = nullptr;
+	// The size of the whole binary (code, metadata and footer).
+	uint32_t binary_size_bytes = 0;
 };
 
 struct ShaderMapEntry {
@@ -87,7 +90,8 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	const auto*   binary = reinterpret_cast<const uint32_t*>(addr);
 	ShaderMapData mapped {data};
 	// Translation reads the bytes the hash covers.
-	mapped.code_size_bytes = ShaderProgramSize(binary, data.code_size_bytes);
+	mapped.code_size_bytes   = ShaderProgramSize(binary, data.code_size_bytes);
+	mapped.binary_size_bytes = data.code_size_bytes;
 	const auto hash        = XXH3_64bits(binary, mapped.code_size_bytes);
 	mapped.vertex_error =
 	    ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, mapped.vertex);
@@ -117,14 +121,15 @@ void ShaderSetMapListener(ShaderMapListener listener, void* userdata) {
 	}
 }
 
-// The program hash of the shader mapped at `addr` (0 if none).
-uint64_t ShaderMappedHash(uint64_t addr) {
+std::span<const uint32_t> ShaderMappedBinary(uint64_t addr) {
+	EXIT_IF(g_shader_map == nullptr);
+
 	std::scoped_lock lock(g_shader_map_mutex);
-	if (g_shader_map == nullptr) {
-		return 0;
+	const auto       iter = g_shader_map->find(addr);
+	if (iter == g_shader_map->end()) {
+		return {};
 	}
-	const auto iter = g_shader_map->find(addr);
-	return iter != g_shader_map->end() ? iter->second.hash : 0;
+	return {reinterpret_cast<const uint32_t*>(addr), iter->second.data.binary_size_bytes / sizeof(uint32_t)};
 }
 
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
@@ -888,6 +893,33 @@ void ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info) {
 	     info.tg_size_en ? "true" : "false");
 	LOGF("\t threadgroup_id     = {%s, %s, %s}\n", info.group_id[0] ? "true" : "false",
 	     info.group_id[1] ? "true" : "false", info.group_id[2] ? "true" : "false");
+}
+
+// Registered names by address. The names are interned and never released, so the pointers
+// ShaderRegisteredName() returns stay valid (a game registers a bounded set of names).
+static std::mutex                                g_registered_names_mutex;
+static std::unordered_set<std::string>           g_registered_name_strings;
+static std::unordered_map<uint64_t, const char*> g_registered_names;
+
+void ShaderSetRegisteredName(uint64_t addr, const char* name) {
+	std::scoped_lock lock(g_registered_names_mutex);
+	if (name == nullptr) {
+		g_registered_names.erase(addr);
+		return;
+	}
+	const auto [iter, inserted] = g_registered_name_strings.emplace(name);
+	g_registered_names[addr]    = iter->c_str();
+}
+
+const char* ShaderRegisteredName(uint64_t addr) {
+	std::scoped_lock lock(g_registered_names_mutex);
+	const auto       iter = g_registered_names.find(addr);
+	return iter != g_registered_names.end() ? iter->second : nullptr;
+}
+
+bool ShaderNameRegistered(const char* name) {
+	std::scoped_lock lock(g_registered_names_mutex);
+	return name != nullptr && g_registered_name_strings.contains(name);
 }
 
 } // namespace Libs::Graphics
