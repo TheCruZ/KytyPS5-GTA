@@ -186,6 +186,7 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 		const auto expanded_code = std::span<const uint32_t>(linked.code).subspan(source.code.size());
 		Decoder::DecodeProgram(expanded_code, linked.decoded);
 		linked.decoded.code = expanded_code;
+		linked.decoded.call_bodies = source.expander->Bodies();
 		source.linked = std::move(linked);
 		++source.revision;
 		return source.linked->decoded;
