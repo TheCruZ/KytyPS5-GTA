@@ -24,6 +24,11 @@ public:
 
 	template <bool track>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);
+	// Read watchers over a byte range: while one is held any access to the page faults. The
+	// region trackers hold one per GPU-dirty page and the texture cache one per page of an image
+	// it reads back lazily, so the counts of different owners add up.
+	template <bool track>
+	void UpdateAccessWatchers(uint64_t vaddr, uint64_t size);
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);
 
