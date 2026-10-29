@@ -62,6 +62,11 @@ public:
 	// Before the emulated GPU writes guest memory (labels, WRITE_DATA): resolves a tracked page
 	// as its write fault would, without raising the exception.
 	void PrepareGpuWrite(const void* destination, uint64_t size) noexcept;
+	// A completion's store of guest memory (labels, query results). A completion cannot read
+	// memory back and later GPU work may own the page again at any moment, so the bytes go
+	// through the backing store, which never faults; the caches then treat it as a CPU write,
+	// except on pages the GPU owns.
+	void WriteFromCompletion(void* destination, const void* data, uint64_t size) noexcept;
 	// Execution thread, before each operation (see PrepareBda()).
 	void NoteOperation(uint64_t submit_id, bool after_wait) noexcept {
 		if (submit_id != m_bda_submit || after_wait) {
