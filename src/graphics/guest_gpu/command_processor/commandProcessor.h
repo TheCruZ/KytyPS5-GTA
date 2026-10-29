@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "graphics/guest_gpu/command_processor/gpuOperation.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/psrShaders.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
@@ -119,8 +120,8 @@ public:
 	// is dropped.
 	bool HleBlasDispatch(uint64_t data_addr);
 	void EmitHleRefit();
-	// The program hash of the compute shader at `data_addr`.
-	uint64_t ComputeShaderHash(uint64_t data_addr);
+	// The sce::Psr shader at `data_addr` (see psrShaders.h).
+	Psr::Shader ComputePsrShader(uint64_t data_addr);
 	// Reads guest memory the CP decides on (WAIT_REG_MEM, COND_EXEC, predication, branches) as a
 	// serial GPU would: after the earlier operations that write it.
 	void ReadDecisionMemory(const volatile void* address, void* value, size_t size);
@@ -274,8 +275,8 @@ private:
 	std::vector<HleRefitGeometryRef> m_hle_refit_geometries;
 	uint32_t                         m_hle_refit_finished = 0;
 	bool                             m_hle_refit_window   = false;
-	// The program hash of each compute shader address seen.
-	std::unordered_map<uint64_t, uint64_t> m_cs_hashes;
+	// The sce::Psr shader of each compute shader address seen.
+	std::unordered_map<uint64_t, Psr::Shader> m_cs_psr_shaders;
 
 	// State of the execution side, on cache lines of its own.
 	alignas(64) uint64_t m_synthetic_occlusion_counter = 0;
