@@ -45,6 +45,22 @@ enum class Shader : uint8_t {
 	QbvhFanRefitRecoverAabbs,
 	QbvhRefitBottomLevel,
 
+	// Bottom level build of triangle geometry (kBase format): the bounds of a geometry's vertices
+	// and the Morton codes of its triangles (once per geometry; the codes in any index format and
+	// precision, and not in builds that split triangles) and the last pass, which writes the BLAS
+	// (once per BLAS, with or without refit data).
+	MortonComputeBoundingBoxForVertices,
+	MortonComputeCodeForMesh,
+	CollapseToQbvhSimpleBottom,
+
+	// The first pass of every build (the memory it may use: the BVH or the scratch memory, and
+	// their sizes).
+	MortonCaptureMemory,
+	// Decompression of a compressed bottom level BVH (kBase format): the header (the first pass)
+	// and the triangle nodes (the last ones, any index format).
+	DecompressHeaderBase,
+	DecompressComputeFanNode,
+
 	Count
 };
 
