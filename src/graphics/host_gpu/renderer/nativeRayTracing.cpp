@@ -32,6 +32,13 @@ constexpr uint32_t TableEntries     = 1u << 17u;
 constexpr uint32_t SlotCapacity     = 1u << 15u;
 constexpr uint32_t MissingCapacity  = 256;
 constexpr uint32_t MaxJobs          = 256;
+// The host table of BLASes whose builds the host saw (kHostTableEntries in rt_tlas_walk.comp),
+// after the walk's table, and the geometries of the layouts of one preparation's builds.
+constexpr uint32_t HostTableEntries = 1u << 14u;
+constexpr uint32_t HostTableProbes  = 32;
+constexpr uint32_t LayoutCapacity   = 1u << 16u;
+// The root of every BLAS of a TLAS built by hle_tlas.comp (kBlasRoot).
+constexpr uint32_t GuestBlasRoot    = 0x25;
 constexpr uint32_t ChangedCapacity  = 1024;
 constexpr uint32_t PoolCapacity     = 1u << 23u;
 // The largest queue one walk takes from the pool (kMaxQueue in rt_blas_walk.comp).
@@ -77,7 +84,7 @@ constexpr uint64_t TableTombstone   = 1;
 
 constexpr uint32_t StateSize      = 96;
 constexpr uint32_t MissingStride  = 48;
-constexpr uint32_t JobStride      = 56;
+constexpr uint32_t JobStride      = 72;
 constexpr uint32_t SlotStride     = 64;
 constexpr uint32_t TableStride    = 16;
 constexpr uint32_t ContextStride  = 64;
@@ -197,7 +204,20 @@ struct Job {
 	uint32_t capacity1;
 	uint32_t result;
 	uint32_t pad;
+	uint64_t layout;
+	uint32_t layout_count;
+	uint32_t mismatches;
 };
+
+// Job::result: the build did not match its layout, or the memory did not hold the BLAS the layout
+// describes any more.
+constexpr uint32_t JobLayoutMismatch = 16;
+constexpr uint32_t JobLayoutStale    = 32;
+
+// The host table hashes keys like FindSlot in rt_tlas_walk.comp.
+uint32_t TableHash(uint64_t key) {
+	return static_cast<uint32_t>(key >> 6u) * 0x9e3779b1u ^ static_cast<uint32_t>(key >> 32u) * 0x85ebca6bu;
+}
 static_assert(sizeof(Job) == JobStride);
 
 struct SlotInfo {
@@ -547,7 +567,7 @@ void NativeRayTracing::CreateBuffers() {
 	m_queue          = make(uint64_t {QueueCapacity} * 4, DataFlags, "RT queue");
 	m_instance_nodes = make(uint64_t {InstanceCapacity} * 4, DataFlags, "RT instance nodes");
 	m_instances      = make(uint64_t {InstanceCapacity} * InstanceStride, AsFlags, "RT instances");
-	m_table          = make(uint64_t {TableEntries} * TableStride, DataFlags, "RT BLAS table");
+	m_table          = make(uint64_t {TableEntries + HostTableEntries} * TableStride, DataFlags, "RT BLAS table");
 	m_slots          = make(uint64_t {SlotCapacity} * SlotStride, DataFlags, "RT slots");
 	m_missing        = make(uint64_t {MissingCapacity} * MissingStride, DataFlags, "RT missing");
 	m_context        = make(uint64_t {MaxContexts} * ContextStride, DataFlags, "RT context");
@@ -555,6 +575,8 @@ void NativeRayTracing::CreateBuffers() {
 	m_verify_list    = make(uint64_t {SlotCapacity} * 4, DataFlags, "RT verify list");
 	m_changed        = make(uint64_t {ChangedCapacity} * 4, DataFlags, "RT changed");
 	m_jobs           = make(uint64_t {MaxJobs} * JobStride, DataFlags, "RT jobs");
+	m_layouts        = make(uint64_t {LayoutCapacity} * 16, DataFlags, "RT build layouts");
+	m_host_keys.assign(HostTableEntries, 0);
 	m_build_scratch  = make(BuildScratchSize, AsFlags, "RT build scratch");
 	m_hle_tlas_scratch = make(HleTlasScratchSize, DataFlags, "HLE TLAS bounds");
 	m_hle_jobs       = make(HleRefitJobsSize, DataFlags, "HLE refit jobs");
@@ -669,6 +691,16 @@ void NativeRayTracing::AllocateSlot(Slot& slot, const SlotSizes& sizes) {
 }
 
 bool NativeRayTracing::CreateSlot(const PendingSlot& pending) {
+	// Its build was seen after the walk reported it: the walk finds the host's slot first, the
+	// entry the walk claimed is released.
+	if (const auto it = m_slots_by_blas.find(pending.blas_va); it != m_slots_by_blas.end()) {
+		for (const auto index: it->second) {
+			if (m_slot_list[index]->root == pending.root) {
+				m_retry.push_back(pending.table_index);
+				return true;
+			}
+		}
+	}
 	// Implausibly large (see MaxSlotTriangles) or over the budget: reported again later.
 	SlotSizes sizes;
 	if (!ComputeSlotSizes(pending.opaque, pending.alpha, sizes)) {
@@ -746,6 +778,11 @@ void NativeRayTracing::EvictSlot(uint32_t index) {
 	auto& slot       = *m_slot_list[index];
 	slot.evicted     = true;
 	slot.needs_build = false;
+	if (slot.host_table_index != UINT32_MAX) {
+		m_host_keys[slot.host_table_index] = TableTombstone;
+		m_host_table_writes.emplace_back(slot.host_table_index, TableTombstone, 0);
+		slot.host_table_index = UINT32_MAX;
+	}
 	if (const auto it = m_slots_by_blas.find(slot.blas_va); it != m_slots_by_blas.end()) {
 		std::erase(it->second, index);
 		if (it->second.empty()) {
@@ -867,6 +904,8 @@ void NativeRayTracing::RecordBuilds(const CommandRecorder& command) {
 	std::vector<uint32_t> slots;
 	uint64_t              scratch   = 0;
 	uint64_t              pool_use  = 0;
+	// The layouts of the jobs that have one.
+	std::vector<std::array<uint32_t, 4>> layouts;
 	constexpr uint64_t    Alignment = 256;
 	{
 		Common::LockGuard lock(m_mutex);
@@ -890,14 +929,19 @@ void NativeRayTracing::RecordBuilds(const CommandRecorder& command) {
 			}
 			auto&      slot  = *m_slot_list[index];
 			const auto size  = (slot.build_scratch + Alignment - 1) & ~(Alignment - 1);
-			if (scratch + size > BuildScratchSize) {
+			if (scratch + size > BuildScratchSize ||
+			    (!slot.layout.empty() && layouts.size() + slot.layout.size() > LayoutCapacity)) {
 				break;
 			}
 			// The walks of the builds take a queue each from the pool, which the counts and the
 			// checks of the preparation need too: the builds use up to half of it, the rest waits
-			// for the next preparation (one build always goes).
+			// for the next preparation (one build always goes). A gathered build (see below)
+			// does not walk.
+			const bool     gathered = slot.built && slot.refit_seq == m_refit_seq &&
+			                          slot.built_refit_seq + 1 == m_refit_seq && slot.gathers < MaxGathers;
 			const uint64_t queue =
-			    slot.leaf_count != 0
+			    gathered ? 0
+			    : slot.leaf_count != 0
 			        ? std::min<uint64_t>(uint64_t {slot.leaf_count} + slot.leaf_count / 2 + 64, PoolQueueMax)
 			        : PoolQueueMax;
 			if (!jobs.empty() && pool_use + queue > PoolCapacity / 2) {
@@ -912,9 +956,15 @@ void NativeRayTracing::RecordBuilds(const CommandRecorder& command) {
 			scratch += size;
 			// The game refits (or just changed) the BLAS: see EmitLeaf in rt_blas_walk.comp.
 			const uint32_t refit = slot.refit_seq != 0 || slot.dynamic_until != 0 ? 1u : 0u;
-			jobs.push_back({slot.blas_va, slot.root, index, slot.vertices0.address,
-			                slot.vertices1.address, slot.entries.address, slot.capacity0,
-			                slot.capacity1, 0, refit});
+			Job job {slot.blas_va, slot.root, index, slot.vertices0.address,
+			         slot.vertices1.address, slot.entries.address, slot.capacity0,
+			         slot.capacity1, 0, refit, 0, 0, 0};
+			if (!slot.layout.empty()) {
+				job.layout       = m_layouts->BufferDeviceAddress() + uint64_t {layouts.size()} * 16;
+				job.layout_count = static_cast<uint32_t>(slot.layout.size());
+				layouts.insert(layouts.end(), slot.layout.begin(), slot.layout.end());
+			}
+			jobs.push_back(job);
 			slots.push_back(index);
 		}
 	}
@@ -959,9 +1009,28 @@ void NativeRayTracing::RecordBuilds(const CommandRecorder& command) {
 		                     // many as the BLAS header allows).
 		                     .leaf_count  = slot.leaf_count};
 		UpdateBuffer(command, m_slots->Handle(), uint64_t {index} * SlotStride, &info, sizeof(info));
-		const uint32_t encoded = index + 1;
-		UpdateBuffer(command, m_table->Handle(), uint64_t {slot.table_index} * TableStride + 8,
-		             &encoded, sizeof(encoded));
+		// A slot the host table holds has no entry in the walk's table.
+		if (slot.table_index != UINT32_MAX) {
+			const uint32_t encoded = index + 1;
+			UpdateBuffer(command, m_table->Handle(), uint64_t {slot.table_index} * TableStride + 8,
+			             &encoded, sizeof(encoded));
+		}
+		// A layout build writes only the positions its triangles take: the others stay inactive
+		// (NaN vertices, entries of ~0).
+		if (!slot.layout.empty()) {
+			command.fillBuffer(slot.vertices0.buffer->Handle(), slot.vertices0.offset, slot.vertices0.size,
+			                   0x7fc00000u);
+			command.fillBuffer(slot.vertices1.buffer->Handle(), slot.vertices1.offset, slot.vertices1.size,
+			                   0x7fc00000u);
+			command.fillBuffer(slot.entries.buffer->Handle(), slot.entries.offset, slot.entries.size,
+			                   0xffffffffu);
+		}
+	}
+	for (size_t done = 0; done < layouts.size();) {
+		const auto chunk = std::min<size_t>(layouts.size() - done, 4096);
+		UpdateBuffer(command, m_layouts->Handle(), uint64_t {done} * 16, &layouts[done],
+		             static_cast<uint32_t>(chunk * 16));
+		done += chunk;
 	}
 	UpdateBuffer(command, m_jobs->Handle(), 0, jobs.data(),
 	             static_cast<uint32_t>(jobs.size() * JobStride));
@@ -1078,10 +1147,20 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 	std::vector<std::pair<uint32_t, uint32_t>> evicted;
 	std::vector<std::pair<uint32_t, SlotInfo>> reallocated;
 	std::vector<uint32_t>                      moved;
+	std::vector<std::tuple<uint32_t, uint64_t, uint32_t>> host_writes;
 	{
 		Common::LockGuard lock(m_mutex);
 		m_frame = frame;
 		DestroyRetired();
+		for (const auto index: m_give_up) {
+			if (index < m_slot_list.size() && m_slot_list[index] != nullptr && !m_slot_list[index]->evicted) {
+				evicted.push_back({index, m_slot_list[index]->table_index});
+				EvictSlot(index);
+			}
+		}
+		m_give_up.clear();
+		moved.insert(moved.end(), m_moved_slots.begin(), m_moved_slots.end());
+		m_moved_slots.clear();
 		for (const auto& pending: m_new_slots) {
 			if (!CreateSlot(pending)) {
 				// No free slot: reported again later (a few times).
@@ -1139,6 +1218,7 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 			return true;
 		});
 		retry.swap(m_retry);
+		host_writes.swap(m_host_table_writes);
 		// Slots the guest changed lately are rebuilt before each use: the verification finds a
 		// change only after the TLAS of that preparation was built.
 		std::erase_if(m_dynamic, [&](uint32_t index) {
@@ -1201,7 +1281,16 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 	for (const auto& [index, table_index]: evicted) {
 		constexpr SlotInfo cleared {};
 		UpdateBuffer(command, m_slots->Handle(), uint64_t {index} * SlotStride, &cleared, sizeof(cleared));
-		forget(table_index);
+		if (table_index != UINT32_MAX) {
+			forget(table_index);
+		}
+	}
+	// The host table, after the evictions released their entries.
+	for (const auto& [index, key, encoded]: host_writes) {
+		const std::array<uint32_t, 4> entry {static_cast<uint32_t>(key), static_cast<uint32_t>(key >> 32u),
+		                                     encoded, 0};
+		UpdateBuffer(command, m_table->Handle(), uint64_t {TableEntries + index} * TableStride, entry.data(),
+		             sizeof(entry));
 	}
 	for (const auto& [index, info]: reallocated) {
 		UpdateBuffer(command, m_slots->Handle(), uint64_t {index} * SlotStride, &info, sizeof(info));
@@ -1377,6 +1466,16 @@ void NativeRayTracing::ProcessReadback(Readback& readback) {
 				}
 			}
 		}
+		if ((job.result & (JobLayoutMismatch | JobLayoutStale)) != 0) {
+			// The guest BLAS is not (or no longer) laid out as its build said: given up, the walks
+			// find what the memory holds. A later build there is laid out again.
+			const auto index = readback.build_slots[i];
+			if (m_slot_list[index] != nullptr && !m_slot_list[index]->evicted &&
+			    !m_slot_list[index]->layout.empty()) {
+				m_give_up.push_back(index);
+			}
+			continue;
+		}
 		if ((job.result & 1u) != 0) {
 			// More triangles than the slot holds (the guest rebuilt the BLAS bigger): the job
 			// came back with the counts. A slot released since needs nothing.
@@ -1470,6 +1569,104 @@ void NativeRayTracing::RecordHleTlas(const CommandRecorder& command, uint64_t in
 	              vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
 }
 
+void NativeRayTracing::NoteGuestBlasBuilds(std::span<const GuestBlasBuild> builds) {
+	if (!m_enabled) {
+		return;
+	}
+	Common::LockGuard lock(m_mutex);
+	for (const auto& build: builds) {
+		if (build.blas_va == 0 || build.geometries.empty()) {
+			continue;
+		}
+		// Each geometry's triangles follow those of the earlier geometries of its opacity.
+		std::vector<std::array<uint32_t, 4>> layout;
+		std::array<uint64_t, 2>              totals {};
+		for (const auto& [triangles, opaque]: build.geometries) {
+			auto& total = totals[opaque ? 0 : 1];
+			layout.push_back({static_cast<uint32_t>(total), triangles, opaque ? 1u : 0u, 0u});
+			total += triangles;
+		}
+		if (totals[0] + totals[1] == 0 || totals[0] + totals[1] > MaxSlotTriangles) {
+			continue;
+		}
+		const auto capacity0 = static_cast<uint32_t>(std::max<uint64_t>(totals[0], 1));
+		const auto capacity1 = static_cast<uint32_t>(std::max<uint64_t>(totals[1], 1));
+		// A BLAS with a slot already (built before, or found by a walk): laid out again.
+		uint32_t index = UINT32_MAX;
+		if (const auto it = m_slots_by_blas.find(build.blas_va); it != m_slots_by_blas.end()) {
+			for (const auto candidate: it->second) {
+				if (m_slot_list[candidate]->root == GuestBlasRoot) {
+					index = candidate;
+				}
+			}
+		}
+		if (index != UINT32_MAX) {
+			auto& slot = *m_slot_list[index];
+			if (slot.capacity0 != capacity0 || slot.capacity1 != capacity1) {
+				SlotSizes sizes;
+				if (!ComputeSlotSizes(capacity0, capacity1, sizes, true)) {
+					continue;
+				}
+				// The recorded work may still use the old structure: it is destroyed later.
+				RetireResources(slot, UINT32_MAX);
+				AllocateSlot(slot, sizes);
+				m_moved_slots.push_back(index);
+			}
+			slot.layout = std::move(layout);
+			// Leaves hold one triangle or more: the walk's queue is sized for as many (a walk
+			// that needs more reports it, see RecordBuilds()).
+			slot.leaf_count = static_cast<uint32_t>(totals[0] + totals[1]);
+			if (!slot.needs_build) {
+				slot.needs_build = true;
+				m_build_queue.push_back(index);
+			}
+			continue;
+		}
+		SlotSizes sizes;
+		if (!ComputeSlotSizes(capacity0, capacity1, sizes, true)) {
+			continue;
+		}
+		// A host table entry: the first free (or released) one of the key's probe chain.
+		const uint64_t key  = build.blas_va ^ (uint64_t {GuestBlasRoot} << 48u);
+		const uint32_t hash = TableHash(key);
+		uint32_t       host = UINT32_MAX;
+		for (uint32_t probe = 0; probe < HostTableProbes; probe++) {
+			const uint32_t candidate = (hash + probe) & (HostTableEntries - 1);
+			if (m_host_keys[candidate] == 0 || m_host_keys[candidate] == TableTombstone) {
+				host = candidate;
+				break;
+			}
+		}
+		if (host == UINT32_MAX) {
+			continue;
+		}
+		if (!m_free_slots.empty()) {
+			index = m_free_slots.back();
+			m_free_slots.pop_back();
+		} else if (m_slot_list.size() < SlotCapacity) {
+			index = static_cast<uint32_t>(m_slot_list.size());
+			m_slot_list.emplace_back();
+		} else {
+			continue;
+		}
+		auto slot              = std::make_unique<Slot>();
+		slot->blas_va          = build.blas_va;
+		slot->root             = GuestBlasRoot;
+		slot->table_index      = UINT32_MAX;
+		slot->host_table_index = host;
+		slot->layout           = std::move(layout);
+		slot->leaf_count       = static_cast<uint32_t>(totals[0] + totals[1]);
+		slot->last_use_frame   = m_frame;
+		AllocateSlot(*slot, sizes);
+		slot->needs_build = true;
+		m_slots_by_blas[build.blas_va].push_back(index);
+		m_build_queue.push_back(index);
+		m_slot_list[index] = std::move(slot);
+		m_host_keys[host]  = key;
+		m_host_table_writes.emplace_back(host, key, index + 1);
+	}
+}
+
 void NativeRayTracing::RecordHleRefit(const CommandRecorder& command, std::span<const uint64_t> blases,
                                       std::span<const HleRefitGeometry> geometries) {
 	if (!m_enabled || blases.empty()) {
@@ -1508,7 +1705,14 @@ void NativeRayTracing::RecordHleRefit(const CommandRecorder& command, std::span<
 		for (const auto blas: blases) {
 			if (const auto it = m_slots_by_blas.find(blas); it != m_slots_by_blas.end()) {
 				for (const auto index: it->second) {
-					m_slot_list[index]->refit_seq = m_refit_seq;
+					// Built again (gathered) at the next preparation, so the frame that refit it
+					// traces the new shape.
+					auto& slot     = *m_slot_list[index];
+					slot.refit_seq = m_refit_seq;
+					if (slot.built && !slot.needs_build) {
+						slot.needs_build = true;
+						m_build_queue.push_back(index);
+					}
 				}
 			}
 		}

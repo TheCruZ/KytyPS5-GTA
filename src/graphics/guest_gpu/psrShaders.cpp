@@ -46,6 +46,14 @@ constexpr NamedShader Names[] = {
     {"psr_qbvh_fan_refit_async", Shader::QbvhFanRefitAsync},
     {"psr_qbvh_fan_refit_recover_aabbs", Shader::QbvhFanRefitRecoverAabbs},
     {"psr_qbvh_refit_bottom_level", Shader::QbvhRefitBottomLevel},
+    {"psr_morton_compute_code_for_mesh_uint8x3", Shader::MortonComputeCodeForMesh},
+    {"psr_morton_compute_code_for_mesh_uint16x3", Shader::MortonComputeCodeForMesh},
+    {"psr_morton_compute_code_for_mesh_uint32x3", Shader::MortonComputeCodeForMesh},
+    {"psr_morton_compute_code_for_mesh_low_precision_uint8x3", Shader::MortonComputeCodeForMesh},
+    {"psr_morton_compute_code_for_mesh_low_precision_uint16x3", Shader::MortonComputeCodeForMesh},
+    {"psr_morton_compute_code_for_mesh_low_precision_uint32x3", Shader::MortonComputeCodeForMesh},
+    {"psr_collapse_to_qbvh_simple_bottom", Shader::CollapseToQbvhSimpleBottom},
+    {"psr_collapse_to_qbvh_simple_bottom_with_refit", Shader::CollapseToQbvhSimpleBottom},
 };
 
 std::atomic<Generation> g_generation {Generation::Unknown};

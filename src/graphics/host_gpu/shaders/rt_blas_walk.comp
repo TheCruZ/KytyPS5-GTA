@@ -8,6 +8,18 @@
 // MODE_BUILD: writes the triangles (opaque ones as geometry 0, alpha tested ones as geometry 1)
 //             with their entry table, and pads both geometries with inactive (NaN) triangles.
 // MODE_VERIFY: recomputes the signature of the boxes of built slots and lists those that changed.
+//
+// A build with a layout (a BLAS whose build the host saw, see NativeRayTracing::NoteGuestBlasBuilds())
+// places each triangle by its primitive: the geometry of its triangle node (the header's table of
+// the geometry of each triangle node: +40 offset, +108 geometry count, +124 first triangle node)
+// and the triangle index of its primitive word (bits 0-29), at the geometry's first host
+// primitive plus that index, in the host geometry of the guest geometry's opacity. Positions no
+// list entry names keep the inactive triangle the host filled them with, and a triangle named by
+// several leaves (split) is written once per leaf with the same values. An entry that does not
+// match the layout (no geometry, an index past the geometry's triangles, an opacity other than the
+// geometry's) is counted and fails the build. So does memory that no longer holds the BLAS the
+// layout describes (a header without the magic and version 9, or with another geometry count:
+// released and reused, or rebuilt since), without placing anything. The host gives up such slots.
 
 #include "rt_common.inc"
 
@@ -25,6 +37,17 @@ layout(buffer_reference, std430, buffer_reference_align = 8) buffer Job {
 	uint     capacity1;
 	uint     result;
 	uint     pad;
+	// The layout of the build (0: none) and its geometries, then (written back) the entries that
+	// did not match it.
+	uint64_t layout_va;
+	uint     layout_count;
+	uint     mismatches;
+};
+
+// The layout of one guest geometry (written by the host): its first host primitive, its triangle
+// count and whether it is opaque.
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer LayoutRef {
+	uvec4 v;
 };
 
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer TriangleRef {
@@ -62,7 +85,7 @@ uint QueueNodes(uint leaf_count) {
 	return leaf_count == 0 ? 0u : leaf_count + leaf_count / 2 + 64;
 }
 
-const uint kJobStride = 56;
+const uint kJobStride = 72;
 const uint kMaxQueue  = 1u << 20;
 
 shared uint s_head;
@@ -77,9 +100,36 @@ shared uint s_queue_base;
 shared uint s_queue_size;
 shared uint s_capacity0;
 shared uint s_capacity1;
+// Layout builds: the guest geometries (the header's), the table of the geometry of each triangle
+// node and the first triangle node, and the entries that did not match.
+shared uint     s_layout_geometries;
+shared uint64_t s_node_geometries;
+shared uint     s_node_first;
+shared uint     s_mismatches;
+// A layout build of memory that does not hold a BVH (not written yet, or released and reused).
+shared uint     s_layout_invalid;
 // The box of the whole BLAS (lo > hi: unknown).
 shared vec3 s_root_lo;
 shared vec3 s_root_hi;
+
+// The host position of a list entry of a layout build (see the top), or kInvalidNode when it
+// does not match the layout.
+uint LayoutPosition(Job job, uint tri, uint word, bool opaque) {
+	if (NodeType(tri) > 3u || (tri >> 3) < s_node_first) {
+		return kInvalidNode;
+	}
+	// The geometry of the triangle node (the game's own leaf code looks it up the same way).
+	const uint lo = LoadGuestU32(s_node_geometries + uint64_t((tri >> 3) - s_node_first) * 4);
+	if (lo >= s_layout_geometries) {
+		return kInvalidNode;
+	}
+	const uvec4 geometry = LayoutRef(job.layout_va + uint64_t(lo) * 16).v;
+	const uint  triangle = word & 0x3fffffffu;
+	if (triangle >= geometry.y || (geometry.z != 0u) != opaque) {
+		return kInvalidNode;
+	}
+	return geometry.x + triangle;
+}
 
 // Counts (and in MODE_BUILD writes) the triangles of a guest leaf list.
 // `lo`/`hi`: the box of the leaf in its parent node (lo > hi: unknown, for a root leaf).
@@ -91,7 +141,17 @@ void EmitLeaf(uint64_t blas_va, uint64_t base, uint leaf, Job job, vec3 lo, vec3
 		const uint     tri    = LoadGuestU32(entry);
 		const uint     word   = LoadGuestU32(entry + 4);
 		const bool     opaque = ((word >> 30) & 1u) != 0;
-		const uint     index  = opaque ? atomicAdd(s_opaque, 1u) : atomicAdd(s_alpha, 1u);
+		uint           index  = opaque ? atomicAdd(s_opaque, 1u) : atomicAdd(s_alpha, 1u);
+		if (pc.mode == MODE_BUILD && job.layout_va != 0) {
+			// Nothing to place from memory that holds another BLAS: the positions stay inactive.
+			if (s_layout_invalid != 0) {
+				return;
+			}
+			index = LayoutPosition(job, tri, word, opaque);
+			if (index == kInvalidNode) {
+				atomicAdd(s_mismatches, 1u);
+			}
+		}
 		if (pc.mode == MODE_BUILD) {
 			const uint capacity = opaque ? s_capacity0 : s_capacity1;
 			if (index < capacity) {
@@ -150,9 +210,10 @@ void GatherTriangle(Job job, uint64_t base, uint index, uint geometry) {
 	const uvec3    ids          = TriangleVertexIds(NodeType(tri));
 	TriangleRef    out_triangle = TriangleRef((geometry == 0u ? job.vertices0 : job.vertices1) + uint64_t(index) * 36);
 	vec3 p[3];
-	bool usable = true;
+	// A position of a layout build that no list entry named stays inactive.
+	bool usable = entry.x != kInvalidNode;
 	for (uint v = 0; v < 3; v++) {
-		p[v]   = LoadVertex(node, ids[v]);
+		p[v]   = usable ? LoadVertex(node, ids[v]) : vec3(0.0);
 		usable = usable && !any(isnan(p[v])) && all(lessThan(abs(p[v]), vec3(1e18)));
 	}
 	for (uint v = 0; v < 3; v++) {
@@ -223,6 +284,24 @@ void main() {
 		s_capacity1 = pc.mode == MODE_BUILD ? job.capacity1 : 0;
 		s_root_lo   = vec3(1e30);
 		s_root_hi   = vec3(-1e30);
+		s_mismatches        = 0;
+		s_layout_geometries = 0;
+		s_layout_invalid    = 0;
+		s_node_first        = 0;
+		s_node_geometries   = 0;
+		if (pc.mode == MODE_BUILD && job.layout_va != 0) {
+			// The header's geometries must be the layout's.
+			const uint geometries = LoadGuestU32(blas_va + 108);
+			s_layout_geometries   = geometries == job.layout_count ? geometries : 0u;
+			s_node_geometries     = blas_va + LoadGuestU32(blas_va + 40);
+			s_node_first          = LoadGuestU32(blas_va + 124);
+			// "PSR_BVHL", version 9, and the geometries of the build the layout describes: the
+			// guest may have built another BLAS there since (the build waits for a preparation).
+			s_layout_invalid = LoadGuestU32(blas_va) != 0x5f525350u || LoadGuestU32(blas_va + 4) != 0x4c485642u ||
+			                           LoadGuestU32(blas_va + 252) != 9u || geometries != job.layout_count
+			                       ? 1u
+			                       : 0u;
+		}
 		if (IsBoxNode(root)) {
 			const BoxNode root_box = LoadBoxNode(base, root);
 			for (uint c = 0; c < 4; c++) {
@@ -338,6 +417,18 @@ void main() {
 		return;
 	}
 	SlotInfo info = SlotInfo(pc.slots + uint64_t(slot) * kSlotStride);
+	if (pc.mode == MODE_BUILD && job.layout_va != 0) {
+		// Every position is used (the host filled them with inactive triangles before the walk).
+		if (lid == 0) {
+			info.leaf_count = leaf_count;
+			info.count0     = s_capacity0;
+			info.count1     = s_capacity1;
+			info.signature  = s_signature;
+			job.mismatches  = s_mismatches;
+			job.result      = (s_overflow << 1) | (s_mismatches != 0 ? 16u : 0u) | (s_layout_invalid << 5);
+		}
+		return;
+	}
 	if (pc.mode == MODE_BUILD) {
 		// Inactive triangles (a NaN vertex) fill the rest of both geometries.
 		const float nan = uintBitsToFloat(0x7fc00000u);

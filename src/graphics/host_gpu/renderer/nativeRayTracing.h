@@ -13,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <span>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -36,6 +37,11 @@ struct GraphicContext;
 // A shader then lets the hardware find opaque hits and runs the guest's own leaf code (triangle
 // and alpha test) only for the alpha tested triangles a ray hits. BLASes the host has not seen are reported by the top-level walk, counted on the
 // GPU and read back asynchronously; the host allocates them and builds them the next time.
+//
+// BLASes whose builds the command processor saw (games that build them with sce::Psr, see
+// NoteGuestBlasBuilds()) do not wait for that: their slots are created, sized from the build's
+// geometries, as the guest builds them and built at the next preparation, and the walk finds them
+// in a table of the host's.
 //
 // The host memory is bounded: the readbacks list the slots each TLAS references, a slot no TLAS
 // referenced for EvictFrames frames is evicted (its table entry, acceleration structure and
@@ -100,6 +106,20 @@ public:
 	// pass.
 	void RecordHleRefit(const CommandRecorder& command, std::span<const uint64_t> blases,
 	                    std::span<const HleRefitGeometry> geometries);
+
+	// A BLAS the game built with sce::Psr (see CommandProcessor::PsrBlasDispatch()): its address
+	// and, per geometry in the build's order, its triangle count and whether it is opaque, as the
+	// game's CPU wrote them in the build's geometry table.
+	struct GuestBlasBuild {
+		uint64_t                               blas_va = 0;
+		std::vector<std::pair<uint32_t, bool>> geometries;
+	};
+	// In operation order after the guest built the BLASes of `builds`: gives each a slot laid out
+	// by primitive (each guest triangle at a position given by its geometry and triangle index, see
+	// rt_blas_walk.comp) and builds it at the next preparation, from the guest BLAS as usual. A BLAS
+	// whose build does not match the layout is given up (its slot is evicted) and from then on
+	// found and counted by the walks.
+	void NoteGuestBlasBuilds(std::span<const GuestBlasBuild> builds);
 
 	// The device address of the context table the shaders look their TLAS up in (see
 	// ContextEntry in rt_tlas_walk.comp), 0 when disabled.
@@ -200,6 +220,11 @@ private:
 		uint64_t                     last_use_frame  = 0;
 		// Released: kept in m_retired's shadow until the readbacks that may name it are gone.
 		bool                         evicted         = false;
+		// A slot of a BLAS whose build the host saw: per guest geometry, its first host primitive,
+		// triangle count and opacity (see NoteGuestBlasBuilds()), and its entry in the host table
+		// (UINT32_MAX: none; table_index is then UINT32_MAX too).
+		std::vector<std::array<uint32_t, 4>> layout;
+		uint32_t                     host_table_index = UINT32_MAX;
 	};
 
 	// Acceleration structures and buffers the GPU may still read, destroyed once the work
@@ -300,6 +325,8 @@ private:
 	std::unique_ptr<Buffer> m_verify_list;
 	std::unique_ptr<Buffer> m_changed;
 	std::unique_ptr<Buffer> m_jobs;
+	// The layouts of the builds of a preparation (see Slot::layout).
+	std::unique_ptr<Buffer> m_layouts;
 	std::unique_ptr<Buffer> m_build_scratch;
 	std::unique_ptr<Buffer> m_tlas_storage;
 	vk::AccelerationStructureKHR m_tlas         = nullptr;
@@ -351,6 +378,14 @@ private:
 	std::unordered_map<uint32_t, uint32_t> m_last_instance_counts;
 	uint32_t                  m_prepare_id          = 0;
 	uint64_t                  m_frame               = 0;
+	// The host table (see FindHostSlot in rt_tlas_walk.comp): the key of each entry, and the
+	// entries to write at the next preparation (index, key, slot + 1).
+	std::vector<uint64_t>                                 m_host_keys;
+	std::vector<std::tuple<uint32_t, uint64_t, uint32_t>> m_host_table_writes;
+	// Slots that got new memory outside a preparation: their infos are written at the next one.
+	std::vector<uint32_t>     m_moved_slots;
+	// Slots whose layout build did not match: evicted at the next preparation.
+	std::vector<uint32_t> m_give_up;
 
 };
 

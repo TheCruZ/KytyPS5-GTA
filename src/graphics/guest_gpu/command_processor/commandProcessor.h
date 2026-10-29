@@ -5,6 +5,7 @@
 #include "graphics/guest_gpu/command_processor/gpuOperation.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/psrShaders.h"
+#include "graphics/host_gpu/renderer/nativeRayTracing.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
@@ -120,6 +121,11 @@ public:
 	// is dropped.
 	bool HleBlasDispatch(uint64_t data_addr);
 	void EmitHleRefit();
+	// sce::Psr's BLAS builds, seen (not replaced) so the native ray tracing follows them (see
+	// graphicsRun.cpp).
+	void PsrBlasDispatch(uint64_t data_addr);
+	// After the dispatch that wrote it: the BLAS PsrBlasDispatch() saw built.
+	void EmitPsrBlasBuilt();
 	// The sce::Psr shader at `data_addr` (see psrShaders.h).
 	Psr::Shader ComputePsrShader(uint64_t data_addr);
 	// Reads guest memory the CP decides on (WAIT_REG_MEM, COND_EXEC, predication, branches) as a
@@ -275,6 +281,12 @@ private:
 	std::vector<HleRefitGeometryRef> m_hle_refit_geometries;
 	uint32_t                         m_hle_refit_finished = 0;
 	bool                             m_hle_refit_window   = false;
+	// The sce::Psr BLAS build in progress (see PsrBlasDispatch()): its geometry table and the
+	// geometries whose Morton codes it computed.
+	uint64_t             m_psr_blas_table = 0;
+	std::vector<uint8_t> m_psr_blas_seen;
+	// The BLAS whose last build pass is being dispatched (blas_va 0: none).
+	NativeRayTracing::GuestBlasBuild m_psr_blas_built;
 	// The sce::Psr shader of each compute shader address seen.
 	std::unordered_map<uint64_t, Psr::Shader> m_cs_psr_shaders;
 

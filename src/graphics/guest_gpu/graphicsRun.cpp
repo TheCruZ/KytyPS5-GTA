@@ -1854,8 +1854,86 @@ bool CommandProcessor::HleTlasDispatch(uint64_t data_addr) {
 	return true;
 }
 
+// Games using sce::Psr build the BLASes of their triangle geometry with
+// Psr_Gpu_BottomLevelBvh_Build, one BLAS after another, each from a geometry table the game's CPU
+// writes (120-byte srt_geometry_config entries: +0 kind, 1 = triangles; +4 flags, bit 0 opaque;
+// +8 vertex buffer V#; +24 index buffer V#, whose record count, +32, is the triangle count; +56
+// object matrix). With native ray tracing the builds still run (shaders read the guest BVH), and
+// the command processor tells NativeRayTracing about each one as it ends, so the host BLAS follows
+// it in the same frame instead of waiting for a walk to find it: psr_morton_compute_code_for_mesh_*
+// runs once per geometry (the table V# at s[0:3], its record count the geometry count, and the
+// geometry index s7) and psr_collapse_to_qbvh_simple_bottom(_with_refit) writes the BLAS (its
+// address at s[0:1], its primitive count at s14), user data of generation Base460. A build
+// whose geometries are not all triangle geometries seen by the Morton pass, or whose triangles do
+// not add up to the primitive count (split triangles), is left to the walks.
+void CommandProcessor::PsrBlasDispatch(uint64_t data_addr) {
+	if (data_addr == 0 || !m_renderer.GetNativeRayTracing().Enabled()) {
+		return;
+	}
+	using Psr::Shader;
+	const auto shader = ComputePsrShader(data_addr);
+	if (shader != Shader::MortonComputeCodeForMesh && shader != Shader::CollapseToQbvhSimpleBottom) {
+		return;
+	}
+	const auto& user = GetShCtx().GetCs().cs_user_sgpr.value;
+	// Addresses have 48 bits.
+	const auto address = [&](uint32_t sgpr) {
+		return uint64_t {user[sgpr]} | (uint64_t {user[sgpr + 1] & 0xffffu} << 32u);
+	};
+	constexpr uint32_t GeometryStride = 120;
+	constexpr uint32_t MaxGeometries  = 1024;
+	if (shader == Shader::MortonComputeCodeForMesh) {
+		const auto table = address(0);
+		const auto count = user[2];
+		if (table != m_psr_blas_table || count != m_psr_blas_seen.size()) {
+			m_psr_blas_table = count != 0 && count <= MaxGeometries ? table : 0;
+			m_psr_blas_seen.assign(m_psr_blas_table != 0 ? count : 0, 0);
+		}
+		if (user[7] < m_psr_blas_seen.size()) {
+			m_psr_blas_seen[user[7]] = 1;
+		}
+		return;
+	}
+	const auto blas       = address(0);
+	const auto primitives = user[14];
+	const auto table      = m_psr_blas_table;
+	const auto seen       = m_psr_blas_seen;
+	m_psr_blas_table      = 0;
+	m_psr_blas_seen.clear();
+	if (blas == 0 || table == 0 || std::ranges::find(seen, 0) != seen.end()) {
+		return;
+	}
+	NativeRayTracing::GuestBlasBuild build {.blas_va = blas};
+	std::vector<uint32_t>            entries(seen.size() * GeometryStride / 4);
+	ReadGuestAroundGpuWrites(table, entries.data(), entries.size() * 4);
+	uint64_t triangles = 0;
+	for (size_t g = 0; g < seen.size(); g++) {
+		const auto* entry = &entries[g * GeometryStride / 4];
+		if (entry[0] != 1) {
+			return;
+		}
+		build.geometries.emplace_back(entry[8], (entry[1] & 1u) != 0);
+		triangles += entry[8];
+	}
+	if (triangles != primitives) {
+		return;
+	}
+	m_psr_blas_built = std::move(build);
+}
+
+void CommandProcessor::EmitPsrBlasBuilt() {
+	if (m_psr_blas_built.blas_va == 0) {
+		return;
+	}
+	EmitHostCommand([this, build = std::move(m_psr_blas_built)] {
+		m_renderer.GetNativeRayTracing().NoteGuestBlasBuilds(std::span(&build, 1));
+	});
+	m_psr_blas_built = {};
+}
+
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
+	PsrBlasDispatch(GetShCtx().GetCs().cs_regs.data_addr);
 	if (HleTlasDispatch(GetShCtx().GetCs().cs_regs.data_addr) ||
 	    HleBlasDispatch(GetShCtx().GetCs().cs_regs.data_addr)) {
 		return;
@@ -1867,6 +1945,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 	                      .thread_group_z = thread_group_z,
 	                      .mode           = mode};
 	Emit(std::move(operation));
+	EmitPsrBlasBuilt();
 }
 
 void CommandProcessor::ExecuteDispatchDirect(const GpuOperation& operation, uint32_t thread_group_x,
@@ -1899,6 +1978,7 @@ void CommandProcessor::ExecuteDispatchDirect(const GpuOperation& operation, uint
 }
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
+	PsrBlasDispatch(GetShCtx().GetCs().cs_regs.data_addr);
 	if (HleTlasDispatch(GetShCtx().GetCs().cs_regs.data_addr) ||
 	    HleBlasDispatch(GetShCtx().GetCs().cs_regs.data_addr)) {
 		return;
@@ -1908,6 +1988,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	auto operation     = MakeOperation(GpuOperationKind::DispatchIndirect);
 	operation.dispatch = {.mode = mode, .args_addr = args_addr};
 	Emit(std::move(operation));
+	EmitPsrBlasBuilt();
 }
 
 void CommandProcessor::ExecuteDispatchIndirect(const GpuOperation& operation) {
