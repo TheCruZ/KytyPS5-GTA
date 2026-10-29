@@ -462,8 +462,11 @@ public:
 		}
 		ForwardPrivateLds();
 		FoldBoundedLoopSelectors();
+		// The planning passes add no memory operations, but dead code elimination removes some.
+		m_memory_index_uses.clear();
 		PlanScalarReads();
 		EliminateDeadCode(m_program.blocks);
+		m_memory_index_uses.clear();
 		PlanIndirectDescriptors();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
@@ -684,13 +687,13 @@ private:
 		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi || m_native_cfg.blocks.empty())
 			return value;
 		std::vector<const Inst*> candidates;
-		std::vector<const Inst*> visited;
+		// A set: inlined calls merge registers in Phi webs of thousands of nodes.
+		std::unordered_set<const Inst*> visited;
 		std::vector<const Inst*> pending {phi};
 		while (!pending.empty()) {
 			const auto* inst = pending.back();
 			pending.pop_back();
-			if (std::ranges::find(visited, inst) != visited.end()) continue;
-			visited.push_back(inst);
+			if (!visited.insert(inst).second) continue;
 			if (inst->GetOpcode() == ValueOpcode::Phi) {
 				for (size_t i = 0; i < inst->NumArgs(); ++i) {
 					const auto* arg = inst->Arg(i).Resolve().TryInstruction();
