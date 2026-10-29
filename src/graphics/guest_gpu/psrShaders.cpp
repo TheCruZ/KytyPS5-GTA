@@ -333,7 +333,8 @@ static Shader IdentifyShaderCode(uint64_t code_address) {
 		LOGF("Psr: library generation %s (shaders recognized by their code)%s\n",
 		     GenerationName(match.generation),
 		     match.generation == Generation::Base252
-		         ? ": its BLAS refits are replaced, its BLAS and top level builds are emulated"
+		         ? ": its BLAS refits and top level builds are replaced, its BLAS builds are emulated "
+		           "and followed"
 		         : "");
 	} else if (known != match.generation) {
 		return Shader::None;

@@ -7,6 +7,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pssr.h"
 #include "graphics/guest_gpu/psrShaders.h"
+#include "graphics/host_gpu/renderer/nativeRayTracing.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
@@ -126,6 +127,11 @@ public:
 	// is dropped.
 	bool HleBlasDispatch(uint64_t data_addr);
 	void EmitHleRefit();
+	// sce::Psr's BLAS builds, seen (not replaced) so the native ray tracing follows them (see
+	// graphicsRun.cpp).
+	void PsrBlasDispatch(uint64_t data_addr);
+	// After the dispatch that wrote it: the BLAS PsrBlasDispatch() saw built.
+	void EmitPsrBlasBuilt();
 	// The sce::Psr shader at `data_addr` (see psrShaders.h).
 	Psr::Shader ComputePsrShader(uint64_t data_addr);
 	// Reads guest memory the CP decides on (WAIT_REG_MEM, COND_EXEC, predication, branches) as a
