@@ -7,6 +7,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/shader/shaderBindings.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -85,6 +86,38 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_texture_cache.FlushLazyReadback(fault_vaddr, fault_size);
 	}
 	return true;
+}
+
+void RenderContext::WriteFromCompletion(void* destination, const void* data,
+                                        uint64_t size) noexcept {
+	const auto vaddr = reinterpret_cast<uint64_t>(destination);
+	// Through the backing store the bytes never fault, even on a page the execution thread
+	// hands back to the GPU while the completion runs. The caches then learn of the write as from
+	// a write fault, except that pages the GPU owns stay GPU-owned (a readback of them downloads
+	// only the bytes the GPU wrote).
+	if (GuestRange {vaddr, size}.Valid() && LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+		const auto page_size = m_page_manager.GetPageSize();
+		for (auto page = vaddr & ~(page_size - 1); page < vaddr + size; page += page_size) {
+			if (m_page_manager.IsWatched(page)) {
+				m_buffer_cache.InvalidateUnlessGpuModified(vaddr, size);
+				m_texture_cache.InvalidateMemory(vaddr, size);
+				m_image_heap.InvalidateMemory(vaddr, size);
+				break;
+			}
+		}
+		return;
+	}
+	if (size == sizeof(uint32_t)) {
+		uint32_t value = 0;
+		std::memcpy(&value, data, sizeof(value));
+		*static_cast<volatile uint32_t*>(destination) = value;
+	} else if (size == sizeof(uint64_t)) {
+		uint64_t value = 0;
+		std::memcpy(&value, data, sizeof(value));
+		*static_cast<volatile uint64_t*>(destination) = value;
+	} else {
+		std::memcpy(destination, data, size);
+	}
 }
 
 void RenderContext::PrepareGpuWrite(const void* destination, uint64_t size) noexcept {

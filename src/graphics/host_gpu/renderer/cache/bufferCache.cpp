@@ -335,6 +335,12 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
+void BufferCache::InvalidateUnlessGpuModified(uint64_t vaddr, uint64_t size) noexcept {
+	if (GuestRange {vaddr, size}.Valid()) {
+		m_memory_tracker.InvalidateRegion(vaddr, size, [] {});
+	}
+}
+
 void BufferCache::InvalidateFaultedPage(uint64_t vaddr) {
 	// The guest fills its streaming memory (vertex and constant rings) upwards, and every page it
 	// writes under a cached buffer takes a fault: thousands per frame, each a system call to drop
