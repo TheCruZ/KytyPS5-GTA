@@ -132,7 +132,7 @@ static uint64_t GetHostThreadId() {
 }
 #endif
 
-static uint64_t KernelReadTscNative() {
+static uint64_t KernelHostTsc() {
 #if defined(_M_X64) || defined(__x86_64__)
 	return __rdtsc();
 #else
@@ -140,7 +140,7 @@ static uint64_t KernelReadTscNative() {
 #endif
 }
 
-static uint64_t KernelGetTscFrequencyNative() {
+static uint64_t KernelHostTscFrequency() {
 	static const uint64_t frequency = [] {
 #if defined(_M_X64) || defined(__x86_64__)
 		const auto host_frequency = Common::Timer::QueryPerformanceFrequency();
@@ -148,15 +148,15 @@ static uint64_t KernelGetTscFrequencyNative() {
 			return uint64_t {1000000000};
 		}
 
-		KernelReadTscNative();
+		KernelHostTsc();
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
-		KernelReadTscNative();
+		KernelHostTsc();
 
 		const auto host_start = Common::Timer::QueryPerformanceCounter();
-		const auto tsc_start  = KernelReadTscNative();
+		const auto tsc_start  = KernelHostTsc();
 		std::this_thread::sleep_for(std::chrono::milliseconds(100));
 		const auto host_end = Common::Timer::QueryPerformanceCounter();
-		const auto tsc_end  = KernelReadTscNative();
+		const auto tsc_end  = KernelHostTsc();
 
 		const auto host_delta = host_end - host_start;
 		const auto tsc_delta  = tsc_end - tsc_start;
@@ -178,6 +178,24 @@ static uint64_t KernelGetTscFrequencyNative() {
 	}();
 
 	return frequency;
+}
+
+// Games convert sceKernelReadTsc() ticks to time with the rate of the console they were made for, not with
+// sceKernelGetTscFrequency(): Red Dead Redemption multiplies the ticks by a constant of 1/1594.02 per
+// microsecond, i.e. a counter of about 1.594 GHz, so a host counter at 3.7 GHz made its frame time 2.3
+// times too long and the whole game ran up to 2.3 times too fast (its step is clamped to 50 ms, which
+// hid it at low fps). Present a counter at that rate to the guest, whatever the host runs at.
+static constexpr uint64_t GUEST_TSC_FREQUENCY = 1594000000;
+
+static uint64_t KernelReadTscNative() {
+	const auto host      = KernelHostTsc();
+	const auto frequency = KernelHostTscFrequency();
+	// Whole seconds and the remainder apart so that the product cannot overflow 64 bits.
+	return (host / frequency) * GUEST_TSC_FREQUENCY + (host % frequency) * GUEST_TSC_FREQUENCY / frequency;
+}
+
+static uint64_t KernelGetTscFrequencyNative() {
+	return GUEST_TSC_FREQUENCY;
 }
 
 static uint64_t KernelGetInitialTsc() {
