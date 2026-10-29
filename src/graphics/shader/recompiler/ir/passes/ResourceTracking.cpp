@@ -456,14 +456,21 @@ public:
 		m_shader_writes = HasShaderMemoryWrites(program);
 	}
 
+	// Owner of each memory metadata index (SharedMemoryIndex for several), see MemoryIndexBelongsTo().
+	static inline const Inst         SharedMemoryIndex {ValueOpcode::Void};
+	mutable std::vector<const Inst*> m_memory_owners;
+	mutable bool                     m_memory_owners_valid = false;
+
 	void Run() {
 		if (m_program.resource_tracking_complete) {
 			Fail(0, "resources already tracked");
 		}
 		ForwardPrivateLds();
 		FoldBoundedLoopSelectors();
+		m_memory_owners_valid = false;
 		PlanScalarReads();
 		EliminateDeadCode(m_program.blocks);
+		m_memory_owners_valid = false;
 		PlanIndirectDescriptors();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
@@ -679,13 +686,13 @@ private:
 		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi || m_native_cfg.blocks.empty())
 			return value;
 		std::vector<const Inst*> candidates;
-		std::vector<const Inst*> visited;
+		// A set: inlined calls merge registers in Phi webs of thousands of nodes.
+		std::unordered_set<const Inst*> visited;
 		std::vector<const Inst*> pending {phi};
 		while (!pending.empty()) {
 			const auto* inst = pending.back();
 			pending.pop_back();
-			if (std::ranges::find(visited, inst) != visited.end()) continue;
-			visited.push_back(inst);
+			if (!visited.insert(inst).second) continue;
 			if (inst->GetOpcode() == ValueOpcode::Phi) {
 				for (size_t i = 0; i < inst->NumArgs(); ++i) {
 					const auto* arg = inst->Arg(i).Resolve().TryInstruction();
@@ -1223,22 +1230,28 @@ private:
 		           : nullptr;
 	}
 
+	// Whether no memory operation but owner uses the metadata index. The operations of each
+	// index are found once per pass (the planning passes add no memory operations); scanning the
+	// program for each read made the tracking of large inlined shaders take minutes.
 	bool MemoryIndexBelongsTo(uint32_t index, const Inst& owner) const {
-		for (const auto* block: m_program.blocks) {
-			for (const auto& inst: *block) {
-				const auto op = inst.GetOpcode();
-				if ((BufferAccessOf(op) == BufferAccess::None &&
-				     AddressOpcodeInfoOf(op).access == AddressAccess::None &&
-				     ImageOpcodeInfoOf(op).access == ImageAccess::None) ||
-				    &inst == &owner) {
-					continue;
-				}
-				if (inst.Flags<MemoryFlags>().index == index) {
-					return false;
+		if (!m_memory_owners_valid) {
+			m_memory_owners.assign(m_program.memory_info.size(), nullptr);
+			for (const auto* block: m_program.blocks) {
+				for (const auto& inst: *block) {
+					const auto op = inst.GetOpcode();
+					if (BufferAccessOf(op) == BufferAccess::None &&
+					    AddressOpcodeInfoOf(op).access == AddressAccess::None &&
+					    ImageOpcodeInfoOf(op).access == ImageAccess::None) continue;
+					const auto used = inst.Flags<MemoryFlags>().index;
+					if (used >= m_memory_owners.size()) m_memory_owners.resize(used + 1u, nullptr);
+					auto& entry = m_memory_owners[used];
+					entry = entry == nullptr ? &inst : &SharedMemoryIndex;
 				}
 			}
+			m_memory_owners_valid = true;
 		}
-		return true;
+		const auto* entry = index < m_memory_owners.size() ? m_memory_owners[index] : nullptr;
+		return entry == nullptr || entry == &owner;
 	}
 
 	bool MakeRuntimeTableSource(const Inst& read, DescriptorSource& descriptor) {
