@@ -6,6 +6,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pssr.h"
 #include "graphics/guest_gpu/psrShaders.h"
+#include "graphics/host_gpu/renderer/nativeRayTracing.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
@@ -127,6 +128,11 @@ public:
 	// is dropped.
 	bool HleBlasDispatch(uint64_t data_addr);
 	void EmitHleRefit();
+	// sce::Psr's BLAS builds, seen (not replaced) so the native ray tracing follows them (see
+	// graphicsRun.cpp).
+	void PsrBlasDispatch(uint64_t data_addr);
+	// After the dispatch that wrote it: the BLAS PsrBlasDispatch() saw built.
+	void EmitPsrBlasBuilt();
 	// The sce::Psr shader at `data_addr` (see psrShaders.h).
 	Psr::Shader ComputePsrShader(uint64_t data_addr);
 	// Reads guest memory the CP decides on (WAIT_REG_MEM, COND_EXEC, predication, branches) as a
@@ -282,6 +288,20 @@ private:
 	std::vector<HleRefitGeometryRef> m_hle_refit_geometries;
 	uint32_t                         m_hle_refit_finished = 0;
 	bool                             m_hle_refit_window   = false;
+	// The sce::Psr BLAS builds in progress (see PsrBlasDispatch()), by the address of their scratch
+	// memory: the geometry table and the geometries whose Morton codes the build computed.
+	struct PsrBlasBuildState {
+		uint64_t             table = 0;
+		std::vector<uint8_t> seen;
+	};
+	std::unordered_map<uint64_t, PsrBlasBuildState> m_psr_blas_builds;
+	// The sizes of the memory the last builds captured, by address, and the BLAS whose
+	// decompression pass is being dispatched (address 0: none) with the size of its memory.
+	std::unordered_map<uint64_t, uint32_t> m_psr_captured;
+	uint64_t                               m_psr_decompressed      = 0;
+	uint32_t                               m_psr_decompressed_size = 0;
+	// The BLAS whose last build pass is being dispatched (blas_va 0: none).
+	NativeRayTracing::GuestBlasBuild m_psr_blas_built;
 	// The sce::Psr shader of each compute shader address seen.
 	std::unordered_map<uint64_t, Psr::Shader> m_cs_psr_shaders;
 
