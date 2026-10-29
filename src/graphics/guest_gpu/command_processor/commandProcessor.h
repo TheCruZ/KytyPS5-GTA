@@ -234,6 +234,8 @@ private:
 	bool     m_predicate_skip = false;
 	// A ZPASS predication waits for host occlusion query results it asked for.
 	bool     m_occlusion_wait_requested = false;
+	// RELEASE_MEM labels queued behind occlusion counters and not written yet.
+	std::atomic<uint32_t> m_deferred_labels {0};
 	// A WAIT_REG_MEM was processed since the last operation was made.
 	bool m_wait_since_operation = false;
 	// An ACQUIRE_MEM since the last operation.

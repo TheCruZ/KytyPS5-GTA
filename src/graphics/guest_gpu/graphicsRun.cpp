@@ -1807,6 +1807,46 @@ void CommandProcessor::ExecuteReleaseMem(uint32_t data_sel, bool interrupt, void
 			std::memcpy(address, value, size);
 		}
 	};
+	// Occlusion counters reach guest memory in a priority completion once the GPU got past
+	// their dump. A label released after a dump tells the guest that the counters are there: GTA
+	// San Andreas DE writes one into every query object after its end dump and reads the query
+	// once it is set. On the console the label lands after the counters, so it goes behind them
+	// through the same completions instead of being written now. Labels keep their order: while
+	// a deferred label is not written yet, later ones follow it through the completions too.
+	// EOP interrupts always go through the priority completions, so they stay in order as well.
+	if (data_sel != 0 && (m_renderer.GetOcclusionQueries().HasPendingDumps() ||
+	                      m_deferred_labels.load(std::memory_order_acquire) != 0)) {
+		const auto     vaddr = reinterpret_cast<uint64_t>(address);
+		const uint64_t size  = data_sel == 1 ? sizeof(uint32_t) : sizeof(uint64_t);
+		if (data_sel <= 3 && GuestRange {vaddr, size}.Valid() &&
+		    !m_renderer.GetBufferCache().IsRegionGpuModified(vaddr, size)) {
+			m_renderer.PrepareGpuWrite(address, size);
+			m_deferred_labels.fetch_add(1, std::memory_order_relaxed);
+			GetScheduler().DeferPriorityOperation(
+			    [this, address, data, data_sel] {
+				    if (data_sel == 1) {
+					    *static_cast<volatile uint32_t*>(address) = static_cast<uint32_t>(data);
+				    } else {
+					    *static_cast<volatile uint64_t*>(address) =
+					        data_sel == 3 ? Sync::ReadReferenceClock() : data;
+				    }
+				    m_deferred_labels.fetch_sub(1, std::memory_order_release);
+			    },
+			    vaddr, size);
+			if (interrupt) {
+				DeferEopInterrupt(interrupt_context_id);
+			}
+			return;
+		}
+		// A label that cannot be deferred (GPU-written memory, GDS) behind deferred ones waits
+		// until the GPU and the completions queued before it, those labels included, have run.
+		if (m_deferred_labels.load(std::memory_order_acquire) != 0) {
+			auto&      scheduler = GetScheduler();
+			const auto tick      = scheduler.CurrentTick();
+			scheduler.Wait(tick);
+			scheduler.WaitPriorityOperations(tick);
+		}
+	}
 	// EndOfPipeData: kNone, kImmediate32b, kImmediate64b, kRefClk; 5 reads GDS.
 	switch (data_sel) {
 		case 0: break;
