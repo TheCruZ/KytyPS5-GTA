@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <deque>
+#include <mutex>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -115,12 +116,14 @@ private:
 
 } // namespace OcclusionCounters
 
-// Host occlusion queries behind the guest's ZPASS_DONE counters. Everything runs on the GPU
-// execution thread, in operation order: Vulkan occlusion queries are active only inside render
-// pass instances (they never split one), and the counters reach guest memory once the GPU is
-// known to have finished the queries (checked at dumps and, with a fresh GPU tick, once per
-// frame). Only at a flip, and only while the GPU is more than a frame behind, the execution
-// thread waits for it: the counters of a frame reach guest memory by the next frame's flip.
+// Host occlusion queries behind the guest's ZPASS_DONE counters. Queries and dumps are recorded
+// on the GPU execution thread, in operation order: Vulkan occlusion queries are active only inside
+// render pass instances (they never split one). As on the console, a dump's counters reach guest
+// memory when the GPU finishes the work before it: a priority completion queued with the dump
+// writes them, in dump order and ahead of any later completion that tells the guest the GPU got
+// there (a suspend point, a flip). The execution thread also publishes the dumps it finds
+// finished, and at a flip, while the GPU is more than a frame behind, waits for it: the counters
+// of a frame reach guest memory by the next frame's flip.
 class OcclusionQueries {
 public:
 	explicit OcclusionQueries(RenderContext& context);
@@ -140,12 +143,15 @@ public:
 	// earlier frames.
 	void OnFrame();
 	// Publishes the dumps of command buffers the GPU finished; `refresh` queries the GPU's
-	// progress first (a driver call).
+	// progress first (a driver call). Any thread.
 	void PublishCompleted(bool refresh);
 	// The guest unmaps [address, address + size): pending dumps there are not written.
 	void OnUnmap(uint64_t address, uint64_t size);
 	// Whether a dump waits for the GPU before its counters reach guest memory.
-	[[nodiscard]] bool HasPendingDumps() const noexcept { return !m_pending.empty(); }
+	[[nodiscard]] bool HasPendingDumps() const {
+		std::lock_guard lock(m_mutex);
+		return !m_pending.empty();
+	}
 	// Whether the samples of the draws recorded now reach a guest occlusion counter.
 	[[nodiscard]] bool Counting() const noexcept { return Enabled() && m_segments.Counting(); }
 
@@ -167,12 +173,15 @@ private:
 	vk::Device                  m_device = nullptr;
 	vk::QueryPool               m_pool   = nullptr;
 	vk::QueryControlFlags       m_control;
-	OcclusionCounters::Segments m_segments;
 	bool                        m_rendering    = false;
 	bool                        m_query_active = false;
 	uint32_t                    m_active_slot  = 0;
 	uint64_t                    m_frame        = 0;
-	uint64_t                    m_total        = 0;
+	// The execution thread records dumps and the priority completions publish them: the pending
+	// dumps, the running total, the result scratch and the slots published dumps release.
+	mutable std::mutex          m_mutex;
+	OcclusionCounters::Segments m_segments;
+	uint64_t                    m_total = 0;
 	std::deque<PendingDump>     m_pending;
 	std::vector<uint64_t>       m_results;
 };
