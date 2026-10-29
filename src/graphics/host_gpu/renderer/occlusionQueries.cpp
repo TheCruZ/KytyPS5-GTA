@@ -4,9 +4,11 @@
 #include "common/hackNotice.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "kernel/memory.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -55,8 +57,11 @@ OcclusionQueries::~OcclusionQueries() {
 
 void OcclusionQueries::BeginQuery(const CommandRecorder& recorder) {
 	EXIT_IF(m_query_active || !m_rendering);
-	if (!m_segments.AllocateSlot(m_active_slot)) {
-		return;
+	{
+		std::lock_guard lock(m_mutex);
+		if (!m_segments.AllocateSlot(m_active_slot)) {
+			return;
+		}
 	}
 	recorder.beginQuery(m_pool, m_active_slot, m_control);
 	m_query_active = true;
@@ -96,9 +101,12 @@ void OcclusionQueries::OnFrame() {
 	// frame of the water without reflections and waves. Wait for the GPU to finish the
 	// dumps of earlier frames before this frame's flip (it usually already has).
 	uint64_t tick = 0;
-	for (const auto& pending: m_pending) {
-		if (pending.frame < m_frame) {
-			tick = std::max(tick, pending.tick);
+	{
+		std::lock_guard lock(m_mutex);
+		for (const auto& pending: m_pending) {
+			if (pending.frame < m_frame) {
+				tick = std::max(tick, pending.tick);
+			}
 		}
 	}
 	auto& scheduler = m_context.GetCommandScheduler();
@@ -110,7 +118,8 @@ void OcclusionQueries::OnFrame() {
 }
 
 void OcclusionQueries::PublishCompleted(bool refresh) {
-	auto& master = m_context.GetCommandScheduler().GetMasterSemaphore();
+	auto&           master = m_context.GetCommandScheduler().GetMasterSemaphore();
+	std::lock_guard lock(m_mutex);
 	while (!m_pending.empty()) {
 		if (!master.IsFree(m_pending.front().tick)) {
 			if (!refresh) {
@@ -127,6 +136,7 @@ void OcclusionQueries::PublishCompleted(bool refresh) {
 }
 
 void OcclusionQueries::OnUnmap(uint64_t address, uint64_t size) {
+	std::lock_guard lock(m_mutex);
 	for (auto& pending: m_pending) {
 		if (pending.dump.address < address + size &&
 		    address < pending.dump.address + OcclusionCounters::DumpSize) {
@@ -137,13 +147,35 @@ void OcclusionQueries::OnUnmap(uint64_t address, uint64_t size) {
 
 void OcclusionQueries::Dump(CommandScheduler& scheduler, uint64_t address) {
 	EXIT_IF(m_pool == nullptr);
+	// The counters reach memory in a completion, which cannot read memory back: bytes earlier GPU
+	// work wrote under them are read back now, as for a label (see ExecuteReleaseMem()). The
+	// readback may end the render pass, and with it the active query, before the code below.
+	if (GuestRange {address, OcclusionCounters::DumpSize}.Valid() &&
+	    m_context.GetBufferCache().HasGpuDirtyBytes(address, OcclusionCounters::DumpSize)) {
+		m_context.PrepareGpuWrite(reinterpret_cast<const void*>(address), OcclusionCounters::DumpSize);
+	}
 	auto&      buffer   = scheduler.Current();
 	const auto recorder = buffer.Handle();
 	if (m_query_active) {
 		EndQuery(recorder);
 	}
-	m_pending.push_back(
-	    {.dump = m_segments.OnDump(address), .tick = scheduler.CurrentTick(), .frame = m_frame});
+	const auto tick = scheduler.CurrentTick();
+	{
+		std::lock_guard lock(m_mutex);
+		m_pending.push_back({.dump = m_segments.OnDump(address), .tick = tick, .frame = m_frame});
+	}
+	// The GPU writes the counters when it gets past the dump. Queued now, the completion runs
+	// before those of any later operation: a guest that learns the GPU finished this work (a
+	// suspend point, a flip) finds them in memory, as on the console. One completion per command
+	// buffer publishes all of its dumps (ASTRO BOT dumps ~10,000 times a frame, one per object):
+	// a completion per dump made the execution thread queue and track 10,000 operations a frame.
+	// An unmap of counters a later dump of the command buffer wrote does not wait for it: the
+	// unmap drops their publication instead (OnUnmap()).
+	if (tick != m_completion_tick) {
+		m_completion_tick = tick;
+		scheduler.DeferPriorityOperation([this] { PublishCompleted(true); }, address,
+		                                 OcclusionCounters::DumpSize);
+	}
 	PublishCompleted(false);
 	if (m_segments.Counting() && buffer.IsRendering()) {
 		EXIT_IF(!m_rendering);
@@ -201,11 +233,13 @@ void OcclusionQueries::Publish(const PendingDump& pending) {
 	if (!pending.write) {
 		return;
 	}
-	// DB 0 last: once its ready bit is visible, the other DBs are too.
-	auto* counters = reinterpret_cast<volatile uint64_t*>(dump.address);
+	// DB 0 last: once its ready bit is visible, the other DBs are too. Dump() read back the
+	// GPU-written bytes under the counters; later GPU work may own the pages again.
 	for (uint32_t db = OcclusionCounters::DbCount; db-- > 0;) {
-		counters[db * (OcclusionCounters::DbStride / sizeof(uint64_t))] =
-		    OcclusionCounters::DbValue(db, m_total);
+		const auto value = OcclusionCounters::DbValue(db, m_total);
+		m_context.WriteFromCompletion(
+		    reinterpret_cast<void*>(dump.address + db * OcclusionCounters::DbStride), &value,
+		    sizeof(value));
 	}
 }
 
