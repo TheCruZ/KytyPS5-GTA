@@ -28,6 +28,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -866,6 +867,33 @@ void ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info) {
 	     info.tg_size_en ? "true" : "false");
 	LOGF("\t threadgroup_id     = {%s, %s, %s}\n", info.group_id[0] ? "true" : "false",
 	     info.group_id[1] ? "true" : "false", info.group_id[2] ? "true" : "false");
+}
+
+// Registered names by address. The names are interned and never released, so the pointers
+// ShaderRegisteredName() returns stay valid (a game registers a bounded set of names).
+static std::mutex                                g_registered_names_mutex;
+static std::unordered_set<std::string>           g_registered_name_strings;
+static std::unordered_map<uint64_t, const char*> g_registered_names;
+
+void ShaderSetRegisteredName(uint64_t addr, const char* name) {
+	std::scoped_lock lock(g_registered_names_mutex);
+	if (name == nullptr) {
+		g_registered_names.erase(addr);
+		return;
+	}
+	const auto [iter, inserted] = g_registered_name_strings.emplace(name);
+	g_registered_names[addr]    = iter->c_str();
+}
+
+const char* ShaderRegisteredName(uint64_t addr) {
+	std::scoped_lock lock(g_registered_names_mutex);
+	const auto       iter = g_registered_names.find(addr);
+	return iter != g_registered_names.end() ? iter->second : nullptr;
+}
+
+bool ShaderNameRegistered(const char* name) {
+	std::scoped_lock lock(g_registered_names_mutex);
+	return name != nullptr && g_registered_name_strings.contains(name);
 }
 
 } // namespace Libs::Graphics
