@@ -19,6 +19,10 @@
 
 namespace Libs::Graphics {
 
+namespace ShaderRecompiler::IR {
+struct ShaderInfo;
+} // namespace ShaderRecompiler::IR
+
 class BufferCache;
 class CommandRecorder;
 class CommandScheduler;
@@ -72,8 +76,9 @@ public:
 		uint32_t header_offset = 0;
 		uint32_t root          = 0;
 	};
-	// The source of a shader that traces through a guest TLAS, or null.
-	[[nodiscard]] static const TlasSource* FindTlasSource(uint64_t shader_hash) noexcept;
+	// The source of a program that traces through a guest TLAS (its info), or false.
+	[[nodiscard]] static bool FindTlasSource(const ShaderRecompiler::IR::ShaderInfo& info,
+	                                         TlasSource& source) noexcept;
 
 	// Records, before the dispatch, the walk of the guest TLAS whose header the 64-bit value at
 	// `user_pointer + source.header_offset` points to, the builds of pending BLASes and the TLAS

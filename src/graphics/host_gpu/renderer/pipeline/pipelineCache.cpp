@@ -82,11 +82,11 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
 	}
 }
 
-// Programs with the native ray tracing patch (see RayTracingPatch.h) differ from the stored
-// software ones: they get their own program keys.
-void AppendNativeRayTracingKey(ShaderType stage, uint64_t hash, std::vector<uint32_t>& key) {
-	if (stage == ShaderType::Compute && NativeRayTracing::PatchShaders() &&
-	    ShaderRecompiler::Decoder::FindRayTracingPatch(hash) != nullptr) {
+// Compute programs compiled with the native ray tracing patching on (see RayTracingPatch.h: the
+// compiler patches the ones whose traversal loops it recognizes) differ from the stored software
+// ones: they get their own program keys.
+void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key) {
+	if (stage == ShaderType::Compute && NativeRayTracing::PatchShaders()) {
 		key.push_back(0x52545041u);
 	}
 }
@@ -582,7 +582,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	m_lookup_key.hash            = params.hash;
 	m_lookup_key.user_data_count = params.user_data_count;
 	BuildStageStaticKey(input_info, m_lookup_key.static_state);
-	AppendNativeRayTracingKey(options.stage, params.hash, m_lookup_key.static_state);
+	AppendNativeRayTracingKey(options.stage, m_lookup_key.static_state);
 	auto entry = m_program_cache.find(m_lookup_key);
 	const auto bind = [&](const ShaderModule& module) {
 		input_info.stage = {.module = &module, .resources = &entry->second.resources};
@@ -1153,7 +1153,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	m_ahead_key.hash            = params.hash;
 	m_ahead_key.user_data_count = params.user_data_count;
 	BuildStageStaticKey(input_info, m_ahead_key.static_state);
-	AppendNativeRayTracingKey(m_ahead_key.stage, params.hash, m_ahead_key.static_state);
+	AppendNativeRayTracingKey(m_ahead_key.stage, m_ahead_key.static_state);
 	const auto entry = m_program_cache.find(m_ahead_key);
 	if (entry == m_program_cache.end() && ahead.stages != ProgramResolution::MaxStages) {
 		QueueCompile(params, input_info, push_data_cursor, nullptr);

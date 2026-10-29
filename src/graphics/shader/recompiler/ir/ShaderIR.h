@@ -641,6 +641,11 @@ struct ShaderInfo {
 	// Native ray tracing: ray query pseudo-instructions and the sites they belong to.
 	bool                            ray_query                     = false;
 	uint32_t                        ray_query_sites               = 0;
+	// Its guest TLAS: the header address is the 64-bit value at user data pointer
+	// `ray_query_user_sgpr` + `ray_query_header_offset`, the root node `ray_query_root`.
+	uint32_t                        ray_query_user_sgpr           = 0;
+	uint32_t                        ray_query_header_offset       = 0;
+	uint32_t                        ray_query_root                = 0;
 	bool                            subgroup_ballot               = false;
 	bool                            subgroup_vote                 = false;
 	bool                            subgroup_barrier              = false;

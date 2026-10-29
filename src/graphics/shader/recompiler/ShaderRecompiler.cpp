@@ -607,11 +607,12 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 	} else {
 		Decoder::DecodeProgram(code, source.decoded);
 		if (options.native_ray_tracing) {
-			if (const auto* patch = Decoder::FindRayTracingPatch(options.shader_hash);
-			    patch != nullptr && Decoder::ApplyRayTracingPatch(*patch, source.decoded)) {
+			Decoder::RayTracingPatch patch;
+			if (Decoder::DeriveRayTracingPatch(source.decoded, patch) &&
+			    Decoder::ApplyRayTracingPatch(patch, source.decoded)) {
 				LOGF("%s native ray tracing patch: hash=0x%016" PRIx64 " sites=%" PRIu64 "\n",
 				     StageName(options.stage), options.shader_hash,
-				     static_cast<uint64_t>(patch->sites.size()));
+				     static_cast<uint64_t>(patch.sites.size()));
 			}
 		}
 	}
@@ -844,6 +845,12 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " IR TranslateProgram\n", stage,
 	     options.shader_hash);
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
+	// The TLAS of the native ray tracing patch (see NativeRayTracing::FindTlasSource()).
+	if (decoded.ray_tracing_source.valid) {
+		ir.info.ray_query_user_sgpr     = decoded.ray_tracing_source.user_sgpr;
+		ir.info.ray_query_header_offset = decoded.ray_tracing_source.header_offset;
+		ir.info.ray_query_root          = decoded.ray_tracing_source.root;
+	}
 	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     stage, options.shader_hash,

@@ -417,12 +417,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	auto              vk_buffer        = buffer.Handle();
 	if (auto& native_rt = m_context.GetNativeRayTracing(); native_rt.Enabled()) {
-		if (const auto* source = NativeRayTracing::FindTlasSource(program.shader_hash);
-		    source != nullptr) {
+		if (NativeRayTracing::TlasSource source; NativeRayTracing::FindTlasSource(program.info, source)) {
 			const auto& user = cs_regs.cs_user_sgpr.value;
 			const auto  pointer =
-			    uint64_t {user[source->user_sgpr]} | (uint64_t {user[source->user_sgpr + 1]} << 32u);
-			native_rt.Prepare(vk_buffer, pointer, *source, m_context.GetGpu().GetFrameNum());
+			    uint64_t {user[source.user_sgpr]} | (uint64_t {user[source.user_sgpr + 1]} << 32u);
+			native_rt.Prepare(vk_buffer, pointer, source, m_context.GetGpu().GetFrameNum());
 		}
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,

@@ -10,7 +10,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
-#include "graphics/shader/recompiler/frontend/decode/RayTracingPatch.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
 #include <atomic>
@@ -326,15 +326,14 @@ bool NativeRayTracing::PatchShaders() noexcept {
 	return g_device_support.load(std::memory_order_relaxed);
 }
 
-const NativeRayTracing::TlasSource* NativeRayTracing::FindTlasSource(uint64_t shader_hash) noexcept {
-	// Only the shaders the recompiler patches trace through the host structures.
-	static thread_local TlasSource source;
-	const auto* patch = ShaderRecompiler::Decoder::FindRayTracingPatch(shader_hash);
-	if (patch == nullptr || !PatchShaders()) {
-		return nullptr;
+bool NativeRayTracing::FindTlasSource(const ShaderRecompiler::IR::ShaderInfo& info,
+                                      TlasSource& source) noexcept {
+	// Only the programs the recompiler patched trace through the host structures.
+	if (!info.ray_query || !PatchShaders()) {
+		return false;
 	}
-	source = {patch->user_sgpr, patch->header_offset, patch->root};
-	return &source;
+	source = {info.ray_query_user_sgpr, info.ray_query_header_offset, info.ray_query_root};
+	return true;
 }
 
 NativeRayTracing::Allocation NativeRayTracing::Arena::Allocate(uint64_t size, uint64_t alignment) {
