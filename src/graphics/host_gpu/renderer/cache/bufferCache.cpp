@@ -325,12 +325,13 @@ BufferCache::~BufferCache() {
 	m_buffers.clear();
 }
 
-void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size, bool guest_fault) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
-	m_memory_tracker.InvalidateRegion(vaddr, size,
-	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
+	m_memory_tracker.InvalidateRegion(vaddr, size, [this, vaddr, size, guest_fault] {
+		ReadMemory(vaddr, size, true, guest_fault);
+	});
 }
 
 void BufferCache::InvalidateFaultedPage(uint64_t vaddr) {
@@ -347,13 +348,13 @@ void BufferCache::InvalidateFaultedPage(uint64_t vaddr) {
 	if (page >= TRACKER_PAGE_SIZE && GuestRange {page - TRACKER_PAGE_SIZE, end - page}.Valid() &&
 	    m_memory_tracker.IsRegionCpuModified(page - TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE) &&
 	    !m_memory_tracker.IsRegionGpuModified(page, end - page)) {
-		InvalidateMemory(page, end - page);
+		InvalidateMemory(page, end - page, true);
 		return;
 	}
-	InvalidateMemory(vaddr, 1);
+	InvalidateMemory(vaddr, 1, true);
 }
 
-void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool guest_fault) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
@@ -363,19 +364,65 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	// writes once the work before it executed: the operations queued since cannot be what the
 	// access needs, so the readback runs before them instead of after the whole backlog (a
 	// frame of draws, 100-200 ms while an area streams in).
-	m_scheduler.Context().GetGpu().SendUrgentCommandSync([this, vaddr, size, is_write] {
+	m_scheduler.Context().GetGpu().SendUrgentCommandSync([this, vaddr, size, is_write, guest_fault] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
-		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+		auto&      buffer    = m_slot_buffers[FindBuffer(vaddr, size)];
+		const auto read_size = guest_fault ? ReadAheadSize(buffer, vaddr, size) : size;
 
-		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+		// Pages whose GPU-written bytes were all read through the mirror stay GPU-dirty with
+		// nothing left to download: they are released all the same.
+		const auto pages_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+		const auto pages_end   = Common::AlignUp(vaddr + read_size, TRACKER_PAGE_SIZE);
+		if (DownloadBufferMemory<false>(buffer, vaddr, read_size) ||
+		    !m_gpu_modified_ranges.Intersects(pages_begin, pages_end - pages_begin)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, read_size);
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		}
 	});
+}
+
+uint64_t BufferCache::ReadAheadSize(const Buffer& buffer, uint64_t vaddr, uint64_t size) const {
+	// The guest reads (and overwrites) GPU results page by page, each page a fault and a
+	// readback (Demon's Souls: ~100 consecutive pages a frame). Read the GPU-written pages that
+	// follow along when their writes were already submitted, or when the readback drains the GPU
+	// anyway (the faulting bytes were written by work still being recorded).
+	static constexpr uint64_t MaxReadAhead = 256 * 1024;
+	const auto                faulting_end = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	const auto                limit =
+	    std::min(buffer.CpuAddress() + buffer.Size(), faulting_end + MaxReadAhead);
+	const auto latest_write = [&](uint64_t begin, uint64_t end) {
+		uint64_t latest = 0;
+		m_gpu_modified_ranges.ForEachInRange(begin, end - begin, [&](uint64_t first, uint64_t last) {
+			latest = std::max(latest, m_write_ticks.Latest(first, last));
+			for (const auto& [pending, bytes]: m_pending_writes) {
+				if (pending < last && first < pending + bytes) {
+					latest = UINT64_MAX;
+				}
+			}
+		});
+		return latest;
+	};
+	const auto needed = latest_write(vaddr, vaddr + size);
+	if (needed == 0) {
+		return size;
+	}
+	const auto current = m_scheduler.CurrentTick();
+	const auto bound   = needed >= current ? UINT64_MAX : current - 1;
+	auto       end     = faulting_end;
+	while (end + TRACKER_PAGE_SIZE <= limit &&
+	       m_gpu_modified_ranges.Intersects(end, TRACKER_PAGE_SIZE) &&
+	       !m_texture_cache.IsRegionGpuModified(end, TRACKER_PAGE_SIZE)) {
+		const auto tick = latest_write(end, end + TRACKER_PAGE_SIZE);
+		if (tick == 0 || tick > bound) {
+			break;
+		}
+		end += TRACKER_PAGE_SIZE;
+	}
+	return end > faulting_end ? end - vaddr : size;
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
