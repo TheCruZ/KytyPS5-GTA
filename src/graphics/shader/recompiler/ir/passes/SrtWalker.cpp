@@ -7,6 +7,7 @@
 #include <xbyak/xbyak.h>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstring>
 #include <deque>
@@ -172,10 +173,44 @@ thread_local bool                         t_walker_faulted = false;
 // Guest memory starts here: a table pointer below it is null.
 constexpr uint64_t GuestMemoryStart = 0x40000;
 
-// Every guest load is mov eax, [r10] (41 8b 02), so a fault completes it as a zero read.
+std::atomic<SrtWalkerGuestRead> g_guest_read {nullptr};
+
+// Bit 32 set: the low dword is the value at the address; clear: load it directly.
+uint64_t KYTY_SYSV_ABI ProbeGuestLoad(uint64_t address) {
+	const auto read  = g_guest_read.load(std::memory_order_relaxed);
+	uint32_t   value = 0;
+	if (read != nullptr && address >= GuestMemoryStart && read(address, value, t_walker_ahead)) {
+		return uint64_t {1} << 32u | value;
+	}
+	return 0;
+}
+
+// Every direct guest load is mov eax, [r10] (41 8b 02), so a fault completes it as a zero read.
+// The emulator is asked first: on the pages the GPU owns a direct load faults, and a fault costs
+// microseconds (descriptor tables that share pages with GPU-written data took dozens per walk).
+// The walker keeps its state in rdi, rsi, rdx and r8; rcx, r9 and r11 are free here.
 void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
+	Xbyak::Label direct, done;
 	code.lea(code.r10, code.ptr[address]);
+	for (const auto& reg: {code.rdi, code.rsi, code.rdx, code.r8, code.r10, code.rbp}) {
+		code.push(reg);
+	}
+	code.mov(code.rbp, code.rsp);
+	code.and_(code.rsp, -16);
+	code.mov(code.rdi, code.r10);
+	code.mov(code.rax, reinterpret_cast<uint64_t>(&ProbeGuestLoad));
+	code.call(code.rax);
+	code.mov(code.rsp, code.rbp);
+	for (const auto& reg: {code.rbp, code.r10, code.r8, code.rdx, code.rsi, code.rdi}) {
+		code.pop(reg);
+	}
+	code.bt(code.rax, 32);
+	code.jnc(direct);
+	code.mov(code.eax, code.eax);
+	code.jmp(done);
+	code.L(direct);
 	code.mov(code.eax, code.dword[code.r10]);
+	code.L(done);
 }
 
 class RuntimeValidator {
@@ -1446,6 +1481,10 @@ uint32_t SrtWalkerAheadLoadLength(uint64_t rip, uint64_t address) {
 	const auto length = SrtWalkerLoadLength(rip);
 	if (length != 0) t_walker_faulted = true;
 	return length;
+}
+
+void SetSrtWalkerGuestRead(SrtWalkerGuestRead read) {
+	g_guest_read.store(read, std::memory_order_relaxed);
 }
 
 uint32_t SrtWalkerLoadLength(uint64_t rip) {

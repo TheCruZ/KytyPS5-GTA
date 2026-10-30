@@ -84,6 +84,11 @@ bool WalkedValue(const ResourcePlan& plan, Value value, uint32_t& result);
 bool WalkedDescriptor(const ResourcePlan& plan, uint32_t source, DescriptorValue& result);
 bool WalkedActive(const ResourcePlan& plan, uint32_t source);
 bool WalkedImageActive(const ResourcePlan& plan, uint32_t image);
+// Reads the dword at a guest address that a direct load may fault on (a page the GPU owns),
+// without faulting; false when the walker should load it directly. `ahead` tells a walk ahead of
+// execution. Set by the emulator; without it every load is direct.
+using SrtWalkerGuestRead = bool (*)(uint64_t address, uint32_t& value, bool ahead);
+void SetSrtWalkerGuestRead(SrtWalkerGuestRead read);
 // Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
 // The exception handler completes such a load as a zero read.
 uint32_t SrtWalkerLoadLength(uint64_t rip);

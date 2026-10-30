@@ -650,6 +650,13 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+// An SRT walker load of a GPU-owned page reads bytes the GPU did not write from the backing
+// store, as the fault below would, without the fault.
+static bool ReadWalkerGuestMemory(uint64_t address, uint32_t& value, bool ahead) {
+	return !ahead && Libs::LibKernel::Memory::MayBeGpuWritten(address, sizeof(value)) &&
+	       Libs::LibKernel::Memory::TryReadAroundGpuWrites(address, &value, sizeof(value));
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -1770,6 +1777,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	if (!Common::HostException::InstallHandler(KytyExceptionHandler)) {
 		EXIT("Failed to install the required vectored exception handler\n");
 	}
+	Libs::Graphics::ShaderRecompiler::IR::SetSrtWalkerGuestRead(ReadWalkerGuestMemory);
 
 	std::vector<std::pair<uint64_t, uint64_t>> executable_segments;
 	uint64_t                                   eh_frame_header_addr = 0;
