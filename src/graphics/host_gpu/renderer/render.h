@@ -503,16 +503,7 @@ private:
 	                                        CommandBuffer& command, uint32_t group_x,
 	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
 
-	// GET_LOD_STATS counters since their last reset. With --lod-stats a bound T# with counting
-	// enabled counts as sampled at its BASE_LEVEL, clamped when its MIN_LOD lies above that level.
-	struct MipStatsCounter {
-		uint8_t finest_level = 15; // no samples
-		bool    clamped      = false;
-		bool    unclamped    = false;
-	};
-
 	RenderContext&                        m_context;
-	bool                                  m_lod_stats = Config::LodStatsEnabled();
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
@@ -521,7 +512,6 @@ private:
 	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
 	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
 	vk::Pipeline                          m_pssr_pipeline          = nullptr;
-	std::array<MipStatsCounter, 256>      m_mip_stats {};
 	// Prepared bindings and slot memos point into the elements: a deque never relocates its
 	// entries (std::unordered_map has no noexcept move, so a growing vector copied the elements
 	// and left those pointers dangling).
