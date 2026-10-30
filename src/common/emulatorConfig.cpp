@@ -234,10 +234,6 @@ bool RelaxedShaderFloatEnabled() {
 	return g_config->relaxed_shader_float;
 }
 
-bool LodStatsEnabled() {
-	return g_config->lod_stats_enabled;
-}
-
 bool AsyncPipelinesEnabled() {
 	return g_config->async_pipelines_enabled;
 }

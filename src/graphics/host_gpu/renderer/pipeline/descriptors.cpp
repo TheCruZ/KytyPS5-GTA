@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/execHelpers.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/lodStats.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -65,7 +66,8 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 		case BindingKind::FaultBuffer:
 		case BindingKind::FlattenedSrt:
 		case BindingKind::ShaderData:
-		case BindingKind::SharedMemory: return vk::DescriptorType::eStorageBuffer;
+		case BindingKind::SharedMemory:
+		case BindingKind::MipStats: return vk::DescriptorType::eStorageBuffer;
 		case BindingKind::UniformBuffers: return vk::DescriptorType::eUniformBuffer;
 		case BindingKind::Count: EXIT("invalid native descriptor binding kind");
 	}
@@ -782,18 +784,6 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
 		return {.layout = vk::ImageLayout::eGeneral};
-	}
-	// Image heap resolves do not follow the draws that sample them and storage access is not
-	// sampling: neither reports samples.
-	if (m_lod_stats && descriptor.MipStatsCntEn() && !resource.heap && !storage) {
-		auto&         counter = m_mip_stats[descriptor.MipStatsCntId()];
-		const uint8_t base    = descriptor.BaseLevel();
-		counter.finest_level  = std::min(counter.finest_level, base);
-		if (descriptor.MinLod() > base << 8u) {
-			counter.clamped = true;
-		} else {
-			counter.unclamped = true;
-		}
 	}
 
 	// The description is computed once per T# and view of it; images are looked up every time.
@@ -1864,6 +1854,15 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			prepared.uniform_buffers[resource.uniform_index] = view;
 		}
 	}
+	// GET_LOD_STATS: the counting field of each image whose T# the draw supplies.
+	for (uint32_t i = 0; i < layout.mip_stats_count; i++) {
+		const auto& resource = program.info.images[i];
+		const auto& value    = snapshot.images[i];
+		prepared.shader_data[layout.MipStatsDword() + i] =
+		    !resource.heap && resource.table_capacity == 0u && value.dword_count >= 8u
+		        ? LodStatsReport::ImageField(value.dwords.data())
+		        : LodStatsReport::NoCounterFlag;
+	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
 	}
@@ -2062,6 +2061,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	m_descriptor_writes.clear();
 	size_t image_cursor = 0;
 	std::array<vk::DescriptorBufferInfo, 2> address_buffers;
+	vk::DescriptorBufferInfo                mip_stats_view;
 
 	for (auto* prepared: prepared_bindings) {
 		const auto& program     = prepared->runtime->module->info;
@@ -2163,6 +2163,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						auto& view = address_buffers[kind == BindingKind::FaultBuffer];
 						view = {bda_buffer->Handle(), 0, bda_buffer->Size()};
 						write.pBufferInfo = &view;
+						break;
+					}
+					case BindingKind::MipStats: {
+						const auto& counters = m_context.GetLodStats().CounterBuffer();
+						mip_stats_view       = {counters.Handle(), 0, counters.Size()};
+						write.pBufferInfo    = &mip_stats_view;
 						break;
 					}
 					case BindingKind::FlattenedSrt:

@@ -1600,6 +1600,25 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	return true;
 }
 
+// GET_LOD_STATS: whether a pixel program instrumented for mip statistics records nothing in this
+// draw, as no image whose T# the draw supplies has a counter. Its plain variant then renders the
+// same without the storage buffer atomics, which make the driver run the depth and stencil tests
+// after a shader that can discard.
+static bool RecordsNoMipStats(const ShaderStageRuntime& stage) {
+	if (stage.module == nullptr || stage.module->plain == nullptr || stage.resources == nullptr) {
+		return false;
+	}
+	const auto& images = stage.module->info.info.images;
+	const auto& values = stage.resources->images;
+	for (uint32_t i = 0; i < images.size() && i < values.size(); i++) {
+		if (!images[i].heap && images[i].table_capacity == 0u && values[i].dword_count >= 8u &&
+		    LodStatsReport::HasCounter(values[i].dwords.data())) {
+			return false;
+		}
+	}
+	return true;
+}
+
 // Whether a draw may be skipped while the driver compiles its pipeline: the picture is all it
 // changes. Its shaders write no memory, its samples reach no guest occlusion counter and it
 // renders to no linear image (the CPU reads those back, e.g. GTA V's vehicle damage).
@@ -1680,6 +1699,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		}
 	}
 
+	state.ps_plain = state.ps_active && RecordsNoMipStats(state.ps_input_info.stage);
 	auto* const pipeline_ptr = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    buffer, state,
 	    Config::AsyncPipelinesEnabled() && DrawOnlyChangesPicture(m_context, state, vertex_stages) &&
