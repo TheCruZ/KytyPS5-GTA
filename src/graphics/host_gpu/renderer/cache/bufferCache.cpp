@@ -1356,7 +1356,21 @@ bool BufferCache::WriteAroundGpuWrites(uint64_t vaddr, const void* data, uint64_
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	return m_gpu_modified_ranges.Intersects(vaddr, size);
+	// Reads around the GPU's writes ask this for every few bytes they read, mostly within the
+	// same gap between GPU-written ranges: answer those from the last gap found until the set
+	// changes.
+	auto& gap = m_clean_gap;
+	if (gap.version == m_gpu_modified_ranges.Version() && vaddr >= gap.begin &&
+	    vaddr < gap.end && size <= gap.end - vaddr) {
+		return false;
+	}
+	uint64_t begin = 0;
+	uint64_t end   = 0;
+	if (m_gpu_modified_ranges.Intersects(vaddr, size, begin, end)) {
+		return true;
+	}
+	gap = {.version = m_gpu_modified_ranges.Version(), .begin = begin, .end = end};
+	return false;
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {

@@ -289,6 +289,14 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	// The last gap between GPU-written ranges HasGpuDirtyBytes() found, valid while the set keeps
+	// its version.
+	struct CleanGap {
+		uint64_t version = UINT64_MAX;
+		uint64_t begin   = 0;
+		uint64_t end     = 0;
+	};
+	CleanGap m_clean_gap;
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 16>                          m_checked_color_metadata;
 	RangeSet                                          m_released_ranges;

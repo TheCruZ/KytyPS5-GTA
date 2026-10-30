@@ -13,6 +13,7 @@ namespace Libs::Graphics {
 class RangeSet final {
 public:
 	void Add(uint64_t address, uint64_t size) {
+		m_version++;
 		const auto end = End(address, size);
 		auto       it  = m_ranges.lower_bound(address);
 		if (it != m_ranges.begin() && std::prev(it)->second >= address) {
@@ -34,6 +35,7 @@ public:
 	}
 
 	void Subtract(uint64_t address, uint64_t size) {
+		m_version++;
 		const auto end = End(address, size);
 		auto       it  = m_ranges.lower_bound(address);
 		if (it != m_ranges.begin() && std::prev(it)->second > address) {
@@ -53,7 +55,13 @@ public:
 		}
 	}
 
-	void Clear() { m_ranges.clear(); }
+	void Clear() {
+		m_version++;
+		m_ranges.clear();
+	}
+
+	// Advances whenever the set may have changed.
+	[[nodiscard]] uint64_t Version() const noexcept { return m_version; }
 
 	template <typename Func>
 	void ForEach(Func&& func) const {
@@ -69,6 +77,27 @@ public:
 			return true;
 		}
 		return it != m_ranges.end() && it->first < end;
+	}
+
+	// As Intersects(); when the range intersects nothing, [gap_begin, gap_end) is the gap between
+	// the ranges around it, which the range lies in.
+	[[nodiscard]] bool Intersects(uint64_t address, uint64_t size, uint64_t& gap_begin,
+	                              uint64_t& gap_end) const {
+		const auto end = End(address, size);
+		auto       it  = m_ranges.lower_bound(address);
+		gap_begin      = 0;
+		if (it != m_ranges.begin()) {
+			const auto previous = std::prev(it)->second;
+			if (previous > address) {
+				return true;
+			}
+			gap_begin = previous;
+		}
+		if (it != m_ranges.end() && it->first < end) {
+			return true;
+		}
+		gap_end = it != m_ranges.end() ? it->first : UINT64_MAX;
+		return false;
 	}
 
 	[[nodiscard]] bool Contains(uint64_t address, uint64_t size) const {
@@ -108,6 +137,7 @@ private:
 	}
 
 	std::map<uint64_t, uint64_t> m_ranges;
+	uint64_t                     m_version = 0;
 };
 
 } // namespace Libs::Graphics
