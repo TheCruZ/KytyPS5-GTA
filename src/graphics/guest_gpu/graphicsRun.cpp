@@ -2044,14 +2044,11 @@ void CommandProcessor::ExecuteTriggerEvent(uint32_t event_type, uint32_t event_i
 }
 
 void CommandProcessor::WriteLodStats(void* dst, uint32_t size) {
-	const auto sequence = EmitCallback([dst, size] {
-		memset(dst, 0, size);
-		// Hack?
-		if (size >= sizeof(uint32_t)) {
-			auto* label = static_cast<uint32_t*>(dst);
-			*label      = 1;
-		}
-	});
+	// HACK: until mip statistics are emulated, the report is left incomplete (its first dword, the
+	// completion mark, stays 0), which texture streamers take as "no data yet"; a game may lower
+	// texture detail over time. A report marked complete with zero counters would claim every
+	// texture was sampled at its finest mip.
+	const auto sequence = EmitCallback([dst, size] { memset(dst, 0, size); });
 	NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst), size);
 }
 
