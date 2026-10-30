@@ -105,7 +105,6 @@ struct ConfigOptions {
 	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = true;
 	bool                   occlusion_queries_enabled   = true;
-	bool                   lod_stats_enabled           = false;
 	bool                   async_pipelines_enabled     = true;
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
@@ -180,7 +179,6 @@ bool ReadbackTiledImagesEnabled();
 bool SyncRawImageBuffersEnabled();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
-bool LodStatsEnabled();
 // Draws whose new pipeline the driver is still compiling are skipped instead of waiting for it.
 bool AsyncPipelinesEnabled();
 bool TrophyEnabled();

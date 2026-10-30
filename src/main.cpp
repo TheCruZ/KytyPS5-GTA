@@ -116,7 +116,6 @@ static void PrintUsage() {
 	::printf("  --shader-cache                       Keep compiled shaders and pipelines between boots.\n");
 	::printf("  --no-tessellation                    Skip tessellation patches instead of drawing them.\n");
 	::printf("  --no-occlusion-queries               Read occlusion queries as always visible.\n");
-	::printf("  --lod-stats                          Report bound textures in mip statistics.\n");
 	::printf(
 	    "  --no-async-pipelines                 Wait for new pipelines instead of skipping the\n"
 	    "                                       draws that need them while they compile.\n");
@@ -255,7 +254,6 @@ static constexpr Flag FLAGS[] = {
     {"--tessellation", &ConfigOptions::tessellation_enabled},
     {"--no-tessellation", &ConfigOptions::tessellation_enabled, false},
     {"--no-occlusion-queries", &ConfigOptions::occlusion_queries_enabled, false},
-    {"--lod-stats", &ConfigOptions::lod_stats_enabled},
     {"--async-pipelines", &ConfigOptions::async_pipelines_enabled},
     {"--no-async-pipelines", &ConfigOptions::async_pipelines_enabled, false},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},

@@ -226,10 +226,6 @@ bool OcclusionQueriesEnabled() {
 	return g_config->occlusion_queries_enabled;
 }
 
-bool LodStatsEnabled() {
-	return g_config->lod_stats_enabled;
-}
-
 bool AsyncPipelinesEnabled() {
 	return g_config->async_pipelines_enabled;
 }
