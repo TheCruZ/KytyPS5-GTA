@@ -42,16 +42,236 @@ uint32_t SpillPointerType(ValueEmitContext& ctx, IR::Type type) {
 	return value_type == 0 ? 0 : TypePointer(ctx.state, spv::StorageClassFunction, value_type);
 }
 
+// The code of an inlined call target, emitted as a SPIR-V function of its own that main calls.
+// A whole program of inlined hit-group functions in one SPIR-V function (Wolverine's ray-tracing
+// compute 0xe6d76d24f59f8015: 20 of them, 1.6 M words) runs the NVIDIA compiler out of memory;
+// DontInline functions are compiled one at a time.
+// The region is every block the entry block dominates; it must leave through edges to one block,
+// `exit`. It receives the values defined before it that it reads, and returns the values the
+// exit block's Phis take on its edges and the values that code after it reads directly.
+struct OutlinedRegion {
+	const IR::Block*                     entry = nullptr;
+	const IR::Block*                     exit  = nullptr;
+	std::unordered_set<const IR::Block*> blocks;
+	std::vector<const IR::Inst*>         inputs;
+	std::vector<const IR::Inst*>         outputs; // the exit block's Phis first, then direct values
+	size_t                               phi_outputs = 0;
+	uint32_t                             function    = 0;
+	uint32_t                             input_type  = 0;
+	uint32_t                             output_type = 0;
+	uint32_t                             call_label  = 0;
+	std::vector<uint32_t>                output_ids; // in main, per output and half
+};
+
+struct PhiSlot {
+	size_t                arg    = 0;       // the operand, unless region is set
+	const OutlinedRegion* region = nullptr; // one operand for all of a region's edges
+	size_t                output = 0;       // the region's output for this Phi
+};
+
 struct DeferredPhiPatch {
-	DeferredPhi     phi;
-	const IR::Inst* instruction = nullptr;
-	uint32_t        half        = 0;
+	DeferredPhi          phi;
+	const IR::Inst*      instruction = nullptr;
+	uint32_t             half        = 0;
+	std::vector<PhiSlot> slots;
 };
 
 struct StructuredFunctionState {
-	std::unordered_map<const IR::Block*, uint32_t> block_exit_labels;
-	std::vector<DeferredPhiPatch>                  deferred_phis;
+	std::unordered_map<const IR::Block*, uint32_t>              block_exit_labels;
+	std::vector<DeferredPhiPatch>                               deferred_phis;
+	std::unordered_map<const IR::Block*, const OutlinedRegion*> region_of; // main only
 };
+
+bool HasSpirvType(IR::Type type) {
+	switch (type) {
+		case IR::Type::U1:
+		case IR::Type::U8:
+		case IR::Type::U16:
+		case IR::Type::U32:
+		case IR::Type::F16:
+		case IR::Type::U64:
+		case IR::Type::U32x2:
+		case IR::Type::F32:
+		case IR::Type::F64:
+		case IR::Type::U32x3:
+		case IR::Type::U32x4:
+		case IR::Type::F32x2: return true;
+		default: return false;
+	}
+}
+
+// Immediate dominators over the IR CFG (Cooper, Harvey and Kennedy); unreachable blocks have none.
+std::unordered_map<const IR::Block*, const IR::Block*> ImmediateDominators(const IR::Program& program) {
+	std::vector<const IR::Block*>                 order;
+	std::unordered_map<const IR::Block*, size_t>  rpo;
+	std::unordered_set<const IR::Block*>          seen;
+	std::vector<std::pair<const IR::Block*, size_t>> stack {{program.blocks.front(), 0}};
+	seen.insert(program.blocks.front());
+	while (!stack.empty()) {
+		auto& [block, next] = stack.back();
+		const auto successors = block->ImmSuccessors();
+		if (next < successors.size()) {
+			const auto* successor = successors[next++];
+			if (seen.insert(successor).second) stack.emplace_back(successor, 0);
+			continue;
+		}
+		order.push_back(block);
+		stack.pop_back();
+	}
+	std::reverse(order.begin(), order.end());
+	for (size_t i = 0; i < order.size(); i++)
+		rpo[order[i]] = i;
+	std::unordered_map<const IR::Block*, const IR::Block*> idom {{order.front(), order.front()}};
+	const auto intersect = [&](const IR::Block* a, const IR::Block* b) {
+		while (a != b) {
+			while (rpo.at(a) > rpo.at(b)) a = idom.at(a);
+			while (rpo.at(b) > rpo.at(a)) b = idom.at(b);
+		}
+		return a;
+	};
+	for (bool changed = true; changed;) {
+		changed = false;
+		for (size_t i = 1; i < order.size(); i++) {
+			const IR::Block* dominator = nullptr;
+			for (const auto* predecessor: order[i]->ImmPredecessors()) {
+				if (!idom.contains(predecessor)) continue;
+				dominator = dominator == nullptr ? predecessor : intersect(predecessor, dominator);
+			}
+			if (dominator != nullptr && idom[order[i]] != dominator) {
+				idom[order[i]] = dominator;
+				changed = true;
+			}
+		}
+	}
+	return idom;
+}
+
+// The regions of a compute program's inlined call targets that can become functions.
+std::vector<OutlinedRegion> FindOutlinedRegions(const IR::Program& program) {
+	std::vector<OutlinedRegion> regions;
+	if (program.inlined_call_entries.empty() || program.dispatcher_fallback ||
+	    program.stage != ShaderType::Compute || program.blocks.empty())
+		return regions;
+	const auto idom = ImmediateDominators(program);
+	const auto dominates = [&](const IR::Block* dominator, const IR::Block* block) {
+		if (!idom.contains(block)) return false;
+		for (;;) {
+			if (block == dominator) return true;
+			const auto* parent = idom.at(block);
+			if (parent == block) return false;
+			block = parent;
+		}
+	};
+	std::unordered_set<const IR::Block*> claimed;
+	for (const auto pc: program.inlined_call_entries) {
+		const auto found = std::ranges::find_if(program.blocks, [&](const IR::Block* block) {
+			return block->start_pc == pc && block->end_pc > pc;
+		});
+		if (found == program.blocks.end() || *found == program.blocks.front() || claimed.contains(*found) ||
+		    (*found)->ImmPredecessors().size() != 1u)
+			continue;
+		OutlinedRegion region;
+		region.entry = *found;
+		for (const auto* block: program.blocks)
+			if (dominates(region.entry, block)) region.blocks.insert(block);
+		std::unordered_set<const IR::Block*> exits;
+		bool ok = true;
+		for (const auto* block: program.blocks) {
+			if (!region.blocks.contains(block)) continue;
+			for (const auto* successor: block->ImmSuccessors())
+				if (!region.blocks.contains(successor)) exits.insert(successor);
+			const auto& term = block->terminator;
+			// A return would end the function, not the invocation.
+			ok &= (term.kind == CFG::TerminatorKind::Branch && term.true_block != nullptr) ||
+			      (term.kind == CFG::TerminatorKind::ConditionalBranch && term.true_block != nullptr &&
+			       term.false_block != nullptr && !block->condition.IsEmpty());
+		}
+		if (!ok || exits.size() != 1u) continue;
+		region.exit = *exits.begin();
+		for (const auto* block: program.blocks) {
+			if (!region.blocks.contains(block)) continue;
+			for (const auto* inst: {block->terminator.merge_block, block->terminator.continue_block})
+				ok &= inst == nullptr || region.blocks.contains(inst) || inst == region.exit;
+		}
+		if (!ok) continue;
+		// Inputs: the outside values the region's instructions and conditions read, through
+		// operands without a SPIR-V value (resource handles) as well.
+		std::unordered_set<const IR::Inst*> inputs, visited;
+		const auto collect = [&](auto&& self, IR::Value value) -> void {
+			value = value.Resolve();
+			const auto* inst = value.TryInstruction();
+			if (inst == nullptr || region.blocks.contains(inst->Parent()) || !visited.insert(inst).second) return;
+			if (HasSpirvType(inst->GetType())) {
+				if (inputs.insert(inst).second) region.inputs.push_back(inst);
+				return;
+			}
+			for (size_t index = 0; index < inst->NumArgs(); index++) self(self, inst->Arg(index));
+		};
+		for (const auto* block: program.blocks) {
+			if (!region.blocks.contains(block)) continue;
+			for (const auto& inst: *block)
+				for (size_t index = 0; index < inst.NumArgs(); index++) collect(collect, inst.Arg(index));
+			collect(collect, block->condition);
+			collect(collect, block->indirect_target);
+		}
+		// Outputs: the exit block's Phis on the region's edges, then the values used outside.
+		for (const auto& phi: *region.exit) {
+			if (phi.GetOpcode() != IR::ValueOpcode::Phi) break;
+			bool from_region = false;
+			for (size_t index = 0; index < phi.NumArgs(); index++)
+				from_region |= region.blocks.contains(phi.PhiBlock(index));
+			if (!from_region) continue;
+			ok &= HasSpirvType(phi.GetType());
+			region.outputs.push_back(&phi);
+		}
+		region.phi_outputs = region.outputs.size();
+		std::unordered_set<const IR::Inst*> direct;
+		const auto used_outside = [&](const IR::Inst& inst, const IR::Block* consumer) {
+			if (!region.blocks.contains(consumer) && direct.insert(&inst).second) {
+				ok &= HasSpirvType(inst.GetType());
+				region.outputs.push_back(&inst);
+			}
+		};
+		for (const auto* block: program.blocks) {
+			if (region.blocks.contains(block)) continue;
+			for (const auto& inst: *block) {
+				for (size_t index = 0; index < inst.NumArgs(); index++) {
+					const auto* arg = inst.Arg(index).Resolve().TryInstruction();
+					if (arg == nullptr || !region.blocks.contains(arg->Parent())) continue;
+					if (inst.GetOpcode() == IR::ValueOpcode::Phi && region.blocks.contains(inst.PhiBlock(index))) {
+						ok &= block == region.exit;
+						continue;
+					}
+					used_outside(*arg, block);
+				}
+			}
+			for (const auto& value: {block->condition, block->indirect_target}) {
+				const auto* arg = value.IsEmpty() ? nullptr : value.Resolve().TryInstruction();
+				if (arg != nullptr && region.blocks.contains(arg->Parent())) used_outside(*arg, block);
+			}
+		}
+		if (!ok) continue;
+		for (const auto* block: region.blocks) claimed.insert(block);
+		regions.push_back(std::move(region));
+	}
+	return regions;
+}
+
+std::vector<PhiSlot> PhiSlots(const StructuredFunctionState& structured, const IR::Inst& phi) {
+	std::vector<PhiSlot> slots;
+	for (size_t index = 0; index < phi.NumArgs(); index++) {
+		const auto found = structured.region_of.find(phi.PhiBlock(index));
+		if (found == structured.region_of.end()) {
+			slots.push_back({index});
+			continue;
+		}
+		const auto* region = found->second;
+		if (std::ranges::any_of(slots, [&](const PhiSlot& slot) { return slot.region == region; })) continue;
+		const auto output = std::ranges::find(region->outputs, &phi) - region->outputs.begin();
+		slots.push_back({index, region, static_cast<size_t>(output)});
+	}
+	return slots;
+}
 
 struct DispatcherFunctionState {
 	std::array<std::unordered_map<const IR::Inst*, uint32_t>, 2> spills;
@@ -264,9 +484,10 @@ void EmitStructuredInstruction(ValueEmitContext& ctx, StructuredFunctionState& s
 				ctx.Fail(inst, "has a predecessor outside the structured function");
 			}
 		}
+		auto slots = PhiSlots(structured, inst);
 		structured.deferred_phis.push_back(
-		    {ctx.state.builder.AddDeferredPhi(type, ctx.Result(inst), inst.NumArgs()), &inst,
-		     ctx.half});
+		    {ctx.state.builder.AddDeferredPhi(type, ctx.Result(inst), slots.size()), &inst, ctx.half,
+		     std::move(slots)});
 		return;
 	}
 	EmitDirectInstruction(ctx, inst);
@@ -321,24 +542,220 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structured) {
 	for (const auto& deferred: structured.deferred_phis) {
 		auto& lane = deferred.half == 0 ? ctx : *ctx.other_half;
-		for (size_t index = 0; index < deferred.instruction->NumArgs(); index++) {
-			const auto* predecessor = deferred.instruction->PhiBlock(index);
+		for (size_t slot = 0; slot < deferred.slots.size(); slot++) {
+			const auto& source = deferred.slots[slot];
+			if (source.region != nullptr) {
+				ctx.state.builder.PatchDeferredPhi(
+				    deferred.phi, slot,
+				    source.region->output_ids.at(source.output * ctx.state.lane_count + deferred.half),
+				    source.region->call_label);
+				continue;
+			}
+			const auto* predecessor = deferred.instruction->PhiBlock(source.arg);
 			const auto  found       = structured.block_exit_labels.find(predecessor);
 			if (found == structured.block_exit_labels.end()) {
 				ctx.Fail(*deferred.instruction, "has a predecessor that was not emitted");
 			}
 			ctx.state.builder.PatchDeferredPhi(
-			    deferred.phi, index, lane.Def(deferred.instruction->Arg(index)), found->second);
+			    deferred.phi, slot, lane.Def(deferred.instruction->Arg(source.arg)), found->second);
 		}
 	}
 }
 
-void EmitStructuredFunction(ValueEmitContext& ctx) {
+// Values computed at a function's entry that the instructions use.
+void EmitFunctionEntryValues(EmitterState& state) {
+	if (state.gds_variable != 0) {
+		state.gds_length = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), state.gds_length,
+		                          state.gds_variable, 0);
+	}
+	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
+		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
+		const auto group_y = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 1);
+		const auto group_z = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 2);
+		const auto count_x = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 0);
+		const auto count_y = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 1);
+		const auto row = EmitAddU32(state, group_y, EmitBinaryU32(state, spv::OpIMul, group_z, count_y));
+		const auto index = EmitAddU32(state, group_x, EmitBinaryU32(state, spv::OpIMul, row, count_x));
+		state.lds_base_dwords = EmitBinaryU32(state, spv::OpIMul, index,
+		                                     ConstantU32(state, LdsDwordCount(state)));
+	}
+}
+
+void EmitOutlinedFunction(ValueEmitContext& ctx, OutlinedRegion& region) {
+	auto&       state   = ctx.state;
+	const auto& program = state.program;
+	const auto  lanes   = state.lane_count;
+	std::vector<uint32_t> input_members, output_members;
+	for (const auto* input: region.inputs)
+		for (uint32_t half = 0; half < lanes; half++) input_members.push_back(TypeId(state, input->GetType()));
+	for (const auto* output: region.outputs)
+		for (uint32_t half = 0; half < lanes; half++) output_members.push_back(TypeId(state, output->GetType()));
+	region.input_type  = input_members.empty() ? 0u
+	    : state.builder.Type(spv::OpTypeStruct, std::span<const uint32_t>(input_members));
+	region.output_type = output_members.empty() ? TypeVoid(state)
+	    : state.builder.Type(spv::OpTypeStruct, std::span<const uint32_t>(output_members));
+	const auto function_type = region.input_type == 0u
+	    ? state.builder.Type(spv::OpTypeFunction, region.output_type)
+	    : state.builder.Type(spv::OpTypeFunction, region.output_type, region.input_type);
+	region.function = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFunction, region.output_type, region.function,
+	                          spv::FunctionControlDontInlineMask, function_type);
+	const auto parameter = region.input_type == 0u ? 0u : state.builder.AllocateId();
+	if (parameter != 0u) state.builder.AddFunction(spv::OpFunctionParameter, region.input_type, parameter);
+	state.current_block = nullptr;
+	EmitLabel(state, state.builder.AllocateId());
+	EmitFunctionEntryValues(state);
+	EmitMemoryBindings(state);
+	uint32_t member = 0;
+	for (const auto* input: region.inputs) {
+		for (uint32_t half = 0; half < lanes; half++) {
+			const auto id = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeId(state, input->GetType()), id,
+			                          parameter, member++);
+			input->SetDefinition(half, id);
+		}
+	}
+	// Inside the function the entry block has a label of its own and the exit block is the
+	// return block.
+	const auto main_entry = region.entry->Definition();
+	const auto main_exit  = region.exit->Definition();
+	const auto return_label = state.builder.AllocateId();
+	region.entry->SetDefinition(state.builder.AllocateId());
+	region.exit->SetDefinition(return_label);
+	state.builder.AddFunction(spv::OpBranch, region.entry->Definition());
+	StructuredFunctionState structured;
+	for (const auto* block: program.blocks) {
+		if (!region.blocks.contains(block)) continue;
+		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
+			if (block == region.entry && inst.GetOpcode() == IR::ValueOpcode::Phi) {
+				lane.Define(inst, lane.Def(inst.Arg(0))); // the entry block has one predecessor
+				return;
+			}
+			EmitStructuredInstruction(lane, structured, inst);
+		});
+		structured.block_exit_labels.emplace(block, state.current_label);
+		EmitStructuredTerminator(ctx, block);
+	}
+	state.current_block = nullptr;
+	EmitLabel(state, return_label);
+	std::vector<const IR::Block*> exit_edges;
+	for (const auto* block: program.blocks)
+		if (region.blocks.contains(block) && std::ranges::find(block->ImmSuccessors(), region.exit) !=
+		                                         block->ImmSuccessors().end())
+			exit_edges.push_back(block);
+	std::vector<uint32_t> results;
+	for (size_t output = 0; output < region.outputs.size(); output++) {
+		const auto* inst = region.outputs[output];
+		for (uint32_t half = 0; half < lanes; half++) {
+			auto& lane = half == 0 ? ctx : *ctx.other_half;
+			if (output >= region.phi_outputs) {
+				results.push_back(0u); // after the Phis
+				continue;
+			}
+			std::vector<std::pair<uint32_t, uint32_t>> incoming;
+			for (const auto* edge: exit_edges) {
+				for (size_t index = 0; index < inst->NumArgs(); index++) {
+					if (inst->PhiBlock(index) == edge) {
+						incoming.emplace_back(lane.Def(inst->Arg(index)), structured.block_exit_labels.at(edge));
+						break;
+					}
+				}
+			}
+			if (incoming.size() == 1u) {
+				results.push_back(incoming.front().first);
+				continue;
+			}
+			std::vector<uint32_t> words {spv::OpPhi, TypeId(state, inst->GetType()), state.builder.AllocateId()};
+			for (const auto& [value, label]: incoming) {
+				words.push_back(value);
+				words.push_back(label);
+			}
+			state.builder.AddFunction(words);
+			results.push_back(words[2]);
+		}
+	}
+	for (size_t output = region.phi_outputs; output < region.outputs.size(); output++)
+		for (uint32_t half = 0; half < lanes; half++)
+			results[output * lanes + half] = (half == 0 ? ctx : *ctx.other_half).Def(IR::Value(const_cast<IR::Inst*>(region.outputs[output])));
+	if (results.empty()) {
+		state.builder.AddFunction(spv::OpReturn);
+	} else {
+		const auto composite = state.builder.AllocateId();
+		std::vector<uint32_t> words {spv::OpCompositeConstruct, region.output_type, composite};
+		words.insert(words.end(), results.begin(), results.end());
+		state.builder.AddFunction(words);
+		state.builder.AddFunction(spv::OpReturnValue, composite);
+	}
+	state.builder.AddFunction(spv::OpFunctionEnd);
+	PatchStructuredPhis(ctx, structured);
+	region.entry->SetDefinition(main_entry);
+	region.exit->SetDefinition(main_exit);
+	state.gds_length      = 0;
+	state.lds_base_dwords = 0;
+	state.memory_byte_offsets.clear();
+	state.memory_byte_sizes.clear();
+	// Every outside value the region read came in as an input; main defines its own ids.
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (!region.blocks.contains(block) && inst.Definition(0) != 0u &&
+			    std::ranges::find(region.inputs, &inst) == region.inputs.end()) {
+				ctx.Fail(inst, "is read by an outlined call target without being passed to it");
+			}
+			inst.ResetDefinitions();
+		}
+	}
+}
+
+void EmitOutlinedCall(ValueEmitContext& ctx, OutlinedRegion& region) {
+	auto& state = ctx.state;
+	const auto lanes = state.lane_count;
+	state.current_block = region.entry;
+	EmitLabel(state, region.entry->Definition());
+	uint32_t argument = 0;
+	if (region.input_type != 0u) {
+		argument = state.builder.AllocateId();
+		std::vector<uint32_t> words {spv::OpCompositeConstruct, region.input_type, argument};
+		for (const auto* input: region.inputs)
+			for (uint32_t half = 0; half < lanes; half++)
+				words.push_back((half == 0 ? ctx : *ctx.other_half).Def(IR::Value(const_cast<IR::Inst*>(input))));
+		state.builder.AddFunction(words);
+	}
+	const auto result = state.builder.AllocateId();
+	if (argument != 0u) {
+		state.builder.AddFunction(spv::OpFunctionCall, region.output_type, result, region.function, argument);
+	} else {
+		state.builder.AddFunction(spv::OpFunctionCall, region.output_type, result, region.function);
+	}
+	uint32_t member = 0;
+	region.output_ids.clear();
+	for (size_t output = 0; output < region.outputs.size(); output++) {
+		const auto* inst = region.outputs[output];
+		for (uint32_t half = 0; half < lanes; half++) {
+			const auto id = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeId(state, inst->GetType()), id, result,
+			                          member++);
+			region.output_ids.push_back(id);
+			if (output >= region.phi_outputs) (half == 0 ? ctx : *ctx.other_half).Define(*inst, id);
+		}
+	}
+	region.call_label = state.current_label;
+	state.builder.AddFunction(spv::OpBranch, region.exit->Definition());
+}
+
+void EmitStructuredFunction(ValueEmitContext& ctx, std::vector<OutlinedRegion>& regions) {
 	const auto& program = ctx.state.program;
 	StructuredFunctionState structured;
+	for (const auto& region: regions)
+		for (const auto* block: region.blocks) structured.region_of.emplace(block, &region);
 	ctx.state.builder.AddFunction(spv::OpBranch, program.blocks.front()->Definition());
 	for (size_t index = 0; index < program.blocks.size(); index++) {
 		const auto* block = program.blocks[index];
+		if (const auto found = structured.region_of.find(block); found != structured.region_of.end()) {
+			if (found->second->entry == block)
+				EmitOutlinedCall(ctx, *const_cast<OutlinedRegion*>(found->second));
+			continue;
+		}
 		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
 			EmitStructuredInstruction(lane, structured, inst);
 		});
@@ -686,17 +1103,48 @@ void EmitProgram(EmitterState& state) {
 			high.scratch_u32_variable = state.builder.AllocateId();
 		}
 	}
+	auto regions = FindOutlinedRegions(program);
+	// Outlined functions reach per-invocation memory through Private variables.
+	const auto per_invocation = regions.empty() ? spv::StorageClassFunction : spv::StorageClassPrivate;
+	if (!regions.empty()) {
+		state.scratch_storage_class = spv::StorageClassPrivate;
+		if (state.program.info.function_lds) {
+			state.lds_storage_class = spv::StorageClassPrivate;
+			state.builder.DefineGlobalVariable(
+			    state.lds_variable, TypeU32ArrayPointer(state, per_invocation, LdsDwordCount(state)),
+			    per_invocation);
+		}
+		if (state.program.info.function_scratch) {
+			for (uint32_t half = 0; half < state.lane_count; half++) {
+				state.builder.DefineGlobalVariable(
+				    state.scratch_variable[half],
+				    TypeU32ArrayPointer(state, per_invocation, state.program.scratch_dwords), per_invocation);
+			}
+		}
+		for (auto* lane: {&ctx, &high}) {
+			if (lane->scratch_u32_variable != 0) {
+				state.builder.DefineGlobalVariable(lane->scratch_u32_variable,
+				                                   TypePointer(state, per_invocation, TypeU32(state)),
+				                                   per_invocation);
+			}
+		}
+		for (auto& region: regions) {
+			EmitOutlinedFunction(ctx, region);
+		}
+		LOGF("ShaderRecompiler hash=0x%016" PRIx64 " outlined %" PRIu64 " inlined call targets into functions\n",
+		     program.shader_hash, static_cast<uint64_t>(regions.size()));
+	}
 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state),
 	                          state.mesh_guest_func != 0 ? state.mesh_guest_func : state.main_func,
 	                          spv::FunctionControlMaskNone, TypeFunction(state));
 	EmitLabel(state, state.entry_label);
-	if (state.program.info.function_lds) {
+	if (state.program.info.function_lds && per_invocation == spv::StorageClassFunction) {
 		state.builder.AddFunction(
 		    spv::OpVariable,
 		    TypeU32ArrayPointer(state, spv::StorageClassFunction, LdsDwordCount(state)),
 		    state.lds_variable, spv::StorageClassFunction);
 	}
-	if (state.program.info.function_scratch) {
+	if (state.program.info.function_scratch && per_invocation == spv::StorageClassFunction) {
 		for (uint32_t half = 0; half < state.lane_count; half++) {
 			state.builder.AddFunction(
 			    spv::OpVariable,
@@ -723,31 +1171,16 @@ void EmitProgram(EmitterState& state) {
 				}
 			}
 		}
-		if (lane.scratch_u32_variable != 0) {
+		if (lane.scratch_u32_variable != 0 && per_invocation == spv::StorageClassFunction) {
 			state.builder.AddFunction(spv::OpVariable,
 			                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 			                          lane.scratch_u32_variable, spv::StorageClassFunction);
 		}
 	}
-	if (state.gds_variable != 0) {
-		state.gds_length = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), state.gds_length,
-		                          state.gds_variable, 0);
-	}
+	EmitFunctionEntryValues(state); // pixel shaders use no buffer-backed LDS: GDS stays first
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
-	}
-	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
-		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
-		const auto group_y = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 1);
-		const auto group_z = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 2);
-		const auto count_x = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 0);
-		const auto count_y = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 1);
-		const auto row = EmitAddU32(state, group_y, EmitBinaryU32(state, spv::OpIMul, group_z, count_y));
-		const auto index = EmitAddU32(state, group_x, EmitBinaryU32(state, spv::OpIMul, row, count_x));
-		state.lds_base_dwords = EmitBinaryU32(state, spv::OpIMul, index,
-		                                     ConstantU32(state, LdsDwordCount(state)));
 	}
 	EmitMemoryBindings(state);
 	if (program.blocks.empty()) {
@@ -755,7 +1188,7 @@ void EmitProgram(EmitterState& state) {
 	} else if (state.program.dispatcher_fallback) {
 		EmitDispatcherFunction(ctx, *dispatcher);
 	} else {
-		EmitStructuredFunction(ctx);
+		EmitStructuredFunction(ctx, regions);
 	}
 	state.builder.AddFunction(spv::OpFunctionEnd);
 	state.current_block = nullptr;

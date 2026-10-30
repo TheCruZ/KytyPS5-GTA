@@ -132,6 +132,9 @@ struct EmitterState {
 	uint32_t                                         flattened_srt_variable  = 0;
 	uint32_t                                         uniform_buffer_variable = 0;
 	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;
+	// Per-invocation memory (scratch and function-local LDS) lives in Function variables of
+	// main unless the program has outlined functions, which need it as Private.
+	spv::StorageClass                                scratch_storage_class = spv::StorageClassFunction;
 	uint32_t                                         lds_base_dwords         = 0;
 	uint32_t                                         lds_variable            = 0;
 	uint32_t                                         lds_u64_variable        = 0;

@@ -845,6 +845,9 @@ struct Program: ResourcePlan {
 	uint32_t                      wave_size      = 64;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
+	// Byte pcs where the code of an inlined call target starts (programs expanded by
+	// ShaderFunctionExpander): the SPIR-V emitter gives each its own function.
+	std::vector<uint32_t>         inlined_call_entries;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;
 	struct ScalarWrite { uint32_t pc; ScalarReg reg; Value value; };
