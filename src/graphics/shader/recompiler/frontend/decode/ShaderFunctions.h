@@ -23,10 +23,12 @@ constexpr uint32_t ShaderCallMissTrapCode = 0x7fu;
 // Empty output means no calls; unresolved calls never discard guest instructions.
 // consulted_user_data, when given, receives the user-data registers the result depends on;
 // together with the code and the memory read through `read`, they determine the result.
+// long_branches receives the branches beyond the reach of their encoding (see LongBranch): the
+// expanded code decodes correctly only with them.
 bool InlineShaderFunctions(std::span<const uint32_t> code, uint64_t base,
                            std::span<const uint32_t> user_data, const ShaderCodeReader& read,
-                           std::vector<uint32_t>& expanded, std::string& reason,
-                           uint32_t wave_size = 64,
+                           std::vector<uint32_t>& expanded, std::vector<LongBranch>& long_branches,
+                           std::string& reason, uint32_t wave_size = 64,
                            std::vector<uint32_t>* consulted_user_data = nullptr);
 
 // InlineShaderFunctions for a caller that expands the same shaders over and over (the pipeline
@@ -47,6 +49,8 @@ public:
 	            uint32_t wave_size, uint64_t code_hash = 0);
 	// Where the last successful Expand() placed each call target's code.
 	[[nodiscard]] const std::vector<InlinedCallBody>& Bodies() const;
+	// The long branches of the last successful Expand(): its code decodes correctly only with them.
+	[[nodiscard]] const std::vector<LongBranch>& LongBranches() const;
 	// Whether the code Expand last analyzed at this address contains calls (true when unknown).
 	[[nodiscard]] bool HasCalls(std::span<const uint32_t> code) const;
 	// The user-data registers the last complete call resolution of this code (same content hash

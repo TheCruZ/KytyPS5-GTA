@@ -178,54 +178,25 @@ bool EmitOriginalPc(std::vector<uint32_t>& code, const Instruction& inst, uint64
 
 using Branches = std::vector<std::pair<uint32_t, uint32_t>>;
 
-bool RelocateBranches(std::vector<uint32_t>& code, Branches& branches, std::string& reason) {
-	// Keep relocation symbolic until every function has been inserted. A long
-	// edge uses guarded S_BRANCH islands; ordinary fallthrough skips the island.
-	// Unlike GETPC/ADD/SETPC stubs, these do not clobber guest SGPRs or SCC.
-	for (size_t index = 0; index < branches.size();) {
-		const auto [at, target] = branches[index];
-		const auto delta        = int64_t(target) - int64_t(at) - 1;
-		if (delta >= std::numeric_limits<int16_t>::min() &&
-		    delta <= std::numeric_limits<int16_t>::max()) {
-			++index;
-			continue;
-		}
-		if (code.size() + 2 > MaxExpandedWords || branches.size() > MaxExpandedWords) {
-			reason = "expanded shader branch islands exceed the bounded code size";
-			return false;
-		}
-		const auto desired   = delta > 0 ? at + 16384u : at - 16384u;
-		uint32_t   insertion = 0;
-		for (uint32_t word = 0; word <= desired && word < code.size();) {
-			insertion = word;
-			Instruction inst;
-			DecodeInstruction(code, word, inst);
-			if (inst.word_count == 0 || inst.word_count > code.size() - word) {
-				reason = "expanded shader has an invalid branch-island boundary";
-				return false;
-			}
-			word += inst.word_count;
-		}
-		if (insertion <= std::min(at, target) || insertion >= std::max(at, target)) {
-			reason = "cannot place a branch island between expanded instructions";
-			return false;
-		}
-		code.insert(code.begin() + insertion, {0xbf820000u, 0xbf820000u});
-		for (auto& [source, destination]: branches) {
-			if (source >= insertion) source += 2;
-			if (destination >= insertion) destination += 2;
-		}
-		const auto onward      = branches[index].second;
-		branches[index].second = insertion + 1u;
-		branches.emplace_back(insertion, insertion + 2u); // Fallthrough bypass.
-		branches.emplace_back(insertion + 1u, onward);    // Long edge continuation.
-		// Insertion may lengthen an earlier edge beyond its range, so revisit it.
-		index = 0;
-	}
+bool RelocateBranches(std::vector<uint32_t>& code, const Branches& branches,
+                      std::vector<LongBranch>& long_branches) {
+	// Relocation stays symbolic until every function has been inserted. An edge beyond the
+	// 16-bit offset keeps offset 0 and becomes a long branch of the decoded program: branch
+	// islands placed inside other callees' code made the expansion's control flow
+	// unstructured (a goto into the middle of another body), and the structurizer then routed
+	// every inlined callee through the same blocks.
+	long_branches.clear();
 	for (const auto [at, target]: branches) {
 		const auto delta = int64_t(target) - int64_t(at) - 1;
-		code[at]         = (code[at] & 0xffff0000u) | (static_cast<uint32_t>(delta) & 0xffffu);
+		if (delta >= std::numeric_limits<int16_t>::min() &&
+		    delta <= std::numeric_limits<int16_t>::max()) {
+			code[at] = (code[at] & 0xffff0000u) | (static_cast<uint32_t>(delta) & 0xffffu);
+		} else {
+			code[at] &= 0xffff0000u;
+			long_branches.push_back({at * 4u, target * 4u});
+		}
 	}
+	std::ranges::sort(long_branches, {}, &LongBranch::pc);
 	return true;
 }
 
@@ -480,9 +451,10 @@ std::vector<bool> ReachesCall(const Decoder::Program& program, const std::map<ui
 bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
                     const std::vector<CallSite>& sites, const std::set<uint32_t>& dependencies,
                     const ShaderCodeReader& read, uint32_t wave_size,
-                    std::vector<uint32_t>& expanded, std::string& reason,
-                    std::vector<InlinedCallBody>* bodies = nullptr) {
+                    std::vector<uint32_t>& expanded, std::vector<LongBranch>& long_branches,
+                    std::string& reason, std::vector<InlinedCallBody>* bodies = nullptr) {
 	if (bodies != nullptr) bodies->clear();
+	long_branches.clear();
 	const auto&              program = analysis.program;
 	std::map<uint32_t, Call> calls;
 	for (const auto& site: sites) {
@@ -634,7 +606,7 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 		}
 		relocations.emplace_back(at, found->second);
 	}
-	if (!RelocateBranches(result, relocations, reason)) return false;
+	if (!RelocateBranches(result, relocations, long_branches)) return false;
 	expanded = std::move(result);
 	return true;
 }
@@ -670,9 +642,11 @@ void MergeReads(Reads& reads) {
 
 bool InlineShaderFunctions(std::span<const uint32_t> code, uint64_t base,
                            std::span<const uint32_t> user_data, const ShaderCodeReader& read,
-                           std::vector<uint32_t>& expanded, std::string& reason,
-                           uint32_t wave_size, std::vector<uint32_t>* consulted_user_data) {
+                           std::vector<uint32_t>& expanded, std::vector<LongBranch>& long_branches,
+                           std::string& reason, uint32_t wave_size,
+                           std::vector<uint32_t>* consulted_user_data) {
 	expanded.clear();
+	long_branches.clear();
 	reason.clear();
 	if (consulted_user_data != nullptr) {
 		consulted_user_data->clear();
@@ -692,7 +666,8 @@ bool InlineShaderFunctions(std::span<const uint32_t> code, uint64_t base,
 	std::set<uint32_t>    dependencies;
 	const bool            ok =
 	    ResolveCalls(analysis, base, user_data, read, wave_size, sites, dependencies, reason) &&
-	    BuildExpansion(analysis, base, sites, dependencies, read, wave_size, expanded, reason);
+	    BuildExpansion(analysis, base, sites, dependencies, read, wave_size, expanded, long_branches,
+	                   reason);
 	if (consulted_user_data != nullptr) {
 		consulted_user_data->assign(dependencies.begin(), dependencies.end());
 	}
@@ -710,6 +685,7 @@ struct ShaderFunctionExpander::Impl {
 		bool                  ok = false;
 		std::string           reason;
 		std::vector<uint32_t> code;
+		std::vector<LongBranch> long_branches;
 		std::vector<InlinedCallBody> bodies;
 	};
 	struct Shader {
@@ -726,6 +702,7 @@ struct ShaderFunctionExpander::Impl {
 
 	std::unordered_map<uint64_t, Shader> shaders; // by code address
 	std::vector<InlinedCallBody>         bodies;  // of the last expansion
+	std::vector<LongBranch>              long_branches; // of the last expansion
 	std::vector<uint32_t>                scratch;
 
 	bool StillReads(const Expansion& expansion, const ShaderCodeReader& read) {
@@ -745,6 +722,10 @@ ShaderFunctionExpander::ShaderFunctionExpander(): m_impl(std::make_unique<Impl>(
 
 const std::vector<InlinedCallBody>& ShaderFunctionExpander::Bodies() const {
 	return m_impl->bodies;
+}
+
+const std::vector<LongBranch>& ShaderFunctionExpander::LongBranches() const {
+	return m_impl->long_branches;
 }
 ShaderFunctionExpander::~ShaderFunctionExpander() = default;
 
@@ -774,6 +755,7 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
                                     std::string& reason, uint32_t wave_size, uint64_t code_hash) {
 	expanded.clear();
 	reason.clear();
+	m_impl->long_branches.clear();
 	if (wave_size != 32u && wave_size != 64u) {
 		reason = "shader calls require a known wave size";
 		return false;
@@ -810,7 +792,8 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 		    m_impl->StillReads(expansion, read)) {
 			expanded = expansion.code;
 			reason   = expansion.reason;
-			m_impl->bodies = expansion.bodies;
+			m_impl->bodies        = expansion.bodies;
+			m_impl->long_branches = expansion.long_branches;
 			return expansion.ok;
 		}
 	}
@@ -826,8 +809,10 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 		return ok;
 	};
 	expansion.ok = BuildExpansion(analysis, base, expansion.sites, dependencies, recording,
-	                              wave_size, expansion.code, expansion.reason, &expansion.bodies);
-	m_impl->bodies = expansion.bodies;
+	                              wave_size, expansion.code, expansion.long_branches,
+	                              expansion.reason, &expansion.bodies);
+	m_impl->bodies        = expansion.bodies;
+	m_impl->long_branches = expansion.long_branches;
 	MergeReads(expansion.reads);
 	expanded = expansion.code;
 	reason   = expansion.reason;
