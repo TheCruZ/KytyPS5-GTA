@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>             // IWYU pragma: keep
@@ -17,6 +18,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
@@ -226,6 +228,60 @@ void Thread::PinCurrent(int logical_cpu) {
 	}
 #else
 	(void)logical_cpu;
+#endif
+}
+
+void Thread::ReserveCores(std::span<const int> logical_cpus) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	ULONG length = 0;
+	(void)::GetSystemCpuSetInformation(nullptr, 0, &length, ::GetCurrentProcess(), 0);
+	if (length == 0) {
+		return;
+	}
+	std::vector<uint8_t> buffer(length);
+	auto* const          first = reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data());
+	if (!::GetSystemCpuSetInformation(first, length, &length, ::GetCurrentProcess(), 0)) {
+		return;
+	}
+	const auto for_each_set = [&](auto&& func) {
+		for (ULONG offset = 0; offset + sizeof(SYSTEM_CPU_SET_INFORMATION) <= length;) {
+			const auto* info =
+			    reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+			if (info->Type == CpuSetInformation) {
+				func(info->CpuSet);
+			}
+			offset += info->Size;
+		}
+	};
+	// The physical cores (group, core index) of the reserved logical processors.
+	std::vector<std::pair<WORD, BYTE>> reserved;
+	for_each_set([&](const auto& set) {
+		for (const auto cpu: logical_cpus) {
+			if (set.Group == 0 && cpu >= 0 && set.LogicalProcessorIndex == cpu) {
+				reserved.emplace_back(set.Group, set.CoreIndex);
+			}
+		}
+	});
+	std::vector<ULONG>                 others;
+	std::vector<std::pair<WORD, BYTE>> other_cores;
+	for_each_set([&](const auto& set) {
+		const std::pair core {set.Group, set.CoreIndex};
+		if (std::ranges::find(reserved, core) == reserved.end()) {
+			others.push_back(set.Id);
+			if (std::ranges::find(other_cores, core) == other_cores.end()) {
+				other_cores.push_back(core);
+			}
+		}
+	});
+	// Smaller processors keep every core for the guest, which expects about seven.
+	constexpr size_t MinOtherCores = 6;
+	if (reserved.empty() || other_cores.size() < MinOtherCores) {
+		return;
+	}
+	(void)::SetProcessDefaultCpuSets(::GetCurrentProcess(), others.data(),
+	                                 static_cast<ULONG>(others.size()));
+#else
+	(void)logical_cpus;
 #endif
 }
 
