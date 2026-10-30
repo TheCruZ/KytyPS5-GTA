@@ -13,6 +13,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <map>
 #include <mutex>
 #include <span>
@@ -261,6 +262,8 @@ private:
 	// A readback of [begin, end) waited for writes still being recorded (`drained`) or for
 	// submitted ones; `device_address` when they were device-address writes.
 	void NoteReadbackWait(uint64_t begin, uint64_t end, bool device_address, bool drained);
+	// Whether to submit for a pending flush request now (see CommitWriteTicks()).
+	[[nodiscard]] bool TakeFlushRequest();
 
 	// The tick of the command buffer that last wrote each guest range a cached buffer holds.
 	class WriteTicks {
@@ -316,6 +319,11 @@ private:
 	// m_readback_count at the last readback that waited for device-address writes (0: none).
 	uint64_t                  m_device_address_hot = 0;
 	bool                      m_flush_requested    = false;
+	// Requested submissions (see TakeFlushRequest()): at most one per interval, and the tick a
+	// request was put off at (0: none put off).
+	static constexpr std::chrono::microseconds MinRequestedFlushInterval {1000};
+	std::chrono::steady_clock::time_point      m_last_requested_flush {};
+	uint64_t                                   m_flush_deferred_tick = 0;
 	struct ReadbackQueue {
 		vk::CommandPool         pool    = nullptr;
 		vk::CommandBuffer       command = nullptr;

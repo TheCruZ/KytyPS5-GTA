@@ -905,9 +905,35 @@ void BufferCache::NoteReadbackWait(uint64_t begin, uint64_t end, bool device_add
 	}
 }
 
+bool BufferCache::TakeFlushRequest() {
+	if (!m_flush_requested) {
+		return false;
+	}
+	// The work the request is about went out with a submission made meanwhile.
+	if (m_flush_deferred_tick != 0 && m_scheduler.CurrentTick() != m_flush_deferred_tick) {
+		m_flush_requested     = false;
+		m_flush_deferred_tick = 0;
+		return false;
+	}
+	// A submission costs the recording thread a queue submit. While readbacks keep coming, every
+	// operation that may write what they read asks for one (Demon's Souls: ~2,000 a frame, the
+	// device-address writers of a game whose SRT walks read GPU-written dwords through the
+	// mirror). Submit at most once per interval: a readback then waits at most for the work
+	// recorded since; the request stays for a later operation.
+	const auto now = std::chrono::steady_clock::now();
+	if (now - m_last_requested_flush < MinRequestedFlushInterval) {
+		m_flush_deferred_tick = m_scheduler.CurrentTick();
+		return false;
+	}
+	m_last_requested_flush = now;
+	m_flush_requested      = false;
+	m_flush_deferred_tick  = 0;
+	return true;
+}
+
 bool BufferCache::CommitWriteTicks() {
 	if (m_pending_writes.empty() && !m_device_address_pending) {
-		return std::exchange(m_flush_requested, false);
+		return TakeFlushRequest();
 	}
 	// The operation's commands are all recorded: they run in the current command buffer or in
 	// one submitted while it was recorded.
@@ -927,7 +953,7 @@ bool BufferCache::CommitWriteTicks() {
 		m_device_address_pending = false;
 		m_device_address_tick    = tick;
 	}
-	return std::exchange(m_flush_requested, false);
+	return TakeFlushRequest();
 }
 
 void BufferCache::MarkMirrorLinesWritten(uint64_t vaddr, uint64_t size, uint64_t tick) {
