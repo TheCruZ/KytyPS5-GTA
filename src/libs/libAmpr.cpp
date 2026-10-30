@@ -208,11 +208,14 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 		const auto real_path = LibKernel::FileSystem::GetRealFilename(path);
 		info.host_path       = real_path;
 
-		if (Common::File::IsDirectoryExisting(real_path)) {
+		// One attribute query per path: games resolve every file of their package this way (Demon's
+		// Souls ~224,000 at boot, which took ~2 minutes with a query each for directory, file and
+		// size).
+		if (const auto host = Common::File::GetInfo(real_path); host && host->is_file) {
+			info.file_size = host->size;
+		} else if (host || Common::File::IsDirectoryExisting(real_path)) {
 			info.is_dir    = true;
 			info.file_size = 0x10000;
-		} else if (Common::File::IsFileExisting(real_path)) {
-			info.file_size = Common::File::Size(real_path);
 		} else {
 			info.result = LibKernel::KERNEL_ERROR_ENOENT;
 		}
