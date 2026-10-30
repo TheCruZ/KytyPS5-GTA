@@ -196,6 +196,7 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	expected[static_cast<size_t>(Kind::BdaPagetable)] = program.info.uses_dma;
 	expected[static_cast<size_t>(Kind::FaultBuffer)] = program.info.uses_dma;
 	expected[static_cast<size_t>(Kind::FlattenedSrt)] = uses_flattened_srt;
+	expected[static_cast<size_t>(Kind::MipStats)] = UsesMipStats(program);
 	expected[static_cast<size_t>(Kind::ShaderData)] =
 	    program.bindings.ShaderDataDwords() != 0 && !program.bindings.UsesPushData();
 	uint64_t descriptor_mask = 0;
@@ -214,6 +215,8 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	    (has_dispatch_threads && (program.stage != ShaderType::Compute ||
 	                              program.bindings.dispatch_thread_dword != registers.size())) ||
 	    program.bindings.memory_offset_dword != registers.size() + (has_dispatch_threads ? 3u : 0u) ||
+	    program.bindings.mip_stats_count !=
+	        (UsesMipStats(program) ? program.info.images.size() : 0u) ||
 	    !std::is_sorted(registers.begin(), registers.end()) ||
 	    std::adjacent_find(registers.begin(), registers.end()) != registers.end()) {
 		Fail(program, "native shader-data layout is inconsistent");
@@ -222,9 +225,42 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 
 } // namespace
 
+bool UsesMipStats(const IR::Program& program) {
+	if (program.stage != ShaderType::Pixel) {
+		return false;
+	}
+	const auto& images = program.info.images;
+	// Images whose T# the draw supplies; table elements and heap images have no field.
+	const auto drawn = [&](uint32_t resource) {
+		return resource < images.size() && !images[resource].heap &&
+		       images[resource].table_capacity == 0u;
+	};
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() != IR::ValueOpcode::ImageSampleRaw) {
+				continue;
+			}
+			const auto index = inst.Flags<IR::MemoryFlags>().index;
+			if (index >= program.memory_info.size()) {
+				continue;
+			}
+			const auto resource = program.memory_info[index].resource;
+			if (drawn(resource)) {
+				return true;
+			}
+			if (resource < images.size() &&
+			    std::ranges::any_of(images[resource].indirect_resources, drawn)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   uint32_t push_data_start_dword, const Profile& profile,
-                                  bool emit_debug_info) {
+                                  bool emit_debug_info,
+                                  bool mip_stats_records) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
@@ -247,6 +283,7 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 		state.debug_source = state.builder.AddString(name);
 		state.builder.EnableNames();
 	}
+	state.mip_stats_records     = mip_stats_records;
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u

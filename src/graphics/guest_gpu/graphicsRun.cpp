@@ -2045,16 +2045,11 @@ void CommandProcessor::ExecuteTriggerEvent(uint32_t event_type, uint32_t event_i
 	}
 }
 
-void CommandProcessor::WriteLodStats(void* dst, uint32_t size) {
-	const auto sequence = EmitCallback([dst, size] {
-		memset(dst, 0, size);
-		// Hack?
-		if (size >= sizeof(uint32_t)) {
-			auto* label = static_cast<uint32_t*>(dst);
-			*label      = 1;
-		}
+void CommandProcessor::WriteLodStats(void* dst, uint32_t size, uint32_t control) {
+	// The report reaches guest memory when the GPU completes it (LodStatsCounter::Report).
+	EmitCallback([this, dst, size, control] {
+		m_renderer.GetLodStats().Report(reinterpret_cast<uint64_t>(dst), size, control);
 	});
-	NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst), size);
 }
 
 void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_arg) {

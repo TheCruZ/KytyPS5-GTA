@@ -1289,9 +1289,8 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	auto*      dst         = reinterpret_cast<void*>((buffer[1] & 0xffffffc0u) |
 	                                                 (static_cast<uint64_t>(buffer[2]) << 32u));
 
-	if (dst != nullptr && buffer_size != 0) {
-		cp.WriteLodStats(dst, buffer_size);
-	}
+	// A packet without a buffer resets or probes the counters.
+	cp.WriteLodStats(dst, buffer_size, buffer[3]);
 
 	return 4;
 }

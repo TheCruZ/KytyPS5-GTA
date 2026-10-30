@@ -111,7 +111,8 @@ public:
 	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
 	void ProcessPssr(const Pssr::Request& request);
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
-	void WriteLodStats(void* dst, uint32_t size);
+	// GET_LOD_STATS: see LodStatsCounter.
+	void WriteLodStats(void* dst, uint32_t size, uint32_t control);
 	void RunGarbageCollector();
 	// Runs a host command in operation order.
 	void EmitHostCommand(Common::UniqueFunction<void>&& command);
