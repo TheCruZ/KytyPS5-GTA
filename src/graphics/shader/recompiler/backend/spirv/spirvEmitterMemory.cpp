@@ -1389,7 +1389,7 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 	const auto raw = state.builder.AllocateId();
 	state.builder.AddName(state.indirect_format_function, "convert_indirect_buffer_format");
 	state.builder.AddFunction(spv::OpFunction, type, state.indirect_format_function,
-	                          spv::FunctionControlMaskNone, function_type);
+	                          SharedHelperControl(state), function_type);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, format);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, selector);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, component);
@@ -1460,7 +1460,7 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			                  (memory.formatted ? "_formatted" : "");
 			state.builder.AddName(function, name.c_str());
 			state.builder.AddFunction(spv::OpFunction, result_type, function,
-			                          spv::FunctionControlMaskNone, signature);
+			                          SharedHelperControl(state), signature);
 			std::array<uint32_t, 8> args;
 			for (auto& arg: args) {
 				arg = state.builder.AllocateId();
@@ -1487,7 +1487,7 @@ void DefineGetBdaPointer(EmitterState& state) {
 	const auto entry_label     = state.builder.AllocateId();
 	state.builder.AddName(state.bda_pointer_function, "get_bda_pointer");
 	state.builder.AddFunction(spv::OpFunction, type, state.bda_pointer_function,
-	                          spv::FunctionControlMaskNone, function_type);
+	                          SharedHelperControl(state), function_type);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, address);
 	EmitLabel(state, entry_label);
 

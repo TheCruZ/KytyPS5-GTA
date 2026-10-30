@@ -210,6 +210,16 @@ inline void EmitLabel(EmitterState& state, uint32_t label) {
 
 uint32_t TypeId(EmitterState& state, IR::Type type);
 
+// Function control of the shared memory helpers (BDA pointer, runtime-V# buffer loads, format
+// conversion). Programs of inlined call targets call them from hundreds of sites, and the NVIDIA
+// compiler inlining each copy ran out of time and memory: Wolverine's 0xe6d76d24f59f8015 did
+// not compile in 10 minutes and 25 GB with them inlined, and takes 166 s and 5.5 GB with one
+// copy of each. Other programs keep inlining them.
+inline spv::FunctionControlMask SharedHelperControl(const EmitterState& state) {
+	return state.program.inlined_call_entries.empty() ? spv::FunctionControlMaskNone
+	                                                  : spv::FunctionControlDontInlineMask;
+}
+
 // Shared instruction construction; typed aliases add no forwarding functions.
 template <spv::Op opcode, IR::Type type, typename... Args>
 uint32_t EmitNative(EmitterState& state, Args... args) {
