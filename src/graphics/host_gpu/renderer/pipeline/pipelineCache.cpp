@@ -1174,8 +1174,9 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	const auto stage_index    = ahead.stages++;
 	auto&      resources      = ahead.resources[stage_index];
 	auto&      specialization = ahead.specializations[stage_index];
-	// The walker's loads that fault ahead of execution fail the walk instead of downloading
-	// GPU-written bytes; the others are logged with the value they read.
+	// The walker's loads of GPU-owned pages read the backing store instead of downloading
+	// GPU-written bytes, and the loads that still fault fail the walk; every load is logged with
+	// the value it read, for the execution thread to check.
 	ShaderRecompiler::IR::SrtRuntime runtime {
 	    .user_data                  = std::span(params.user_data).first(params.user_data_count),
 	    .shader_base                = params.Base(),

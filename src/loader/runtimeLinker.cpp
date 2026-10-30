@@ -651,10 +651,15 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 }
 
 // An SRT walker load of a GPU-owned page reads bytes the GPU did not write from the backing
-// store, as the fault below would, without the fault.
+// store, as the fault below would, without the fault. A walk ahead of execution takes the
+// backing store's bytes whatever wrote them: it logs every load, and the execution thread checks
+// the logged bytes against the GPU's before it uses the walk (GuestReadLog::StillValid()).
 static bool ReadWalkerGuestMemory(uint64_t address, uint32_t& value, bool ahead) {
-	return !ahead && Libs::LibKernel::Memory::MayBeGpuWritten(address, sizeof(value)) &&
-	       Libs::LibKernel::Memory::TryReadAroundGpuWrites(address, &value, sizeof(value));
+	if (!Libs::LibKernel::Memory::MayBeGpuWritten(address, sizeof(value))) {
+		return false;
+	}
+	return ahead ? Libs::LibKernel::Memory::TryReadBacking(address, &value, sizeof(value))
+	             : Libs::LibKernel::Memory::TryReadAroundGpuWrites(address, &value, sizeof(value));
 }
 
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
