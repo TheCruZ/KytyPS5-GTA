@@ -4,6 +4,7 @@
 #include "common/common.h"
 
 #include <memory>
+#include <span>
 #include <string>
 
 namespace Common {
@@ -38,6 +39,10 @@ public:
 	// processor (when `logical_cpu` is not negative). No-ops where unsupported.
 	static void RaiseCurrentPriority();
 	static void PinCurrent(int logical_cpu);
+	// Keeps the threads of the process that pick no processors themselves off the physical cores
+	// of `logical_cpus` (and their SMT siblings), for threads pinned there, when at least six
+	// other physical cores remain.
+	static void ReserveCores(std::span<const int> logical_cpus);
 
 	// Get current thread id
 	// Once a thread has finished, the id may be reused by another thread.
