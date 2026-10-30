@@ -112,7 +112,8 @@ public:
 	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
 	void ProcessPssr(const Pssr::Request& request);
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
-	void WriteLodStats(void* dst, uint32_t size);
+	// GET_LOD_STATS: see LodStatsCounter.
+	void WriteLodStats(void* dst, uint32_t size, uint32_t control);
 	void RunGarbageCollector();
 	// Runs a host command in operation order.
 	void EmitHostCommand(Common::UniqueFunction<void>&& command);
@@ -139,7 +140,6 @@ public:
 	void MemSemaphore(uint64_t* counter, bool signal, bool write);
 	void WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num, uint32_t write_control);
 	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes);
-	void GetLodStats(volatile uint32_t* dst, uint32_t size, bool reset);
 	void DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, uint8_t src_sel,
 	             uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes);
 	void SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,

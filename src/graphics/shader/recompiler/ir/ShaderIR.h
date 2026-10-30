@@ -391,6 +391,8 @@ enum class DescriptorBindingKind : uint32_t {
 	ShaderData,
 	SharedMemory,
 	UniformBuffers,
+	// GET_LOD_STATS counters, which instrumented pixel shaders record into (LodStatsCounter).
+	MipStats,
 	Count,
 };
 
@@ -400,7 +402,7 @@ inline constexpr uint32_t UniformBufferBytes = 65536u;
 inline constexpr uint32_t UniformBufferBaseSlack = 256u;
 
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 51u);
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 59u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 60u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
@@ -568,6 +570,9 @@ struct Bindings {
 	uint32_t push_data_start_dword = PushData::NoStart;
 	uint32_t dispatch_thread_dword = PushData::NoStart;
 	uint32_t memory_offset_dword = 0;
+	// GET_LOD_STATS field of each image (one dword each, LodStatsReport::ImageField) after the
+	// bound ranges; non-zero only for pixel shaders instrumented for mip statistics.
+	uint32_t mip_stats_count = 0;
 
 	// Packed 8-bit binding offsets, then each binding's bound range in bytes: OpArrayLength
 	// reads 0 for ranges of 2 GiB or more on NVIDIA.
@@ -575,10 +580,11 @@ struct Bindings {
 		return memory_offset_dword +
 		       (descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] + 3u) / 4u;
 	}
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	[[nodiscard]] uint32_t MipStatsDword() const {
 		return MemorySizeDword() +
 		       descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)];
 	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const { return MipStatsDword() + mip_stats_count; }
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
 	}
