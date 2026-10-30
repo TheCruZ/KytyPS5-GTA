@@ -654,7 +654,34 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 // store, as the fault below would, without the fault. A walk ahead of execution takes the
 // backing store's bytes whatever wrote them: it logs every load, and the execution thread checks
 // the logged bytes against the GPU's before it uses the walk (GuestReadLog::StillValid()).
-static bool ReadWalkerGuestMemory(uint64_t address, uint32_t& value, bool ahead) {
+static Libs::Graphics::ShaderRecompiler::IR::SrtWalkerPage WalkerGuestPage(uint64_t address,
+                                                                            bool     ahead,
+                                                                            const uint8_t*& backing) {
+	using Libs::Graphics::ShaderRecompiler::IR::SrtWalkerPage;
+	// Tracking regions without GPU writes never fault on reads.
+	if (!Libs::LibKernel::Memory::MayBeGpuWritten(address, sizeof(uint32_t))) {
+		return SrtWalkerPage::Direct;
+	}
+	constexpr uint64_t PageSize = 4096;
+	if (ahead) {
+		backing = static_cast<const uint8_t*>(
+		    Libs::LibKernel::Memory::FindBackingPointer(address & ~(PageSize - 1), PageSize));
+		return backing != nullptr ? SrtWalkerPage::Backing : SrtWalkerPage::PerLoad;
+	}
+	// Pages the GPU does not own read directly.
+	if (!Libs::LibKernel::Memory::MayFaultOnGpuRead(address & ~(PageSize - 1), PageSize)) {
+		return SrtWalkerPage::Direct;
+	}
+	backing = Libs::LibKernel::Memory::FindAroundBackingPage(address);
+	return SrtWalkerPage::PerLoad;
+}
+
+static bool ReadWalkerGuestMemory(uint64_t address, uint32_t& value, bool ahead,
+                                  const uint8_t* backing) {
+	if (backing != nullptr) {
+		return Libs::LibKernel::Memory::TryReadAroundGpuWritesOnPage(address, &value, sizeof(value),
+		                                                             backing);
+	}
 	if (!Libs::LibKernel::Memory::MayBeGpuWritten(address, sizeof(value))) {
 		return false;
 	}
@@ -1782,7 +1809,8 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	if (!Common::HostException::InstallHandler(KytyExceptionHandler)) {
 		EXIT("Failed to install the required vectored exception handler\n");
 	}
-	Libs::Graphics::ShaderRecompiler::IR::SetSrtWalkerGuestRead(ReadWalkerGuestMemory);
+	Libs::Graphics::ShaderRecompiler::IR::SetSrtWalkerGuestMemory(
+	    {.page = WalkerGuestPage, .read = ReadWalkerGuestMemory});
 
 	std::vector<std::pair<uint64_t, uint64_t>> executable_segments;
 	uint64_t                                   eh_frame_header_addr = 0;

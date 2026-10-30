@@ -7,6 +7,7 @@
 #include <xbyak/xbyak.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cstring>
@@ -173,16 +174,43 @@ thread_local bool                         t_walker_faulted = false;
 // Guest memory starts here: a table pointer below it is null.
 constexpr uint64_t GuestMemoryStart = 0x40000;
 
-std::atomic<SrtWalkerGuestRead> g_guest_read {nullptr};
+SrtWalkerGuestMemory    g_guest_memory;
+std::atomic_bool        g_guest_memory_set {false};
+// Counts the walks on this thread: the page answers below hold within one.
+thread_local uint64_t   t_walk = 0;
+// The emulator's answers for the pages this walk loaded from lately, by page.
+struct WalkerPageAnswer {
+	uint64_t       walk    = 0;
+	uint64_t       page    = ~uint64_t {0};
+	SrtWalkerPage  kind    = SrtWalkerPage::Direct;
+	const uint8_t* backing = nullptr;
+};
+thread_local std::array<WalkerPageAnswer, 4> t_page_answers;
 
 // Bit 32 set: the low dword is the value at the address; clear: load it directly.
 uint64_t KYTY_SYSV_ABI ProbeGuestLoad(uint64_t address) {
-	const auto read  = g_guest_read.load(std::memory_order_relaxed);
-	uint32_t   value = 0;
-	if (read != nullptr && address >= GuestMemoryStart && read(address, value, t_walker_ahead)) {
-		return uint64_t {1} << 32u | value;
+	constexpr uint64_t PageSize = 4096;
+	if (address < GuestMemoryStart || !g_guest_memory_set.load(std::memory_order_acquire)) {
+		return 0;
 	}
-	return 0;
+	const auto page   = address & ~(PageSize - 1);
+	auto&      answer = t_page_answers[(page / PageSize) % t_page_answers.size()];
+	if (answer.walk != t_walk || answer.page != page) {
+		answer = {.walk = t_walk, .page = page};
+		answer.kind = g_guest_memory.page(address, t_walker_ahead, answer.backing);
+	}
+	uint32_t value = 0;
+	switch (answer.kind) {
+		case SrtWalkerPage::Direct: return 0;
+		case SrtWalkerPage::Backing:
+			// Walker loads are aligned dwords: they never cross the page.
+			std::memcpy(&value, answer.backing + (address - page), sizeof(value));
+			return uint64_t {1} << 32u | value;
+		case SrtWalkerPage::PerLoad: break;
+	}
+	return g_guest_memory.read(address, value, t_walker_ahead, answer.backing)
+	           ? uint64_t {1} << 32u | value
+	           : 0;
 }
 
 // Every direct guest load is mov eax, [r10] (41 8b 02), so a fault completes it as a zero read.
@@ -1414,6 +1442,7 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	t_running_walker = plan.srt_code.get();
 	t_walker_ahead   = runtime.record_load != nullptr;
 	t_walker_faulted = false;
+	++t_walk;
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
 	                                                     plan.srt_scratch.data(), runtime.shader_base);
 	t_running_walker = nullptr;
@@ -1483,8 +1512,13 @@ uint32_t SrtWalkerAheadLoadLength(uint64_t rip, uint64_t address) {
 	return length;
 }
 
-void SetSrtWalkerGuestRead(SrtWalkerGuestRead read) {
-	g_guest_read.store(read, std::memory_order_relaxed);
+void SetSrtWalkerGuestMemory(const SrtWalkerGuestMemory& memory) {
+	if (g_guest_memory_set.load(std::memory_order_acquire)) {
+		return;
+	}
+	g_guest_memory = memory;
+	g_guest_memory_set.store(memory.page != nullptr && memory.read != nullptr,
+	                         std::memory_order_release);
 }
 
 uint32_t SrtWalkerLoadLength(uint64_t rip) {

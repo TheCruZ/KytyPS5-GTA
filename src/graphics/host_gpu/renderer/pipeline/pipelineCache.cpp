@@ -361,31 +361,47 @@ bool GuestReadLog::StillValid() const {
 		return false;
 	}
 	std::array<uint8_t, StrictCheckBytes> buffer {};
-	// Most entries lie on pages the GPU does not own: decide that once per page.
-	uint64_t checked_page  = UINT64_MAX;
-	bool     checked_owned = false;
+	// Most entries lie on pages the GPU does not own: decide that once per page. The entries of
+	// a draw alternate between a few pages (its descriptor tables and the GPU-owned pages around
+	// them), so the last pages are kept, with the backing bytes of the GPU-owned ones for reading
+	// around the GPU's writes there (see FindAroundBackingPage()).
+	struct CheckedPage {
+		uint64_t       page    = UINT64_MAX;
+		bool           owned   = false;
+		const uint8_t* backing = nullptr;
+	};
+	std::array<CheckedPage, 4> checked {};
 	for (const auto& entry: m_entries) {
 		const auto* recorded = m_bytes.data() + entry.offset;
 		if (!entry.strict) {
-			const auto first_page = entry.address >> 12u;
-			const auto last_page  = (entry.address + entry.size - 1) >> 12u;
-			bool       gpu_owned  = false;
-			if (first_page == last_page && first_page == checked_page) {
-				gpu_owned = checked_owned;
+			const auto  first_page   = entry.address >> 12u;
+			const auto  last_page    = (entry.address + entry.size - 1) >> 12u;
+			bool        gpu_owned    = false;
+			const auto* page_backing = static_cast<const uint8_t*>(nullptr);
+			if (first_page == last_page) {
+				auto& page = checked[first_page % checked.size()];
+				if (page.page != first_page) {
+					page.page    = first_page;
+					page.owned   = Libs::LibKernel::Memory::MayFaultOnGpuRead(entry.address, entry.size);
+					page.backing = page.owned
+					                   ? Libs::LibKernel::Memory::FindAroundBackingPage(entry.address)
+					                   : nullptr;
+				}
+				gpu_owned    = page.owned;
+				page_backing = page.backing;
 			} else {
 				gpu_owned = Libs::LibKernel::Memory::MayFaultOnGpuRead(entry.address, entry.size);
-				if (first_page == last_page) {
-					checked_page  = first_page;
-					checked_owned = gpu_owned;
-				}
 			}
 			// On GPU-owned pages a direct load faults and reads back all the GPU's queued work:
 			// bytes the GPU did not write compare from the backing store.
 			bool around = gpu_owned;
 			for (uint32_t done = 0; around && done < entry.size; done += sizeof(buffer)) {
 				const auto bytes = std::min<uint32_t>(entry.size - done, sizeof(buffer));
-				around           = Libs::LibKernel::Memory::TryReadAroundGpuWrites(
-                    entry.address + done, buffer.data(), bytes);
+				around           = page_backing != nullptr
+				                       ? Libs::LibKernel::Memory::TryReadAroundGpuWritesOnPage(
+				                             entry.address + done, buffer.data(), bytes, page_backing)
+				                       : Libs::LibKernel::Memory::TryReadAroundGpuWrites(
+				                             entry.address + done, buffer.data(), bytes);
 				if (around && std::memcmp(buffer.data(), recorded + done, bytes) != 0) {
 					return false;
 				}
