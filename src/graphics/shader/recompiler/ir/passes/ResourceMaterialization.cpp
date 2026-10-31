@@ -1385,8 +1385,13 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		if (NullImageDescriptor(descriptor)) {
 			image.numeric_class = base.atomic ? Prospero::TextureNumericClass::Uint
 			                                  : Prospero::TextureNumericClass::Float;
-			image.dimension     = Decoder::ImageDimension::Dim2D;
-			image.cube          = false;
+			// A null image reads zero through a null descriptor of any view type: it keeps the
+			// dimension the shader samples with, so a game that binds the image later (a texture
+			// still streaming in) reuses the same program instead of compiling another.
+			image.dimension     = base.dimension != Decoder::ImageDimension::Unknown
+			                          ? base.dimension
+			                          : Decoder::ImageDimension::Dim2D;
+			image.cube          = base.dimension != Decoder::ImageDimension::Unknown && base.cube;
 			continue;
 		}
 		const auto descriptor_dimension = DescriptorDimension(descriptor, base.dimension);
