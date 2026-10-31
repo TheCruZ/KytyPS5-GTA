@@ -603,6 +603,7 @@ void RenderExecutor::DispatchIndirectThreads(uint64_t submit_id, CommandBuffer& 
 		return;
 	}
 	ShaderComputeInputInfo input_info {};
+	m_context.GetImageHeap().BeginDraw();
 	const ShaderModule*    compute_module = nullptr;
 	if (!TakeResolvedDispatch(input_info, compute_module)) {
 		input_info.async_compute              = async_compute;
@@ -634,6 +635,10 @@ void RenderExecutor::DispatchIndirectThreads(uint64_t submit_id, CommandBuffer& 
 			// Its results are often read back soon: submit it at once (see CommitWriteTicks()).
 			m_context.GetBufferCache().RequestFlushForReadbacks();
 		}
+	}
+	// The heap resolves the elements this dispatch acquired before its descriptors are written.
+	if (program.info.uses_image_heap) {
+		m_context.GetImageHeap().Rebind(*this);
 	}
 	RebindImages(bindings);
 	(void)PrepareIndirectWriteTargets(m_context, bindings);

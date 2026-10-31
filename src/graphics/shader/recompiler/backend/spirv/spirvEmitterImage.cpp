@@ -770,7 +770,17 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 		ctx.Fail(inst, "has no indirect image runtime mapping");
 	}
 	if (image.heap) {
-		const auto entry = EmitImageHeapEntry(state, key, image.indirect_mapping_offset);
+		// The blocks a record-table root's records name hold slots of its list, whose slot count
+		// and address precede the mapping.
+		const auto entry = IsRecordTableSource(state, image.source)
+		    ? EmitImageHeapEntry(state,
+		                         Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+		                                EmitRecordTableIndex(state, key, ctx.Def(handle->Arg(1)),
+		                                                     image.indirect_mapping_offset,
+		                                                     image.indirect_search_iterations),
+		                                ConstantU32(state, 2u)),
+		                         image.indirect_mapping_offset - 3u)
+		    : EmitImageHeapEntry(state, key, image.indirect_mapping_offset);
 		const auto kinds = static_cast<uint32_t>(image.indirect_resources.size()) - 1u;
 		// One kind leaves every slot word a bare element.
 		if (kinds == 1u) return emit(image.indirect_resources[1], entry);

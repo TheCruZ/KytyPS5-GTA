@@ -40,6 +40,10 @@ public:
 	}
 	bool Acquire(const ShaderRecompiler::IR::ImageHeapRequest& request,
 	             ShaderRecompiler::IR::ImageHeapView&          result) override;
+	// The candidates of a root that selects descriptors through records. Roots with one profile
+	// share a view (and so its elements and kinds); each root owns the slots of its last list.
+	bool AcquireList(const ShaderRecompiler::IR::ImageHeapList& list,
+	                 ShaderRecompiler::IR::ImageHeapView&       result) override;
 	// Image discovery: resolves new elements and rediscovers changed images.
 	void Rebind(RenderExecutor& executor);
 	// Recording: uploads slots, moves resident images to their read layout and binds the array.
@@ -55,6 +59,16 @@ private:
 
 	struct DescriptorHash {
 		size_t operator()(const DescriptorValue& value) const noexcept;
+	};
+	struct ListKey {
+		const void* owner    = nullptr;
+		uint32_t    resource = 0;
+		bool        operator==(const ListKey&) const = default;
+	};
+	struct ListKeyHash {
+		size_t operator()(const ListKey& key) const noexcept {
+			return std::hash<const void*> {}(key.owner) ^ (size_t {key.resource} * 0x9e3779b97f4a7c15ull);
+		}
 	};
 
 	struct Element {
@@ -104,6 +118,15 @@ private:
 		std::vector<std::unique_ptr<View>> views;
 	};
 
+	// A root's record-table candidates: slots like a view's, which select elements of its view.
+	struct List {
+		View*                   view = nullptr;
+		std::vector<uint32_t>   slots; // Null slot, one per candidate, trailing null slot.
+		std::unique_ptr<Buffer> buffer;
+		size_t                  dirty_begin = 0; // Slots to upload.
+		size_t                  dirty_end   = 0;
+	};
+
 	[[nodiscard]] bool Refresh(Memory& memory);
 	void               MarkDirty(Memory& memory, size_t begin, size_t end);
 	template <bool track>
@@ -113,6 +136,9 @@ private:
 	void     UpdateProbes(View& view, uint64_t begin, uint64_t end);
 	void     UpdateProbe(View& view, uint64_t probe);
 	void     Assign(View& view, size_t slot, uint32_t entry);
+	void     Assign(List& list, size_t slot, uint32_t entry);
+	void     Upload(CommandBuffer& buffer, const std::vector<uint32_t>& slots, Buffer& device,
+	                size_t& dirty_begin, size_t& dirty_end);
 	void     Bury();
 	uint32_t Intern(View& view, uint32_t kind, const DescriptorValue& value);
 	void     Release(View& view, uint32_t entry);
@@ -127,7 +153,12 @@ private:
 	PageManager&                         m_page_manager;
 	std::mutex                           m_mutex; // Fault-visible Memory state and m_memories.
 	std::vector<std::unique_ptr<Memory>> m_memories;
+	// Views of record-table candidates, one per profile (Memory holds no table), and each root's
+	// last list.
+	std::vector<std::unique_ptr<Memory>>          m_list_memories;
+	std::unordered_map<ListKey, List, ListKeyHash> m_lists;
 	std::vector<View*>                   m_active; // Acquired since the last commit.
+	std::vector<List*>                   m_active_lists;
 	uint64_t                             m_draw         = 1;
 	uint64_t                             m_suspend_draw = 0; // m_draw at the last suspend point.
 	std::vector<Element>                 m_elements;
