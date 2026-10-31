@@ -332,9 +332,17 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size, bool guest_fau
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
-	m_memory_tracker.InvalidateRegion(vaddr, size, [this, vaddr, size, guest_fault] {
+	// A CPU write needs the whole range CPU-modified. GPU-modified pages are read back first; a
+	// GPU write recorded while another thread's readback waits keeps a page GPU-modified, so
+	// repeat until every page is CPU-modified.
+	for (;;) {
+		bool gpu_modified = false;
+		m_memory_tracker.InvalidateRegion(vaddr, size, [&gpu_modified] { gpu_modified = true; });
+		if (!gpu_modified) {
+			return;
+		}
 		ReadMemory(vaddr, size, true, guest_fault);
-	});
+	}
 }
 
 void BufferCache::InvalidateUnlessGpuModified(uint64_t vaddr, uint64_t size) noexcept {
@@ -369,6 +377,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
+	if (!GuestGpu::IsGpuThread()) {
+		ReadMemoryAsync(vaddr, size, is_write, guest_fault);
+		return;
+	}
 	// The guest reads (or writes) memory the GPU wrote only after a label the execution thread
 	// writes once the work before it executed: the operations queued since cannot be what the
 	// access needs, so the readback runs before them instead of after the whole backlog (a
@@ -384,6 +396,14 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 		// nothing left to download: they are released all the same.
 		const auto pages_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 		const auto pages_end   = Common::AlignUp(vaddr + read_size, TRACKER_PAGE_SIZE);
+		// Bytes another thread's readback downloaded are in the backing once it published them.
+		if (const auto inflight = InFlightReadbackTick(pages_begin, pages_end); inflight != 0) {
+			m_scheduler.Wait(inflight);
+			m_scheduler.WaitPriorityOperations(inflight);
+			std::erase_if(m_inflight_readbacks, [inflight](const InFlightReadback& readback) {
+				return readback.tick <= inflight;
+			});
+		}
 		if (DownloadBufferMemory<false>(buffer, vaddr, read_size) ||
 		    !m_gpu_modified_ranges.Intersects(pages_begin, pages_end - pages_begin)) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, read_size);
@@ -392,6 +412,80 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		}
 	});
+}
+
+void BufferCache::ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write, bool guest_fault) {
+	// The execution thread records the download right away (see ReadMemory()) and submits it, then
+	// goes on with its operations while this thread waits for the GPU and the publication: on
+	// hardware only the reading thread waits for the memory, not the GPU front end.
+	auto&    gpu         = m_scheduler.Context().GetGpu();
+	uint64_t tick        = 0;
+	uint64_t read_size   = size;
+	uint64_t pages_begin = 0;
+	uint64_t pages_end   = 0;
+	gpu.SendUrgentCommandSync([&] {
+		if (is_write && !IsRegionRegistered(vaddr, size)) {
+			return;
+		}
+		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+		read_size    = guest_fault ? ReadAheadSize(buffer, vaddr, size) : size;
+		pages_begin  = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+		pages_end    = Common::AlignUp(vaddr + read_size, TRACKER_PAGE_SIZE);
+		tick         = InFlightReadbackTick(pages_begin, pages_end);
+		// Pages read back while their writer is still being recorded make operations that write
+		// them submit at once (see NoteWrite()), so the GPU is done sooner next time.
+		NoteReadbackWait(pages_begin, pages_end, false,
+		                 m_write_ticks.Latest(pages_begin, pages_end) >= m_scheduler.CurrentTick());
+		if (DownloadBufferMemory<true>(buffer, vaddr, read_size)) {
+			const auto recorded = m_scheduler.CurrentTick();
+			m_inflight_readbacks.push_back({pages_begin, pages_end, recorded});
+			tick = std::max(tick, recorded);
+		}
+		if (tick == 0) {
+			// Nothing to download or in flight: the pages leave GPU ownership at once.
+			ReleaseReadback(vaddr, size, pages_begin, pages_end, 0, is_write);
+			return;
+		}
+		// This thread may only wait for submitted work.
+		if (tick >= m_scheduler.CurrentTick()) {
+			m_scheduler.Flush();
+		}
+	});
+	if (tick == 0) {
+		return;
+	}
+	m_scheduler.GetMasterSemaphore().Wait(tick);
+	m_scheduler.WaitPriorityOperations(tick);
+	gpu.SendUrgentCommandSync(
+	    [&] { ReleaseReadback(vaddr, size, pages_begin, pages_end, tick, is_write); });
+}
+
+uint64_t BufferCache::InFlightReadbackTick(uint64_t begin, uint64_t end) const {
+	uint64_t tick = 0;
+	for (const auto& readback: m_inflight_readbacks) {
+		if (readback.begin < end && begin < readback.end) {
+			tick = std::max(tick, readback.tick);
+		}
+	}
+	return tick;
+}
+
+void BufferCache::ReleaseReadback(uint64_t vaddr, uint64_t size, uint64_t pages_begin,
+                                  uint64_t pages_end, uint64_t tick, bool is_write) {
+	// Downloads up to `tick` are published.
+	std::erase_if(m_inflight_readbacks,
+	              [tick](const InFlightReadback& readback) { return readback.tick <= tick; });
+	// GPU writes recorded since the download keep their pages GPU-owned for the next readback, as
+	// do pages another download in flight covers.
+	if (InFlightReadbackTick(pages_begin, pages_end) != 0 ||
+	    m_gpu_modified_ranges.Intersects(pages_begin, pages_end - pages_begin)) {
+		// The faulting access runs again and reads (or writes) after the next readback.
+		return;
+	}
+	m_memory_tracker.UnmarkRegionAsGpuModified(pages_begin, pages_end - pages_begin);
+	if (is_write) {
+		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	}
 }
 
 uint64_t BufferCache::ReadAheadSize(const Buffer& buffer, uint64_t vaddr, uint64_t size) const {
@@ -1022,6 +1116,11 @@ bool BufferCache::TryReadMirroredGpuWrites(uint64_t vaddr, void* data, uint64_t 
 	    !GuestGpu::IsGpuThread()) {
 		return false;
 	}
+	// The bytes of a download in flight left the dirty ranges with their write ticks, so a mirror
+	// line older than them would pass (see HasGpuDirtyBytes()).
+	if (InFlightReadbackTick(vaddr, vaddr + size) != 0) {
+		return false;
+	}
 	// Writes of the operation being recorded have no tick yet.
 	for (const auto& [address, bytes]: m_pending_writes) {
 		if (address < vaddr + size && vaddr < address + bytes) {
@@ -1373,6 +1472,12 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	// mix the guest's descriptors with GPU-written data: answer within a page from its mask.
 	constexpr uint64_t PageSize = 4096;
 	const auto         page     = vaddr / PageSize;
+	// Bytes another thread's readback downloads have left the dirty ranges, but the backing holds
+	// them only once that download is published.
+	if (!m_inflight_readbacks.empty() && size != 0 &&
+	    InFlightReadbackTick(vaddr, vaddr + size) != 0) {
+		return true;
+	}
 	if (size == 0 || (vaddr + size - 1) / PageSize != page) {
 		return m_gpu_modified_ranges.Intersects(vaddr, size);
 	}
@@ -1488,7 +1593,10 @@ void BufferCache::RunGarbageCollector() {
 			return false;
 		}
 		if (dirty) {
-			EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()));
+			// Pages a readback download in flight covers publish with the wait below.
+			EXIT_NOT_IMPLEMENTED(
+			    !DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()) &&
+			    InFlightReadbackTick(buffer.CpuAddress(), buffer.CpuAddress() + buffer.Size()) == 0);
 			dirty_buffers.push_back(id);
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
