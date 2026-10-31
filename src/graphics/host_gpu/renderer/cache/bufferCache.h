@@ -247,6 +247,16 @@ private:
 	// Execution thread: the bytes from vaddr a guest fault on [vaddr, vaddr + size) reads back,
 	// with the GPU-written pages that follow it whose writes were submitted.
 	[[nodiscard]] uint64_t ReadAheadSize(const Buffer& buffer, uint64_t vaddr, uint64_t size) const;
+	// ReadMemory() for threads other than the execution thread: the execution thread records and
+	// submits the download and keeps working while the faulting thread waits for it.
+	void ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write, bool guest_fault);
+	// Execution thread: the newest tick of a download in flight over [begin, end), or 0.
+	[[nodiscard]] uint64_t InFlightReadbackTick(uint64_t begin, uint64_t end) const;
+	// Execution thread, after a readback of [vaddr, vaddr + size) (pages [pages_begin, pages_end))
+	// published the bytes downloaded at `tick`: the pages leave GPU ownership unless the GPU wrote
+	// them again since, and a guest write marks them CPU-modified.
+	void ReleaseReadback(uint64_t vaddr, uint64_t size, uint64_t pages_begin, uint64_t pages_end,
+	                     uint64_t tick, bool is_write);
 	// Reads GPU-written bytes whose last writes were already submitted: a copy on the readback
 	// queue waits for those submissions only, not for the work queued after them.
 	[[nodiscard]] bool DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::BufferCopy> copies,
@@ -315,6 +325,14 @@ private:
 	uint64_t                                           m_gpu_write_generation = 0;
 	WriteTicks                                        m_write_ticks;
 	std::vector<std::pair<uint64_t, uint64_t>>        m_pending_writes;
+	// Downloads for other threads' readbacks whose publication is pending: their pages stay
+	// GPU-owned until the readback that recorded them released them (execution thread only).
+	struct InFlightReadback {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		uint64_t tick  = 0;
+	};
+	std::vector<InFlightReadback>                     m_inflight_readbacks;
 	uint64_t                                          m_device_address_tick    = 0;
 	bool                                              m_device_address_pending = false;
 	// Pages whose readbacks found the writes they need still being recorded, which drains the
