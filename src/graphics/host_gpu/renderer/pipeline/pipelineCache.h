@@ -42,21 +42,42 @@ public:
 	void Clear() {
 		m_entries.clear();
 		m_bytes.clear();
+		m_flat_loads.clear();
+		m_words.clear();
+		m_refresh.clear();
+		m_stage       = 0;
+		m_plan        = nullptr;
 		m_failed      = false;
 		m_gpu_written = false;
 	}
 	// Reads the backing store without faulting. Strict reads are checked the way specialization
 	// memory is read (GPU-owned bytes fail), the others as plain loads.
 	bool               Read(uint64_t address, void* data, uint64_t size, bool strict);
-	// A plain load the SRT walker made.
-	void               RecordLoad(uint64_t address, uint32_t value);
+	// A plain load the SRT walker made for the stage being resolved; flat_slot names the
+	// flattened SRT dword that is its only use (NoFlatSlot otherwise), or a descriptor word with
+	// refreshable bits (DescriptorSlot()).
+	void               RecordLoad(uint64_t address, uint32_t value, uint32_t flat_slot);
+	void SetStage(uint32_t stage, const ShaderRecompiler::IR::ResourcePlan* plan = nullptr) {
+		m_stage = stage;
+		m_plan  = plan;
+	}
 	void               Fail() { m_failed = true; }
 	[[nodiscard]] bool Failed() const { return m_failed; }
 	// Whether some read may have taken stale bytes of memory the GPU wrote (the backing store
 	// gets them only once read back).
 	[[nodiscard]] bool MayHaveReadGpuWrites() const { return m_gpu_written; }
-	// Execution thread: whether every read still gives the recorded bytes.
+	// Execution thread: whether every read still gives the recorded bytes. The loads that only
+	// fill flattened SRT dwords are not compared: RefreshFlatLoads() reads them again. Neither are
+	// the refreshable bits of descriptor words: RefreshDescriptorWords() writes their new values.
 	[[nodiscard]] bool StillValid() const;
+	// Execution thread, after StillValid(): writes the refreshable bits that changed (the guest
+	// rewrites V# bases and T# statistics fields after it submits the draws) into the stage's
+	// buffer or image descriptors, and the whole word into the flattened SRT dword it also fills.
+	void RefreshDescriptorWords(std::span<ShaderRecompiler::IR::ResourceSnapshot>          resources,
+	                            std::span<const ShaderRecompiler::IR::ResourcePlan* const> plans) const;
+	// Execution thread: writes the current value of each such load into its stage's flattened
+	// SRT (the guest rewrites constants, such as a camera matrix, after it submits the draws).
+	void RefreshFlatLoads(std::span<ShaderRecompiler::IR::ResourceSnapshot> resources) const;
 
 private:
 	static constexpr uint64_t StrictCheckBytes = 64;
@@ -65,12 +86,40 @@ private:
 		uint32_t size    = 0;
 		uint32_t offset  = 0;
 		bool     strict  = false;
+		// The descriptor words with refreshable bits among its dwords: m_words[words_begin, words_end).
+		uint32_t words_begin = 0;
+		uint32_t words_end   = 0;
 	};
-	void                 Append(uint64_t address, const void* data, uint32_t size, bool strict);
-	std::vector<Entry>   m_entries;
-	std::vector<uint8_t> m_bytes;
-	bool                 m_failed      = false;
-	bool                 m_gpu_written = false;
+	// A load of one descriptor word with refreshable bits.
+	struct Word {
+		uint32_t offset = 0; // Of its bytes in m_bytes.
+		uint32_t stage  = 0;
+		uint32_t source = 0;
+		uint32_t word   = 0;
+		uint32_t mask   = 0;
+	};
+	// Reads the entry's bytes now, as StillValid() does.
+	void ReadNow(const Entry& entry, uint8_t* bytes) const;
+	// Whether the entry's bytes differ from the recorded ones only in refreshable bits.
+	[[nodiscard]] bool OnlyRefreshableBitsChanged(const Entry& entry) const;
+	// Consecutive dwords of one page that fill consecutive flattened SRT dwords of a stage.
+	struct FlatLoad {
+		uint64_t address = 0;
+		uint32_t stage   = 0;
+		uint32_t slot    = 0;
+		uint32_t count   = 1;
+	};
+	void                  Append(uint64_t address, const void* data, uint32_t size, bool strict);
+	std::vector<Entry>    m_entries;
+	std::vector<uint8_t>  m_bytes;
+	std::vector<FlatLoad> m_flat_loads;
+	std::vector<Word>     m_words;
+	// Entries whose refreshable bits changed (found by StillValid()).
+	mutable std::vector<uint32_t> m_refresh;
+	uint32_t              m_stage       = 0;
+	const ShaderRecompiler::IR::ResourcePlan* m_plan = nullptr;
+	bool                  m_failed      = false;
+	bool                  m_gpu_written = false;
 };
 
 // Storage of the shader programs a draw resolved ahead of its execution: the resource snapshots
@@ -80,12 +129,23 @@ struct ProgramResolution {
 
 	std::array<ShaderRecompiler::IR::ResourceSnapshot, MaxStages>       resources;
 	std::array<ShaderRecompiler::IR::ResourceSpecialization, MaxStages> specializations;
+	// The resource plans the stages were resolved with.
+	std::array<const ShaderRecompiler::IR::ResourcePlan*, MaxStages>    plans {};
 	GuestReadLog                                                        reads;
 	uint32_t                                                            stages = 0;
 
 	void Reset() {
 		reads.Clear();
 		stages = 0;
+	}
+	// Execution thread: whether the resolution holds, with its flattened SRT dwords read again.
+	[[nodiscard]] bool Revalidate() {
+		if (!reads.StillValid()) {
+			return false;
+		}
+		reads.RefreshDescriptorWords(std::span(resources).first(stages), std::span(plans).first(stages));
+		reads.RefreshFlatLoads(std::span(resources).first(stages));
+		return true;
 	}
 };
 
