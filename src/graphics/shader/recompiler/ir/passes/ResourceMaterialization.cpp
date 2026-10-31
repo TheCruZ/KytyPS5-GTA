@@ -700,7 +700,19 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		std::unordered_map<uint32_t, KeyedTable> keyed_tables;
 		std::unordered_set<DescriptorValue, DescriptorValueHash> tables; // the V# of each entry
 		std::vector<uint32_t> blocks;
+		// Sampled roots keep their candidates in the host's resident image heap: the blocks hold
+		// heap entries instead of ordinals of materialized descriptors, so neither the number of
+		// candidates nor their order reaches the shader's descriptor layout.
+		bool heap_list = false;
+		if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Image>) {
+			const auto& image = program.info.images[resource_index];
+			heap_list = runtime.image_heap != nullptr && dword_count == 8u &&
+			            image.resource_class == ImageResourceClass::Sampled &&
+			            image.mip_mode != ImageMipMode::Dynamic;
+		}
 		std::vector<uint32_t>        element_words;
+		std::vector<DescriptorValue> heap_values;
+		std::vector<size_t>          heap_blocks; // The block word of each heap value.
 		for (const auto record: records) {
 			DescriptorValue record_table {.dword_count = 4u};
 			if (!ReadScalarTable(record, UINT64_MAX, pointer.offset, runtime,
@@ -743,7 +755,13 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				                     std::span(candidate.dwords).first(read_dwords)))
 					return read_failed("record descriptor read", 0u, element, element_base, offset, descriptor_bytes);
 				if (!normalize(candidate)) return normalization_failed(offset, element, pointer.element_stride, "element");
-				blocks.push_back(intern_candidate(candidate));
+				if (heap_list) {
+					heap_blocks.push_back(blocks.size());
+					heap_values.push_back(candidate);
+					blocks.push_back(0u);
+				} else {
+					blocks.push_back(intern_candidate(candidate));
+				}
 			}
 			// Tables at one base (a scene-wide table and a range of it) give the shader the same
 			// elements for the keys both cover: the longer one serves both.
@@ -756,6 +774,27 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			} else if (count > same_key->second.count) {
 				same_key->second.count                 = count;
 				entries[same_key->second.entry].second = block;
+			}
+		}
+		ImageHeapView heap_view;
+		if (heap_list) {
+			heap_list = runtime.image_heap->AcquireList(
+			    {.owner = &program, .resource = resource_index,
+			     .root = &program.info.images[resource_index], .values = heap_values},
+			    heap_view);
+			const auto heap_kinds = heap_view.kinds;
+			// Candidate i selects slot i + 1 of the root's list.
+			for (size_t i = 0; i < heap_blocks.size(); ++i) {
+				blocks[heap_blocks[i]] = heap_list ? static_cast<uint32_t>(i + 1u)
+				                                   : intern_candidate(heap_values[i]);
+			}
+			if (heap_list) {
+				for (const auto& kind: heap_kinds) {
+					descriptors.push_back(kind);
+					auto child          = root_resource;
+					child.indirect_root = resource_index;
+					specializations.push_back(child);
+				}
 			}
 		}
 		// Every element null: the root's null descriptor serves every key.
@@ -771,9 +810,16 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		    program.stage == ShaderType::Compute ? g_compute_indirect_keys.load(std::memory_order_relaxed)
 		                                         : MinIndirectMappingCapacity,
 		    std::bit_ceil(entries.size()));
-		const auto mapping_offset = snapshot.flattened_srt.size();
+		// A list's slot count and device address precede the mapping (see EmitImageHeapEntry()).
+		const auto list_offset    = snapshot.flattened_srt.size();
+		const auto mapping_offset = list_offset + (heap_list ? 3u : 0u);
 		const auto blocks_offset  = mapping_offset + 1u + key_capacity * 2u;
 		snapshot.flattened_srt.resize(blocks_offset + blocks.size(), 0u);
+		if (heap_list) {
+			snapshot.flattened_srt[list_offset]      = heap_view.slot_count;
+			snapshot.flattened_srt[list_offset + 1u] = static_cast<uint32_t>(heap_view.slots);
+			snapshot.flattened_srt[list_offset + 2u] = static_cast<uint32_t>(heap_view.slots >> 32u);
+		}
 		snapshot.flattened_srt[mapping_offset] = static_cast<uint32_t>(entries.size());
 		for (size_t entry = 0; entry < entries.size(); ++entry) {
 			snapshot.flattened_srt[mapping_offset + 1u + entry * 2u] = entries[entry].first;
@@ -782,7 +828,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			    static_cast<uint32_t>(blocks_offset + entries[entry].second);
 		}
 		std::ranges::copy(blocks, snapshot.flattened_srt.begin() + static_cast<std::ptrdiff_t>(blocks_offset));
-		if (std::is_same_v<Specialization, ResourceSpecialization::Image> && stable_layout) {
+		if (std::is_same_v<Specialization, ResourceSpecialization::Image> && stable_layout && !heap_list) {
 			const auto children = descriptors.size() - children_begin;
 			const auto total    = std::max<size_t>(
                 program.stage == ShaderType::Compute
@@ -798,6 +844,14 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		root.indirect_root              = resource_index;
 		root.indirect_mapping_offset    = static_cast<uint32_t>(mapping_offset);
 		root.indirect_search_iterations = std::bit_width(key_capacity);
+		if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Image>) {
+			root.heap = heap_list;
+			if (heap_list) {
+				for (auto child = children_begin; child < specializations.size(); ++child) {
+					specializations[child].heap = true;
+				}
+			}
+		}
 		return true;
 	}
 	if (sources.empty()) {
