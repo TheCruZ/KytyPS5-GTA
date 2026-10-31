@@ -10,6 +10,9 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <bit>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cinttypes>
 #include <cstring>
 #include <limits>

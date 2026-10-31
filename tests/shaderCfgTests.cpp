@@ -35,6 +35,8 @@
 #include "SrtWalkerTestMemory.h"
 
 #include <algorithm>
+#include <chrono>
+#include <map>
 #include <array>
 #include <bit>
 #include <cstdint>
@@ -2284,12 +2286,42 @@ void TestInlinedCallTargetsBecomeFunctions() {
   std::string reason;
   Check(expander.Expand(shader, 0x300000000ull, user_data, read, expanded, reason, 32u),
         ("the call table did not expand: " + reason).c_str());
+  {
+    // The game loads its functions elsewhere on another start: the expansion follows their code,
+    // and only the runtime words (their addresses) change.
+    const auto words = expander.RuntimeWords();
+    const auto saved_table = table;
+    const auto saved_functions = functions;
+    functions.fill(0xbf800000u);
+    for (uint32_t k = 0; k < Targets; ++k) {
+      const auto code = function(k);
+      const uint32_t slot = Targets - 1u - k;
+      std::copy(code.begin(), code.end(), functions.begin() + slot * 1024u);
+      const uint64_t target = FunctionBase + slot * 4096u;
+      table[k * 2u] = static_cast<uint32_t>(target);
+      table[k * 2u + 1u] = static_cast<uint32_t>(target >> 32u);
+    }
+    Decoder::ShaderFunctionExpander moved;
+    std::vector<uint32_t> again;
+    std::string again_reason;
+    Check(moved.Expand(shader, 0x300000000ull, user_data, read, again, again_reason, 32u),
+          ("the moved call table did not expand: " + again_reason).c_str());
+    Check(again == expanded && moved.RuntimeLiterals() == expander.RuntimeLiterals(),
+          "moving the call targets changed the expanded program");
+    Check(moved.RuntimeWords() != words, "moving the call targets kept their runtime words");
+    table = saved_table;
+    functions = saved_functions;
+  }
   std::vector<uint32_t> linked(std::begin(shader), std::end(shader));
   linked.insert(linked.end(), expanded.begin(), expanded.end());
   const auto expanded_code = std::span<const uint32_t>(linked).subspan(std::size(shader));
   Decoder::Program decoded;
   Decoder::DecodeProgram(expanded_code, decoded, expander.LongBranches());
   decoded.call_bodies = expander.Bodies();
+  decoded.runtime_literals = expander.RuntimeLiterals();
+  Check(!decoded.runtime_literals.empty() &&
+            decoded.runtime_literals.size() == expander.RuntimeWords().size(),
+        "the expansion kept guest addresses as literals");
   auto translated = TranslateProgram(decoded, options);
   Check(translated.program.inlined_call_entries.size() == Targets,
         "the translated program lost its inlined call targets");
@@ -2300,6 +2332,7 @@ void TestInlinedCallTargetsBecomeFunctions() {
       .user_data = options.user_data,
       .shader_base = reinterpret_cast<uint64_t>(shader),
       .read_specialization_memory = ReadHostTestMemory,
+      .call_words = expander.RuntimeWords(),
   };
   Check(IR::MaterializeResources(plan, runtime, resources, specialization),
         "the expanded program's resources did not materialize");
