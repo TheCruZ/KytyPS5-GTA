@@ -3,6 +3,8 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <string>
+#include <cstdlib>
 #include <bit>
 #include <functional>
 #include <optional>
@@ -456,7 +458,7 @@ void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (ctx.half != 0 &&
 	    (op == Op::Ballot || op == Op::ReadFirstLane || op == Op::SubgroupUMinU32 ||
 	     op == Op::SubgroupUMaxU32 || op == Op::SubgroupOrU32 || op == Op::ReadConstBuffer ||
-	     op == Op::ReadRealtimeClock ||
+	     op == Op::ReadRealtimeClock || op == Op::ReadCallWord ||
 	     (op == Op::LoadAddressU32 && ctx.Memory(inst).kind == IR::ResourceKind::ScalarAddress))) {
 		// Whole-wave results, clocks and SMEM loads (SGPR operands, no EXEC) match in both halves.
 		ctx.Define(inst, ctx.other_half->Result(inst));

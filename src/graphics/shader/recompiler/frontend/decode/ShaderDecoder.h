@@ -894,6 +894,16 @@ struct InlinedCallBody {
 
 // A direct branch of an expanded program whose target is beyond the reach of its 16-bit offset,
 // by byte pc: its encoding holds offset 0 and the decoded branch takes this target.
+// A literal of an expanded program that holds a guest address (a call target, a return or GETPC
+// address): the code carries `word`, an index into the expansion's runtime words, and the shader
+// reads the word at run time, so the program does not depend on where the game put its code.
+struct RuntimeLiteral {
+	uint32_t pc   = 0;
+	uint32_t word = 0;
+
+	bool operator==(const RuntimeLiteral&) const = default;
+};
+
 struct LongBranch {
 	uint32_t pc     = 0;
 	uint32_t target = 0;
@@ -908,6 +918,7 @@ struct Program {
 	// Set on programs expanded by ShaderFunctionExpander.
 	std::vector<InlinedCallBody> call_bodies;
 	std::vector<LongBranch>      long_branches; // ascending pc
+	std::vector<RuntimeLiteral>  runtime_literals; // ascending pc
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.

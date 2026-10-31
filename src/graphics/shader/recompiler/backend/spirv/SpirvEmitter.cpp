@@ -68,7 +68,7 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			const auto op = inst.GetOpcode();
-			uses_flattened_srt |= op == IR::ValueOpcode::ReadConst;
+			uses_flattened_srt |= op == IR::ValueOpcode::ReadConst || op == IR::ValueOpcode::ReadCallWord;
 			if (IR::BufferAccessOf(op) != IR::BufferAccess::None ||
 			    IR::SharedAccessOf(op) != IR::SharedAccess::None ||
 			    IR::AddressOpcodeInfoOf(op).access != IR::AddressAccess::None) {
