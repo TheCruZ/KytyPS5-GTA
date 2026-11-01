@@ -141,6 +141,43 @@ bool ReadAheadShaderState(void* userdata, uint64_t address, void* data, uint64_t
 	return static_cast<GuestReadLog*>(userdata)->Read(address, data, size, false);
 }
 
+// The buffer ranges the dispatches and draws resolved lately ahead of execution write (resolution
+// thread only): the GPU produces their bytes, and a walk ahead does not read a zero-tested bound
+// there (see SrtRuntime::gpu_produced), as the writer may not have run yet.
+struct AheadWrites {
+	static constexpr size_t Capacity = 256;
+	std::array<std::pair<uint64_t, uint64_t>, Capacity> ranges {};
+	size_t                                              next = 0;
+	void Add(uint64_t begin, uint64_t end) {
+		for (const auto& [b, e]: ranges) {
+			if (b == begin && e == end) return;
+		}
+		ranges[next] = {begin, end};
+		next         = (next + 1) % Capacity;
+	}
+};
+thread_local AheadWrites t_ahead_writes;
+
+bool AheadGpuProduced(uint64_t address) {
+	for (const auto& [begin, end]: t_ahead_writes.ranges) {
+		if (address >= begin && address < end) return true;
+	}
+	return false;
+}
+
+void NoteAheadWrites(const ShaderRecompiler::IR::ResourcePlan&     plan,
+                     const ShaderRecompiler::IR::ResourceSnapshot& resources) {
+	for (size_t i = 0; i < plan.info.buffers.size() && i < resources.buffers.size(); i++) {
+		const auto& descriptor = resources.buffers[i];
+		if (!plan.info.buffers[i].written || descriptor.dword_count != 4u) continue;
+		// The V#'s base and size (NUM_RECORDS records of STRIDE bytes, or bytes without a stride).
+		const uint64_t base    = descriptor.dwords[0] | (uint64_t {descriptor.dwords[1] & 0xffffu} << 32u);
+		const uint32_t stride  = (descriptor.dwords[1] >> 16u) & 0x3fffu;
+		const uint64_t size    = uint64_t {descriptor.dwords[2]} * (stride != 0u ? stride : 1u);
+		if (base != 0 && size != 0) t_ahead_writes.Add(base, base + size);
+	}
+}
+
 void RecordAheadLoad(void* userdata, uint64_t address, uint32_t value, uint32_t flat_slot) {
 	static_cast<GuestReadLog*>(userdata)->RecordLoad(address, value, flat_slot);
 }
@@ -1490,6 +1527,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	    .userdata                   = &ahead.reads,
 	    .read_specialization_memory = ReadAheadStrict,
 	    .record_load                = RecordAheadLoad,
+	    .gpu_produced               = AheadGpuProduced,
 	};
 	if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 		// As GetProgram(): descriptor tables indexed by the workgroup id probe one entry per group.
@@ -1501,6 +1539,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 		ahead.reads.Fail();
 		return nullptr;
 	}
+	NoteAheadWrites(entry->second.resource_plan, resources);
 	const auto matches = [&](const ShaderModule& candidate) {
 		const auto& layout = candidate.info.bindings;
 		return layout.push_data_start_dword ==
