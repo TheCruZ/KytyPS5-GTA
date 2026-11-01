@@ -238,6 +238,8 @@ private:
 		// Built for a fast build (see FastBlasFlags), gathered builds since the last walk.
 		bool                         fast_built      = false;
 		uint32_t                     gathers         = 0;
+		// The last build allows updates (see UpdatableBlasFlags): a gathered build refits it.
+		bool                         updatable       = false;
 		// The last frame a TLAS referenced the slot (from the readbacks), or its creation.
 		uint64_t                     last_use_frame  = 0;
 		// Released: kept in m_retired's shadow until the readbacks that may name it are gone.

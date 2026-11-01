@@ -45,6 +45,9 @@ layout(buffer_reference, std430, buffer_reference_align = 8) buffer Job {
 	uint64_t layout_va;
 	uint     layout_count;
 	uint     mismatches;
+	// Written back by a build: the leaves of the guest BLAS (the host sizes its next walk's queue).
+	uint     leaves;
+	uint     pad2;
 };
 
 // The layout of one guest geometry (written by the host): its first host primitive, its triangle
@@ -71,6 +74,9 @@ layout(push_constant, std430) uniform Push {
 	uint     pool_capacity;
 	uint     job_count;
 	uint     changed_capacity;
+	// The preparation (see SlotInfo::rebase).
+	uint     prepare_id;
+	uint     pad;
 } pc;
 
 const uint MODE_COUNT  = 0u;
@@ -88,7 +94,7 @@ uint QueueNodes(uint leaf_count) {
 	return leaf_count == 0 ? 0u : leaf_count + leaf_count / 2 + 64;
 }
 
-const uint kJobStride = 72;
+const uint kJobStride = 80;
 const uint kMaxQueue  = 1u << 20;
 
 shared uint s_head;
@@ -477,7 +483,9 @@ void main() {
 			info.count0     = s_capacity0;
 			info.count1     = s_capacity1;
 			info.signature  = s_signature;
+			info.rebase     = 0;
 			job.mismatches  = s_mismatches;
+			job.leaves      = leaf_count;
 			job.result      = (s_overflow << 1) | (s_mismatches != 0 ? 16u : 0u) | (s_layout_invalid << 5);
 		}
 		return;
@@ -496,6 +504,8 @@ void main() {
 			info.count0     = opaque;
 			info.count1     = alpha;
 			info.signature  = s_signature;
+			info.rebase     = 0;
+			job.leaves      = leaf_count;
 			const bool grow = opaque > s_capacity0 || alpha > s_capacity1;
 			job.result      = (grow ? 1u : 0u) | (s_overflow << 1);
 			// The host reads back the counts: to make room for them, or to give a slot with far
@@ -506,6 +516,13 @@ void main() {
 		return;
 	}
 	// A walk without room in its queue found more boxes than the BLAS had: it changed.
+	if (lid == 0 && s_overflow == 0 && info.rebase == (0x80000000u | (pc.prepare_id & 0x7fffffffu))) {
+		// Gathered in this preparation: the guest's refit moved the boxes and the host followed.
+		info.signature  = s_signature;
+		info.leaf_count = leaf_count;
+		info.rebase     = 0;
+		return;
+	}
 	if (lid == 0 && (s_overflow & 4u) == 0 && (s_overflow == 0 || (s_overflow & 1u) != 0)) {
 		if ((s_overflow & 1u) != 0 || info.signature != s_signature || info.leaf_count != leaf_count) {
 			const uint index = atomicAdd(state.changed_count, 1u);
@@ -517,6 +534,7 @@ void main() {
 			if (s_overflow == 0) {
 				info.signature  = s_signature;
 				info.leaf_count = leaf_count;
+				info.rebase     = 0;
 			}
 		}
 	}

@@ -163,7 +163,11 @@ layout(buffer_reference, std430, buffer_reference_align = 8) buffer SlotInfo {
 	uint     root;
 	uint     stamp;
 	uint     leaf_count;
-	uint     pad;
+	// Set by a gathered build (see MODE_GATHER in rt_blas_walk.comp) to bit 31 and the preparation:
+	// the triangles follow the guest's refit boxes, so the check of that same preparation takes their
+	// signature instead of reporting a change. A later check (the guest may have changed the BLAS
+	// since) compares as usual.
+	uint     rebase;
 };
 
 // A guest BLAS the top-level walk did not find, counted by the BLAS walk.
