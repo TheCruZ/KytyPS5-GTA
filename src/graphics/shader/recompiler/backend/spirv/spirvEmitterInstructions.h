@@ -367,6 +367,7 @@ uint32_t              EmitRayQuerySelectedLeaf(ValueEmitContext& ctx, const IR::
 uint32_t              EmitRayQueryResult(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitRayQueryFlag(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitRayQueryMark(ValueEmitContext& ctx, const IR::Inst& inst);
+void                  EmitRayQueryAlpha(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitImageQueryDimensions = EmitImage;
 inline constexpr auto EmitImageQueryLod        = EmitImage;
 inline constexpr auto EmitImageRead            = EmitImage;

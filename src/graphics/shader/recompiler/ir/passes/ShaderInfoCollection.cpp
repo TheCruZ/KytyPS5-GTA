@@ -544,6 +544,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		case ValueOpcode::RayQueryResult:
 		case ValueOpcode::RayQueryFlag:
 		case ValueOpcode::RayQueryMark:
+		case ValueOpcode::RayQueryAlpha:
 			info.ray_query = true;
 			info.ray_query_sites |= 1u << RayQuerySite(inst.Flags<uint32_t>());
 			break;

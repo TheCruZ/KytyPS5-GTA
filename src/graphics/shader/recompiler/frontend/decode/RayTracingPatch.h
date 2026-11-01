@@ -36,6 +36,10 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 //              entered it accepted a hit and stop.
 //   RT_MODE    SCC = the site is traversing natively.
 //   RT_EXIT    EXEC = the lanes that started the traversal; ends the native traversal.
+//   RT_ALPHA   before RT_INIT of a site with a RayTracingAlphaTest: image_nsa_addr[0] = the level
+//              of detail VGPR, [1] = material V# offset, [2] = buffer table V# offset,
+//              [3] = threshold, [4] = level of detail offset; src0 = spread SGPR, src1 = factor
+//              SGPR, src2 / src3 = SGPR pairs of the material and buffer table user pointers.
 //
 // A closest hit site (RayTracingKind::ClosestOpaque) is a per lane traversal whose leaf code
 // accepts the nearest triangle of either facing, with no alpha test: the hardware finds the hit
@@ -47,6 +51,36 @@ enum class RayTracingKind : uint32_t {
 
 // A register a site does not have.
 constexpr uint32_t NoRegister = 0xffffffffu;
+
+// The alpha test of a Packet site's leaf code, when it is GTA V's (see DeriveAlphaTest in
+// RayTracingPatch.cpp): the native traversal runs it per lane on each alpha tested candidate the
+// hardware reports and confirms the candidates it accepts, so the guest leaf code never runs.
+// Per triangle (node N, primitive word W) of instance record R:
+//   B  = ((R[0x34] & 0x3fffff) << 32 | R[0x30]) << 3      the BLAS
+//   m  = B[B[0x28] + ((N >> 3) - B[0x7c]) * 4] + R[0x78]    the material index
+//   M  = 12 bytes of the material table at m * 12
+//   indices: V# (M1 >> 8) * 16 of the buffer table, formatted elements (W & 0x3fffffff) * 3 + k
+//   uv:      V# (M0 >> 8) * 16 of the buffer table, two floats at (M1 & 0xfc) + (M0 & 0xfc) * index
+//   level:   min(M2 & 15, log2(2 * (spread * t + lod)) + lod_offset)
+//   accepted when the W channel of T# (M2 >> 4) of the leaf code's bindless table at uv exceeds
+//   threshold * (M0 bit 0 ? factor : 1).
+// Every register holds its value from the site entry through the traversal.
+struct RayTracingAlphaTest {
+	bool     valid = false;
+	// The lane's level of detail term (VGPR), the cone spread and the threshold factor (SGPRs).
+	uint32_t lod_vgpr    = 0;
+	uint32_t spread_sgpr = 0;
+	uint32_t factor_sgpr = 0;
+	// The V#s of the material table and of the vertex and index buffer table: 16 bytes at user
+	// data pointer (SGPR pair) `*_user` + `*_offset`.
+	uint32_t material_user   = 0;
+	uint32_t material_offset = 0;
+	uint32_t buffer_user     = 0;
+	uint32_t buffer_offset   = 0;
+	// Float bits.
+	uint32_t threshold  = 0;
+	uint32_t lod_offset = 0;
+};
 
 struct RayTracingSite {
 	RayTracingKind kind = RayTracingKind::Packet;
@@ -90,6 +124,8 @@ struct RayTracingSite {
 	uint32_t after_leaf_pc = 0;
 	// Where the loop exits to.
 	uint32_t exit_pc = 0;
+	// Packet sites: the alpha test the native traversal runs instead of the leaf code.
+	RayTracingAlphaTest alpha;
 };
 
 constexpr uint32_t NoAlphaOff = 0xffffffffu;

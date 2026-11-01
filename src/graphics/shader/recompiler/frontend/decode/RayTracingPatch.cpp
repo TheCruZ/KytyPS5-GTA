@@ -264,6 +264,19 @@ bool AddNativeTraversal(Layout& layout, const Program& program, const RayTracing
 		AddClosestTraversal(layout, site, index);
 		return true;
 	}
+	if (site.alpha.valid) {
+		// What the per-lane alpha test reads (see RayTracingAlphaTest).
+		auto& alpha             = layout.AddPseudo(Opcode::RT_ALPHA, index);
+		alpha.image_nsa_addr[0] = site.alpha.lod_vgpr;
+		alpha.image_nsa_addr[1] = site.alpha.material_offset;
+		alpha.image_nsa_addr[2] = site.alpha.buffer_offset;
+		alpha.image_nsa_addr[3] = site.alpha.threshold;
+		alpha.image_nsa_addr[4] = site.alpha.lod_offset;
+		alpha.src0              = Sgpr(site.alpha.spread_sgpr);
+		alpha.src1              = Sgpr(site.alpha.factor_sgpr);
+		alpha.src2              = Sgpr(site.alpha.material_user);
+		alpha.src3              = Sgpr(site.alpha.buffer_user);
+	}
 	auto& init = layout.AddPseudo(Opcode::RT_INIT, index);
 	for (uint32_t i = 0; i < 3; i++) {
 		init.image_nsa_addr[i]     = site.origin[i];
@@ -753,7 +766,445 @@ private:
 				}
 			}
 		}
+		// The alpha test (none: the native traversal runs the leaf code for each candidate).
+		site.alpha = {};
+		RayTracingAlphaTest alpha;
+		if (DeriveAlphaTest(header, back, setup, leaf, tail, t.src0.reg, word.src0.reg,
+		                    instance.src0.reg, alpha)) {
+			site.alpha = alpha;
+		}
 		return site.cull_mask != NoRegister;
+	}
+
+	// ---- The alpha test of GTA V's leaf code (see RayTracingAlphaTest). ----
+	//
+	// The leaf code tests one entry of a leaf list; past its opaque check, the alpha test is
+	// straight-line code. It is recognized by the dataflow of the values it computes: each
+	// register a step reads is traced to the last instruction before it that writes it (within
+	// the leaf code), which must be the expected one with the expected constants.
+
+	static uint32_t ScalarIndex(const Operand& operand) {
+		switch (operand.kind) {
+			case OperandKind::Sgpr: return operand.reg;
+			case OperandKind::VccLo: return 106u;
+			case OperandKind::VccHi: return 107u;
+			default: return NoRegister;
+		}
+	}
+
+	// Whether the instruction writes SGPR `reg` (lane masks and 64-bit results are pairs; loads
+	// write their dwords).
+	static bool WritesScalar(const Instruction& inst, uint32_t reg) {
+		const auto name  = magic_enum::enum_name(inst.opcode);
+		const bool wide  = name.find("64") != std::string_view::npos || name.starts_with("V_CMP");
+		const auto count = inst.family == Family::SMEM ? std::max(inst.data_dwords, 1u) : (wide ? 2u : 1u);
+		const auto covers = [&](const Operand& dst, uint32_t n) {
+			const auto first = ScalarIndex(dst);
+			return first != NoRegister && reg >= first && reg < first + n;
+		};
+		return covers(inst.dst, count) || covers(inst.dst2, 2u);
+	}
+
+	// Whether the instruction writes VGPR `reg` (conservatively wide for image results).
+	static bool WritesVector(const Instruction& inst, uint32_t reg) {
+		if (inst.dst.kind != OperandKind::Vgpr) {
+			return false;
+		}
+		uint32_t count = 1;
+		switch (inst.family) {
+			case Family::MIMG: count = 8; break;
+			case Family::MUBUF:
+			case Family::MTBUF:
+			case Family::FLAT:
+			case Family::DS: count = std::max(inst.data_dwords, 1u) * 2u; break;
+			default:
+				count = magic_enum::enum_name(inst.opcode).find("64") != std::string_view::npos ? 2u : 1u;
+				break;
+		}
+		return reg >= inst.dst.reg && reg < inst.dst.reg + count;
+	}
+
+	// The last instruction in [from, i) that writes SGPR `reg` (npos: none).
+	size_t ScalarWriter(size_t i, uint32_t reg, size_t from) const {
+		if (reg == NoRegister) {
+			return npos;
+		}
+		for (size_t j = i; j-- > from;) {
+			if (WritesScalar(m_inst[j], reg)) {
+				return j;
+			}
+		}
+		return npos;
+	}
+
+	// The writer of SGPR operand `operand` of instruction `i`, when it has `opcode` (npos: other).
+	size_t ScalarSource(size_t i, const Operand& operand, Opcode opcode, size_t from) const {
+		const auto j = ScalarWriter(i, ScalarIndex(operand), from);
+		return j != npos && m_inst[j].opcode == opcode ? j : npos;
+	}
+
+	// The writer of the `count` SGPRs from `reg` read by instruction `i`: one instruction with
+	// `opcode` writing them all (npos: other).
+	size_t ScalarRangeSource(size_t i, uint32_t reg, uint32_t count, Opcode opcode, size_t from) const {
+		const auto j = ScalarWriter(i, reg, from);
+		if (j == npos || m_inst[j].opcode != opcode || ScalarIndex(m_inst[j].dst) != reg) {
+			return npos;
+		}
+		for (uint32_t k = 1; k < count; k++) {
+			if (ScalarWriter(i, reg + k, from) != j) {
+				return npos;
+			}
+		}
+		return j;
+	}
+
+	size_t VectorSource(size_t i, const Operand& operand, Opcode opcode, size_t from) const {
+		if (operand.kind != OperandKind::Vgpr) {
+			return npos;
+		}
+		for (size_t j = i; j-- > from;) {
+			if (WritesVector(m_inst[j], operand.reg)) {
+				return m_inst[j].opcode == opcode && m_inst[j].dst.reg == operand.reg ? j : npos;
+			}
+		}
+		return npos;
+	}
+
+	static bool Plain(const Operand& operand) {
+		return !operand.negate && !operand.absolute && !operand.clamp && operand.omod == 0 &&
+		       operand.sdwa_sel == 6 && !operand.dpp && !operand.dpp8;
+	}
+
+	// S_<op> dst, src, <constant> with the source register `source` (NoRegister: any).
+	bool IsScalarConstantOp(size_t i, Opcode opcode, uint32_t constant) const {
+		return i != npos && m_inst[i].opcode == opcode && IsConstant(m_inst[i].src1, constant);
+	}
+
+	// A user data V#: S_LOAD_DWORDX4 from an SGPR pair no instruction before `limit` writes.
+	bool UserVsharp(size_t load, size_t limit, uint32_t& user, uint32_t& offset) const {
+		if (load == npos || m_inst[load].opcode != Opcode::S_LOAD_DWORDX4 ||
+		    m_inst[load].src0.kind != OperandKind::Sgpr ||
+		    (m_inst[load].src1.kind != OperandKind::Unknown && m_inst[load].src1.kind != OperandKind::Null)) {
+			return false;
+		}
+		const auto base = m_inst[load].src0.reg;
+		for (size_t j = 0; j < limit; j++) {
+			if (WritesScalar(m_inst[j], base) || WritesScalar(m_inst[j], base + 1)) {
+				return false;
+			}
+		}
+		user   = base;
+		offset = m_inst[load].offset;
+		return true;
+	}
+
+	// The S_LOAD_DWORD <dst>, s[base:base+1], <constant offset> that writes `operand` before `i`.
+	size_t ConstantFieldLoad(size_t i, const Operand& operand, uint32_t base, uint32_t offset, size_t from) const {
+		const auto j = ScalarSource(i, operand, Opcode::S_LOAD_DWORD, from);
+		return j != npos && IsSgpr(m_inst[j].src0, base) && m_inst[j].offset == offset &&
+		               (m_inst[j].src1.kind == OperandKind::Unknown || m_inst[j].src1.kind == OperandKind::Null)
+		           ? j
+		           : npos;
+	}
+
+	bool DeriveAlphaTest(size_t header, size_t back, size_t setup, size_t leaf, size_t tail, uint32_t t_vgpr,
+	                     uint32_t word_sgpr, uint32_t record_sgpr, RayTracingAlphaTest& alpha) const {
+		constexpr uint32_t One = 0x3f800000u, NoTypeBits = 0xc0000000u;
+		// The sample: the leaf code's only IMAGE_SAMPLE, an explicit level of the W channel, then
+		// V_CMP_GT_F32 <sampled>, <reference>.
+		size_t sample = npos;
+		for (size_t i = leaf; i < tail; i++) {
+			if (m_inst[i].opcode == Opcode::IMAGE_SAMPLE) {
+				if (sample != npos) {
+					return false;
+				}
+				sample = i;
+			}
+		}
+		if (sample == npos) {
+			return false;
+		}
+		const auto& sampled = m_inst[sample];
+		if (sampled.dmask != 8 || sampled.image_sample_flags != ImageSampleFlagLod ||
+		    sampled.image_dimension != ImageDimension::Dim2D || sampled.src1.kind != OperandKind::Sgpr ||
+		    sampled.dst.kind != OperandKind::Vgpr) {
+			return false;
+		}
+		// The T#: 32 bytes of the texture table at (M2 >> 4) * 32.
+		const auto tsharp = ScalarRangeSource(sample, sampled.src1.reg, 8, Opcode::S_BUFFER_LOAD_DWORDX8, leaf);
+		if (tsharp == npos || m_inst[tsharp].offset != 0 || m_inst[tsharp].src0.kind != OperandKind::Sgpr) {
+			return false;
+		}
+		const auto key_scale = ScalarSource(tsharp, m_inst[tsharp].src1, Opcode::S_LSHL_B32, leaf);
+		if (!IsScalarConstantOp(key_scale, Opcode::S_LSHL_B32, 5)) {
+			return false;
+		}
+		const auto key = ScalarSource(key_scale, m_inst[key_scale].src0, Opcode::S_LSHR_B32, leaf);
+		if (!IsScalarConstantOp(key, Opcode::S_LSHR_B32, 4)) {
+			return false;
+		}
+		uint32_t texture_user = 0, texture_offset = 0;
+		if (!UserVsharp(ScalarRangeSource(tsharp, m_inst[tsharp].src0.reg, 4, Opcode::S_LOAD_DWORDX4, leaf), tail,
+		                texture_user, texture_offset)) {
+			return false;
+		}
+		// M2: the third dword of the material record.
+		const auto m2 = ScalarSource(key, m_inst[key].src0, Opcode::S_BUFFER_LOAD_DWORD, leaf);
+		if (m2 == npos || m_inst[m2].offset != 8 || m_inst[m2].src0.kind != OperandKind::Sgpr) {
+			return false;
+		}
+		const auto material_vsharp = m_inst[m2].src0.reg;
+		const auto record_offset   = ScalarIndex(m_inst[m2].src1);
+		if (!UserVsharp(ScalarRangeSource(m2, material_vsharp, 4, Opcode::S_LOAD_DWORDX4, leaf), tail,
+		                alpha.material_user, alpha.material_offset)) {
+			return false;
+		}
+		// Its offset: (geometry word + R[0x78]) * 12.
+		const auto scale4 = ScalarSource(m2, m_inst[m2].src1, Opcode::S_LSHL_B32, leaf);
+		if (!IsScalarConstantOp(scale4, Opcode::S_LSHL_B32, 2)) {
+			return false;
+		}
+		const auto scale3 = ScalarSource(scale4, m_inst[scale4].src0, Opcode::S_MUL_I32, leaf);
+		if (!IsScalarConstantOp(scale3, Opcode::S_MUL_I32, 3)) {
+			return false;
+		}
+		const auto sum = ScalarSource(scale3, m_inst[scale3].src0, Opcode::S_ADD_I32, leaf);
+		if (sum == npos) {
+			return false;
+		}
+		const auto blas_head = [&](size_t i) {
+			// The BLAS the leaf code's triangle test reads: the S_BFE_U64 of its T# in the setup.
+			for (size_t j = leaf; j < tail; j++) {
+				if (m_inst[j].opcode != Opcode::IMAGE_BVH_INTERSECT_RAY || m_inst[j].src1.kind != OperandKind::Sgpr) {
+					continue;
+				}
+				const auto bfe = ScalarSource(j, m_inst[j].src1, Opcode::S_BFE_U64, setup);
+				return bfe != npos && IsConstant(m_inst[bfe].src1, 0x280008) && m_inst[bfe].src0.kind == OperandKind::Sgpr &&
+				       m_inst[bfe].src0.reg == i;
+			}
+			return false;
+		};
+		bool geometry_ok = false, base_ok = false;
+		for (const auto* operand: {&m_inst[sum].src0, &m_inst[sum].src1}) {
+			if (ConstantFieldLoad(sum, *operand, record_sgpr, 0x78, leaf) != npos) {
+				base_ok = true;
+				continue;
+			}
+			// The geometry word: B[B[0x28] + ((N >> 3) - B[0x7c]) * 4] of the triangle node N.
+			const auto load = ScalarSource(sum, *operand, Opcode::S_LOAD_DWORD, leaf);
+			if (load == npos || m_inst[load].offset != 0 || m_inst[load].src0.kind != OperandKind::Sgpr ||
+			    !blas_head(m_inst[load].src0.reg)) {
+				continue;
+			}
+			const auto blas  = m_inst[load].src0.reg;
+			const auto index = ScalarSource(load, m_inst[load].src1, Opcode::S_LSHL2_ADD_U32, leaf);
+			if (index == npos || ConstantFieldLoad(index, m_inst[index].src1, blas, 0x28, leaf) == npos) {
+				continue;
+			}
+			const auto local = ScalarSource(index, m_inst[index].src0, Opcode::S_SUB_U32, leaf);
+			if (local == npos || ConstantFieldLoad(local, m_inst[local].src1, blas, 0x7c, leaf) == npos) {
+				continue;
+			}
+			const auto node = ScalarSource(local, m_inst[local].src0, Opcode::S_LSHR_B32, leaf);
+			if (!IsScalarConstantOp(node, Opcode::S_LSHR_B32, 3)) {
+				continue;
+			}
+			// N is the node of the triangle test.
+			const auto node_sgpr = ScalarIndex(m_inst[node].src0);
+			for (size_t j = leaf; j < tail; j++) {
+				if (m_inst[j].opcode != Opcode::IMAGE_BVH_INTERSECT_RAY) {
+					continue;
+				}
+				const auto move = VectorSource(j, m_inst[j].src0, Opcode::V_MOV_B32, leaf);
+				geometry_ok = move != npos && ScalarIndex(m_inst[move].src0) == node_sgpr &&
+				              ScalarWriter(node, node_sgpr, move) == npos;
+				break;
+			}
+		}
+		if (!geometry_ok || !base_ok) {
+			return false;
+		}
+		// M0, M1: the first two dwords of the record.
+		size_t m01 = npos;
+		for (size_t i = leaf; i < sample && m01 == npos; i++) {
+			const auto& load = m_inst[i];
+			if (load.opcode == Opcode::S_BUFFER_LOAD_DWORDX2 && load.offset == 0 && IsSgpr(load.src0, material_vsharp) &&
+			    ScalarIndex(load.src1) == record_offset && ScalarWriter(i, record_offset, leaf) == scale4 &&
+			    ScalarRangeSource(i, material_vsharp, 4, Opcode::S_LOAD_DWORDX4, leaf) ==
+			        ScalarRangeSource(m2, material_vsharp, 4, Opcode::S_LOAD_DWORDX4, leaf)) {
+				m01 = i;
+			}
+		}
+		if (m01 == npos || m_inst[m01].dst.kind != OperandKind::Sgpr) {
+			return false;
+		}
+		const auto m0_sgpr = m_inst[m01].dst.reg, m1_sgpr = m0_sgpr + 1;
+		const auto is_m0 = [&](size_t i, const Operand& operand) {
+			return ScalarIndex(operand) == m0_sgpr && ScalarWriter(i, m0_sgpr, leaf) == m01;
+		};
+		const auto is_m1 = [&](size_t i, const Operand& operand) {
+			return ScalarIndex(operand) == m1_sgpr && ScalarWriter(i, m1_sgpr, leaf) == m01;
+		};
+		// The reference: threshold * (M0 bit 0 ? factor : 1.0), compared with the sample.
+		size_t compare = npos;
+		for (size_t i = sample + 1; i < tail && compare == npos; i++) {
+			if (m_inst[i].opcode == Opcode::V_CMP_GT_F32 && m_inst[i].src0.kind == OperandKind::Vgpr &&
+			    m_inst[i].src0.reg == sampled.dst.reg && VectorSource(i, m_inst[i].src0, Opcode::IMAGE_SAMPLE, sample) == sample) {
+				compare = i;
+			}
+		}
+		if (compare == npos) {
+			return false;
+		}
+		const auto reference = VectorSource(compare, m_inst[compare].src1, Opcode::V_MUL_F32, leaf);
+		if (reference == npos || !Plain(m_inst[reference].src0) || !Plain(m_inst[reference].src1) ||
+		    !Plain(m_inst[reference].dst)) {
+			return false;
+		}
+		bool threshold_ok = false, factor_ok = false;
+		for (const auto* operand: {&m_inst[reference].src0, &m_inst[reference].src1}) {
+			const auto j = ScalarWriter(reference, ScalarIndex(*operand), leaf);
+			if (j == npos) {
+				continue;
+			}
+			const auto& inst = m_inst[j];
+			if (inst.opcode == Opcode::S_MOV_B32 && inst.src0.kind == OperandKind::LiteralConstant) {
+				alpha.threshold = inst.src0.value;
+				threshold_ok    = true;
+			} else if (inst.opcode == Opcode::S_CSELECT_B32 && inst.src0.kind == OperandKind::Sgpr &&
+			           inst.src1.kind == OperandKind::FloatInlineConstant && inst.src1.value == One) {
+				// S_BITCMP1_B32 M0, 0 sets SCC.
+				size_t bitcmp = j;
+				while (bitcmp-- > leaf && m_inst[bitcmp].opcode == Opcode::S_NOP) {
+				}
+				if (bitcmp > leaf && m_inst[bitcmp].opcode == Opcode::S_BITCMP1_B32 &&
+				    IsConstant(m_inst[bitcmp].src1, 0) && is_m0(bitcmp, m_inst[bitcmp].src0)) {
+					alpha.factor_sgpr = inst.src0.reg;
+					factor_ok         = true;
+				}
+			}
+		}
+		if (!threshold_ok || !factor_ok) {
+			return false;
+		}
+		// The level: min(M2 & 15, log2(2 * (spread * t + lod)) + offset).
+		const auto level = VectorSource(sample, Operand {.kind = OperandKind::Vgpr, .reg = AddressReg(sampled, 2)},
+		                                Opcode::V_MIN_F32, leaf);
+		if (level == npos || !Plain(m_inst[level].src0) || !Plain(m_inst[level].src1) || !Plain(m_inst[level].dst)) {
+			return false;
+		}
+		bool max_ok = false, lod_ok = false;
+		for (const auto* operand: {&m_inst[level].src0, &m_inst[level].src1}) {
+			if (const auto convert = VectorSource(level, *operand, Opcode::V_CVT_F32_U32, leaf); convert != npos) {
+				const auto mask = ScalarSource(convert, m_inst[convert].src0, Opcode::S_AND_B32, leaf);
+				max_ok = IsScalarConstantOp(mask, Opcode::S_AND_B32, 15) &&
+				         ScalarWriter(mask, ScalarIndex(m_inst[mask].src0), leaf) == m2;
+				continue;
+			}
+			const auto offset = VectorSource(level, *operand, Opcode::V_ADD_F32, leaf);
+			if (offset == npos || m_inst[offset].src0.kind != OperandKind::LiteralConstant || !Plain(m_inst[offset].src1) ||
+			    !Plain(m_inst[offset].dst)) {
+				continue;
+			}
+			const auto log = VectorSource(offset, m_inst[offset].src1, Opcode::V_LOG_F32, leaf);
+			if (log == npos || !Plain(m_inst[log].src0) || !Plain(m_inst[log].dst)) {
+				continue;
+			}
+			const auto cone = VectorSource(log, m_inst[log].src0, Opcode::V_MAD_F32, leaf);
+			if (cone == npos) {
+				continue;
+			}
+			const auto& mad = m_inst[cone];
+			// omod 1: the result times 2.
+			if (mad.dst.omod != 1 || mad.dst.clamp || !Plain(mad.src0) || !Plain(mad.src1) || !Plain(mad.src2) ||
+			    mad.src0.kind != OperandKind::Sgpr || mad.src1.kind != OperandKind::Vgpr || mad.src1.reg != t_vgpr ||
+			    mad.src2.kind != OperandKind::Vgpr) {
+				continue;
+			}
+			alpha.spread_sgpr = mad.src0.reg;
+			alpha.lod_vgpr    = mad.src2.reg;
+			alpha.lod_offset  = m_inst[offset].src0.value;
+			lod_ok            = true;
+		}
+		if (!max_ok || !lod_ok) {
+			return false;
+		}
+		// The index buffer: three BUFFER_LOAD_FORMAT_X idxen through V# (M1 >> 8) * 16 of the buffer
+		// table; the vertices: three S_BUFFER_LOAD_DWORDX2 through V# (M0 >> 8) * 16.
+		const auto table_vsharp = [&](size_t load, bool index_buffer, uint32_t& vsharp) {
+			const auto& inst = m_inst[load];
+			const auto scale = ScalarSource(load, inst.src1, Opcode::S_LSHL_B32, leaf);
+			if (inst.offset != 0 || inst.src0.kind != OperandKind::Sgpr || !IsScalarConstantOp(scale, Opcode::S_LSHL_B32, 4)) {
+				return false;
+			}
+			const auto shift = ScalarSource(scale, m_inst[scale].src0, Opcode::S_LSHR_B32, leaf);
+			if (!IsScalarConstantOp(shift, Opcode::S_LSHR_B32, 8) ||
+			    !(index_buffer ? is_m1(shift, m_inst[shift].src0) : is_m0(shift, m_inst[shift].src0))) {
+				return false;
+			}
+			vsharp = inst.src0.reg;
+			return true;
+		};
+		uint32_t formatted = 0, uvs = 0, buffer_table = NoRegister;
+		size_t   table_load = npos;
+		for (size_t i = leaf; i < sample; i++) {
+			const auto& inst = m_inst[i];
+			if (inst.opcode == Opcode::BUFFER_LOAD_FORMAT_X) {
+				const auto vsharp = ScalarRangeSource(i, inst.src1.reg, 4, Opcode::S_BUFFER_LOAD_DWORDX4, leaf);
+				uint32_t   table  = 0;
+				if (!inst.idxen || inst.offen || inst.offset != 0 || inst.src1.kind != OperandKind::Sgpr || vsharp == npos ||
+				    !table_vsharp(vsharp, true, table) || (buffer_table != NoRegister && table != buffer_table)) {
+					return false;
+				}
+				buffer_table = table;
+				table_load   = vsharp;
+				formatted++;
+			} else if (inst.opcode == Opcode::S_BUFFER_LOAD_DWORDX2 && i != m01) {
+				const auto vsharp = ScalarRangeSource(i, inst.src0.reg, 4, Opcode::S_BUFFER_LOAD_DWORDX4, leaf);
+				uint32_t   table  = 0;
+				if (inst.src0.kind != OperandKind::Sgpr || vsharp == npos || !table_vsharp(vsharp, false, table) ||
+				    (buffer_table != NoRegister && table != buffer_table)) {
+					return false;
+				}
+				buffer_table = table;
+				uvs++;
+			}
+		}
+		if (formatted != 3 || uvs != 3 ||
+		    !UserVsharp(ScalarRangeSource(table_load, buffer_table, 4, Opcode::S_LOAD_DWORDX4, leaf), tail,
+		                alpha.buffer_user, alpha.buffer_offset)) {
+			return false;
+		}
+		// The primitive index (W & 0x3fffffff) * 3, the vertex stride and uv offset (& 0xfc).
+		bool primitive_ok = false;
+		uint32_t strides  = 0;
+		for (size_t i = leaf; i < sample; i++) {
+			const auto& inst = m_inst[i];
+			if (inst.opcode == Opcode::S_ANDN2_B32 && inst.src1.kind == OperandKind::FloatInlineConstant &&
+			    inst.src1.value == NoTypeBits && ScalarIndex(inst.src0) == word_sgpr) {
+				for (size_t j = i + 1; j < sample && !primitive_ok; j++) {
+					primitive_ok = IsScalarConstantOp(j, Opcode::S_MUL_I32, 3) &&
+					               ScalarWriter(j, ScalarIndex(m_inst[j].src0), leaf) == i;
+				}
+			}
+			if (IsScalarConstantOp(i, Opcode::S_AND_B32, 0xfc) && (is_m0(i, inst.src0) || is_m1(i, inst.src0))) {
+				strides |= is_m0(i, inst.src0) ? 1u : 2u;
+			}
+		}
+		if (!primitive_ok || strides != 3) {
+			return false;
+		}
+		// The registers the native code reads at the site entry keep their value in the traversal.
+		for (size_t i = header; i <= back; i++) {
+			if (WritesScalar(m_inst[i], alpha.spread_sgpr) || WritesScalar(m_inst[i], alpha.factor_sgpr) ||
+			    WritesVector(m_inst[i], alpha.lod_vgpr)) {
+				return false;
+			}
+		}
+		(void)texture_user;
+		(void)texture_offset;
+		alpha.valid = true;
+		return true;
 	}
 
 	bool DeriveClosest(size_t header, size_t back, RayTracingSite& site) const {
