@@ -916,6 +916,29 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	dst->Fill(dst_offset, size, value);
 }
 
+bool BufferCache::ReplicateBuffer(uint64_t destination, uint64_t count, uint64_t source,
+                                  uint64_t pattern) {
+	const auto size = count * sizeof(uint32_t);
+	const auto from = pattern * sizeof(uint32_t);
+	if (destination == 0 || source == 0 || ((destination | source) & 3u) != 0 || count == 0 ||
+	    pattern == 0 || (destination < source + from && source < destination + size) ||
+	    IsRegionGpuModified(destination, size) || IsRegionGpuModified(source, from) ||
+	    m_texture_cache.FindImageFromRange(source, from)) {
+		return false;
+	}
+	m_gpu_write_generation++;
+	(void)m_texture_cache.ClearMeta(destination);
+	// As FillBuffer(): invalidate the cached buffers and images up front.
+	InvalidateMemory(destination, size);
+	m_texture_cache.InvalidateMemory(destination, size);
+	const auto* values = reinterpret_cast<const uint32_t*>(source);
+	auto*       target = reinterpret_cast<uint32_t*>(destination);
+	for (uint64_t index = 0; index < count; ++index) {
+		target[index] = values[index % pattern];
+	}
+	return true;
+}
+
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
                              bool src_gds) {
 	m_gpu_write_generation++;
