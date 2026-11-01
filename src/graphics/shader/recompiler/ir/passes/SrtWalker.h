@@ -85,6 +85,12 @@ struct SrtRuntime {
 	// above the null page with the value it read. A load whose value only fills a flattened SRT
 	// dword reports that dword: nothing else the walk resolved depends on its bytes.
 	SrtLoadRecorder           record_load           = nullptr;
+	// A walk ahead of execution: whether the GPU produces the dword at an address (a dispatch
+	// resolved lately writes it). A load whose value only decides control flow is not read there:
+	// a bound tested for zero (`lane < n` with an unknown lane: no lane when n is 0) or a value
+	// that only branch conditions depend on stays unknown, which reaches both sides. Its bytes may
+	// not be written yet.
+	bool (*gpu_produced)(uint64_t address) = nullptr;
 	// The runtime words of an expanded program (ShaderSource::call_words): they follow the
 	// walked SRT words in the flattened SRT, where ReadCallWord reads them.
 	std::span<const uint32_t> call_words;

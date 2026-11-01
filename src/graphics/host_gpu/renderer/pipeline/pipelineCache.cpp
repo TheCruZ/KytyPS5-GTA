@@ -141,6 +141,73 @@ bool ReadAheadShaderState(void* userdata, uint64_t address, void* data, uint64_t
 	return static_cast<GuestReadLog*>(userdata)->Read(address, data, size, false);
 }
 
+// The buffer ranges the dispatches and draws resolved lately ahead of execution write (resolution
+// thread only): the GPU produces their bytes, and a walk ahead does not read there a load that
+// only decides control flow (see SrtRuntime::gpu_produced), as the writer may not have run yet.
+// Walks ask for most such loads, nearly all of them outside these ranges: a counting filter of
+// the 64 KB blocks the ranges cover answers those without scanning the ranges.
+struct AheadWrites {
+	static constexpr size_t   Capacity        = 256;
+	static constexpr uint64_t BlockShift      = 16;
+	static constexpr size_t   FilterBits      = 12;
+	static constexpr uint64_t MaxFilterBlocks = 4096; // Wider ranges (256 MB) are always scanned.
+	std::array<std::pair<uint64_t, uint64_t>, Capacity> ranges {};
+	std::array<uint16_t, size_t {1} << FilterBits>     filter {};
+	uint32_t                                            wide = 0;
+	size_t                                              next = 0;
+
+	static size_t Slot(uint64_t block) {
+		return static_cast<size_t>((block * 0x9e3779b97f4a7c15ull) >> (64u - FilterBits));
+	}
+	void Count(uint64_t begin, uint64_t end, int delta) {
+		if (begin >= end) return;
+		const auto first = begin >> BlockShift;
+		const auto last  = (end - 1) >> BlockShift;
+		if (last - first >= MaxFilterBlocks) {
+			wide = static_cast<uint32_t>(static_cast<int>(wide) + delta);
+			return;
+		}
+		for (auto block = first; block <= last; block++) {
+			auto& count = filter[Slot(block)];
+			count       = static_cast<uint16_t>(count + delta);
+		}
+	}
+	void Add(uint64_t begin, uint64_t end) {
+		for (const auto& [b, e]: ranges) {
+			if (b == begin && e == end) return;
+		}
+		Count(ranges[next].first, ranges[next].second, -1);
+		ranges[next] = {begin, end};
+		Count(begin, end, 1);
+		next = (next + 1) % Capacity;
+	}
+	[[nodiscard]] bool Contains(uint64_t address) const {
+		if (wide == 0 && filter[Slot(address >> BlockShift)] == 0) return false;
+		for (const auto& [begin, end]: ranges) {
+			if (address >= begin && address < end) return true;
+		}
+		return false;
+	}
+};
+thread_local AheadWrites t_ahead_writes;
+
+bool AheadGpuProduced(uint64_t address) {
+	return t_ahead_writes.Contains(address);
+}
+
+void NoteAheadWrites(const ShaderRecompiler::IR::ResourcePlan&     plan,
+                     const ShaderRecompiler::IR::ResourceSnapshot& resources) {
+	for (size_t i = 0; i < plan.info.buffers.size() && i < resources.buffers.size(); i++) {
+		const auto& descriptor = resources.buffers[i];
+		if (!plan.info.buffers[i].written || descriptor.dword_count != 4u) continue;
+		// The V#'s base and size (NUM_RECORDS records of STRIDE bytes, or bytes without a stride).
+		const uint64_t base    = descriptor.dwords[0] | (uint64_t {descriptor.dwords[1] & 0xffffu} << 32u);
+		const uint32_t stride  = (descriptor.dwords[1] >> 16u) & 0x3fffu;
+		const uint64_t size    = uint64_t {descriptor.dwords[2]} * (stride != 0u ? stride : 1u);
+		if (base != 0 && size != 0) t_ahead_writes.Add(base, base + size);
+	}
+}
+
 void RecordAheadLoad(void* userdata, uint64_t address, uint32_t value, uint32_t flat_slot) {
 	static_cast<GuestReadLog*>(userdata)->RecordLoad(address, value, flat_slot);
 }
@@ -1492,6 +1559,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	    .userdata                   = &ahead.reads,
 	    .read_specialization_memory = ReadAheadStrict,
 	    .record_load                = RecordAheadLoad,
+	    .gpu_produced               = AheadGpuProduced,
 	};
 	if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 		// As GetProgram(): descriptor tables indexed by the workgroup id probe one entry per group.
@@ -1503,6 +1571,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 		ahead.reads.Fail();
 		return nullptr;
 	}
+	NoteAheadWrites(entry->second.resource_plan, resources);
 	const auto matches = [&](const ShaderModule& candidate) {
 		const auto& layout = candidate.info.bindings;
 		return layout.push_data_start_dword ==
