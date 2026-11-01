@@ -83,7 +83,7 @@ struct ConfigOptions {
 	bool                   vr_enabled                  = false;
 	bool                   pro_enabled                 = false;
 	bool                   amd_cpu_enabled             = false;
-	bool                   guest_tsc_enabled           = false;
+	bool                   guest_tsc_enabled           = true;
 	bool                   network_connected           = false;
 	bool                   psn_emulation_enabled       = false;
 	uint32_t               vblank_frequency            = 60;
