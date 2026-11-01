@@ -144,7 +144,7 @@ public:
 	bool                   renderdoc_enabled           = false;
 	bool                   pro_enabled                 = false;
 	bool                   amd_cpu_enabled             = false;
-	bool                   guest_tsc_enabled           = false;
+	bool                   guest_tsc_enabled           = true;
 #if defined(_WIN32)
 	bool red_zone_protection_enabled = true;
 #endif
