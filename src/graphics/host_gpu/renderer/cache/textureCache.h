@@ -264,6 +264,9 @@ private:
 	void RefreshDepthCopy(ImageId copy_id);
 	void ReleaseDepthCopies(ImageId color_id);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
+	// A copy between a depth and a color image of the same texel size with vkCmdCopyImage
+	// (VK_KHR_maintenance8); false when the device or the formats do not allow it.
+	[[nodiscard]] bool CopyDepthColor(Image& destination, Image& source);
 	void               CopyImage(ImageId destination, ImageId source);
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
