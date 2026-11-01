@@ -145,6 +145,20 @@ void Translator::EmitRayTracing(const Decoder::Instruction& inst) {
 			write_mask(ExecOperand(), flag(Flag::InTraversal));
 			mark(Mark::Exit, IR::U1(IR::Value(true)));
 			return;
+		case Decoder::Opcode::RT_ALPHA: {
+			// The values the per-lane alpha test reads (see RayTracingAlphaTest): the level of
+			// detail term, the cone spread, the threshold factor and the V#s of the material table
+			// and of the buffer table, which the guest leaf code loads from user data.
+			const auto material = LoadScalarAddressDwords(inst.src2.reg, inst.image_nsa_addr[1], 4, inst.pc);
+			const auto buffers  = LoadScalarAddressDwords(inst.src3.reg, inst.image_nsa_addr[2], 4, inst.pc);
+			ir.Emit(IR::ValueOpcode::RayQueryAlpha,
+			        {ReadU32(VectorOperand(inst.image_nsa_addr[0])), ReadU32(inst.src0), ReadU32(inst.src1),
+			         material[0], material[1], material[2], material[3], buffers[0], buffers[1], buffers[2],
+			         buffers[3], IR::U32(IR::Value(inst.image_nsa_addr[3])),
+			         IR::U32(IR::Value(inst.image_nsa_addr[4]))},
+			        flags(0u));
+			return;
+		}
 		default: FailMissingTranslation(inst);
 	}
 }

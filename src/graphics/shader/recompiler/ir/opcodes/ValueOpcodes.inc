@@ -350,6 +350,8 @@ VALUE_OPCODE(RayQuerySelectedLeaf, U32)
 VALUE_OPCODE(RayQueryResult, U32)
 VALUE_OPCODE(RayQueryFlag, U1)
 VALUE_OPCODE(RayQueryMark, Void, U1)
+// Level of detail term, cone spread, threshold factor, material V#, buffer table V#, threshold, level offset.
+VALUE_OPCODE(RayQueryAlpha, Void, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32)
 VALUE_OPCODE(ImageQueryLod, U32x4, ImageResource, SamplerResource, ImageAddress)
 VALUE_OPCODE(ImageRead, U32x4, ImageResource, ImageAddress, U1)
 VALUE_OPCODE(ImageWrite, Void, ImageResource, ImageAddress, U32x4, U1)
