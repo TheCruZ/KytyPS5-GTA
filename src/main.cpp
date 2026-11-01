@@ -104,7 +104,7 @@ static void PrintUsage() {
 	::printf("  --trinity                            Enable experimental PS5 Pro mode for supported titles\n"
 	         "                                       (PSSR uses linear scaling). Default: off.\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
-	::printf("  --guest-tsc                          Run the guest TSC at the PS5's 1.6 GHz.\n");
+	::printf("  --no-guest-tsc                       Run the guest TSC at the host rate, not the PS5's 1.6 GHz.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation                  Enable Vulkan validation.\n");
@@ -245,6 +245,7 @@ static constexpr Flag FLAGS[] = {
     {"--trinity", &ConfigOptions::pro_enabled},
     {"--amd-cpu", &ConfigOptions::amd_cpu_enabled},
     {"--guest-tsc", &ConfigOptions::guest_tsc_enabled},
+    {"--no-guest-tsc", &ConfigOptions::guest_tsc_enabled, false},
     {"--network-connected", &ConfigOptions::network_connected},
     {"--emulate-psn", &ConfigOptions::psn_emulation_enabled},
     {"--vulkan-validation", &ConfigOptions::vulkan_validation_enabled},
