@@ -388,13 +388,10 @@ void GuestReadLog::RefreshFlatLoads(
     std::span<ShaderRecompiler::IR::ResourceSnapshot> resources) const {
 	// As the execution thread's own walk loads: around the GPU's writes on the pages it owns,
 	// directly elsewhere.
-	// The loads of a draw alternate between a few pages: decide each once (see StillValid()).
-	struct CheckedPage {
-		uint64_t       page    = UINT64_MAX;
-		bool           owned   = false;
-		const uint8_t* backing = nullptr;
-	};
-	std::array<CheckedPage, 4> checked {};
+	// The loads of a draw alternate between a few pages, mostly those StillValid() just decided:
+	// its answers still hold. A page it read back since no longer faults, and reading it around
+	// the GPU's writes then finds no dirty bytes and takes the backing, which holds them.
+	auto& checked = m_checked;
 	for (const auto& load: m_flat_loads) {
 		if (load.stage >= resources.size() ||
 		    uint64_t {load.slot} + load.count > resources[load.stage].flattened_srt.size()) {
@@ -538,13 +535,9 @@ bool GuestReadLog::StillValid() const {
 	// Most entries lie on pages the GPU does not own: decide that once per page. The entries of
 	// a draw alternate between a few pages (its descriptor tables and the GPU-owned pages around
 	// them), so the last pages are kept, with the backing bytes of the GPU-owned ones for reading
-	// around the GPU's writes there (see FindAroundBackingPage()).
-	struct CheckedPage {
-		uint64_t       page    = UINT64_MAX;
-		bool           owned   = false;
-		const uint8_t* backing = nullptr;
-	};
-	std::array<CheckedPage, 4> checked {};
+	// around the GPU's writes there (see FindAroundBackingPage()). RefreshFlatLoads() reuses them.
+	auto& checked = m_checked;
+	checked.fill({});
 	// An entry with descriptor words compares its other bits.
 	const auto refreshable = [&](const Entry& entry) {
 		if (entry.words_begin == entry.words_end || !OnlyRefreshableBitsChanged(entry)) {
