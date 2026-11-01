@@ -26,7 +26,8 @@ void Translator::TranslateInstruction(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::RT_RESOLVE:
 		case Decoder::Opcode::RT_EXIT_CHECK:
 		case Decoder::Opcode::RT_COMMIT:
-		case Decoder::Opcode::RT_EXIT: return EmitRayTracing(inst);
+		case Decoder::Opcode::RT_EXIT:
+		case Decoder::Opcode::RT_ALPHA: return EmitRayTracing(inst);
 		default: break;
 	}
 
