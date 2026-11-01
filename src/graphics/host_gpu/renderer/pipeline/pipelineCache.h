@@ -28,6 +28,7 @@
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <array>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -114,6 +115,13 @@ private:
 	std::vector<Word>     m_words;
 	// Entries whose refreshable bits changed (found by StillValid()).
 	mutable std::vector<uint32_t> m_refresh;
+	// The pages StillValid() found GPU-owned or not, by page % size, for RefreshFlatLoads().
+	struct CheckedPage {
+		uint64_t       page    = UINT64_MAX;
+		bool           owned   = false;
+		const uint8_t* backing = nullptr;
+	};
+	mutable std::array<CheckedPage, 8> m_checked {};
 	uint32_t              m_stage       = 0;
 	const ShaderRecompiler::IR::ResourcePlan* m_plan = nullptr;
 	bool                  m_failed      = false;
