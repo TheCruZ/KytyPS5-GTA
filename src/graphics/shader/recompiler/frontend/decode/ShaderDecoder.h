@@ -765,6 +765,7 @@ enum class Opcode {
 	RT_EXIT_CHECK,
 	RT_COMMIT,
 	RT_EXIT,
+	RT_ALPHA,
 	COUNT
 };
 
