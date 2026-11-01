@@ -802,9 +802,47 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
 		id = FindBuffer(vaddr, size);
 	}
+	// Dispatches bind the same written ranges (tens of megabytes) again and again. While the
+	// range stays in the same buffer, none of its pages became CPU dirty and none stopped being
+	// GPU dirty since the last synchronization marked it written, there is nothing to upload and
+	// its pages are GPU dirty already: only the write itself is recorded below.
+	WrittenMemo* written = nullptr;
+	uint64_t     written_cpu_epoch = 0;
+	uint64_t     written_gpu_epoch = 0;
+	if (is_written) {
+		const auto hash   = (vaddr ^ (size << 40u)) * 0x9e3779b97f4a7c15ull;
+		written           = &(*m_written_memo)[(hash >> 32u) % WrittenMemoSlots];
+		// Global epochs: two loads, where the ranges' own epochs visit every tracking region of
+		// tens of megabytes.
+		written_cpu_epoch = RegionManager::CpuDirtyEpoch();
+		written_gpu_epoch = RegionManager::GpuCleanEpoch();
+		if (written->vaddr == vaddr && written->size == size &&
+		    written->buffer_epoch == m_buffer_set_epoch && written->cpu_epoch == written_cpu_epoch &&
+		    written->gpu_epoch == written_gpu_epoch &&
+		    (IsBufferInvalid(id) || id == written->id)) {
+			auto& buffer = m_slot_buffers[written->id];
+			TouchBuffer(buffer);
+			m_gpu_write_generation++;
+			if (m_gpu_modified_ranges.Add(vaddr, size)) {
+				NoteGpuModifiedChange(vaddr, size);
+			}
+			ForgetColorMetadataChecks(vaddr, size);
+			NoteWrite(vaddr, size);
+			return {&buffer, buffer.Offset(vaddr)};
+		}
+	}
+
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+	if (written != nullptr) {
+		*written = {.vaddr        = vaddr,
+		            .size         = size,
+		            .buffer_epoch = m_buffer_set_epoch,
+		            .cpu_epoch    = written_cpu_epoch,
+		            .gpu_epoch    = written_gpu_epoch,
+		            .id           = id};
+	}
 	if (plain_read) {
 		*memo = {.vaddr        = vaddr,
 		         .size         = size,
