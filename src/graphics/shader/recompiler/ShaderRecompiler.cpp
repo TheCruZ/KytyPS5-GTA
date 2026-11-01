@@ -625,9 +625,12 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 			Decoder::RayTracingPatch patch;
 			if (Decoder::DeriveRayTracingPatch(source.decoded, patch) &&
 			    Decoder::ApplyRayTracingPatch(patch, source.decoded)) {
-				LOGF("%s native ray tracing patch: hash=0x%016" PRIx64 " sites=%" PRIu64 "\n",
+				LOGF("%s native ray tracing patch: hash=0x%016" PRIx64 " sites=%" PRIu64
+				     " alpha=%" PRIu64 "\n",
 				     StageName(options.stage), options.shader_hash,
-				     static_cast<uint64_t>(patch.sites.size()));
+				     static_cast<uint64_t>(patch.sites.size()),
+				     static_cast<uint64_t>(std::ranges::count_if(
+				         patch.sites, [](const auto& site) { return site.alpha.valid; })));
 			}
 		}
 	}

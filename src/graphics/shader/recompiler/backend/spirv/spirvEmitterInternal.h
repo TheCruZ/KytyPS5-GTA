@@ -151,6 +151,12 @@ struct EmitterState {
 	std::array<uint32_t, 4>                          ray_query_reuse {};
 	// Rounds of a site's native traversal (a wave never runs more than MaxRayQueryRounds).
 	std::array<uint32_t, 4>                          ray_query_rounds {};
+	// The per-lane alpha test (RayQueryAlpha): per site and half, its arguments; the guest leaf
+	// code's sample of the bindless table it samples (nullptr: the sites run the leaf code).
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_alpha {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_alpha_cache {};
+	std::array<bool, 4>                              ray_query_alpha_sites {};
+	const IR::Inst*                                  ray_query_alpha_sample = nullptr;
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
@@ -588,6 +594,47 @@ void DeclareRayQueryVariables(EmitterState& state);
 // After every function variable is declared.
 void InitializeRayQueryVariables(EmitterState& state);
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
+// Guest memory reads of the native ray tracing alpha test (spirvEmitterRayQuery.cpp), with the
+// semantics of the guest instructions it stands for: a dword at a guest address (S_LOAD_DWORD),
+// a dword of a buffer through a V# (S_BUFFER_LOAD_DWORD) and an element through a V#
+// (BUFFER_LOAD_FORMAT_X idxen); zero where the guest would read zero.
+uint32_t EmitGuestDwordLoad(ValueEmitContext& ctx, uint32_t address);
+uint32_t EmitScalarBufferDwordLoad(ValueEmitContext& ctx, const std::array<uint32_t, 4>& vsharp,
+                                   uint32_t offset);
+uint32_t EmitFormattedBufferLoadX(ValueEmitContext& ctx, const std::array<uint32_t, 4>& vsharp,
+                                  uint32_t index);
+// A guest object of `size` bytes at a guest address: one translation when it lies in one
+// caching page (`inside`; `host` is then its host address, 0 when the page has no buffer).
+struct GuestObject {
+	uint32_t address = 0;
+	uint32_t host    = 0;
+	uint32_t inside  = 0;
+};
+GuestObject EmitGuestObject(ValueEmitContext& ctx, uint32_t address, uint32_t size);
+// The dword at `offset` (< size) of the object, as EmitGuestDwordLoad() would read it.
+uint32_t EmitGuestObjectDword(ValueEmitContext& ctx, const GuestObject& object, uint32_t offset);
+// The same with the offset an id (a dword multiple below the size).
+uint32_t EmitGuestObjectDwordAt(ValueEmitContext& ctx, const GuestObject& object, uint32_t offset_id);
+// The three elements of a triangle of an index buffer through its V# from element `first`, as
+// EmitFormattedBufferLoadX() reads each.
+std::array<uint32_t, 3> EmitTriangleIndices(ValueEmitContext& ctx, const std::array<uint32_t, 4>& vsharp,
+                                            uint32_t first);
+// `size` bytes of a buffer from `offset` through a V#, read dword by dword as
+// EmitScalarBufferDwordLoad() would.
+struct ScalarBufferObject {
+	uint32_t    size   = 0;
+	uint32_t    offset = 0;
+	GuestObject object;
+};
+void     EmitScalarBufferObject(ValueEmitContext& ctx, const std::array<uint32_t, 4>& vsharp, uint32_t offset,
+                                uint32_t size, ScalarBufferObject& object);
+uint32_t EmitScalarBufferObjectDword(ValueEmitContext& ctx, const ScalarBufferObject& object, uint32_t offset);
+// Whether `inst` samples a 2D float bindless table image at an explicit level, and that sample
+// at table entry `key`, coordinates (u, v) and level `lod` (F32): the texel as the instruction
+// returns it (U32x4).
+bool     IsImageTableSampleLod(const EmitterState& state, const IR::Inst& inst);
+uint32_t EmitImageTableSampleLod(ValueEmitContext& ctx, const IR::Inst& sample, uint32_t key,
+                                 uint32_t u, uint32_t v, uint32_t lod);
 
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>
