@@ -183,7 +183,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			    total_size += Common::AlignUp(end - start, 64);
 		    });
 		    if (m_gpu_modified_ranges.Subtract(address, bytes)) {
-			    NoteGpuModifiedChange(address, bytes);
+			    NoteGpuModifiedChange(address, bytes, false);
 		    }
 		    ForgetColorMetadataChecks(address, bytes);
 	    });
@@ -842,7 +842,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			TouchBuffer(buffer);
 			m_gpu_write_generation++;
 			if (m_gpu_modified_ranges.Add(vaddr, size)) {
-				NoteGpuModifiedChange(vaddr, size);
+				NoteGpuModifiedChange(vaddr, size, true);
 			}
 			ForgetColorMetadataChecks(vaddr, size);
 			NoteWrite(vaddr, size);
@@ -872,7 +872,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		m_gpu_write_generation++;
 		if (m_gpu_modified_ranges.Add(vaddr, size)) {
-			NoteGpuModifiedChange(vaddr, size);
+			NoteGpuModifiedChange(vaddr, size, true);
 		}
 		ForgetColorMetadataChecks(vaddr, size);
 		NoteWrite(vaddr, size);
@@ -1181,6 +1181,8 @@ bool BufferCache::TryReadMirroredGpuWrites(uint64_t vaddr, void* data, uint64_t 
 	const auto last  = Common::AlignUp(vaddr + size, MirrorLineSize);
 	uint64_t   wait  = 0;
 	bool       held  = true;
+	// The slots of the lines, for the copy below (MirrorMaxRead bytes span at most this many).
+	std::array<uint32_t, MirrorMaxRead / MirrorLineSize + 1> slots {};
 	for (auto line = first; line < last; line += MirrorLineSize) {
 		const auto it = m_mirror_lines.find(line);
 		if (it == m_mirror_lines.end()) {
@@ -1190,6 +1192,7 @@ bool BufferCache::TryReadMirroredGpuWrites(uint64_t vaddr, void* data, uint64_t 
 		}
 		auto& entry    = it->second;
 		entry.last_use = ++m_mirror_uses;
+		slots[(line - first) / MirrorLineSize] = entry.slot;
 		if (entry.tick == 0 || entry.tick < needed) {
 			// Copy it at the end of this command buffer, for the next read.
 			held = false;
@@ -1217,7 +1220,7 @@ bool BufferCache::TryReadMirroredGpuWrites(uint64_t vaddr, void* data, uint64_t 
 		while (start < end) {
 			const auto line   = Common::AlignDown(start, MirrorLineSize);
 			const auto chunk  = std::min(end, line + MirrorLineSize) - start;
-			const auto slot   = m_mirror_lines.find(line)->second.slot;
+			const auto slot   = slots[(line - first) / MirrorLineSize];
 			const auto offset = uint64_t {slot} * MirrorLineSize + (start - line);
 			m_mirror->Invalidate(offset, chunk);
 			std::memcpy(static_cast<uint8_t*>(data) + (start - vaddr), mapped + offset, chunk);
@@ -1226,7 +1229,7 @@ bool BufferCache::TryReadMirroredGpuWrites(uint64_t vaddr, void* data, uint64_t 
 		}
 	});
 	if (m_gpu_modified_ranges.Subtract(vaddr, size)) {
-		NoteGpuModifiedChange(vaddr, size);
+		NoteGpuModifiedChange(vaddr, size, false);
 	}
 	return true;
 }
@@ -1547,13 +1550,39 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	return false;
 }
 
-void BufferCache::NoteGpuModifiedChange(uint64_t vaddr, uint64_t size) {
+void BufferCache::NoteGpuModifiedChange(uint64_t vaddr, uint64_t size, bool dirty) {
+	// The ranges gained or lost exactly these bytes, so the cached masks of their pages take the
+	// change instead of being built again: reads around the GPU's writes publish the bytes they
+	// read (a few thousand small ranges a frame), on the pages they keep asking about.
 	constexpr uint64_t PageSize = 4096;
-	const auto         first    = vaddr / PageSize;
-	const auto         last     = (vaddr + std::max<uint64_t>(size, 1) - 1) / PageSize;
-	for (auto& mask: m_dirty_masks) {
-		if (mask.page >= first && mask.page <= last) {
-			mask.page = UINT64_MAX;
+	if (size == 0) {
+		return;
+	}
+	const auto first = vaddr / PageSize;
+	const auto last  = (vaddr + size - 1) / PageSize;
+	const auto apply = [&](DirtyPageMask& mask) {
+		const auto base = mask.page * PageSize;
+		const auto low  = std::max(vaddr, base) - base;
+		const auto high = std::min(vaddr + size, base + PageSize) - base - 1;
+		for (auto word = low / 64; word <= high / 64; word++) {
+			const auto from = word == low / 64 ? low % 64 : 0;
+			const auto to   = word == high / 64 ? high % 64 : 63;
+			const auto bits = (~uint64_t {0} >> (63 - to)) & (~uint64_t {0} << from);
+			mask.bits[word] = dirty ? mask.bits[word] | bits : mask.bits[word] & ~bits;
+		}
+	};
+	if (last - first >= m_dirty_masks.size()) {
+		for (auto& mask: m_dirty_masks) {
+			if (mask.page >= first && mask.page <= last) {
+				apply(mask);
+			}
+		}
+		return;
+	}
+	for (auto page = first; page <= last; page++) {
+		auto& mask = m_dirty_masks[page % m_dirty_masks.size()];
+		if (mask.page == page) {
+			apply(mask);
 		}
 	}
 }
@@ -1709,7 +1738,7 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 			    const auto first = std::max(page, start);
 			    const auto last  = std::min(page + bytes, finish);
 			    if (m_gpu_modified_ranges.Add(first, last - first)) {
-				    NoteGpuModifiedChange(first, last - first);
+				    NoteGpuModifiedChange(first, last - first, true);
 			    }
 		    });
 	}
