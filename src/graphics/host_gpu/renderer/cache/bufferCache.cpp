@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include "common/alignment.h"
+#include "gpu_tiler_shaders/buffer_scatter_spv.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/hackNotice.h"
@@ -311,6 +312,12 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 
 BufferCache::~BufferCache() {
 	m_scheduler.SetSubmitHook(nullptr, nullptr);
+	if (m_scatter_pipeline) {
+		m_graphics.device.destroyPipeline(m_scatter_pipeline);
+	}
+	if (m_scatter_layout) {
+		m_graphics.device.destroyPipelineLayout(m_scatter_layout);
+	}
 	if (m_readback.pool) {
 		m_graphics.device.destroyFence(m_readback.fence);
 		m_graphics.device.destroyCommandPool(m_readback.pool);
@@ -663,7 +670,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
 	if (source && m_upload_batching && source == m_staging_buffer.Handle()) {
-		m_upload_batch_buffers.emplace_back(buffer.Handle(), static_cast<uint32_t>(copies.size()));
+		m_upload_batch_buffers.push_back(
+		    {buffer.Handle(), buffer.BufferDeviceAddress(), static_cast<uint32_t>(copies.size())});
 		m_upload_batch_copies.insert(m_upload_batch_copies.end(), copies.begin(), copies.end());
 	} else if (source) {
 		auto& command = m_scheduler.Current();
@@ -707,7 +715,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	// Within a batch of uploads (see FlushUploadBatch()) the staging buffer must not wait for
 	// the current command buffer: that would submit it without the batched copies. A copy that
 	// does not fit then goes through a buffer of its own.
-	const auto source = UploadMemory(m_graphics, m_scheduler, m_staging_buffer, total_size, 4,
+	const auto source = UploadMemory(m_graphics, m_scheduler, m_staging_buffer, total_size, 16,
 	    vk::BufferUsageFlagBits::eTransferSrc, [&](uint8_t* mapped, uint64_t base_offset) {
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
@@ -1777,6 +1785,13 @@ void BufferCache::FlushUploadBatch() {
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
 	const auto native = command.Handle();
+	// A batch that copies to several buffers runs as one dispatch: a copy command each costs about
+	// as much GPU time as a small dispatch (GTA V: ~200 buffers per batch, several batches a frame).
+	if (m_upload_batch_buffers.size() > 1 && ScatterUploadBatch(native)) {
+		m_upload_batch_buffers.clear();
+		m_upload_batch_copies.clear();
+		return;
+	}
 	// As SynchronizeBuffer() records around each upload, for all the buffers at once.
 	vk::MemoryBarrier before {};
 	before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
@@ -1787,9 +1802,9 @@ void BufferCache::FlushUploadBatch() {
 	                       &before, 0, nullptr, 0, nullptr);
 	const auto staging = m_staging_buffer.Handle();
 	size_t     first   = 0;
-	for (const auto& [destination, count]: m_upload_batch_buffers) {
-		native.copyBuffer(staging, destination, count, m_upload_batch_copies.data() + first);
-		first += count;
+	for (const auto& batch: m_upload_batch_buffers) {
+		native.copyBuffer(staging, batch.buffer, batch.count, m_upload_batch_copies.data() + first);
+		first += batch.count;
 	}
 	vk::MemoryBarrier after {};
 	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
@@ -1799,6 +1814,95 @@ void BufferCache::FlushUploadBatch() {
 	                       1, &after, 0, nullptr, 0, nullptr);
 	m_upload_batch_buffers.clear();
 	m_upload_batch_copies.clear();
+}
+
+bool BufferCache::ScatterUploadBatch(const CommandRecorder& native) {
+	// One job per piece of up to ScatterJobBytes of a copy, by device address: small pieces keep
+	// enough workgroups in flight to hide the latency of reads from host memory.
+	struct Job {
+		uint64_t source;
+		uint64_t destination;
+		uint32_t size;
+		uint32_t pad0;
+		uint64_t pad1;
+	};
+	static_assert(sizeof(Job) == 32);
+	constexpr uint64_t ScatterJobBytes = 4 * 1024;
+	constexpr uint32_t MaxJobs         = 65535;
+	const auto         staging         = m_staging_buffer.BufferDeviceAddress();
+	std::vector<Job>   jobs;
+	size_t             first = 0;
+	for (const auto& batch: m_upload_batch_buffers) {
+		if (batch.address == 0 || staging == 0) {
+			return false;
+		}
+		for (uint32_t i = 0; i < batch.count; i++) {
+			const auto& copy = m_upload_batch_copies[first + i];
+			// The shader copies whole dwords.
+			if (((copy.srcOffset | copy.dstOffset | copy.size) & 3u) != 0) {
+				return false;
+			}
+			for (uint64_t done = 0; done < copy.size; done += ScatterJobBytes) {
+				jobs.push_back({staging + copy.srcOffset + done, batch.address + copy.dstOffset + done,
+				                static_cast<uint32_t>(std::min(ScatterJobBytes, copy.size - done)), 0, 0});
+			}
+		}
+		first += batch.count;
+	}
+	if (jobs.empty() || jobs.size() > MaxJobs) {
+		return false;
+	}
+	// The job list goes after the staged data, in the same lap of the staging buffer (no wait: that
+	// would submit the command buffer without the batch).
+	const auto bytes            = jobs.size() * sizeof(Job);
+	const auto [mapped, offset] = m_staging_buffer.Map(bytes, 16, false);
+	if (mapped == nullptr) {
+		return false;
+	}
+	std::memcpy(mapped, jobs.data(), bytes);
+	m_staging_buffer.Commit();
+	if (!m_scatter_pipeline) {
+		const auto                   device = m_graphics.device;
+		const vk::PushConstantRange  push {vk::ShaderStageFlagBits::eCompute, 0, 16};
+		vk::PipelineLayoutCreateInfo layout_info {};
+		layout_info.pushConstantRangeCount = 1;
+		layout_info.pPushConstantRanges    = &push;
+		RequireVulkanSuccess(device.createPipelineLayout(&layout_info, nullptr, &m_scatter_layout),
+		                     "create buffer scatter pipeline layout");
+		const auto                        module = CompileSPV(BUFFER_SCATTER_SPV, device);
+		vk::PipelineShaderStageCreateInfo stage {};
+		stage.stage  = vk::ShaderStageFlagBits::eCompute;
+		stage.module = module;
+		stage.pName  = "main";
+		vk::ComputePipelineCreateInfo pipeline_info {};
+		pipeline_info.stage  = stage;
+		pipeline_info.layout = m_scatter_layout;
+		const auto result    = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &m_scatter_pipeline);
+		device.destroyShaderModule(module, nullptr);
+		RequireVulkanSuccess(result, "create buffer scatter pipeline");
+		SetVulkanObjectNameF(device, m_scatter_pipeline, "Kyty.BufferScatter");
+	}
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eComputeShader, vk::DependencyFlagBits::eByRegion, 1,
+	                       &before, 0, nullptr, 0, nullptr);
+	struct Push {
+		uint64_t jobs;
+		uint32_t job_count;
+		uint32_t pad;
+	} push {staging + offset, static_cast<uint32_t>(jobs.size()), 0};
+	native.bindPipeline(vk::PipelineBindPoint::eCompute, m_scatter_pipeline);
+	native.pushConstants(m_scatter_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+	native.dispatch(push.job_count, 1, 1);
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+	                       vk::PipelineStageFlagBits::eAllCommands, vk::DependencyFlagBits::eByRegion,
+	                       1, &after, 0, nullptr, 0, nullptr);
+	return true;
 }
 
 // Each buffer's upload would record its own pair of barriers: record them once, around the
