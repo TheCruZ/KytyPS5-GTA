@@ -25,6 +25,7 @@ namespace Libs::Graphics {
 
 struct GraphicContext;
 class CommandScheduler;
+class CommandRecorder;
 class TextureCache;
 
 using BufferId = Common::SlotId;
@@ -164,6 +165,8 @@ public:
 	// together as SynchronizeBuffersInRanges() records them.
 	void SynchronizeBuffersInSpans(std::span<const std::pair<uint64_t, uint64_t>> spans);
 	void FlushUploadBatch();
+	// FlushUploadBatch() as one dispatch; false when the batch does not fit it.
+	bool ScatterUploadBatch(const CommandRecorder& native);
 	// Advances whenever a buffer is registered: a new buffer may cover CPU-dirty pages that no
 	// earlier synchronization uploaded.
 	[[nodiscard]] uint64_t RegisterEpoch() const { return m_register_epoch; }
@@ -398,8 +401,17 @@ private:
 	// behind one pair of barriers (see FlushUploadBatch()).
 	bool                                              m_upload_batching   = false;
 	uint64_t                                          m_upload_batch_tick = 0;
-	std::vector<std::pair<vk::Buffer, uint32_t>>      m_upload_batch_buffers;
+	struct UploadBatchBuffer {
+		vk::Buffer        buffer;
+		vk::DeviceAddress address = 0;
+		uint32_t          count   = 0;
+	};
+	std::vector<UploadBatchBuffer>                    m_upload_batch_buffers;
 	std::vector<vk::BufferCopy>                       m_upload_batch_copies;
+	// The batch's copies as one dispatch (buffer_scatter.comp), created at the first batch that
+	// copies to several buffers.
+	vk::PipelineLayout                                m_scatter_layout   = nullptr;
+	vk::Pipeline                                      m_scatter_pipeline = nullptr;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
