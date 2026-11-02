@@ -51,9 +51,9 @@ void Translator::EmitRayTracing(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::RT_INIT: {
 			std::array<IR::U32, 8> ray;
 			for (uint32_t i = 0; i < 8; i++) {
-				// A site without a mask register traces against every instance.
+				// A site without a mask register has a constant mask.
 				ray[i] = i == 7 && inst.image_nsa_addr[i] == Decoder::NoRegister
-				             ? IR::U32(IR::Value(0xffu))
+				             ? IR::U32(IR::Value(inst.image_nsa_addr[8]))
 				             : ReadU32(VectorOperand(inst.image_nsa_addr[i]));
 			}
 			const auto header    = ReadU32Pair(inst.src0);
@@ -147,16 +147,21 @@ void Translator::EmitRayTracing(const Decoder::Instruction& inst) {
 			return;
 		case Decoder::Opcode::RT_ALPHA: {
 			// The values the per-lane alpha test reads (see RayTracingAlphaTest): the level of
-			// detail term, the cone spread, the threshold factor and the V#s of the material table
-			// and of the buffer table, which the guest leaf code loads from user data.
+			// detail term, the cone spread, the threshold factor (1.0 without one), the V#s of the
+			// material table and of the buffer table, which the guest leaf code loads from user
+			// data, and the threshold (the lane's reference when the site has one).
 			const auto material = LoadScalarAddressDwords(inst.src2.reg, inst.image_nsa_addr[1], 4, inst.pc);
 			const auto buffers  = LoadScalarAddressDwords(inst.src3.reg, inst.image_nsa_addr[2], 4, inst.pc);
+			const auto factor   = inst.src1.kind == Decoder::OperandKind::Sgpr ? ReadU32(inst.src1)
+			                                                                    : IR::U32(IR::Value(0x3f800000u));
+			const auto threshold = inst.image_nsa_addr[5] != Decoder::NoRegister
+			                           ? ReadU32(VectorOperand(inst.image_nsa_addr[5]))
+			                           : IR::U32(IR::Value(inst.image_nsa_addr[3]));
 			ir.Emit(IR::ValueOpcode::RayQueryAlpha,
-			        {ReadU32(VectorOperand(inst.image_nsa_addr[0])), ReadU32(inst.src0), ReadU32(inst.src1),
-			         material[0], material[1], material[2], material[3], buffers[0], buffers[1], buffers[2],
-			         buffers[3], IR::U32(IR::Value(inst.image_nsa_addr[3])),
+			        {ReadU32(VectorOperand(inst.image_nsa_addr[0])), ReadU32(inst.src0), factor, material[0],
+			         material[1], material[2], material[3], buffers[0], buffers[1], buffers[2], buffers[3], threshold,
 			         IR::U32(IR::Value(inst.image_nsa_addr[4]))},
-			        flags(0u));
+			        flags(inst.dmask));
 			return;
 		}
 		default: FailMissingTranslation(inst);
