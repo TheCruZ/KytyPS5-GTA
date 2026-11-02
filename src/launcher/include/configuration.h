@@ -124,6 +124,7 @@ public:
 	bool                   relaxed_shader_float        = false;
 	bool                   shader_cache_enabled        = true;
 	bool                   async_pipelines_enabled     = true;
+	bool                   pipeline_manifest_record    = false;
 	bool                   trophy_enabled              = true;
 	int                    trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled        = false;
@@ -172,6 +173,7 @@ public:
 		relaxed_shader_float        = other.relaxed_shader_float;
 		shader_cache_enabled        = other.shader_cache_enabled;
 		async_pipelines_enabled     = other.async_pipelines_enabled;
+		pipeline_manifest_record    = other.pipeline_manifest_record;
 		trophy_enabled              = other.trophy_enabled;
 		trophy_duration_seconds     = other.trophy_duration_seconds;
 		perf_overlay_enabled        = other.perf_overlay_enabled;
