@@ -338,6 +338,8 @@ private:
 			TableResolution*                    resolution = nullptr;
 			uint32_t                            table      = 0;
 			uint32_t                            capacity   = 0;
+			// The ImageTableSnapshot::slots_id the range's values were taken from (0: unknown).
+			uint64_t                            slots_id   = 0;
 		};
 		struct Element {
 			TableElementResolution*               resolution = nullptr;

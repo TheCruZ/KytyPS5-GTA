@@ -43,6 +43,9 @@ struct ImageTableSnapshot {
 	std::vector<uint32_t>        raw;     // The table words the slots were built from.
 	std::vector<DescriptorValue> slots;
 	std::vector<uint32_t>        mapping; // Entry count, then the slot of each entry.
+	// Names the content of `slots`: snapshots that reuse the slots of an earlier one (the table's
+	// words did not change) keep its id; 0 for none.
+	uint64_t                     slots_id = 0;
 };
 
 // A flattened SRT dword run whose guest bytes the GPU writes (see ResourceSnapshot).
