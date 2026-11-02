@@ -1,0 +1,6 @@
+# kyty pipeline manifest v1
+M 9131d94f3e5b ps code=05a5318c13c0f384 ud=6 sysbase=2 center=0 smask=f omode=4 faceall kill in=0,1 si=n:Float/d:2D ss=-
+M d28f0a81c7fb ps code=474470cb2dd506e4 ud=4 sysbase=2 center=0 smask=f omode=4 faceall early in=0
+M ce84b1ae2511 cs code=6dc17afc0445255d ud=10 t=64,1,1 tid=1 wgr=10 gx sb=st:4/f:32UInt/sw:4
+M 6b5a8b9610f6 ps code=d669d731db68f519 ud=6 sysbase=2 center=0 smask=f omode=4 faceall early in=1 si=n:Float/d:2D ss=-
+M 0d52efb4e523 cs code=eeb821b44ca6111d ud=9 t=8,8,1 tid=2 wgr=9 gx gy sb=st:1/f:8UInt/sw:204,st:2/f:8_8UInt/sw:22c
