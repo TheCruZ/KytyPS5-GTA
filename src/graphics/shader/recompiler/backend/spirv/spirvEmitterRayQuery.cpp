@@ -51,6 +51,7 @@ constexpr uint32_t CommittedIntersection = 1; // RayQueryCommittedIntersectionKH
 // gl_RayFlags: back faces (see the instance flags of the TLAS walk) do not count; with the
 // guest's alpha test off, every triangle is opaque.
 constexpr uint32_t RayFlagOpaque              = 0x1;
+constexpr uint32_t RayFlagNoOpaque            = 0x2;
 constexpr uint32_t RayFlagCullBackFacing      = 0x10;
 
 struct LaneVariables {
@@ -382,10 +383,45 @@ void ClearAlphaCache(EmitterState& s, const LaneVariables& lane) {
 	Store(s, AlphaCachePointer(s, lane, AlphaCache::RecordOffset), U32(s, None));
 }
 
+// The base address and the stride of a buffer V#.
+uint32_t VsharpBase(EmitterState& s, const std::array<uint32_t, 4>& vsharp) {
+	return PackU64(s, vsharp[0], And(s, vsharp[1], 0xffffu));
+}
+
+uint32_t VsharpStride(EmitterState& s, const std::array<uint32_t, 4>& vsharp) {
+	return EmitBitFieldUExtract(s, vsharp[1], U32(s, 16), U32(s, 14));
+}
+
+// Elements `index` + k (k < 3) of a structured buffer of dwords as BUFFER_LOAD_DWORD idxen reads
+// them (zero past NUM_RECORDS); with a 4-byte stride the three share one translation.
+std::array<uint32_t, 3> StructuredDwords(ValueEmitContext& ctx, const std::array<uint32_t, 4>& vsharp,
+                                         uint32_t index) {
+	auto&      s = ctx.state;
+	const auto u = TypeU32(s), wide = TypeU64(s);
+	const auto stride  = VsharpStride(s, vsharp);
+	const auto address = [&](uint32_t element) {
+		return Binary(s, spv::OpIAdd, wide, VsharpBase(s, vsharp),
+		              Unary(s, spv::OpUConvert, wide, Binary(s, spv::OpIMul, u, element, stride)));
+	};
+	const auto packed = Equal(s, stride, U32(s, 4));
+	const auto object = EmitGuestObject(ctx, address(index), 12);
+	std::array<uint32_t, 3> words {};
+	for (uint32_t k = 0; k < 3; k++) {
+		const auto element = Add(s, index, U32(s, k));
+		words[k]           = EmitValueOrZeroIfCondition(s, Less(s, element, vsharp[2]), [&] {
+			const auto fast = EmitValueOrZeroIfCondition(s, packed, [&] { return EmitGuestObjectDword(ctx, object, k * 4); });
+			const auto slow = EmitValueOrZeroIfCondition(s, LogicalNot(s, packed),
+			                                             [&] { return EmitGuestDwordLoad(ctx, address(element)); });
+			return Select(s, u, packed, fast, slow);
+		});
+	}
+	return words;
+}
+
 // GTA V's alpha test of an alpha tested candidate (see RayTracingAlphaTest in RayTracingPatch.h):
 // whether the guest leaf code would accept it. Fields of one guest object are read with one
 // translation of its address.
-uint32_t AlphaTest(ValueEmitContext& ctx, const LaneVariables& lane, const GuestEntry& candidate) {
+uint32_t AlphaTest(ValueEmitContext& ctx, const LaneVariables& lane, const GuestEntry& candidate, bool lane_layout) {
 	auto&      s = ctx.state;
 	const auto u = TypeU32(s), f = TypeF32(s), wide = TypeU64(s), b = TypeBool(s);
 	const auto shr = [&](uint32_t value, uint32_t bits) {
@@ -436,18 +472,26 @@ uint32_t AlphaTest(ValueEmitContext& ctx, const LaneVariables& lane, const Guest
 	const auto at    = Add(s, shl(local, 2), cache(AlphaCache::TableOffset));
 	const auto geometry =
 	    EmitGuestDwordLoad(ctx, Binary(s, spv::OpIAdd, wide, blas, Unary(s, spv::OpUConvert, wide, at)));
-	const auto record_offset = mul(Add(s, geometry, cache(AlphaCache::MaterialBase)), U32(s, 12));
+	const auto material_index = Add(s, geometry, cache(AlphaCache::MaterialBase));
+	const auto record_offset  = mul(material_index, U32(s, 12));
 	EmitIfCondition(s, Binary(s, spv::OpINotEqual, b, record_offset, cache(AlphaCache::RecordOffset)), [&] {
 		std::array<uint32_t, 4> material {}, buffers {};
 		for (uint32_t i = 0; i < 4; i++) {
 			material[i] = AlphaU32(s, lane, AlphaArgument::Material, i);
 			buffers[i]  = AlphaU32(s, lane, AlphaArgument::Buffers, i);
 		}
-		ScalarBufferObject record;
-		EmitScalarBufferObject(ctx, material, record_offset, 12, record);
+		// The record: 12 bytes at m * 12, or elements m * 3 + k of a structured buffer.
 		std::array<uint32_t, 3> words {};
+		if (lane_layout) {
+			words = StructuredDwords(ctx, material, mul(material_index, U32(s, 3)));
+		} else {
+			ScalarBufferObject record;
+			EmitScalarBufferObject(ctx, material, record_offset, 12, record);
+			for (uint32_t i = 0; i < 3; i++) {
+				words[i] = EmitScalarBufferObjectDword(ctx, record, i * 4);
+			}
+		}
 		for (uint32_t i = 0; i < 3; i++) {
-			words[i] = EmitScalarBufferObjectDword(ctx, record, i * 4);
 			keep(AlphaCache::Material, words[i], i);
 		}
 		// V# (M1 >> 8) * 16 of the buffer table holds the indices, V# (M0 >> 8) * 16 the vertices.
@@ -459,7 +503,21 @@ uint32_t AlphaTest(ValueEmitContext& ctx, const LaneVariables& lane, const Guest
 			}
 		};
 		table_vsharp(words[1], AlphaCache::Indices);
-		table_vsharp(words[0], AlphaCache::Vertices);
+		if (lane_layout) {
+			// The vertices' base address: the first two dwords of element M0 >> 8 of the buffer
+			// table as a structured buffer (BUFFER_LOAD_DWORDX2 idxen).
+			const auto element = shr(words[0], 8);
+			const auto address = Binary(s, spv::OpIAdd, wide, VsharpBase(s, buffers),
+			                            Unary(s, spv::OpUConvert, wide, mul(element, VsharpStride(s, buffers))));
+			const auto entry   = EmitGuestObject(ctx, address, 8);
+			const auto in_range = Less(s, element, buffers[2]);
+			for (uint32_t i = 0; i < 2; i++) {
+				keep(AlphaCache::Vertices,
+				     EmitValueOrZeroIfCondition(s, in_range, [&] { return EmitGuestObjectDword(ctx, entry, i * 4); }), i);
+			}
+		} else {
+			table_vsharp(words[0], AlphaCache::Vertices);
+		}
 		keep(AlphaCache::RecordOffset, record_offset);
 	});
 	const auto m0 = cache(AlphaCache::Material, 0), m1 = cache(AlphaCache::Material, 1),
@@ -475,9 +533,17 @@ uint32_t AlphaTest(ValueEmitContext& ctx, const LaneVariables& lane, const Guest
 	std::array<std::array<uint32_t, 2>, 3> uv {};
 	const auto triangle = EmitTriangleIndices(ctx, indices, first);
 	for (uint32_t k = 0; k < 3; k++) {
-		const auto index = triangle[k];
+		const auto offset = Add(s, uv_offset, mul(stride, triangle[k]));
+		if (lane_layout) {
+			// FLAT loads at the V#'s base address (no bounds).
+			const auto vertex = EmitGuestObject(
+			    ctx, Binary(s, spv::OpIAdd, wide, VsharpBase(s, vertices), Unary(s, spv::OpUConvert, wide, offset)), 8);
+			uv[k][0] = as_f32(EmitGuestObjectDword(ctx, vertex, 0));
+			uv[k][1] = as_f32(EmitGuestObjectDword(ctx, vertex, 4));
+			continue;
+		}
 		ScalarBufferObject vertex;
-		EmitScalarBufferObject(ctx, vertices, Add(s, uv_offset, mul(stride, index)), 8, vertex);
+		EmitScalarBufferObject(ctx, vertices, offset, 8, vertex);
 		uv[k][0] = as_f32(EmitScalarBufferObjectDword(ctx, vertex, 0));
 		uv[k][1] = as_f32(EmitScalarBufferObjectDword(ctx, vertex, 4));
 	}
@@ -498,11 +564,15 @@ uint32_t AlphaTest(ValueEmitContext& ctx, const LaneVariables& lane, const Guest
 	s.builder.AddFunction(spv::OpExtInst, f, level, GlslStd450(s), GLSLstd450NMin,
 	                      Unary(s, spv::OpConvertUToF, f, And(s, m2, 15u)),
 	                      fadd(log, AlphaF32(s, lane, AlphaArgument::LodOffset)));
-	// The W channel of T# M2 >> 4 of the table against threshold * (M0 bit 0 ? factor : 1).
+	// The W channel of T# M2 >> 4 of the table against threshold * (M0 bit 0 ? factor : 1), or
+	// against the lane's reference.
 	const auto texel =
 	    EmitImageTableSampleLod(ctx, *s.ray_query_alpha_sample, shr(m2, 4), coord(0), coord(1), level);
 	const auto alpha = s.builder.AllocateId();
 	s.builder.AddFunction(spv::OpCompositeExtract, u, alpha, texel, 3u);
+	if (lane_layout) {
+		return Binary(s, spv::OpFOrdGreaterThan, b, as_f32(alpha), AlphaF32(s, lane, AlphaArgument::Threshold));
+	}
 	const auto factor = Select(s, f, BitSet(s, m0, 1u), AlphaF32(s, lane, AlphaArgument::Factor),
 	                           ConstantF32Value(s, 1.0f));
 	return Binary(s, spv::OpFOrdGreaterThan, b, as_f32(alpha),
@@ -516,6 +586,9 @@ void Refill(ValueEmitContext& ctx, uint32_t site, const LaneVariables& lane) {
 	auto&      s = ctx.state;
 	const auto u = TypeU32(s), b = TypeBool(s), wide = TypeU64(s), f = TypeF32(s);
 	const bool alpha_test = s.ray_query_alpha_sites[site] && s.ray_query_alpha_sample != nullptr;
+	const bool lane_layout      = s.ray_query_alpha_lane[site];
+	const bool geometry_opacity = s.ray_query_geometry_opacity[site] && alpha_test;
+	const auto confirm          = [&] { s.builder.AddFunction(spv::OpRayQueryConfirmIntersectionKHR, lane.query); };
 	const auto state  = Load(s, u, lane.state);
 	const auto empty  = Equal(s, Load(s, u, lane.current), Load(s, u, lane.count));
 	const auto refill = LogicalAnd(s, empty, LogicalAnd(s, BitSet(s, state, TraversalBit),
@@ -573,15 +646,29 @@ void Refill(ValueEmitContext& ctx, uint32_t site, const LaneVariables& lane) {
 				    s, type,
 				    U32(s, spv::RayQueryCandidateIntersectionTypeRayQueryCandidateIntersectionTriangleKHR));
 				EmitIfCondition(s, triangle, [&] {
+					if (geometry_opacity) {
+						// Every triangle is a candidate: the opaque ones (geometry 0, opaque by their
+						// primitive word) are hits, the alpha tested ones when the test accepts them.
+						const auto geometry = s.builder.AllocateId();
+						s.builder.AddFunction(spv::OpRayQueryGetIntersectionGeometryIndexKHR, u, geometry, lane.query,
+						                      U32(s, CandidateIntersection));
+						const auto opaque = Equal(s, geometry, U32(s, 0));
+						EmitIfCondition(s, opaque, confirm);
+						EmitIfCondition(s, LogicalNot(s, opaque), [&] {
+							const auto candidate = TriangleEntry(s, lane, CandidateIntersection);
+							EmitIfCondition(s, candidate.valid, [&] {
+								EmitIfCondition(s, AlphaTest(ctx, lane, candidate, lane_layout), confirm);
+							});
+						});
+						return;
+					}
 					const auto candidate = TriangleEntry(s, lane, CandidateIntersection);
 					// An entry outside its table is not tested (the candidate is a miss).
 					EmitIfCondition(s, candidate.valid, [&] {
 						if (alpha_test) {
 							// The lane's own alpha test; the hardware keeps the nearest accepted
 							// candidate (or opaque hit) as the committed hit.
-							EmitIfCondition(s, AlphaTest(ctx, lane, candidate), [&] {
-								s.builder.AddFunction(spv::OpRayQueryConfirmIntersectionKHR, lane.query);
-							});
+							EmitIfCondition(s, AlphaTest(ctx, lane, candidate, lane_layout), confirm);
 							return;
 						}
 						InsertKey(s, lane, count, InstanceNode(s, lane, CandidateIntersection),
@@ -663,7 +750,14 @@ void DeclareRayQueryVariables(EmitterState& s) {
 	for (const auto* block: s.program.blocks) {
 		for (const auto& inst: *block) {
 			if (inst.GetOpcode() == IR::ValueOpcode::RayQueryAlpha) {
-				alpha_sites[IR::RayQuerySite(inst.Flags<uint32_t>()) % IR::MaxRayQuerySites] = true;
+				const auto site   = IR::RayQuerySite(inst.Flags<uint32_t>()) % IR::MaxRayQuerySites;
+				alpha_sites[site] = true;
+				s.ray_query_alpha_lane[site] = IR::RayQueryVariant(inst.Flags<uint32_t>()) == IR::RayQueryAlphaLane;
+			} else if (inst.GetOpcode() == IR::ValueOpcode::RayQueryInit) {
+				const auto flags = inst.Flags<uint32_t>();
+				if ((IR::RayQueryVariant(flags) & IR::RayQueryInitGeometryOpacity) != 0) {
+					s.ray_query_geometry_opacity[IR::RayQuerySite(flags) % IR::MaxRayQuerySites] = true;
+				}
 			} else if (IsImageTableSampleLod(s, inst)) {
 				samples.push_back(&inst);
 			}
@@ -737,7 +831,13 @@ uint32_t EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                      s.bda_pagetable_variable, U32(s, 0),
 	                      U32(s, static_cast<uint32_t>(BufferCache::NATIVE_RT_CONTEXT_PAGE)));
 	const auto context     = Load(s, wide, entry);
-	const auto has_context = Binary(s, spv::OpINotEqual, b, context, ConstantU64(s, 0));
+	const auto variant     = IR::RayQueryVariant(inst.Flags<uint32_t>());
+	const bool geometry_opacity = (variant & IR::RayQueryInitGeometryOpacity) != 0;
+	// A site whose opacity comes from the geometry has no guest leaf code to run for its alpha
+	// tested candidates: without the per-lane alpha test it keeps the guest traversal.
+	const auto has_context = geometry_opacity && !(s.ray_query_alpha_sites[site] && s.ray_query_alpha_sample != nullptr)
+	                             ? ConstantBool(s, false)
+	                             : Binary(s, spv::OpINotEqual, b, context, ConstantU64(s, 0));
 	const auto native = EmitValueOrDefaultIfCondition(s, has_context, b, ConstantBool(s, false), [&] {
 		const auto valid = Binary(s, spv::OpINotEqual, b,
 		                          LoadAddressU32(s, AddressPlus(s, context, ContextValid)), U32(s, 0));
@@ -779,11 +879,10 @@ uint32_t EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst) {
 		// (instance record +60 bit 31). An arbitrary first hit (often static geometry farther
 		// along the ray) left moving vehicles without that flag: trails of their shadows.
 		// Closest hit sites (RayQueryInitBothFacings) count both facings.
-		const uint32_t facing =
-		    (IR::RayQueryVariant(inst.Flags<uint32_t>()) & IR::RayQueryInitBothFacings) != 0
-		        ? 0u
-		        : RayFlagCullBackFacing;
-		const auto flags = Select(s, u, alpha_off, U32(s, facing | RayFlagOpaque), U32(s, facing));
+		// Sites whose opacity comes from the geometry take every triangle as a candidate.
+		const uint32_t facing  = (variant & IR::RayQueryInitBothFacings) != 0 ? 0u : RayFlagCullBackFacing;
+		const uint32_t opacity = geometry_opacity ? RayFlagNoOpaque : 0u;
+		const auto     flags   = Select(s, u, alpha_off, U32(s, facing | RayFlagOpaque), U32(s, facing | opacity));
 		s.builder.AddFunction(spv::OpRayQueryInitializeKHR, lane.query, structure, flags,
 		                      And(s, ray[7], 0xffu), origin, ConstantF32Value(s, 0.0f), direction,
 		                      ray[6]);
