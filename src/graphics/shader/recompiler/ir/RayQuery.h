@@ -37,6 +37,14 @@ enum class RayQueryResultKind : uint32_t {
 
 // RayQueryInit variant bits.
 constexpr uint32_t RayQueryInitBothFacings = 1u;
+// Opacity from the geometry only (the primitive word's opaque bit; instance flags do not
+// count): every triangle is a candidate, the opaque ones are confirmed and the alpha tested
+// ones the per-lane alpha test accepts.
+constexpr uint32_t RayQueryInitGeometryOpacity = 2u;
+
+// RayQueryAlpha variant: how the alpha test reads its data (Decoder::RayTracingAlphaLayout).
+constexpr uint32_t RayQueryAlphaScalar = 0u;
+constexpr uint32_t RayQueryAlphaLane   = 1u;
 
 // RayQueryMark: state changes; the argument selects lanes.
 enum class RayQueryMarkKind : uint32_t {
