@@ -1097,8 +1097,15 @@ void NativeRayTracing::RecordBuilds(const CommandRecorder& command) {
 		gather.jobs      = m_jobs->BufferDeviceAddress() + uint64_t {walk_count} * JobStride;
 		gather.mode      = ModeGather;
 		gather.job_count = static_cast<uint32_t>(jobs.size()) - walk_count;
+		// A workgroup per 1024 triangles of the largest job (one workgroup per job left the
+		// thousands of triangles of a vehicle to 256 invocations in turn).
+		uint32_t largest = 0;
+		for (size_t i = walk_count; i < jobs.size(); i++) {
+			largest = std::max(largest, jobs[i].capacity0 + jobs[i].capacity1);
+		}
+		const uint32_t groups = std::clamp<uint32_t>((largest + 1023u) / 1024u, 1u, 64u);
 		command.pushConstants(m_blas_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(gather), &gather);
-		command.dispatch(gather.job_count, 1, 1);
+		command.dispatch(gather.job_count, groups, 1);
 		command.pushConstants(m_blas_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
 	}
 	if (walk_count != 0) {

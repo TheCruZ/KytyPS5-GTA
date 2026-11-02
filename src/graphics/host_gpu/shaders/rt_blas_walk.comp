@@ -143,9 +143,9 @@ void EmitLeaf(uint64_t blas_va, uint64_t base, uint leaf, Job job, vec3 lo, vec3
 	atomicAdd(s_leaves, 1u);
 	const uint first = leaf >> 3;
 	for (uint k = 0; k < kMaxLeafEntries; k++) {
-		const uint64_t entry  = blas_va + (uint64_t(first + k) << 3);
-		const uint     tri    = LoadGuestU32(entry);
-		const uint     word   = LoadGuestU32(entry + 4);
+		const uvec2    pair   = LoadGuestU32x2(blas_va + (uint64_t(first + k) << 3));
+		const uint     tri    = pair.x;
+		const uint     word   = pair.y;
 		const bool     opaque = ((word >> 30) & 1u) != 0;
 		uint           index  = opaque ? atomicAdd(s_opaque, 1u) : atomicAdd(s_alpha, 1u);
 		if (pc.mode == MODE_BUILD && job.layout_va != 0) {
@@ -162,15 +162,15 @@ void EmitLeaf(uint64_t blas_va, uint64_t base, uint leaf, Job job, vec3 lo, vec3
 			const uint capacity = opaque ? s_capacity0 : s_capacity1;
 			if (index < capacity) {
 				const uint64_t node = NodeAddress(base, tri);
-				const uvec3    ids  = TriangleVertexIds(NodeType(tri));
 				TriangleRef out_triangle =
 				    TriangleRef((opaque ? job.vertices0 : job.vertices1) + uint64_t(index) * 36);
 				// A vertex the hardware cannot take (non-finite or absurdly far, as in a node the
 				// guest is rewriting) makes the triangle inactive (NaN) instead of undefined.
+				vec3 p[3];
+				LoadTriangle(node, NodeType(tri), p);
 				bool usable = true;
 				for (uint v = 0; v < 3; v++) {
-					const vec3 p = LoadVertex(node, ids[v]);
-					usable = usable && !any(isnan(p)) && all(lessThan(abs(p), vec3(1e18)));
+					usable = usable && !any(isnan(p[v])) && all(lessThan(abs(p[v]), vec3(1e18)));
 				}
 				// A triangle outside its box is from a node the guest was writing. Of a BLAS the game
 				// refits (job.pad 1: vehicles, peds) the box is the leaf's, which keeps the triangles
@@ -183,16 +183,15 @@ void EmitLeaf(uint64_t blas_va, uint64_t base, uint leaf, Job job, vec3 lo, vec3
 				if (all(lessThanEqual(box_lo, box_hi))) {
 					const vec3 margin = (box_hi - box_lo) * 1e-3 + vec3(1e-3);
 					for (uint v = 0; v < 3; v++) {
-						const vec3 p = LoadVertex(node, ids[v]);
-						usable = usable && all(greaterThanEqual(p, box_lo - margin)) &&
-						         all(lessThanEqual(p, box_hi + margin));
+						usable = usable && all(greaterThanEqual(p[v], box_lo - margin)) &&
+						         all(lessThanEqual(p[v], box_hi + margin));
 					}
 				}
 				for (uint v = 0; v < 3; v++) {
-					const vec3 p = usable ? LoadVertex(node, ids[v]) : vec3(uintBitsToFloat(0x7fc00000u));
-					out_triangle.v[v * 3]     = p.x;
-					out_triangle.v[v * 3 + 1] = p.y;
-					out_triangle.v[v * 3 + 2] = p.z;
+					const vec3 q = usable ? p[v] : vec3(uintBitsToFloat(0x7fc00000u));
+					out_triangle.v[v * 3]     = q.x;
+					out_triangle.v[v * 3 + 1] = q.y;
+					out_triangle.v[v * 3 + 2] = q.z;
 				}
 				const uint table_index = opaque ? index : s_capacity0 + index;
 				// The barycentric remap of the triangle (node word 15, 8 bits per triangle type).
@@ -213,13 +212,16 @@ void GatherTriangle(Job job, uint64_t base, uint index, uint geometry) {
 	const uvec4    entry        = EntryRef(job.entries + uint64_t(table_index) * 16).v;
 	const uint     tri          = entry.z;
 	const uint64_t node         = NodeAddress(base, tri);
-	const uvec3    ids          = TriangleVertexIds(NodeType(tri));
 	TriangleRef    out_triangle = TriangleRef((geometry == 0u ? job.vertices0 : job.vertices1) + uint64_t(index) * 36);
 	vec3 p[3];
 	// A position of a layout build that no list entry named stays inactive.
 	bool usable = entry.x != kInvalidNode;
+	if (usable) {
+		LoadTriangle(node, NodeType(tri), p);
+	} else {
+		p[0] = p[1] = p[2] = vec3(0.0);
+	}
 	for (uint v = 0; v < 3; v++) {
-		p[v]   = usable ? LoadVertex(node, ids[v]) : vec3(0.0);
 		usable = usable && !any(isnan(p[v])) && all(lessThan(abs(p[v]), vec3(1e18)));
 	}
 	for (uint v = 0; v < 3; v++) {
@@ -242,14 +244,16 @@ void main() {
 		const uint64_t base   = (job.blas_va >> 8) << 8;
 		const uint     count0 = min(info.count0, job.capacity0);
 		const uint     count1 = min(info.count1, job.capacity1);
-		for (uint i = lid; i < count0 + count1; i += gl_WorkGroupSize.x) {
+		// The workgroups of a job (y) take its triangles in turns.
+		const uint     stride = gl_WorkGroupSize.x * gl_NumWorkGroups.y;
+		for (uint i = gl_WorkGroupID.y * gl_WorkGroupSize.x + lid; i < count0 + count1; i += stride) {
 			if (i < count0) {
 				GatherTriangle(job, base, i, 0u);
 			} else {
 				GatherTriangle(job, base, i - count0, 1u);
 			}
 		}
-		if (lid == 0) {
+		if (lid == 0 && gl_WorkGroupID.y == 0) {
 			info.rebase = 0x80000000u | (pc.prepare_id & 0x7fffffffu);
 		}
 		return;
