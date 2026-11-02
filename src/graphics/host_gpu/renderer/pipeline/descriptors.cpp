@@ -1402,7 +1402,7 @@ bool RenderExecutor::ReuseTableBindings(const ShaderRecompiler::IR::CompiledShad
 			same = false;
 			return;
 		}
-		const auto& cached = state.ranges[range_index++];
+		auto& cached = state.ranges[range_index++];
 		if (cached.table != root.table || cached.capacity != root.table_capacity ||
 		    !(cached.root == root) || &FindTableResolution(root) != cached.resolution ||
 		    state.generation != m_table_generation) {
@@ -1410,6 +1410,13 @@ bool RenderExecutor::ReuseTableBindings(const ShaderRecompiler::IR::CompiledShad
 			return;
 		}
 		const auto& table = snapshot.image_tables.at(root.table);
+		// The same slots as when the values were recorded (the table's words did not change):
+		// nothing to compare. GTA V's tables hold ~16 000 T#s, compared on every binding.
+		if (table.slots_id != 0 && table.slots_id == cached.slots_id) {
+			slot_index += root.table_capacity;
+			return;
+		}
+		cached.slots_id = table.slots_id;
 		for (uint32_t slot = 0; slot < root.table_capacity && same; slot++) {
 			const auto& value =
 			    slot != 0u && slot < table.slots.size() ? table.slots[slot] : null_value;
@@ -1707,7 +1714,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		const auto& table = snapshot.image_tables.at(root.table);
 		const ShaderRecompiler::IR::DescriptorValue null_value {.dword_count = 8u};
 		auto& resolution = FindTableResolution(root);
-		table_state->ranges.push_back({root, &resolution, root.table, root.table_capacity});
+		table_state->ranges.push_back(
+		    {root, &resolution, root.table, root.table_capacity, table.slots_id});
 		// Bind each distinct element once, however many slots name it.
 		const auto add = [&](TableElementResolution&                      element,
 		                     const ShaderRecompiler::IR::DescriptorValue& value) {
