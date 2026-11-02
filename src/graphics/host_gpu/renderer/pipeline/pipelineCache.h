@@ -76,7 +76,10 @@ public:
 	                            std::span<const ShaderRecompiler::IR::ResourcePlan* const> plans) const;
 	// Execution thread: writes the current value of each such load into its stage's flattened
 	// SRT (the guest rewrites constants, such as a camera matrix, after it submits the draws).
-	void RefreshFlatLoads(std::span<ShaderRecompiler::IR::ResourceSnapshot> resources) const;
+	// `gpu_copies`: the dwords whose bytes the GPU wrote are left to a copy on the GPU (see
+	// ResourceSnapshot::gpu_flat_loads) instead of being read back.
+	void RefreshFlatLoads(std::span<ShaderRecompiler::IR::ResourceSnapshot> resources,
+	                      bool gpu_copies = false) const;
 
 private:
 	static constexpr uint64_t StrictCheckBytes = 64;
@@ -145,12 +148,13 @@ struct ProgramResolution {
 		stages = 0;
 	}
 	// Execution thread: whether the resolution holds, with its flattened SRT dwords read again.
-	[[nodiscard]] bool Revalidate() {
+	// `gpu_flat_loads`: see GuestReadLog::RefreshFlatLoads().
+	[[nodiscard]] bool Revalidate(bool gpu_flat_loads = false) {
 		if (!reads.StillValid()) {
 			return false;
 		}
 		reads.RefreshDescriptorWords(std::span(resources).first(stages), std::span(plans).first(stages));
-		reads.RefreshFlatLoads(std::span(resources).first(stages));
+		reads.RefreshFlatLoads(std::span(resources).first(stages), gpu_flat_loads);
 		return true;
 	}
 };
