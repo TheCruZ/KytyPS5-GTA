@@ -302,6 +302,7 @@ void PipelineCache::StoreModule(const ProgramKey& key, const Program& program,
 }
 
 void PipelineCache::StorePipeline(const GraphicsPipelineKey& key) {
+	RecordPipeline(key);
 	if (!m_store) {
 		return;
 	}
@@ -312,6 +313,7 @@ void PipelineCache::StorePipeline(const GraphicsPipelineKey& key) {
 }
 
 void PipelineCache::StoreLayout(uint64_t key, const ShaderTessellationInputInfo& layout) {
+	RecordLayout(key, layout);
 	if (!m_store) {
 		return;
 	}
