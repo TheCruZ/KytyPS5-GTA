@@ -91,6 +91,8 @@ struct ConfigOptions {
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
 	bool                   shader_cache_enabled        = false;
+	bool                   pipeline_manifest_enabled   = true;
+	bool                   pipeline_manifest_record    = false;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
@@ -159,6 +161,12 @@ bool     VulkanValidationEnabled();
 
 bool                   ShaderValidationEnabled();
 bool                   ShaderCacheEnabled();
+// Programs and pipelines named in the title's pipeline manifest are created once the guest maps
+// their shaders.
+bool                   PipelineManifestEnabled();
+// The programs and pipelines the session creates are added to the title's manifest in
+// _PipelineCache.
+bool                   PipelineManifestRecord();
 ShaderOptimizationType GetShaderOptimizationType();
 LogDirection           GetShaderLogDirection();
 std::filesystem::path  GetShaderLogFolder();

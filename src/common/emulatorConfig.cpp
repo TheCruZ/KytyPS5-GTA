@@ -162,6 +162,14 @@ bool ShaderCacheEnabled() {
 	return g_config->shader_cache_enabled;
 }
 
+bool PipelineManifestEnabled() {
+	return g_config->pipeline_manifest_enabled;
+}
+
+bool PipelineManifestRecord() {
+	return g_config->pipeline_manifest_record;
+}
+
 ShaderOptimizationType GetShaderOptimizationType() {
 	return g_config->shader_optimization_type;
 }
