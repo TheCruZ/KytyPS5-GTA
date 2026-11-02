@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <span>
 #include <vector>
 
 // Native ray tracing (see RayTracingPatch.h and NativeRayTracing). Each patched traversal (site)
@@ -178,6 +179,12 @@ uint32_t LoadAddressU32(EmitterState& s, uint32_t address) {
 	return result;
 }
 
+// A 4-byte aligned store through a device address.
+void StoreAddressU32(EmitterState& s, uint32_t address, uint32_t value) {
+	const auto pointer = Unary(s, spv::OpConvertUToPtr, TypePhysicalU32Pointer(s), address);
+	s.builder.AddFunction(spv::OpStore, pointer, value, spv::MemoryAccessAlignedMask, 4u);
+}
+
 uint32_t LoadAddressU64(EmitterState& s, uint32_t address) {
 	const auto low  = LoadAddressU32(s, address);
 	const auto high = LoadAddressU32(s, Binary(s, spv::OpIAdd, TypeU64(s), address, ConstantU64(s, 4)));
@@ -270,12 +277,17 @@ void ClearKeys(EmitterState& s, const LaneVariables& lane) {
 // BLAS (rt_blas_walk.comp). Also whether the entry is one of the table (a slot rebuilt meanwhile
 // may have another table).
 struct GuestEntry {
-	uint32_t entry = 0;
-	uint32_t word  = 0;
-	uint32_t node  = 0;
-	uint32_t remap = 0;
-	uint32_t valid = 0;
+	uint32_t entry  = 0;
+	uint32_t word   = 0;
+	uint32_t node   = 0;
+	uint32_t remap  = 0;
+	uint32_t valid  = 0;
+	uint32_t record = 0; // The alpha record of an alpha tested triangle (see AlphaTest()).
 };
+
+// After the entry table of a slot (16 bytes per triangle of both geometries), 32-byte aligned:
+// an alpha record of 32 bytes per alpha tested triangle (NativeRayTracing::ComputeSlotSizes()).
+constexpr uint32_t AlphaRecordStride = 32;
 
 GuestEntry TriangleEntry(EmitterState& s, const LaneVariables& lane, uint32_t intersection) {
 	const auto u = TypeU32(s), wide = TypeU64(s);
@@ -301,7 +313,12 @@ GuestEntry TriangleEntry(EmitterState& s, const LaneVariables& lane, uint32_t in
 		return EmitValueOrZeroIfCondition(
 		    s, valid, [&] { return LoadAddressU32(s, AddressPlus(s, entry, offset)); });
 	};
-	return {field(0), field(4), field(8), field(12), valid};
+	const auto records =
+	    And(s, Add(s, Binary(s, spv::OpIMul, u, Add(s, capacity0, capacity1), U32(s, 16)), U32(s, AlphaRecordStride - 1)),
+	        ~(AlphaRecordStride - 1));
+	const auto record = ScaledAddress(s, Binary(s, spv::OpIAdd, wide, table, Unary(s, spv::OpUConvert, wide, records)),
+	                                  Select(s, u, valid, primitive, U32(s, 0)), AlphaRecordStride);
+	return {field(0), field(4), field(8), field(12), valid, record};
 }
 
 // The guest TLAS leaf pointer of the instance of a hit or candidate.
@@ -364,7 +381,8 @@ enum class AlphaCache : uint32_t {
 	Material,         // M0, M1, M2
 	Indices = 10,     // The V# of the index buffer
 	Vertices = 14,    // The V# of the vertex buffer
-	Count = 18,
+	Coordinates = 18, // The texture coordinates of the candidate's vertices (u0, v0, u1, v1, u2, v2)
+	Count = 24,
 };
 
 uint32_t AlphaCachePointer(EmitterState& s, const LaneVariables& lane, AlphaCache field, uint32_t offset = 0) {
@@ -418,9 +436,27 @@ std::array<uint32_t, 3> StructuredDwords(ValueEmitContext& ctx, const std::array
 	return words;
 }
 
+// The check word of an alpha record: a mix of what selects the texture coordinates of the
+// triangle (its primitive word, the layout, the material's stride and offset, the V#s of the index
+// and vertex buffers) and of the coordinates, never 0 nor ~0 (a cleared record).
+uint32_t AlphaRecordCheck(EmitterState& s, std::span<const uint32_t> words) {
+	const auto u    = TypeU32(s);
+	uint32_t   hash = U32(s, 0x811c9dc5u);
+	for (const auto word: words) {
+		hash = Binary(s, spv::OpIMul, u, Binary(s, spv::OpBitwiseXor, u, hash, word), U32(s, 0x01000193u));
+		hash = Binary(s, spv::OpBitwiseXor, u, hash, Binary(s, spv::OpShiftRightLogical, u, hash, U32(s, 15)));
+	}
+	return Or(s, And(s, hash, ~3u), U32(s, 1));
+}
+
 // GTA V's alpha test of an alpha tested candidate (see RayTracingAlphaTest in RayTracingPatch.h):
 // whether the guest leaf code would accept it. Fields of one guest object are read with one
 // translation of its address.
+//
+// The texture coordinates of a triangle (index and vertex reads after the material's) are kept in
+// its alpha record with a check word over them and what selects them: a later candidate of the
+// triangle with the same material buffers takes them from there. A record the host cleared (a
+// slot built again), half written by another lane or of other buffers fails the check.
 uint32_t AlphaTest(ValueEmitContext& ctx, const LaneVariables& lane, const GuestEntry& candidate, bool lane_layout) {
 	auto&      s = ctx.state;
 	const auto u = TypeU32(s), f = TypeF32(s), wide = TypeU64(s), b = TypeBool(s);
@@ -438,6 +474,11 @@ uint32_t AlphaTest(ValueEmitContext& ctx, const LaneVariables& lane, const Guest
 	const auto keep   = [&](AlphaCache field, uint32_t value, uint32_t offset = 0) {
 		Store(s, AlphaCachePointer(s, lane, field, offset), value);
 	};
+	// The record (check word, then the coordinates), read before anything else.
+	std::array<uint32_t, 7> record {};
+	for (uint32_t i = 0; i < 7; i++) {
+		record[i] = LoadAddressU32(s, AddressPlus(s, candidate.record, i * 4));
+	}
 	// The instance record (R) and its BLAS (B header).
 	const auto node = InstanceNode(s, lane, CandidateIntersection);
 	EmitIfCondition(s, Binary(s, spv::OpINotEqual, b, node, cache(AlphaCache::Instance)), [&] {
@@ -527,25 +568,55 @@ uint32_t AlphaTest(ValueEmitContext& ctx, const LaneVariables& lane, const Guest
 		indices[i]  = cache(AlphaCache::Indices, i);
 		vertices[i] = cache(AlphaCache::Vertices, i);
 	}
-	// The triangle's texture coordinates.
+	// The triangle's texture coordinates, from its record when the check word matches.
 	const auto first  = mul(And(s, candidate.word, 0x3fffffffu), U32(s, 3));
 	const auto stride = And(s, m0, 0xfcu), uv_offset = And(s, m1, 0xfcu);
-	std::array<std::array<uint32_t, 2>, 3> uv {};
-	const auto triangle = EmitTriangleIndices(ctx, indices, first);
-	for (uint32_t k = 0; k < 3; k++) {
-		const auto offset = Add(s, uv_offset, mul(stride, triangle[k]));
-		if (lane_layout) {
-			// FLAT loads at the V#'s base address (no bounds).
-			const auto vertex = EmitGuestObject(
-			    ctx, Binary(s, spv::OpIAdd, wide, VsharpBase(s, vertices), Unary(s, spv::OpUConvert, wide, offset)), 8);
-			uv[k][0] = as_f32(EmitGuestObjectDword(ctx, vertex, 0));
-			uv[k][1] = as_f32(EmitGuestObjectDword(ctx, vertex, 4));
-			continue;
+	// The lane layout reads the vertices without bounds (only the base of their V#).
+	std::vector<uint32_t> selectors {candidate.word, U32(s, lane_layout ? 1u : 0u), stride, uv_offset,
+	                                 indices[0], indices[1], indices[2], indices[3], vertices[0], vertices[1]};
+	if (!lane_layout) {
+		selectors.push_back(vertices[2]);
+		selectors.push_back(vertices[3]);
+	}
+	const auto check = [&](std::span<const uint32_t> coordinates) {
+		std::vector<uint32_t> words = selectors;
+		words.insert(words.end(), coordinates.begin(), coordinates.end());
+		return AlphaRecordCheck(s, words);
+	};
+	const auto recorded = Equal(s, record[0], check(std::span(record).subspan(1)));
+	for (uint32_t c = 0; c < 6; c++) {
+		keep(AlphaCache::Coordinates, record[1 + c], c);
+	}
+	EmitIfCondition(s, LogicalNot(s, recorded), [&] {
+		std::array<uint32_t, 6> words {};
+		const auto triangle = EmitTriangleIndices(ctx, indices, first);
+		for (uint32_t k = 0; k < 3; k++) {
+			const auto offset = Add(s, uv_offset, mul(stride, triangle[k]));
+			if (lane_layout) {
+				// FLAT loads at the V#'s base address (no bounds).
+				const auto vertex = EmitGuestObject(
+				    ctx, Binary(s, spv::OpIAdd, wide, VsharpBase(s, vertices), Unary(s, spv::OpUConvert, wide, offset)),
+				    8);
+				words[k * 2]     = EmitGuestObjectDword(ctx, vertex, 0);
+				words[k * 2 + 1] = EmitGuestObjectDword(ctx, vertex, 4);
+				continue;
+			}
+			ScalarBufferObject vertex;
+			EmitScalarBufferObject(ctx, vertices, offset, 8, vertex);
+			words[k * 2]     = EmitScalarBufferObjectDword(ctx, vertex, 0);
+			words[k * 2 + 1] = EmitScalarBufferObjectDword(ctx, vertex, 4);
 		}
-		ScalarBufferObject vertex;
-		EmitScalarBufferObject(ctx, vertices, offset, 8, vertex);
-		uv[k][0] = as_f32(EmitScalarBufferObjectDword(ctx, vertex, 0));
-		uv[k][1] = as_f32(EmitScalarBufferObjectDword(ctx, vertex, 4));
+		// The coordinates first, the check word last.
+		for (uint32_t c = 0; c < 6; c++) {
+			keep(AlphaCache::Coordinates, words[c], c);
+			StoreAddressU32(s, AddressPlus(s, candidate.record, 4 + c * 4), words[c]);
+		}
+		StoreAddressU32(s, candidate.record, check(words));
+	});
+	std::array<std::array<uint32_t, 2>, 3> uv {};
+	for (uint32_t k = 0; k < 3; k++) {
+		uv[k][0] = as_f32(cache(AlphaCache::Coordinates, k * 2));
+		uv[k][1] = as_f32(cache(AlphaCache::Coordinates, k * 2 + 1));
 	}
 	const auto [i, j] = GuestBarycentrics(s, lane, CandidateIntersection, candidate.remap);
 	const auto w0     = Binary(s, spv::OpFSub, f, Binary(s, spv::OpFSub, f, ConstantF32Value(s, 1.0f), i), j);
@@ -579,107 +650,141 @@ uint32_t AlphaTest(ValueEmitContext& ctx, const LaneVariables& lane, const Guest
 	              fmul(AlphaF32(s, lane, AlphaArgument::Threshold), factor));
 }
 
-// Collects the alpha tested triangles a lane's ray hits (the candidates the hardware reports),
-// for a lane whose list is empty, until the list is full or the query is done. A query is done
-// at its closest opaque hit, kept as the lane's result.
-void Refill(ValueEmitContext& ctx, uint32_t site, const LaneVariables& lane) {
+// Collects the alpha tested triangles the lanes' rays hit (the candidates the hardware reports),
+// for the lanes whose list is empty, until the list is full or the query is done. A query is done
+// at its closest opaque hit, kept as the lane's result. Both halves of an emulated wave64 lane
+// advance their queries in the same loop.
+void Refill(ValueEmitContext& ctx, uint32_t site) {
 	auto&      s = ctx.state;
 	const auto u = TypeU32(s), b = TypeBool(s), wide = TypeU64(s), f = TypeF32(s);
 	const bool alpha_test = s.ray_query_alpha_sites[site] && s.ray_query_alpha_sample != nullptr;
 	const bool lane_layout      = s.ray_query_alpha_lane[site];
 	const bool geometry_opacity = s.ray_query_geometry_opacity[site] && alpha_test;
-	const auto confirm          = [&] { s.builder.AddFunction(spv::OpRayQueryConfirmIntersectionKHR, lane.query); };
-	const auto state  = Load(s, u, lane.state);
-	const auto empty  = Equal(s, Load(s, u, lane.current), Load(s, u, lane.count));
-	const auto refill = LogicalAnd(s, empty, LogicalAnd(s, BitSet(s, state, TraversalBit),
-	                                                    LogicalNot(s, BitSet(s, state, DoneBit | TerminatedBit))));
-	EmitIfCondition(s, refill, [&] {
-		ClearKeys(s, lane);
-		EmitLoop(s, [&](uint32_t merge, uint32_t cont) {
-			const auto count = Load(s, u, lane.count);
-			const auto room  = Less(s, count, U32(s, ListSize));
-			const auto proceed = EmitValueOrDefaultIfCondition(s, room, b, ConstantBool(s, false), [&] {
-				const auto result = s.builder.AllocateId();
-				s.builder.AddFunction(spv::OpRayQueryProceedKHR, b, result, lane.query);
-				return result;
-			});
-			// The query is done: an opaque hit is the lane's result (its alpha tested candidates
-			// do not matter any more).
-			EmitIfCondition(s, LogicalAnd(s, room, LogicalNot(s, proceed)), [&] {
-				const auto committed = s.builder.AllocateId();
-				s.builder.AddFunction(spv::OpRayQueryGetIntersectionTypeKHR, u, committed, lane.query,
+	std::array<LaneVariables, 2> lanes {};
+	std::array<uint32_t, 2>      refills {};
+	for (uint32_t half = 0; half < s.lane_count; half++) {
+		lanes[half]      = Lane(s, site, half);
+		const auto state = Load(s, u, lanes[half].state);
+		const auto empty = Equal(s, Load(s, u, lanes[half].current), Load(s, u, lanes[half].count));
+		refills[half]    = LogicalAnd(s, empty, LogicalAnd(s, BitSet(s, state, TraversalBit),
+		                                                   LogicalNot(s, BitSet(s, state, DoneBit | TerminatedBit))));
+	}
+	// The result of one step of a lane's query: `count` keys before it, `step` whether it ran.
+	const auto handle = [&](const LaneVariables& lane, uint32_t count, uint32_t step, uint32_t proceed) {
+		const auto confirm = [&] { s.builder.AddFunction(spv::OpRayQueryConfirmIntersectionKHR, lane.query); };
+		// The query is done: an opaque hit is the lane's result (its alpha tested candidates
+		// do not matter any more).
+		EmitIfCondition(s, LogicalAnd(s, step, LogicalNot(s, proceed)), [&] {
+			const auto committed = s.builder.AllocateId();
+			s.builder.AddFunction(spv::OpRayQueryGetIntersectionTypeKHR, u, committed, lane.query,
+			                      U32(s, CommittedIntersection));
+			const auto hit = Equal(
+			    s, committed,
+			    U32(s, spv::RayQueryCommittedIntersectionTypeRayQueryCommittedIntersectionTriangleKHR));
+			EmitIfCondition(s, hit, [&] {
+				const auto t = s.builder.AllocateId();
+				s.builder.AddFunction(spv::OpRayQueryGetIntersectionTKHR, f, t, lane.query,
 				                      U32(s, CommittedIntersection));
-				const auto hit = Equal(
-				    s, committed,
-				    U32(s, spv::RayQueryCommittedIntersectionTypeRayQueryCommittedIntersectionTriangleKHR));
-				EmitIfCondition(s, hit, [&] {
-					const auto t = s.builder.AllocateId();
-					s.builder.AddFunction(spv::OpRayQueryGetIntersectionTKHR, f, t, lane.query,
-					                      U32(s, CommittedIntersection));
-					const auto hit_entry = TriangleEntry(s, lane, CommittedIntersection);
-					const auto node = InstanceNode(s, lane, CommittedIntersection);
-					Store(s, lane.result_t, Unary(s, spv::OpBitcast, u, t));
-					Store(s, lane.result_word, hit_entry.word);
-					Store(s, lane.result_node, hit_entry.node);
-					const auto [bary_u, bary_v] =
-					    GuestBarycentrics(s, lane, CommittedIntersection, hit_entry.remap);
-					Store(s, lane.result_u, Unary(s, spv::OpBitcast, u, bary_u));
-					Store(s, lane.result_v, Unary(s, spv::OpBitcast, u, bary_v));
-					Store(s, lane.result_instance,
-					      Binary(s, spv::OpIAdd, wide, Load(s, wide, lane.base),
-					             Binary(s, spv::OpShiftLeftLogical, wide,
-					                    Unary(s, spv::OpUConvert, wide,
-					                          Binary(s, spv::OpShiftRightLogical, u, node, U32(s, 3))),
-					                    ConstantU64(s, 7))));
-					ClearKeys(s, lane);
-					Store(s, lane.state, Or(s, Load(s, u, lane.state), U32(s, CommittedBit)));
-				});
-				Store(s, lane.state, Or(s, Load(s, u, lane.state), U32(s, DoneBit)));
+				const auto hit_entry = TriangleEntry(s, lane, CommittedIntersection);
+				const auto node = InstanceNode(s, lane, CommittedIntersection);
+				Store(s, lane.result_t, Unary(s, spv::OpBitcast, u, t));
+				Store(s, lane.result_word, hit_entry.word);
+				Store(s, lane.result_node, hit_entry.node);
+				const auto [bary_u, bary_v] =
+				    GuestBarycentrics(s, lane, CommittedIntersection, hit_entry.remap);
+				Store(s, lane.result_u, Unary(s, spv::OpBitcast, u, bary_u));
+				Store(s, lane.result_v, Unary(s, spv::OpBitcast, u, bary_v));
+				Store(s, lane.result_instance,
+				      Binary(s, spv::OpIAdd, wide, Load(s, wide, lane.base),
+				             Binary(s, spv::OpShiftLeftLogical, wide,
+				                    Unary(s, spv::OpUConvert, wide,
+				                          Binary(s, spv::OpShiftRightLogical, u, node, U32(s, 3))),
+				                    ConstantU64(s, 7))));
+				ClearKeys(s, lane);
+				Store(s, lane.state, Or(s, Load(s, u, lane.state), U32(s, CommittedBit)));
 			});
-			// A candidate: an alpha tested triangle the ray hits. The wave runs the guest code of
-			// its list entry (triangle and alpha test) later.
-			EmitIfCondition(s, proceed, [&] {
-				const auto type = s.builder.AllocateId();
-				s.builder.AddFunction(spv::OpRayQueryGetIntersectionTypeKHR, u, type, lane.query,
-				                      U32(s, CandidateIntersection));
-				const auto triangle = Equal(
-				    s, type,
-				    U32(s, spv::RayQueryCandidateIntersectionTypeRayQueryCandidateIntersectionTriangleKHR));
-				EmitIfCondition(s, triangle, [&] {
-					if (geometry_opacity) {
-						// Every triangle is a candidate: the opaque ones (geometry 0, opaque by their
-						// primitive word) are hits, the alpha tested ones when the test accepts them.
-						const auto geometry = s.builder.AllocateId();
-						s.builder.AddFunction(spv::OpRayQueryGetIntersectionGeometryIndexKHR, u, geometry, lane.query,
-						                      U32(s, CandidateIntersection));
-						const auto opaque = Equal(s, geometry, U32(s, 0));
-						EmitIfCondition(s, opaque, confirm);
-						EmitIfCondition(s, LogicalNot(s, opaque), [&] {
-							const auto candidate = TriangleEntry(s, lane, CandidateIntersection);
-							EmitIfCondition(s, candidate.valid, [&] {
-								EmitIfCondition(s, AlphaTest(ctx, lane, candidate, lane_layout), confirm);
-							});
+			Store(s, lane.state, Or(s, Load(s, u, lane.state), U32(s, DoneBit)));
+		});
+		// A candidate: an alpha tested triangle the ray hits. The wave runs the guest code of
+		// its list entry (triangle and alpha test) later.
+		EmitIfCondition(s, proceed, [&] {
+			const auto type = s.builder.AllocateId();
+			s.builder.AddFunction(spv::OpRayQueryGetIntersectionTypeKHR, u, type, lane.query,
+			                      U32(s, CandidateIntersection));
+			const auto triangle = Equal(
+			    s, type,
+			    U32(s, spv::RayQueryCandidateIntersectionTypeRayQueryCandidateIntersectionTriangleKHR));
+			EmitIfCondition(s, triangle, [&] {
+				if (geometry_opacity) {
+					// Every triangle is a candidate: the opaque ones (geometry 0, opaque by their
+					// primitive word) are hits, the alpha tested ones when the test accepts them.
+					const auto geometry = s.builder.AllocateId();
+					s.builder.AddFunction(spv::OpRayQueryGetIntersectionGeometryIndexKHR, u, geometry, lane.query,
+					                      U32(s, CandidateIntersection));
+					const auto opaque = Equal(s, geometry, U32(s, 0));
+					EmitIfCondition(s, opaque, confirm);
+					EmitIfCondition(s, LogicalNot(s, opaque), [&] {
+						const auto candidate = TriangleEntry(s, lane, CandidateIntersection);
+						EmitIfCondition(s, candidate.valid, [&] {
+							EmitIfCondition(s, AlphaTest(ctx, lane, candidate, lane_layout), confirm);
 						});
+					});
+					return;
+				}
+				const auto candidate = TriangleEntry(s, lane, CandidateIntersection);
+				// An entry outside its table is not tested (the candidate is a miss).
+				EmitIfCondition(s, candidate.valid, [&] {
+					if (alpha_test) {
+						// The lane's own alpha test; the hardware keeps the nearest accepted
+						// candidate (or opaque hit) as the committed hit.
+						EmitIfCondition(s, AlphaTest(ctx, lane, candidate, lane_layout), confirm);
 						return;
 					}
-					const auto candidate = TriangleEntry(s, lane, CandidateIntersection);
-					// An entry outside its table is not tested (the candidate is a miss).
-					EmitIfCondition(s, candidate.valid, [&] {
-						if (alpha_test) {
-							// The lane's own alpha test; the hardware keeps the nearest accepted
-							// candidate (or opaque hit) as the committed hit.
-							EmitIfCondition(s, AlphaTest(ctx, lane, candidate, lane_layout), confirm);
-							return;
-						}
-						InsertKey(s, lane, count, InstanceNode(s, lane, CandidateIntersection),
-						          candidate.entry);
-						Store(s, lane.count, Add(s, count, U32(s, 1)));
-					});
+					InsertKey(s, lane, count, InstanceNode(s, lane, CandidateIntersection),
+					          candidate.entry);
+					Store(s, lane.count, Add(s, count, U32(s, 1)));
 				});
 			});
-			s.builder.AddFunction(spv::OpBranchConditional, proceed, cont, merge);
 		});
-	});
+	};
+	// The halves in `halves` refill in one loop.
+	const auto refill = [&](std::span<const uint32_t> halves) {
+		auto any = ConstantBool(s, false);
+		for (const auto half: halves) {
+			any = LogicalOr(s, any, refills[half]);
+		}
+		EmitIfCondition(s, any, [&] {
+			for (const auto half: halves) {
+				EmitIfCondition(s, refills[half], [&] { ClearKeys(s, lanes[half]); });
+			}
+			EmitLoop(s, [&](uint32_t merge, uint32_t cont) {
+				// Every half's query advances before either handles its result: the two traversals
+				// (and then the two alpha tests) overlap. A lane steps until its query is done or its
+				// list is full.
+				std::array<uint32_t, 2> counts {}, steps {}, proceeds {};
+				for (const auto half: halves) {
+					const auto& lane = lanes[half];
+					counts[half]     = Load(s, u, lane.count);
+					const auto done  = BitSet(s, Load(s, u, lane.state), DoneBit);
+					steps[half]      = LogicalAnd(s, LogicalAnd(s, refills[half], LogicalNot(s, done)),
+					                              Less(s, counts[half], U32(s, ListSize)));
+					proceeds[half] = EmitValueOrDefaultIfCondition(s, steps[half], b, ConstantBool(s, false), [&] {
+						const auto result = s.builder.AllocateId();
+						s.builder.AddFunction(spv::OpRayQueryProceedKHR, b, result, lane.query);
+						return result;
+					});
+				}
+				auto more = ConstantBool(s, false);
+				for (const auto half: halves) {
+					handle(lanes[half], counts[half], steps[half], proceeds[half]);
+					more = LogicalOr(s, more, proceeds[half]);
+				}
+				s.builder.AddFunction(spv::OpBranchConditional, more, cont, merge);
+			});
+		});
+	};
+	constexpr std::array<uint32_t, 2> Halves {0, 1};
+	refill(std::span(Halves).first(s.lane_count));
 }
 
 // The smallest unprocessed key of a lane's list (None, None when there is none).
@@ -899,9 +1004,9 @@ uint32_t EmitRayQueryNext(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto u = TypeU32(s), b = TypeBool(s);
 	uint32_t   local_instance = 0, local_leaf = 0;
 	std::array<std::pair<uint32_t, uint32_t>, 2> heads {};
+	Refill(ctx, site);
 	for (uint32_t half = 0; half < s.lane_count; half++) {
 		const auto lane = Lane(s, site, half);
-		Refill(ctx, site, lane);
 		const auto [instance, leaf] = LaneMinimum(s, lane);
 		heads[half] = {instance, leaf};
 		if (half == 0) {
