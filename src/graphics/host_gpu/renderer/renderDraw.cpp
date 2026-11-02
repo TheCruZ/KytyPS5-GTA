@@ -1406,7 +1406,7 @@ bool RenderExecutor::TakeResolvedDispatch(ShaderComputeInputInfo& input_info,
                                           const ShaderModule*&    module) {
 	auto* resolved = std::exchange(m_resolved_draw, nullptr);
 	if (resolved == nullptr || resolved->compute_module == nullptr ||
-	    !resolved->programs.Revalidate()) {
+	    !resolved->programs.Revalidate(true)) {
 		return false;
 	}
 	input_info = resolved->compute;
