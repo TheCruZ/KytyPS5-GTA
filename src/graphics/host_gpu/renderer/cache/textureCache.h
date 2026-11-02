@@ -77,6 +77,9 @@ public:
 	// Whether the depth copy `image` no longer holds its color image's contents (false for
 	// other images).
 	[[nodiscard]] bool DepthCopyStale(const Image& image) const;
+	// Whether acquiring the depth copy `image` (FindTexture()) would change nothing: it holds its
+	// color image's contents, and the color image is clean and tracked (false for other images).
+	[[nodiscard]] bool DepthCopyCurrent(const Image& image) const;
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
@@ -148,6 +151,13 @@ public:
 		}
 		return true;
 	}
+	// A counter per image slot that advances whenever the image in the slot changes what a
+	// binding of one of its views, as it was bound, depends on (see Image::StateChanged()), and
+	// when the slot holds another image. While it is unchanged, such a binding still holds
+	// without reading the image.
+	[[nodiscard]] uint32_t ImageVersion(ImageId id) const noexcept {
+		return m_image_versions.Load(id.index);
+	}
 	// A pinned image is used without its bindings looking it up or touching it: the garbage
 	// collector keeps it and overlapping lookups do not delete it as unused. Pins nest.
 	void PinImage(ImageId id);
@@ -216,6 +226,35 @@ private:
 
 		std::array<std::atomic<Leaf*>, ImagePageTable::kPageCount / kLeafSize> m_leaves {};
 	};
+
+	// The ImageVersion() counters, in chunks that never move: images keep a pointer to theirs.
+	class ImageVersions final {
+	public:
+		ImageVersions() = default;
+		~ImageVersions();
+		KYTY_CLASS_NO_COPY(ImageVersions);
+
+		[[nodiscard]] std::atomic<uint32_t>& Counter(uint32_t index);
+		[[nodiscard]] uint32_t               Load(uint32_t index) const noexcept {
+			if ((index >> kChunkBits) >= kMaxChunks) {
+				return 0;
+			}
+			const auto* chunk = m_chunks[index >> kChunkBits].load(std::memory_order_acquire);
+			return chunk == nullptr
+			           ? 0
+			           : (*chunk)[index & (kChunkSize - 1)].load(std::memory_order_acquire);
+		}
+
+	private:
+		static constexpr size_t kChunkBits = 10;
+		static constexpr size_t kChunkSize = size_t {1} << kChunkBits;
+		static constexpr size_t kMaxChunks = 4096;
+		using Chunk                        = std::array<std::atomic<uint32_t>, kChunkSize>;
+
+		std::array<std::atomic<Chunk*>, kMaxChunks> m_chunks {};
+	};
+	// Gives a new image its slot's version counter and advances it.
+	void AttachImageVersion(ImageId id);
 
 	// Callers pass a nonempty, valid guest range.
 	template <typename Func>
@@ -387,6 +426,8 @@ private:
 	BlitHelper                                        m_blit_helper;
 	TileManager                                       m_tiler;
 	BufferCache&                                      m_buffer_cache;
+	// Before the images, which point into it.
+	ImageVersions                                     m_image_versions;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
 	MultiLevelPageTable<uint64_t, ImagePageTable::kPageBits, ImagePageTable::kAddressSpaceBits,

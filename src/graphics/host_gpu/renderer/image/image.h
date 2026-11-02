@@ -88,23 +88,40 @@ public:
 	void ResolveMaybeCpuHash(uint64_t hash) {
 		m_maybe_cpu_dirty = false;
 		m_cpu_dirty       = hash != m_maybe_cpu_hash;
+		StateChanged();
 	}
 
 	void RefreshComplete() {
 		m_cpu_dirty       = false;
 		m_maybe_cpu_dirty = false;
+		StateChanged();
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
-	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
-	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
+	void               MarkGpuModified() noexcept {
+		if (!m_gpu_modified) {
+			m_gpu_modified = true;
+			StateChanged();
+		}
+	}
+	void ClearGpuModified() noexcept {
+		if (m_gpu_modified) {
+			m_gpu_modified = false;
+			StateChanged();
+		}
+	}
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
 	void               MarkBufferModified() noexcept {
 		m_buffer_modified = true;
 		HeapChanged();
 	}
-	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
+	void ClearBufferModified() noexcept {
+		if (m_buffer_modified) {
+			m_buffer_modified = false;
+			StateChanged();
+		}
+	}
 
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size) const noexcept {
 		return info.data.address < address + size && address < info.data.End();
@@ -121,9 +138,17 @@ public:
 		return info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
 		                      : vk::ImageLayout::eShaderReadOnlyOptimal;
 	}
+	// Advances the image's version (see TextureCache::ImageVersion()): what a binding of one of
+	// its views, as it was bound, depends on changed.
+	void StateChanged() const noexcept {
+		if (version != nullptr) {
+			version->fetch_add(1u, std::memory_order_release);
+		}
+	}
 	// Resident image heaps sample an image without rediscovering it until one changes its
 	// contents, tracking, identity or layout.
 	void HeapChanged() const noexcept {
+		StateChanged();
 		if (heap_refs.load(std::memory_order_relaxed) != 0u) {
 			heap_epoch.fetch_add(1u, std::memory_order_relaxed);
 		}
@@ -169,6 +194,9 @@ public:
 	// TextureCache::ArmLazyReadback()); both zero while it is not.
 	uint64_t         readback_begin     = 0;
 	uint64_t         readback_end       = 0;
+	// The texture cache's version counter of the image's slot (see StateChanged()); null outside
+	// a texture cache.
+	std::atomic<uint32_t>* version = nullptr;
 
 private:
 	friend struct ImageTestAccess;

@@ -998,6 +998,15 @@ RenderExecutor::ResolveTableElement(TableResolution&                            
 		inserted                     = emplaced;
 	}
 	auto& element = *known;
+	if (inserted) {
+		if (m_free_table_element_versions.empty()) {
+			element.version_slot = static_cast<uint32_t>(m_table_element_versions.size());
+			m_table_element_versions.push_back(0);
+		} else {
+			element.version_slot = m_free_table_element_versions.back();
+			m_free_table_element_versions.pop_back();
+		}
+	}
 	if (!inserted && element.prepared_stamp == stamp) {
 		// Resolved for an earlier slot of the same bindings.
 		return element;
@@ -1025,9 +1034,12 @@ RenderExecutor::ResolveTableElement(TableResolution&                            
 	// resolve again, after which the element is stable.
 	const auto prepared_stamp = element.prepared_stamp;
 	const auto prepared_index = element.prepared_index;
+	const auto version_slot   = element.version_slot;
 	element                   = {};
 	element.prepared_stamp    = prepared_stamp;
 	element.prepared_index    = prepared_index;
+	element.version_slot      = version_slot;
+	TableElementChanged(element);
 	element.image_epoch       = set_epoch;
 	element.checked_epoch = set_epoch;
 	element.backing_epoch = backing_epoch;
@@ -1126,6 +1138,23 @@ static void CopyGpuFlatLoads(RenderContext& context, const vk::DescriptorBufferI
 
 // Whether binding `texture` (a table element nothing else in the operation binds) leaves its
 // image as it is: CommitBindings() would record no barrier for it.
+// Whether a table element's view, just acquired in `state`, can be kept while the image keeps that
+// state (see TableViewCurrent()). A depth copy has no guest memory to be dirty (see
+// TextureCache::FindDepthCopy()).
+static bool TableViewKeepable(const ImageLookupState& state, const Image& image) {
+	return !state.cpu_dirty && !state.buffer_modified &&
+	       (!image.info.data.Empty() || image.is_depth_copy);
+}
+
+// Whether the view a table element acquired in `view` still holds: acquiring it again would only
+// refresh the image's use. GTA V's ray tracing tables visit ~700 depth copies per frame.
+static bool TableViewCurrent(const TextureCache& texture_cache, const Image& image,
+                             const TextureBinding& texture, const TableViewMemo& view) {
+	return view.valid && texture.image_view &&
+	       ImageLookupState::Of(texture.image_id, image) == view.state &&
+	       (!image.is_depth_copy || texture_cache.DepthCopyCurrent(image));
+}
+
 static bool TableImageReady(const Image& image, const TextureBinding& texture) {
 	if (image.binding.is_bound || image.binding.is_target || image.binding.force_general ||
 	    texture.desc.type == TextureCache::BindingType::Storage) {
@@ -1262,7 +1291,7 @@ void RenderExecutor::RebuildTableSpans(TableBindingState& state) {
 }
 
 void RenderExecutor::AddTableSpans(TableBindingState& state, uint32_t element) {
-	// As RebuildTableSpans() does, keeping the spans sorted.
+	// As RebuildTableSpans() does; MergeTableSpans() puts them in order.
 	constexpr uint32_t PageBits   = TextureCache::ImagePageBits;
 	auto&              entry      = state.elements[element];
 	const auto&        resolution = *entry.resolution;
@@ -1277,11 +1306,31 @@ void RenderExecutor::AddTableSpans(TableBindingState& state, uint32_t element) {
 		                            ? UINT64_MAX
 		                            : range.address + range.size - 1) >>
 		                      PageBits;
-		const auto at =
-		    std::ranges::upper_bound(state.spans, first, {}, &TableBindingState::PageSpan::first);
-		state.spans.insert(at, {first, last, element});
+		state.spans.push_back({first, last, element});
 		state.max_span = std::max(state.max_span, last - first);
 	}
+}
+
+void RenderExecutor::MergeTableSpans(TableBindingState& state, size_t sorted) {
+	// Merges the spans AddTableSpans() appended after the first `sorted` into them, in the order
+	// inserting each one after the spans with its first page would give. Inserting them one by
+	// one moved the spans after each: GTA V's ray tracing tables have ~26 000 elements and take
+	// in hundreds while it streams textures in (up to 9 ms in one binding).
+	auto& spans = state.spans;
+	if (sorted == spans.size()) {
+		return;
+	}
+	const auto middle = spans.begin() + static_cast<std::ptrdiff_t>(sorted);
+	std::stable_sort(middle, spans.end(), [](const auto& a, const auto& b) {
+		return a.first < b.first;
+	});
+	m_table_spans.clear();
+	m_table_spans.reserve(spans.size());
+	std::ranges::merge(std::ranges::subrange(spans.begin(), middle),
+	                   std::ranges::subrange(middle, spans.end()),
+	                   std::back_inserter(m_table_spans), {}, &TableBindingState::PageSpan::first,
+	                   &TableBindingState::PageSpan::first);
+	spans.swap(m_table_spans);
 }
 
 void RenderExecutor::UnpinTableBindings(TableBindingState& state) {
@@ -1311,7 +1360,7 @@ void RenderExecutor::IndexTableSlots(TableBindingState& state) {
 	}
 }
 
-bool RenderExecutor::PatchTableSlots(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+void RenderExecutor::PatchTableSlots(const ShaderRecompiler::IR::CompiledShaderInfo& program,
                                      const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
                                      TableBindingState& state, uint64_t stamp) {
 	auto& texture_cache = m_context.GetTextureCache();
@@ -1320,56 +1369,132 @@ bool RenderExecutor::PatchTableSlots(const ShaderRecompiler::IR::CompiledShaderI
 	std::vector<uint32_t> roots;
 	ForEachImageTable(program.info.images,
 	                  [&](uint32_t root_index, auto /*kind*/) { roots.push_back(root_index); });
-	auto& index_of = state.element_index;
+	auto&        element_of   = state.element_of_version;
+	const size_t sorted_spans = state.spans.size();
 	for (const auto& changed: m_table_changed_slots) {
 		auto&       range = state.ranges[changed.range];
 		const auto& table = snapshot.image_tables.at(range.table);
 		const auto& value = changed.index != 0u && changed.index < table.slots.size()
 		                        ? table.slots[changed.index]
 		                        : null_value;
-		// As the slot by slot resolution in PrepareBindings() does.
+		state.values[changed.slot] = value;
+		// The element of the T#, as the slot by slot resolution in PrepareBindings() finds it.
 		auto&                   resolution = *range.resolution;
 		auto&                   memo       = resolution.slots[changed.index];
 		TableElementResolution* element    = nullptr;
+		bool                    resolved   = false;
 		if (memo.element != nullptr && memo.dwords == value.dwords) {
-			element = &ResolveTableElement(resolution, value, stamp, memo.element);
+			element = memo.element;
 		} else {
-			element = &ResolveTableElement(resolution, value, stamp);
-			memo    = {value.dwords, element};
-		}
-		const auto [found, inserted] =
-		    index_of.try_emplace(element, static_cast<uint32_t>(state.elements.size()));
-		const auto index = found->second;
-		if (inserted) {
-			// As FinishTableBindings() records the elements of a slot by slot resolution; the
-			// visit below binds it and writes its descriptor.
-			state.elements.push_back({.resolution = element, .table = &resolution, .source = value,
-			                          .root = roots.at(changed.range)});
-			auto& entry = state.elements.back();
-			if (element->volatile_dcc || DepthTableElement(texture_cache, element->texture)) {
-				state.always.push_back(index);
-			} else if (!element->permanent && !element->backing_checkable) {
-				state.unchecked_backing.push_back(index);
+			if (const auto found = resolution.elements.find(value.dwords);
+			    found != resolution.elements.end()) {
+				element = &found->second;
+			} else {
+				element  = &ResolveTableElement(resolution, value, stamp);
+				resolved = true;
 			}
-			entry.pinned = element->texture.image_id;
-			texture_cache.PinImage(entry.pinned);
-			// Written with the visit (the element has no view yet).
-			state.infos.emplace_back();
-			state.marks.push_back(0);
-			AddTableSpans(state, index);
+			memo = {value.dwords, element, element->version_slot};
 		}
-		state.values[changed.slot] = value;
-		state.slots[changed.slot]  = index;
+		const auto version_slot = memo.version_slot;
+		if (version_slot < element_of.size() && element_of[version_slot] != UINT32_MAX) {
+			// GTA V moves thousands of T#s between the slots of its ray tracing tables in a
+			// binding. The element's descriptor holds for this slot as for its others: whatever
+			// may change it marks the element for a visit, which writes all its slots (see
+			// RebindReusedTables()). CommitBindings() writes this slot.
+			state.slots[changed.slot] = element_of[version_slot];
+			m_table_moved_slots.push_back(changed.slot);
+			continue;
+		}
+		if (!resolved) {
+			(void)ResolveTableElement(resolution, value, stamp, element);
+		}
+		// As FinishTableBindings() records the elements of a slot by slot resolution; the visit
+		// binds it and writes its descriptor.
+		const auto index = static_cast<uint32_t>(state.elements.size());
+		state.elements.push_back({.resolution = element, .table = &resolution, .source = value,
+		                          .root = roots.at(changed.range)});
+		auto& entry = state.elements.back();
+		if (element->volatile_dcc || DepthTableElement(texture_cache, element->texture)) {
+			state.always.push_back(index);
+		} else if (!element->permanent && !element->backing_checkable) {
+			state.unchecked_backing.push_back(index);
+		}
+		entry.pinned = element->texture.image_id;
+		texture_cache.PinImage(entry.pinned);
+		// Written with the visit (the element has no view yet).
+		state.infos.emplace_back();
+		state.marks.push_back(0);
+		state.checked.emplace_back();
+		AddTableSpans(state, index);
+		EXIT_IF(version_slot == UINT32_MAX);
+		if (version_slot >= element_of.size()) {
+			element_of.resize(size_t {version_slot} + 1, UINT32_MAX);
+		}
+		element_of[version_slot]  = index;
+		state.slots[changed.slot] = index;
 		MarkTableElement(state, index);
 	}
+	MergeTableSpans(state, sorted_spans);
 	IndexTableSlots(state);
-	// Elements no slot names any more keep their images pinned: once there are many, the
-	// tables are resolved slot by slot again.
+	// Elements no slot names any more keep their images pinned: once there are many, they are
+	// dropped.
 	size_t unused = 0;
 	for (size_t element = 0; element < state.elements.size(); element++) {
 		unused += state.element_slot_begin[element + 1] == state.element_slot_begin[element] ? 1 : 0;
 	}
-	return unused <= std::max<size_t>(64, state.elements.size() / 16);
+	if (unused > std::max<size_t>(64, state.elements.size() / 16)) {
+		DropUnusedTableElements(state);
+	}
+}
+
+void RenderExecutor::DropUnusedTableElements(TableBindingState& state) {
+	// Keeps the order of the elements that slots still name; IndexTableSlots() is current.
+	auto&      texture_cache = m_context.GetTextureCache();
+	const auto count         = static_cast<uint32_t>(state.elements.size());
+	auto&      remap         = m_table_remap;
+	remap.assign(count, UINT32_MAX);
+	uint32_t kept = 0;
+	for (uint32_t element = 0; element < count; element++) {
+		auto& entry = state.elements[element];
+		if (state.element_slot_begin[element + 1] == state.element_slot_begin[element]) {
+			if (entry.pinned) {
+				texture_cache.UnpinImage(entry.pinned);
+			}
+			state.element_of_version[entry.resolution->version_slot] = UINT32_MAX;
+			continue;
+		}
+		remap[element] = kept;
+		if (kept != element) {
+			state.element_of_version[entry.resolution->version_slot] = kept;
+			state.elements[kept]                                     = std::move(entry);
+			state.infos[kept]                                        = state.infos[element];
+			state.marks[kept]                                        = state.marks[element];
+			state.checked[kept]                                      = state.checked[element];
+		}
+		kept++;
+	}
+	state.elements.resize(kept);
+	state.infos.resize(kept);
+	state.marks.resize(kept);
+	state.checked.resize(kept);
+	for (auto& slot: state.slots) {
+		slot = remap[slot];
+	}
+	const auto renumber = [&](std::vector<uint32_t>& elements) {
+		std::erase_if(elements, [&](uint32_t element) { return remap[element] == UINT32_MAX; });
+		for (auto& element: elements) {
+			element = remap[element];
+		}
+	};
+	renumber(state.always);
+	renumber(state.unchecked_backing);
+	// Marked by this binding: a dropped element needs no visit.
+	renumber(m_table_marked);
+	std::erase_if(state.spans, [&](const auto& span) { return remap[span.element] == UINT32_MAX; });
+	for (auto& span: state.spans) {
+		span.element = remap[span.element];
+	}
+	IndexTableSlots(state);
 }
 
 void RenderExecutor::FinishTableBindings(TableBindingState& state,
@@ -1388,10 +1513,15 @@ void RenderExecutor::FinishTableBindings(TableBindingState& state,
 		state.slot_infos[slot] = state.infos[state.slots[slot]];
 	}
 	IndexTableSlots(state);
-	state.element_index.clear();
-	state.element_index.reserve(state.elements.size());
+	auto& element_of = state.element_of_version;
+	std::ranges::fill(element_of, UINT32_MAX);
 	for (uint32_t index = 0; index < state.elements.size(); index++) {
-		state.element_index.emplace(state.elements[index].resolution, index);
+		const auto version_slot = state.elements[index].resolution->version_slot;
+		EXIT_IF(version_slot == UINT32_MAX);
+		if (version_slot >= element_of.size()) {
+			element_of.resize(size_t {version_slot} + 1, UINT32_MAX);
+		}
+		element_of[version_slot] = index;
 	}
 	state.always.clear();
 	state.unchecked_backing.clear();
@@ -1408,6 +1538,7 @@ void RenderExecutor::FinishTableBindings(TableBindingState& state,
 	}
 	RebuildTableSpans(state);
 	state.marks.assign(state.elements.size(), 0);
+	state.checked.assign(state.elements.size(), {});
 	state.mark_stamp = 0;
 	state.valid      = true;
 }
@@ -1424,9 +1555,10 @@ bool RenderExecutor::ReuseTableBindings(const ShaderRecompiler::IR::CompiledShad
 	size_t                                      range_index = 0;
 	size_t                                      slot_index  = 0;
 	bool                                        same        = true;
-	// A few slots may name other T#s now (GTA V adds the textures it streams in to its bindless
-	// tables: null slots name them now): those slots are bound again, the rest is reused.
-	const size_t max_changes = std::max<size_t>(256, state.values.size() / 8);
+	// Slots may name other T#s now (GTA V adds the textures it streams in to its bindless tables,
+	// and in places moves thousands of T#s between the ~15 000 slots it fills, at times most of
+	// them): those slots are bound again, the rest is reused. Binding a changed slot costs less
+	// than resolving a slot again, however many change.
 	m_table_changed_slots.clear();
 	ForEachImageTable(program.info.images, [&](uint32_t root_index, auto /*kind*/) {
 		if (!same) {
@@ -1437,7 +1569,7 @@ bool RenderExecutor::ReuseTableBindings(const ShaderRecompiler::IR::CompiledShad
 			same = false;
 			return;
 		}
-		const auto& cached = state.ranges[range_index++];
+		auto& cached = state.ranges[range_index++];
 		if (cached.table != root.table || cached.capacity != root.table_capacity ||
 		    !(cached.root == root) || &FindTableResolution(root) != cached.resolution ||
 		    state.generation != m_table_generation) {
@@ -1445,16 +1577,19 @@ bool RenderExecutor::ReuseTableBindings(const ShaderRecompiler::IR::CompiledShad
 			return;
 		}
 		const auto& table = snapshot.image_tables.at(root.table);
-		for (uint32_t slot = 0; slot < root.table_capacity && same; slot++) {
+		// The same slots as when the values were recorded (the table's words did not change):
+		// nothing to compare. GTA V's tables hold ~16 000 T#s, compared on every binding.
+		if (table.slots_id != 0 && table.slots_id == cached.slots_id) {
+			slot_index += root.table_capacity;
+			return;
+		}
+		cached.slots_id = table.slots_id;
+		for (uint32_t slot = 0; slot < root.table_capacity; slot++) {
 			const auto& value =
 			    slot != 0u && slot < table.slots.size() ? table.slots[slot] : null_value;
 			if (!(state.values[slot_index] == value)) {
-				if (m_table_changed_slots.size() == max_changes) {
-					same = false;
-				} else {
-					m_table_changed_slots.push_back(
-					    {static_cast<uint32_t>(slot_index), static_cast<uint32_t>(range_index - 1), slot});
-				}
+				m_table_changed_slots.push_back(
+				    {static_cast<uint32_t>(slot_index), static_cast<uint32_t>(range_index - 1), slot});
 			}
 			slot_index++;
 		}
@@ -1467,8 +1602,9 @@ bool RenderExecutor::ReuseTableBindings(const ShaderRecompiler::IR::CompiledShad
 	}
 	state.mark_stamp++;
 	m_table_marked.clear();
-	if (!m_table_changed_slots.empty() && !PatchTableSlots(program, snapshot, state, stamp)) {
-		return false;
+	m_table_moved_slots.clear();
+	if (!m_table_changed_slots.empty()) {
+		PatchTableSlots(program, snapshot, state, stamp);
 	}
 	for (const auto element: state.always) {
 		MarkTableElement(state, element);
@@ -1478,7 +1614,8 @@ bool RenderExecutor::ReuseTableBindings(const ShaderRecompiler::IR::CompiledShad
 		auto& entry = state.elements[element];
 		(void)ResolveTableElement(*entry.table, entry.source, stamp, entry.resolution);
 	}
-	prepared.table_visits = m_table_marked;
+	prepared.table_visits      = m_table_marked;
+	prepared.table_moved_slots = m_table_moved_slots;
 	return true;
 }
 
@@ -1517,20 +1654,77 @@ void RenderExecutor::RebindReusedTables(PreparedBindings& prepared) {
 		         ImageLookupState::Of(texture.image_id, *image) == view.state)) &&
 		       !texture_cache.DepthCopyStale(*image) && TableImageReady(*image, texture);
 	};
-	// The check only reads the elements and their images (thousands, scattered in memory):
-	// helper threads take part, each flagging the elements of its chunks.
+	// The images the operation binds so far: TableImageReady() reads the binding state they have
+	// in this operation, which their versions do not count.
+	const auto bound_stamp = ++m_bound_image_stamp;
+	for (const auto id: m_bound_images) {
+		if (!id) {
+			continue;
+		}
+		if (id.index >= m_bound_image_marks.size()) {
+			m_bound_image_marks.resize(size_t {id.index} + 1, 0);
+		}
+		m_bound_image_marks[id.index] = bound_stamp;
+	}
+	// An element found unchanged with versions that still hold is still unchanged: the check
+	// compares a few dense counters instead of reading the element's resolution and image.
+	using Checked              = TableBindingState::Checked;
+	const auto still_unchanged = [&](const Checked& checked) {
+		if (checked.image == Checked::None ||
+		    m_table_element_versions[checked.element] != checked.element_version) {
+			return false;
+		}
+		return checked.image == Checked::NullImage ||
+		       ((checked.image >= m_bound_image_marks.size() ||
+		         m_bound_image_marks[checked.image] != bound_stamp) &&
+		        texture_cache.ImageVersion(ImageId {checked.image}) == checked.image_version);
+	};
 	const auto element_count = static_cast<uint32_t>(state.elements.size());
-	m_table_flags.assign(element_count, 0);
-	GetExecHelpers().ParallelFor(element_count, 256, [&](uint32_t begin, uint32_t end) {
-		for (uint32_t index = begin; index < end; index++) {
-			if (state.marks[index] != state.mark_stamp && !unchanged(index)) {
-				m_table_flags[index] = 1;
+	EXIT_IF(state.checked.size() != element_count);
+	m_table_checks.clear();
+	for (uint32_t index = 0; index < element_count; index++) {
+		if (state.marks[index] != state.mark_stamp && !still_unchanged(state.checked[index])) {
+			m_table_checks.push_back(index);
+		}
+	}
+	// The others are checked by reading them and their images (scattered in memory): after a
+	// large change, helper threads take part, each flagging the elements of its chunks.
+	const auto check_count = static_cast<uint32_t>(m_table_checks.size());
+	m_table_flags.assign(check_count, 0);
+	GetExecHelpers().ParallelFor(check_count, 256, [&](uint32_t begin, uint32_t end) {
+		for (uint32_t check = begin; check < end; check++) {
+			const auto index   = m_table_checks[check];
+			auto&      checked = state.checked[index];
+			// The versions before the check: a change during or after it moves them.
+			const auto& resolution = *state.elements[index].resolution;
+			const auto  image_id   = resolution.texture.image_id;
+			const auto  slot       = resolution.version_slot;
+			const Checked seen {
+			    .image           = image_id ? image_id.index : Checked::NullImage,
+			    .image_version   = image_id ? texture_cache.ImageVersion(image_id) : 0u,
+			    .element         = slot,
+			    .element_version = slot < m_table_element_versions.size()
+			                           ? m_table_element_versions[slot]
+			                           : 0u};
+			if (!unchanged(index)) {
+				m_table_flags[check] = 1;
+				checked              = {};
+				continue;
 			}
+			// A depth copy also depends on its color image (DepthCopyStale()); depth elements
+			// are few (and visited by every binding, see FinishTableBindings()).
+			const auto* image = image_id ? texture_cache.m_slot_images.try_get(image_id) : nullptr;
+			if (slot >= m_table_element_versions.size() ||
+			    (image != nullptr && (image->info.IsDepth() || image->is_depth_copy))) {
+				checked = {};
+				continue;
+			}
+			checked = seen;
 		}
 	});
-	for (uint32_t index = 0; index < element_count; index++) {
-		if (m_table_flags[index] != 0) {
-			MarkTableElement(state, index);
+	for (uint32_t check = 0; check < check_count; check++) {
+		if (m_table_flags[check] != 0) {
+			MarkTableElement(state, m_table_checks[check]);
 		}
 	}
 	size_t visited = 0;
@@ -1552,22 +1746,23 @@ void RenderExecutor::RebindReusedTables(PreparedBindings& prepared) {
 				// Bound as a null descriptor: nothing to acquire.
 				view.valid = false;
 			} else if (auto* image = texture_cache.m_slot_images.try_get(texture.image_id);
-			    view.valid && image != nullptr && texture.image_view &&
-			    ImageLookupState::Of(texture.image_id, *image) == view.state) {
+			    image != nullptr && TableViewCurrent(texture_cache, *image, texture, view)) {
 				image->tick_accessed_last = tick;
 				texture_cache.TouchImage(*image);
 			} else {
 				texture.image_view  = texture_cache.FindTexture(texture.image_id, texture.desc);
 				auto& acquired         = texture_cache.GetImage(texture.image_id);
 				view.state             = ImageLookupState::Of(texture.image_id, acquired);
-				view.valid = !view.state.cpu_dirty && !view.state.buffer_modified &&
-				             !acquired.info.data.Empty();
+				view.valid             = TableViewKeepable(view.state, acquired);
 			}
 			if (texture.image_id != element.pinned) {
 				texture_cache.UnpinImage(element.pinned);
 				element.pinned = texture.image_id;
 				texture_cache.PinImage(element.pinned);
 			}
+			// Other programs' states share the element; this one writes its descriptor below.
+			TableElementChanged(*element.resolution);
+			state.checked[m_table_marked[visited]] = {};
 		}
 		// The lookups above may have registered images over other elements' ranges.
 		MarkTableChanges(state);
@@ -1634,6 +1829,15 @@ void RenderExecutor::BindRenderTarget(ImageId id) {
 }
 
 void RenderExecutor::ResetBindings() {
+	for (auto& elements: m_retired_table_elements) {
+		for (auto& [dwords, element]: elements) {
+			if (element.version_slot < m_table_element_versions.size()) {
+				// Holders of the counter (table binding states of an older generation) see it move.
+				m_table_element_versions[element.version_slot]++;
+				m_free_table_element_versions.push_back(element.version_slot);
+			}
+		}
+	}
 	m_retired_table_elements.clear();
 	for (const auto id: m_bound_images) {
 		m_context.GetTextureCache().m_slot_images[id].binding = {};
@@ -1709,10 +1913,12 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.table_views.clear();
 	prepared.table_sources.clear();
 	prepared.table_roots.clear();
+	prepared.table_versions.clear();
 	prepared.table_slots.clear();
 	prepared.table_state   = nullptr;
 	prepared.tables_reused = false;
 	prepared.table_visits.clear();
+	prepared.table_moved_slots.clear();
 	const auto stamp = ++m_table_prepare_stamp;
 	TableBindingState* table_state = nullptr;
 	if (std::ranges::any_of(program.info.images, [](const ShaderRecompiler::IR::ImageResource& image) {
@@ -1742,7 +1948,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		const auto& table = snapshot.image_tables.at(root.table);
 		const ShaderRecompiler::IR::DescriptorValue null_value {.dword_count = 8u};
 		auto& resolution = FindTableResolution(root);
-		table_state->ranges.push_back({root, &resolution, root.table, root.table_capacity});
+		table_state->ranges.push_back(
+		    {root, &resolution, root.table, root.table_capacity, table.slots_id});
 		// Bind each distinct element once, however many slots name it.
 		const auto add = [&](TableElementResolution&                      element,
 		                     const ShaderRecompiler::IR::DescriptorValue& value) {
@@ -1754,6 +1961,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 				prepared.table_views.push_back(&element.view);
 				prepared.table_sources.push_back(value);
 				prepared.table_roots.push_back(root_index);
+				prepared.table_versions.push_back(element.version_slot);
 				table_state->elements.push_back(
 				    {.resolution = &element, .table = &resolution, .source = value,
 				     .root = root_index});
@@ -1772,7 +1980,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 				add(ResolveTableElement(resolution, value, stamp, memo.element), value);
 			} else {
 				auto& element = ResolveTableElement(resolution, value, stamp);
-				memo          = {value.dwords, &element};
+				memo          = {value.dwords, &element, element.version_slot};
 				add(element, value);
 			}
 		}
@@ -1986,6 +2194,12 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		binding.reused = false;
 	}
 	const auto tick = m_context.GetTextureCache().m_gc_tick;
+	EXIT_IF(prepared.table_versions.size() != prepared.table_images.size());
+	const auto element_changed = [&](size_t k) {
+		if (const auto slot = prepared.table_versions[k]; slot < m_table_element_versions.size()) {
+			m_table_element_versions[slot]++;
+		}
+	};
 	for (size_t k = 0; k < prepared.table_images.size(); k++) {
 		auto& texture = *prepared.table_images[k];
 		auto& view    = *prepared.table_views[k];
@@ -1999,6 +2213,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			                              prepared.table_sources[k]);
 			BindImage(texture.image_id, false);
 			view.valid = false;
+			element_changed(k);
 		}
 		if (!texture.image_id) {
 			// Bound as a null descriptor: nothing to acquire.
@@ -2009,8 +2224,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		// view and refresh the image's use, as the acquisition would. Guest-dirty images are
 		// refreshed by the acquisition.
 		if (auto* image = texture_cache.m_slot_images.try_get(texture.image_id);
-		    view.valid && image != nullptr && texture.image_view &&
-		    ImageLookupState::Of(texture.image_id, *image) == view.state) {
+		    image != nullptr && TableViewCurrent(texture_cache, *image, texture, view)) {
 			image->tick_accessed_last = tick;
 			texture_cache.TouchImage(*image);
 			continue;
@@ -2018,8 +2232,8 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		texture.image_view = texture_cache.FindTexture(texture.image_id, texture.desc);
 		auto& image        = texture_cache.GetImage(texture.image_id);
 		view.state = ImageLookupState::Of(texture.image_id, image);
-		view.valid = !view.state.cpu_dirty && !view.state.buffer_modified &&
-		             !image.info.data.Empty();
+		view.valid = TableViewKeepable(view.state, image);
+		element_changed(k);
 	}
 	if (prepared.tables_reused) {
 		RebindReusedTables(prepared);
@@ -2108,9 +2322,22 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 	m_descriptor_images.resize(image_descriptor_count);
 	m_descriptor_writes.clear();
+	m_descriptor_copies.clear();
+	m_slot_set_writes.clear();
 	size_t image_cursor = 0;
 	std::array<vk::DescriptorBufferInfo, 2> address_buffers;
 	vk::DescriptorBufferInfo                mip_stats_view;
+	// The table ranges of the stages, in the order of their slots in the table states.
+	struct TableRange {
+		TableBindingState* state;
+		BindingKind        kind;
+		uint32_t           binding;
+		uint32_t           base;
+		uint32_t           capacity;
+		uint32_t           first_slot;
+		bool               copied;
+	};
+	std::vector<TableRange> table_ranges;
 
 	for (auto* prepared: prepared_bindings) {
 		const auto& program     = prepared->runtime->module->info;
@@ -2178,6 +2405,34 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 		}
 
+		// GTA V's ray tracing binds tables of 16 384 slots, about 100 000 descriptors per frame,
+		// which barely change: writing them costs the driver ~5 ns each, copying them from the
+		// state's slot set ~1 ns.
+		const bool copy_tables = !pipeline.uses_push_descriptors && table_state != nullptr &&
+		                         descriptors.tables_reused && table_state->slot_set_current;
+		const auto stage_ranges = table_ranges.size();
+		if (table_state != nullptr) {
+			uint32_t first_slot = 0;
+			ForEachImageTable(program.info.images, [&](uint32_t root_index, BindingKind kind) {
+				const auto& root = program.info.images[root_index];
+				const auto  binding = ShaderRecompiler::IR::NativeBinding(program.stage, kind);
+				table_ranges.push_back({.state      = table_state,
+				                        .kind       = kind,
+				                        .binding    = binding,
+				                        .base       = root.table_descriptor_base,
+				                        .capacity   = root.table_capacity,
+				                        .first_slot = first_slot,
+				                        .copied     = copy_tables});
+				first_slot += root.table_capacity;
+			});
+			if (!copy_tables) {
+				// Until the slot set holds this binding's descriptors (see below).
+				table_state->slot_set_current = false;
+			}
+		}
+		const std::span<const TableRange> stage_tables =
+		    std::span {table_ranges}.subspan(stage_ranges);
+
 		std::array<size_t, ShaderRecompiler::IR::ImageBindingCount> image_starts {};
 		for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
 			const auto index = std::countr_zero(mask);
@@ -2191,6 +2446,49 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			    ShaderRecompiler::IR::ImageResourceClass::None) {
 				image_starts[ShaderRecompiler::IR::ImageBindingIndex(kind)] = image_start;
 				image_cursor += write.descriptorCount;
+				std::array<const TableRange*, 16> tables {};
+				size_t                            table_count = 0;
+				for (const auto& table: stage_tables) {
+					if (copy_tables && table.kind == kind) {
+						EXIT_IF(table_count == tables.size());
+						tables[table_count++] = &table;
+					}
+				}
+				if (table_count != 0) {
+					// The slots around the tables are written, the tables copied.
+					const auto end = tables.begin() + static_cast<std::ptrdiff_t>(table_count);
+					std::sort(tables.begin(), end,
+					          [](const auto* a, const auto* b) { return a->base < b->base; });
+					uint32_t next = 0;
+					for (size_t t = 0; t < table_count; t++) {
+						const auto& table = *tables[t];
+						EXIT_IF(table.base < next ||
+						        table.base + table.capacity > write.descriptorCount);
+						if (table.base > next) {
+							auto gap            = write;
+							gap.dstArrayElement = next;
+							gap.descriptorCount = table.base - next;
+							gap.pImageInfo      = m_descriptor_images.data() + image_start + next;
+							m_descriptor_writes.push_back(gap);
+						}
+						vk::CopyDescriptorSet copy {};
+						copy.srcSet          = table_state->slot_set;
+						copy.srcBinding      = table.binding;
+						copy.srcArrayElement = table.base;
+						copy.dstBinding      = table.binding;
+						copy.dstArrayElement = table.base;
+						copy.descriptorCount = table.capacity;
+						m_descriptor_copies.push_back(copy);
+						next = table.base + table.capacity;
+					}
+					if (next < write.descriptorCount) {
+						write.dstArrayElement = next;
+						write.descriptorCount -= next;
+						write.pImageInfo      = m_descriptor_images.data() + image_start + next;
+						m_descriptor_writes.push_back(write);
+					}
+					continue;
+				}
 			} else {
 				switch (kind) {
 					case BindingKind::Buffers:
@@ -2267,19 +2565,49 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				table_state->infos[index] =
 				    MakeImageInfo(table_state->elements[index].resolution->texture, 0u);
 			}
-			// Only the slots of the visited elements change.
+			const auto write_slot = [&](uint32_t slot, const vk::DescriptorImageInfo& info) {
+				auto&      slot_info = table_state->slot_infos[slot];
+				const bool changed   = slot_info.sampler != info.sampler ||
+				                     slot_info.imageView != info.imageView ||
+				                     slot_info.imageLayout != info.imageLayout;
+				if (copy_tables && changed) {
+					const auto table =
+					    std::ranges::find_if(stage_tables, [&](const TableRange& range) {
+						    return slot >= range.first_slot && slot - range.first_slot < range.capacity;
+					    });
+					EXIT_IF(table == stage_tables.end());
+					vk::WriteDescriptorSet write {};
+					write.dstSet          = table_state->slot_set;
+					write.dstBinding      = table->binding;
+					write.dstArrayElement = table->base + (slot - table->first_slot);
+					write.descriptorCount = 1;
+					write.descriptorType  = NativeDescriptorType(table->kind);
+					write.pImageInfo      = &slot_info;
+					m_slot_set_writes.push_back(write);
+				}
+				slot_info = info;
+			};
+			// Only the slots of the visited elements change, and the slots that name another
+			// element of the state now.
 			for (const auto index: descriptors.table_visits) {
+				const auto& info = table_state->infos[index];
 				for (auto k = table_state->element_slot_begin[index];
 				     k < table_state->element_slot_begin[index + 1]; k++) {
-					table_state->slot_infos[table_state->element_slots[k]] =
-					    table_state->infos[index];
+					write_slot(table_state->element_slots[k], info);
 				}
+			}
+			for (const auto slot: descriptors.table_moved_slots) {
+				write_slot(slot, table_state->infos[table_state->slots[slot]]);
 			}
 		}
 		ForEachImageTable(program.info.images, [&](uint32_t root_index, BindingKind kind) {
 			const auto& root  = program.info.images[root_index];
 			const auto  start = image_starts[ShaderRecompiler::IR::ImageBindingIndex(kind)] +
 			                   root.table_descriptor_base;
+			if (copy_tables) {
+				table_element += root.table_capacity;
+				return;
+			}
 			if (descriptors.tables_reused) {
 				EXIT_IF(table_element + root.table_capacity > table_state->slot_infos.size());
 				std::copy_n(table_state->slot_infos.begin() +
@@ -2323,13 +2651,49 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			                               static_cast<uint32_t>(m_descriptor_writes.size()),
 			                               m_descriptor_writes.data());
 		} else {
-			const auto set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout);
+			auto&      heap   = m_context.GetDescriptorHeap();
+			const auto device = m_context.GetGraphics().device;
+			const auto set    = heap.Commit(pipeline.descriptor_set_layout);
 			for (auto& write: m_descriptor_writes) {
 				write.dstSet = set;
 			}
-			m_context.GetGraphics().device.updateDescriptorSets(
-			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
-			    nullptr);
+			for (auto& copy: m_descriptor_copies) {
+				copy.dstSet = set;
+			}
+			// The slots written into the slot sets go first: the copies read them.
+			m_descriptor_writes.insert(m_descriptor_writes.end(), m_slot_set_writes.begin(),
+			                           m_slot_set_writes.end());
+			device.updateDescriptorSets(static_cast<uint32_t>(m_descriptor_writes.size()),
+			                            m_descriptor_writes.data(),
+			                            static_cast<uint32_t>(m_descriptor_copies.size()),
+			                            m_descriptor_copies.data());
+			// The tables that were written keep their descriptors in their states' slot sets for
+			// the next bindings, while the states stay valid.
+			m_descriptor_copies.clear();
+			for (const auto& table: table_ranges) {
+				auto& state = *table.state;
+				if (table.copied || !state.valid) {
+					continue;
+				}
+				if (!state.slot_set) {
+					state.slot_set = heap.CommitPersistent(pipeline.descriptor_set_layout);
+				}
+				vk::CopyDescriptorSet copy {};
+				copy.srcSet          = set;
+				copy.srcBinding      = table.binding;
+				copy.srcArrayElement = table.base;
+				copy.dstSet          = state.slot_set;
+				copy.dstBinding      = table.binding;
+				copy.dstArrayElement = table.base;
+				copy.descriptorCount = table.capacity;
+				m_descriptor_copies.push_back(copy);
+				state.slot_set_current = true;
+			}
+			if (!m_descriptor_copies.empty()) {
+				device.updateDescriptorSets(0, nullptr,
+				                            static_cast<uint32_t>(m_descriptor_copies.size()),
+				                            m_descriptor_copies.data());
+			}
 			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
 			                             0, nullptr);
 		}

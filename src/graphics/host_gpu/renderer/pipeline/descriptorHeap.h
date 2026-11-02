@@ -22,6 +22,9 @@ public:
 	KYTY_CLASS_NO_COPY(DescriptorHeap);
 
 	[[nodiscard]] vk::DescriptorSet Commit(vk::DescriptorSetLayout layout);
+	// A set of a pool of its own that lives as long as the heap. It is never bound: it holds
+	// descriptors that bindings copy into the sets Commit() gives them.
+	[[nodiscard]] vk::DescriptorSet CommitPersistent(vk::DescriptorSetLayout layout);
 
 	// Records the descriptor counts of a layout whose sets come from this heap, so that the heap
 	// asks a pool only for the sets it has room for, and a set larger than a default pool gets a
@@ -60,6 +63,7 @@ private:
 	std::vector<vk::DescriptorPoolSize>                m_free;
 	uint32_t                                           m_free_sets = 0;
 	std::deque<std::pair<Pool, uint64_t>>              m_pending_pools;
+	std::vector<vk::DescriptorPool>                    m_persistent_pools;
 	std::unordered_map<vk::DescriptorSetLayout, Batch> m_sets;
 	std::unordered_map<vk::DescriptorSetLayout, std::vector<vk::DescriptorPoolSize>> m_layout_sizes;
 };

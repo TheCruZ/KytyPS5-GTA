@@ -605,7 +605,7 @@ void TestRegionGpuCleanEpoch() {
   Check(downloaded && tracker.RegionGpuCleanEpoch(index) != cleaned,
         "GPU-clean epoch did not advance when a download cleaned the pages");
   tracker.MarkRegionAsCpuModified(address, page_size);
-  tracker.UntrackMemory(address, page_size);
+  tracker.MarkRegionAsCpuModified(address, page_size);
   Release(memory);
 }
 

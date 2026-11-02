@@ -12,6 +12,7 @@
 #include <optional>
 #include <array>
 #include <atomic>
+#include <utility>
 #include <bit>
 #include <cstdio>
 #include <fmt/format.h>
@@ -1256,14 +1257,18 @@ bool MaterializeImageTable(const ResourcePlan& program,
 			                                 old.raw == words;
 		                          });
 		if (reusable != previous.end()) {
-			next.raw     = std::move(reusable->raw);
-			next.slots   = std::move(reusable->slots);
-			next.mapping = std::move(reusable->mapping);
+			next.raw      = std::move(reusable->raw);
+			next.slots    = std::move(reusable->slots);
+			next.mapping  = std::move(reusable->mapping);
+			next.slots_id = std::exchange(reusable->slots_id, 0);
 		} else if (cached != built.end()) {
 			next.raw.swap(words);
-			next.slots   = cached->slots;
-			next.mapping = cached->mapping;
+			next.slots    = cached->slots;
+			next.mapping  = cached->mapping;
+			next.slots_id = cached->slots_id;
 		} else {
+			static std::atomic<uint64_t> next_slots_id {0};
+			next.slots_id = ++next_slots_id;
 			next.raw.swap(words);
 			next.slots.push_back(DescriptorValue {.dword_count = 8u});
 			next.mapping.assign(static_cast<size_t>(entries) + 1u, 0u);
