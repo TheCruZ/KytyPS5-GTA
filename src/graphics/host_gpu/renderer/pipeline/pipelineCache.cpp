@@ -384,8 +384,11 @@ void GuestReadLog::RecordLoad(uint64_t address, uint32_t value, uint32_t flat_sl
 	Append(address, &value, sizeof(value), false);
 }
 
-void GuestReadLog::RefreshFlatLoads(
-    std::span<ShaderRecompiler::IR::ResourceSnapshot> resources) const {
+void GuestReadLog::RefreshFlatLoads(std::span<ShaderRecompiler::IR::ResourceSnapshot> resources,
+                                    bool gpu_copies) const {
+	for (auto& snapshot: resources) {
+		snapshot.gpu_flat_loads.clear();
+	}
 	// As the execution thread's own walk loads: around the GPU's writes on the pages it owns,
 	// directly elsewhere.
 	// The loads of a draw alternate between a few pages, mostly those StillValid() just decided:
@@ -407,6 +410,14 @@ void GuestReadLog::RefreshFlatLoads(
 		}
 		auto*      values = resources[load.stage].flattened_srt.data() + load.slot;
 		const auto bytes  = load.count * sizeof(uint32_t);
+		// Bytes the GPU wrote to a cached buffer (no GPU-written image covers the page): reading
+		// them here waits for the GPU (through the mirror or a readback). The shader reads them
+		// when it runs, after the work that writes them: a copy on the GPU puts them there in time.
+		if (gpu_copies && page.owned && page.backing != nullptr &&
+		    Libs::LibKernel::Memory::HasGpuWrittenBytes(load.address, bytes)) {
+			resources[load.stage].gpu_flat_loads.push_back({load.address, load.slot, load.count});
+			continue;
+		}
 		const bool around =
 		    page.owned &&
 		    (page.backing != nullptr ? Libs::LibKernel::Memory::TryReadAroundGpuWritesOnPage(
@@ -414,6 +425,11 @@ void GuestReadLog::RefreshFlatLoads(
 		                             : Libs::LibKernel::Memory::TryReadAroundGpuWrites(
 		                                   load.address, values, bytes));
 		if (!around) {
+			// The mirror did not hold them yet: the same copy instead of a readback.
+			if (gpu_copies && page.owned && page.backing != nullptr) {
+				resources[load.stage].gpu_flat_loads.push_back({load.address, load.slot, load.count});
+				continue;
+			}
 			std::memcpy(values, reinterpret_cast<const void*>(load.address), bytes);
 		}
 	}
