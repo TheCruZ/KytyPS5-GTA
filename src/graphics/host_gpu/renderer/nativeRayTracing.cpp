@@ -200,6 +200,13 @@ struct BlasPush {
 	uint32_t pad;
 };
 
+// After the entry table of a slot (16 bytes per triangle), 32-byte aligned: the alpha records of
+// its alpha tested triangles, 32 bytes each, that the RT passes fill (see AlphaTest() of the ray
+// query emitter) and a walk build clears.
+constexpr uint64_t AlphaRecordsOffset(uint32_t capacity0, uint32_t capacity1) {
+	return ((uint64_t {capacity0} + capacity1) * 16 + 31u) & ~uint64_t {31};
+}
+
 struct Job {
 	uint64_t blas_va;
 	uint32_t root;
@@ -674,7 +681,8 @@ bool NativeRayTracing::ComputeSlotSizes(uint32_t opaque, uint32_t alpha, SlotSiz
 	sizes.storage   = (build.accelerationStructureSize + 255u) & ~uint64_t {255};
 	sizes.vertices0 = (uint64_t {sizes.capacity0} * 36 + 255u) & ~uint64_t {255};
 	sizes.vertices1 = (uint64_t {sizes.capacity1} * 36 + 255u) & ~uint64_t {255};
-	sizes.entries   = ((uint64_t {sizes.capacity0} + sizes.capacity1) * 16 + 255u) & ~uint64_t {255};
+	sizes.entries   = (AlphaRecordsOffset(sizes.capacity0, sizes.capacity1) + uint64_t {sizes.capacity1} * 32 + 255u) &
+	                ~uint64_t {255};
 	sizes.scratch   = build.buildScratchSize;
 	// A build that does not fit in the scratch buffer could never run (and would stall the queue).
 	if (sizes.scratch > BuildScratchSize || sizes.Total() > MaxSlotBytes) {
@@ -1045,6 +1053,12 @@ void NativeRayTracing::RecordBuilds(const CommandRecorder& command) {
 		                     // many as the BLAS header allows).
 		                     .leaf_count  = slot.leaf_count};
 		UpdateBuffer(command, m_slots->Handle(), uint64_t {index} * SlotStride, &info, sizeof(info));
+		// The walk may place other triangles: the alpha records start over.
+		if (slot.capacity1 != 0) {
+			command.fillBuffer(slot.entries.buffer->Handle(),
+			                   slot.entries.offset + AlphaRecordsOffset(slot.capacity0, slot.capacity1),
+			                   uint64_t {slot.capacity1} * 32, 0);
+		}
 		// A slot the host table holds has no entry in the walk's table.
 		if (slot.table_index != UINT32_MAX) {
 			const uint32_t encoded = index + 1;
