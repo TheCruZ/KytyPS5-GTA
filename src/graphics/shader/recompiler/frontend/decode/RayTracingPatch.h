@@ -38,15 +38,20 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 //   RT_EXIT    EXEC = the lanes that started the traversal; ends the native traversal.
 //   RT_ALPHA   before RT_INIT of a site with a RayTracingAlphaTest: image_nsa_addr[0] = the level
 //              of detail VGPR, [1] = material V# offset, [2] = buffer table V# offset,
-//              [3] = threshold, [4] = level of detail offset; src0 = spread SGPR, src1 = factor
-//              SGPR, src2 / src3 = SGPR pairs of the material and buffer table user pointers.
+//              [3] = threshold, [4] = level of detail offset, [5] = reference VGPR (NoRegister:
+//              threshold and factor); src0 = spread register, src1 = factor SGPR (none for a
+//              reference VGPR), src2 / src3 = SGPR pairs of the material and buffer table user
+//              pointers; dmask = RayTracingAlphaLayout.
 //
 // A closest hit site (RayTracingKind::ClosestOpaque) is a per lane traversal whose leaf code
-// accepts the nearest triangle of either facing, with no alpha test: the hardware finds the hit
-// and RT_COMMIT writes every register the guest leaf code writes for it.
+// accepts the nearest triangle of either facing: the hardware finds the hit and RT_COMMIT writes
+// every register the guest leaf code writes for it. When the leaf code alpha tests the triangles
+// whose primitive word is not marked opaque (the site has a RayTracingAlphaTest with the Lane
+// layout), the query takes every triangle as a candidate (the guest ignores the instance's
+// opacity flags) and confirms the opaque ones and the alpha tested ones the alpha test accepts.
 enum class RayTracingKind : uint32_t {
 	Packet,        // Wave-wide traversal, the guest leaf code tests the alpha tested triangles.
-	ClosestOpaque, // Closest hit of opaque triangles, both facings.
+	ClosestOpaque, // Closest hit, both facings.
 };
 
 // A register a site does not have.
@@ -63,14 +68,27 @@ constexpr uint32_t NoRegister = 0xffffffffu;
 //   uv:      V# (M0 >> 8) * 16 of the buffer table, two floats at (M1 & 0xfc) + (M0 & 0xfc) * index
 //   level:   min(M2 & 15, log2(2 * (spread * t + lod)) + lod_offset)
 //   accepted when the W channel of T# (M2 >> 4) of the leaf code's bindless table at uv exceeds
-//   threshold * (M0 bit 0 ? factor : 1).
+//   threshold * (M0 bit 0 ? factor : 1), or the lane's reference.
 // Every register holds its value from the site entry through the traversal.
+enum class RayTracingAlphaLayout : uint32_t {
+	// A packet site's scalar leaf code: the material record is 12 bytes at m * 12, the vertices
+	// are read through their V#, the reference is threshold * (M0 bit 0 ? factor : 1).
+	Scalar = 0,
+	// A closest hit site's per lane leaf code: the material record is dwords m * 3 + k of a
+	// structured buffer, the vertices are read at the base address of their V# (from the buffer
+	// table as a structured buffer), the reference is a VGPR.
+	Lane = 1,
+};
+
 struct RayTracingAlphaTest {
-	bool     valid = false;
-	// The lane's level of detail term (VGPR), the cone spread and the threshold factor (SGPRs).
-	uint32_t lod_vgpr    = 0;
-	uint32_t spread_sgpr = 0;
-	uint32_t factor_sgpr = 0;
+	bool                  valid  = false;
+	RayTracingAlphaLayout layout = RayTracingAlphaLayout::Scalar;
+	// The lane's level of detail term (VGPR), the cone spread (an SGPR, or a VGPR in the Lane
+	// layout) and the threshold factor (SGPR, Scalar layout) or reference (VGPR, Lane layout).
+	uint32_t lod_vgpr       = 0;
+	uint32_t spread_reg     = 0;
+	uint32_t factor_sgpr    = 0;
+	uint32_t reference_vgpr = NoRegister;
 	// The V#s of the material table and of the vertex and index buffer table: 16 bytes at user
 	// data pointer (SGPR pair) `*_user` + `*_offset`.
 	uint32_t material_user   = 0;
@@ -91,8 +109,9 @@ struct RayTracingSite {
 	uint32_t origin[3] {};
 	uint32_t direction[3] {};
 	uint32_t t_max     = 0;
-	// The VGPR of the ray's instance mask (NoRegister: every instance).
+	// The VGPR of the ray's instance mask (NoRegister: the constant mask below).
 	uint32_t cull_mask = 0;
+	uint32_t cull_mask_constant = 0xff;
 	// SGPR pair of the TLAS header address at entry_pc.
 	uint32_t header_sgpr = 0;
 	// SGPR that turns the alpha test off (every triangle opaque) when not 0 (NoAlphaOff: none).
@@ -124,7 +143,7 @@ struct RayTracingSite {
 	uint32_t after_leaf_pc = 0;
 	// Where the loop exits to.
 	uint32_t exit_pc = 0;
-	// Packet sites: the alpha test the native traversal runs instead of the leaf code.
+	// The alpha test the native traversal runs instead of the leaf code.
 	RayTracingAlphaTest alpha;
 };
 

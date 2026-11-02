@@ -150,6 +150,10 @@ struct EmitterState {
 	std::array<std::array<uint32_t, 2>, 4>           ray_query_alpha {};
 	std::array<std::array<uint32_t, 2>, 4>           ray_query_alpha_cache {};
 	std::array<bool, 4>                              ray_query_alpha_sites {};
+	// Sites whose alpha test reads its data as a closest hit leaf code does (RayQueryAlphaLane),
+	// and sites whose opacity comes from the geometry only (RayQueryInitGeometryOpacity).
+	std::array<bool, 4>                              ray_query_alpha_lane {};
+	std::array<bool, 4>                              ray_query_geometry_opacity {};
 	const IR::Inst*                                  ray_query_alpha_sample = nullptr;
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
