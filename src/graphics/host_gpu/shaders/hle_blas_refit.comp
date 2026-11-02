@@ -22,7 +22,7 @@
 
 #include "rt_common.inc"
 
-layout(local_size_x = 256) in;
+layout(local_size_x = 512) in;
 
 layout(push_constant, std430) uniform Push {
 	uint64_t jobs;
@@ -63,30 +63,11 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer State {
 layout(buffer_reference, std430, buffer_reference_align = 16) coherent buffer CoherentU32x4 { uvec4 v; };
 layout(buffer_reference, std430, buffer_reference_align = 4) coherent buffer CoherentU32 { uint v; };
 
-uvec4 LoadCoherentU32x4(uint64_t va) {
-	const uint64_t host = HostAddress(va);
-	return host == 0 ? uvec4(0) : CoherentU32x4(host).v;
-}
-
-void StoreCoherentU32x4(uint64_t va, uvec4 value) {
-	const uint64_t host = HostAddress(va);
-	if (host != 0) {
-		CoherentU32x4(host).v = value;
-	}
-}
-
-void StoreCoherentU32(uint64_t va, uint value) {
-	const uint64_t host = HostAddress(va);
-	if (host != 0) {
-		CoherentU32(host).v = value;
-	}
-}
-
-// The child boxes of a box32 node, coherently.
-void LoadBoxes(uint64_t address, out vec3 lo[4], out vec3 hi[4]) {
+// The child boxes of a box32 node (host address, 0 when not cached: zero boxes), coherently.
+void LoadBoxes(uint64_t host, out vec3 lo[4], out vec3 hi[4]) {
 	uint words[24];
 	for (uint i = 0; i < 6; i++) {
-		const uvec4 v    = LoadCoherentU32x4(address + 16 + i * 16);
+		const uvec4 v    = host == 0 ? uvec4(0) : CoherentU32x4(host + 16 + i * 16).v;
 		words[i * 4]     = v.x;
 		words[i * 4 + 1] = v.y;
 		words[i * 4 + 2] = v.z;
@@ -104,20 +85,6 @@ shared uint s_tail;
 shared uint s_overflow;
 shared uint s_base;
 shared uint s_size;
-
-void StoreGuestU32x4(uint64_t va, uvec4 value) {
-	const uint64_t host = HostAddress(va);
-	if (host != 0) {
-		U32x4Ref(host).v = value;
-	}
-}
-
-void StoreGuestU32(uint64_t va, uint value) {
-	const uint64_t host = HostAddress(va);
-	if (host != 0) {
-		U32Ref(host).v = value;
-	}
-}
 
 // A buffer load with format of three components (BUFFER_LOAD_FORMAT_XYZ): the components of
 // element `index` of the V# (0 out of range). Formats of 8, 16 and 32-bit components.
@@ -213,12 +180,17 @@ void VertexJob(uint job_index) {
 			out_v[k * 3 + 1] = q.y;
 			out_v[k * 3 + 2] = q.z;
 		}
-		for (uint w = 0; w < 12; w += 4) {
-			StoreGuestU32x4(node + w * 4, floatBitsToUint(vec4(out_v[w], out_v[w + 1], out_v[w + 2], out_v[w + 3])));
+		// A 64-byte node never crosses a caching page.
+		const uint64_t host = HostAddress(node);
+		if (host != 0) {
+			for (uint w = 0; w < 12; w += 4) {
+				U32x4Ref(host + w * 4).v =
+				    floatBitsToUint(vec4(out_v[w], out_v[w + 1], out_v[w + 2], out_v[w + 3]));
+			}
+			U32Ref(host + 48).v = floatBitsToUint(out_v[12]);
+			U32Ref(host + 52).v = floatBitsToUint(out_v[13]);
+			U32Ref(host + 56).v = floatBitsToUint(out_v[14]);
 		}
-		StoreGuestU32(node + 48, floatBitsToUint(out_v[12]));
-		StoreGuestU32(node + 52, floatBitsToUint(out_v[13]));
-		StoreGuestU32(node + 56, floatBitsToUint(out_v[14]));
 	}
 }
 
@@ -226,9 +198,9 @@ void VertexJob(uint job_index) {
 void LeafBounds(uint64_t blas, uint leaf, inout vec3 lo, inout vec3 hi) {
 	const uint first = leaf >> 3;
 	for (uint k = 0; k < kMaxLeafEntries; k++) {
-		const uint64_t entry = blas + (uint64_t(first + k) << 3);
-		const uint     tri   = LoadGuestU32(entry);
-		const uint     word  = LoadGuestU32(entry + 4);
+		const uvec2    pair  = LoadGuestU32x2(blas + (uint64_t(first + k) << 3));
+		const uint     tri   = pair.x;
+		const uint     word  = pair.y;
 		if (NodeType(tri) == 7u) {
 			// AABB primitives: not refit here (no dynamic BLAS seen with them); keep bounds open
 			// so the box stays conservative.
@@ -236,10 +208,11 @@ void LeafBounds(uint64_t blas, uint leaf, inout vec3 lo, inout vec3 hi) {
 			hi = vec3(uintBitsToFloat(0x7f7fffffu));
 		} else if (NodeType(tri) < 4u) {
 			const uint64_t node = blas + (uint64_t(tri >> 3) << 6);
-			const uvec3    ids  = TriangleVertexIds(NodeType(tri));
-			const vec3     a    = LoadVertex(node, ids.x);
-			const vec3     b    = LoadVertex(node, ids.y);
-			const vec3     c    = LoadVertex(node, ids.z);
+			vec3 p[3];
+			LoadTriangle(node, NodeType(tri), p);
+			const vec3 a = p[0];
+			const vec3 b = p[1];
+			const vec3 c = p[2];
 			if (!(all(equal(a, b)) || all(equal(a, c)) || all(equal(b, c)))) {
 				lo = min(lo, min(a, min(b, c)));
 				hi = max(hi, max(a, max(b, c)));
@@ -324,49 +297,61 @@ void BoxJob(uint job_index) {
 	if (s_overflow != 0) {
 		return;
 	}
-	// Bottom up.
+	// Bottom up. A 64-byte node never crosses a caching page: one translation per node. The new
+	// boxes of the four children are stored after all their reads, which can then overlap.
 	for (int level = int(s_levels) - 1; level >= 0; level--) {
 		const uint begin = s_level_begin[level];
 		const uint end   = s_level_begin[level + 1];
 		for (uint i = begin + lid; i < end; i += gl_WorkGroupSize.x) {
 			const uint     node     = U32Ref(queue + uint64_t(i) * 4).v;
-			const uint64_t address  = blas + (uint64_t(node >> 3) << 6);
-			const uvec4    children = LoadGuestU32x4(address);
+			const uint64_t host     = HostAddress(blas + (uint64_t(node >> 3) << 6));
+			if (host == 0) {
+				continue;
+			}
+			const uvec4 children = U32x4Ref(host).v;
+			vec3        lo[4], hi[4];
 			for (uint c = 0; c < 4; c++) {
+				lo[c]            = vec3(uintBitsToFloat(0x7f800000u));
+				hi[c]            = vec3(uintBitsToFloat(0xff800000u));
 				const uint child = children[c];
 				// Invalid children and padding (0x1e) keep their box.
 				if (child == kInvalidNode || child == 0x1eu || NodeType(child) == 4u ||
 				    NodeType(child) == 6u) {
 					continue;
 				}
-				vec3 lo = vec3(uintBitsToFloat(0x7f800000u));
-				vec3 hi = vec3(uintBitsToFloat(0xff800000u));
 				if (NodeType(child) == 5u) {
-					const uint64_t child_address = blas + (uint64_t(child >> 3) << 6);
-					const uvec4    grand         = LoadGuestU32x4(child_address);
+					const uint64_t child_host = HostAddress(blas + (uint64_t(child >> 3) << 6));
+					const uvec4    grand      = child_host == 0 ? uvec4(0) : U32x4Ref(child_host).v;
 					vec3           box_lo[4], box_hi[4];
-					LoadBoxes(child_address, box_lo, box_hi);
+					LoadBoxes(child_host, box_lo, box_hi);
 					for (uint g = 0; g < 4; g++) {
 						if (grand[g] != kInvalidNode && grand[g] != 0x1eu) {
-							lo = min(lo, box_lo[g]);
-							hi = max(hi, box_hi[g]);
+							lo[c] = min(lo[c], box_lo[g]);
+							hi[c] = max(hi[c], box_hi[g]);
 						}
 					}
 				} else {
-					LeafBounds(blas, child, lo, hi);
+					LeafBounds(blas, child, lo[c], hi[c]);
 				}
-				if (!Finite(lo) || !Finite(hi)) {
-					lo = vec3(uintBitsToFloat(0x7f800000u));
-					hi = vec3(uintBitsToFloat(0xff800000u));
+				if (!Finite(lo[c]) || !Finite(hi[c])) {
+					lo[c] = vec3(uintBitsToFloat(0x7f800000u));
+					hi[c] = vec3(uintBitsToFloat(0xff800000u));
 				}
-				const uint64_t at = address + 16 + c * 24;
+			}
+			for (uint c = 0; c < 4; c++) {
+				const uint child = children[c];
+				if (child == kInvalidNode || child == 0x1eu || NodeType(child) == 4u ||
+				    NodeType(child) == 6u) {
+					continue;
+				}
 				// 24 bytes at 8-byte alignment.
-				StoreCoherentU32(at, floatBitsToUint(lo.x));
-				StoreCoherentU32(at + 4, floatBitsToUint(lo.y));
-				StoreCoherentU32(at + 8, floatBitsToUint(lo.z));
-				StoreCoherentU32(at + 12, floatBitsToUint(hi.x));
-				StoreCoherentU32(at + 16, floatBitsToUint(hi.y));
-				StoreCoherentU32(at + 20, floatBitsToUint(hi.z));
+				const uint64_t at = host + 16 + c * 24;
+				CoherentU32(at).v      = floatBitsToUint(lo[c].x);
+				CoherentU32(at + 4).v  = floatBitsToUint(lo[c].y);
+				CoherentU32(at + 8).v  = floatBitsToUint(lo[c].z);
+				CoherentU32(at + 12).v = floatBitsToUint(hi[c].x);
+				CoherentU32(at + 16).v = floatBitsToUint(hi[c].y);
+				CoherentU32(at + 20).v = floatBitsToUint(hi[c].z);
 			}
 		}
 		memoryBarrierBuffer();
