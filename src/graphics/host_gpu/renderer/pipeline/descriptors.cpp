@@ -953,6 +953,15 @@ RenderExecutor::ResolveTableElement(TableResolution&                            
 		inserted                     = emplaced;
 	}
 	auto& element = *known;
+	if (inserted) {
+		if (m_free_table_element_versions.empty()) {
+			element.version_slot = static_cast<uint32_t>(m_table_element_versions.size());
+			m_table_element_versions.push_back(0);
+		} else {
+			element.version_slot = m_free_table_element_versions.back();
+			m_free_table_element_versions.pop_back();
+		}
+	}
 	if (!inserted && element.prepared_stamp == stamp) {
 		// Resolved for an earlier slot of the same bindings.
 		return element;
@@ -980,9 +989,12 @@ RenderExecutor::ResolveTableElement(TableResolution&                            
 	// resolve again, after which the element is stable.
 	const auto prepared_stamp = element.prepared_stamp;
 	const auto prepared_index = element.prepared_index;
+	const auto version_slot   = element.version_slot;
 	element                   = {};
 	element.prepared_stamp    = prepared_stamp;
 	element.prepared_index    = prepared_index;
+	element.version_slot      = version_slot;
+	TableElementChanged(element);
 	element.image_epoch       = set_epoch;
 	element.checked_epoch = set_epoch;
 	element.backing_epoch = backing_epoch;
@@ -1313,6 +1325,7 @@ bool RenderExecutor::PatchTableSlots(const ShaderRecompiler::IR::CompiledShaderI
 			// Written with the visit (the element has no view yet).
 			state.infos.emplace_back();
 			state.marks.push_back(0);
+			state.checked.emplace_back();
 			AddTableSpans(state, index);
 		}
 		state.values[changed.slot] = value;
@@ -1365,6 +1378,7 @@ void RenderExecutor::FinishTableBindings(TableBindingState& state,
 	}
 	RebuildTableSpans(state);
 	state.marks.assign(state.elements.size(), 0);
+	state.checked.assign(state.elements.size(), {});
 	state.mark_stamp = 0;
 	state.valid      = true;
 }
@@ -1481,20 +1495,77 @@ void RenderExecutor::RebindReusedTables(PreparedBindings& prepared) {
 		         ImageLookupState::Of(texture.image_id, *image) == view.state)) &&
 		       !texture_cache.DepthCopyStale(*image) && TableImageReady(*image, texture);
 	};
-	// The check only reads the elements and their images (thousands, scattered in memory):
-	// helper threads take part, each flagging the elements of its chunks.
+	// The images the operation binds so far: TableImageReady() reads the binding state they have
+	// in this operation, which their versions do not count.
+	const auto bound_stamp = ++m_bound_image_stamp;
+	for (const auto id: m_bound_images) {
+		if (!id) {
+			continue;
+		}
+		if (id.index >= m_bound_image_marks.size()) {
+			m_bound_image_marks.resize(size_t {id.index} + 1, 0);
+		}
+		m_bound_image_marks[id.index] = bound_stamp;
+	}
+	// An element found unchanged with versions that still hold is still unchanged: the check
+	// compares a few dense counters instead of reading the element's resolution and image.
+	using Checked              = TableBindingState::Checked;
+	const auto still_unchanged = [&](const Checked& checked) {
+		if (checked.image == Checked::None ||
+		    m_table_element_versions[checked.element] != checked.element_version) {
+			return false;
+		}
+		return checked.image == Checked::NullImage ||
+		       ((checked.image >= m_bound_image_marks.size() ||
+		         m_bound_image_marks[checked.image] != bound_stamp) &&
+		        texture_cache.ImageVersion(ImageId {checked.image}) == checked.image_version);
+	};
 	const auto element_count = static_cast<uint32_t>(state.elements.size());
-	m_table_flags.assign(element_count, 0);
-	GetExecHelpers().ParallelFor(element_count, 256, [&](uint32_t begin, uint32_t end) {
-		for (uint32_t index = begin; index < end; index++) {
-			if (state.marks[index] != state.mark_stamp && !unchanged(index)) {
-				m_table_flags[index] = 1;
+	EXIT_IF(state.checked.size() != element_count);
+	m_table_checks.clear();
+	for (uint32_t index = 0; index < element_count; index++) {
+		if (state.marks[index] != state.mark_stamp && !still_unchanged(state.checked[index])) {
+			m_table_checks.push_back(index);
+		}
+	}
+	// The others are checked by reading them and their images (scattered in memory): after a
+	// large change, helper threads take part, each flagging the elements of its chunks.
+	const auto check_count = static_cast<uint32_t>(m_table_checks.size());
+	m_table_flags.assign(check_count, 0);
+	GetExecHelpers().ParallelFor(check_count, 256, [&](uint32_t begin, uint32_t end) {
+		for (uint32_t check = begin; check < end; check++) {
+			const auto index   = m_table_checks[check];
+			auto&      checked = state.checked[index];
+			// The versions before the check: a change during or after it moves them.
+			const auto& resolution = *state.elements[index].resolution;
+			const auto  image_id   = resolution.texture.image_id;
+			const auto  slot       = resolution.version_slot;
+			const Checked seen {
+			    .image           = image_id ? image_id.index : Checked::NullImage,
+			    .image_version   = image_id ? texture_cache.ImageVersion(image_id) : 0u,
+			    .element         = slot,
+			    .element_version = slot < m_table_element_versions.size()
+			                           ? m_table_element_versions[slot]
+			                           : 0u};
+			if (!unchanged(index)) {
+				m_table_flags[check] = 1;
+				checked              = {};
+				continue;
 			}
+			// A depth copy also depends on its color image (DepthCopyStale()); depth elements
+			// are few (and visited by every binding, see FinishTableBindings()).
+			const auto* image = image_id ? texture_cache.m_slot_images.try_get(image_id) : nullptr;
+			if (slot >= m_table_element_versions.size() ||
+			    (image != nullptr && (image->info.IsDepth() || image->is_depth_copy))) {
+				checked = {};
+				continue;
+			}
+			checked = seen;
 		}
 	});
-	for (uint32_t index = 0; index < element_count; index++) {
-		if (m_table_flags[index] != 0) {
-			MarkTableElement(state, index);
+	for (uint32_t check = 0; check < check_count; check++) {
+		if (m_table_flags[check] != 0) {
+			MarkTableElement(state, m_table_checks[check]);
 		}
 	}
 	size_t visited = 0;
@@ -1532,6 +1603,9 @@ void RenderExecutor::RebindReusedTables(PreparedBindings& prepared) {
 				element.pinned = texture.image_id;
 				texture_cache.PinImage(element.pinned);
 			}
+			// Other programs' states share the element; this one writes its descriptor below.
+			TableElementChanged(*element.resolution);
+			state.checked[m_table_marked[visited]] = {};
 		}
 		// The lookups above may have registered images over other elements' ranges.
 		MarkTableChanges(state);
@@ -1598,6 +1672,15 @@ void RenderExecutor::BindRenderTarget(ImageId id) {
 }
 
 void RenderExecutor::ResetBindings() {
+	for (auto& elements: m_retired_table_elements) {
+		for (auto& [dwords, element]: elements) {
+			if (element.version_slot < m_table_element_versions.size()) {
+				// Holders of the counter (table binding states of an older generation) see it move.
+				m_table_element_versions[element.version_slot]++;
+				m_free_table_element_versions.push_back(element.version_slot);
+			}
+		}
+	}
 	m_retired_table_elements.clear();
 	for (const auto id: m_bound_images) {
 		m_context.GetTextureCache().m_slot_images[id].binding = {};
@@ -1673,6 +1756,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.table_views.clear();
 	prepared.table_sources.clear();
 	prepared.table_roots.clear();
+	prepared.table_versions.clear();
 	prepared.table_slots.clear();
 	prepared.table_state   = nullptr;
 	prepared.tables_reused = false;
@@ -1719,6 +1803,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 				prepared.table_views.push_back(&element.view);
 				prepared.table_sources.push_back(value);
 				prepared.table_roots.push_back(root_index);
+				prepared.table_versions.push_back(element.version_slot);
 				table_state->elements.push_back(
 				    {.resolution = &element, .table = &resolution, .source = value,
 				     .root = root_index});
@@ -1944,7 +2029,10 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		}
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
-		image.usage.storage |= storage;
+		if (storage && !image.usage.storage) {
+			image.usage.storage = true;
+			image.StateChanged();
+		}
 		if (binding.lookup != nullptr && !binding.reused) {
 			auto& found           = binding.lookup->found;
 			found.id              = binding.image_id;
@@ -1959,6 +2047,12 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		binding.reused = false;
 	}
 	const auto tick = m_context.GetCommandScheduler().CurrentTick();
+	EXIT_IF(prepared.table_versions.size() != prepared.table_images.size());
+	const auto element_changed = [&](size_t k) {
+		if (const auto slot = prepared.table_versions[k]; slot < m_table_element_versions.size()) {
+			m_table_element_versions[slot]++;
+		}
+	};
 	for (size_t k = 0; k < prepared.table_images.size(); k++) {
 		auto& texture = *prepared.table_images[k];
 		auto& view    = *prepared.table_views[k];
@@ -1972,6 +2066,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			                              prepared.table_sources[k]);
 			BindImage(texture.image_id, false);
 			view.valid = false;
+			element_changed(k);
 		}
 		if (!texture.image_id) {
 			// Bound as a null descriptor: nothing to acquire.
@@ -1993,6 +2088,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		view.state = ImageLookupState::Of(texture.image_id, image);
 		view.valid = !view.state.cpu_dirty && !view.state.buffer_modified &&
 		             !image.info.data.Empty();
+		element_changed(k);
 	}
 	if (prepared.tables_reused) {
 		RebindReusedTables(prepared);

@@ -93,6 +93,8 @@ struct PreparedBindings {
 	std::vector<TableViewMemo*>                         table_views;
 	std::vector<ShaderRecompiler::IR::DescriptorValue> table_sources;
 	std::vector<uint32_t>                               table_roots;
+	// The change counter of each element (RenderExecutor::TableElementResolution::version_slot).
+	std::vector<uint32_t>                               table_versions;
 	std::vector<uint32_t>                               table_slots;
 	// The program's table binding state (RenderExecutor::TableBindingState). When
 	// `tables_reused`, the table vectors above stay empty: the tables bind what the state holds,
