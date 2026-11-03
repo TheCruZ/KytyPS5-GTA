@@ -25,6 +25,7 @@
 #include "graphics/host_gpu/renderer/lodStats.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/occlusionQueries.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -163,9 +164,16 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
+	// Occlusion counters the GPU has not finished dumping under the range reach the copy before
+	// the operation runs (see OcclusionQueries::PrepareRead()).
+	auto&      queries  = context.GetOcclusionQueries();
+	const bool counters = queries.PrepareRead(address, size);
 	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
 	    address, size, resource.written,
 	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
+	if (counters) {
+		queries.NoteReadTarget(address, size, *buffer, offset);
+	}
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -1649,6 +1657,7 @@ void RenderExecutor::FlushDeferredDispatchBarrier() {
 void RenderExecutor::BeginGuestOperation(uint32_t queue, bool dispatch_direct, bool draw,
                                          bool guest_sync) {
 	m_guest_queue = queue;
+	m_context.GetOcclusionQueries().DropReadTargets();
 	// On the guest's GPU, draws of one queue overlap unless the guest orders them (a wait or an
 	// ACQUIRE_MEM): the barrier after a draw that wrote memory waits for the next operation that
 	// is not such a draw (see ExecutePreparedDraw()).
