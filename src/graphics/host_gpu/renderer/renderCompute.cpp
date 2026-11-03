@@ -66,6 +66,21 @@ static bool MayWriteThroughDeviceAddresses(const ShaderRecompiler::IR::CompiledS
 	        }));
 }
 
+// The host acceleration structures of a program that traces through a guest TLAS (see
+// NativeRayTracing::Prepare()), recorded before its dispatch, outside a render pass. Indirect
+// dispatches trace too (Astro Bot's RT passes are dispatched with thread dimensions read from
+// memory).
+static void PrepareNativeRayTracing(RenderContext& context, const CommandRecorder& command,
+                                    const HW::ComputeShaderInfo& cs_regs, const PreparedBindings& bindings) {
+	auto&       native_rt = context.GetNativeRayTracing();
+	const auto& info      = bindings.runtime->module->info.info;
+	if (NativeRayTracing::TlasSource source; native_rt.Enabled() && NativeRayTracing::FindTlasSource(info, source)) {
+		const auto& user    = cs_regs.cs_user_sgpr.value;
+		const auto  pointer = uint64_t {user[source.user_sgpr]} | (uint64_t {user[source.user_sgpr + 1]} << 32u);
+		native_rt.Prepare(command, pointer, source, bindings.flattened_srt, context.GetGpu().GetFrameNum());
+	}
+}
+
 static bool PrepareIndirectWriteTargets(RenderContext& context, const PreparedBindings& bindings) {
 	const auto& program = bindings.runtime->module->info;
 	bool        prepared = false;
@@ -447,14 +462,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	RebindBuffers(bindings);
 
 	auto              vk_buffer        = buffer.Handle();
-	if (auto& native_rt = m_context.GetNativeRayTracing(); native_rt.Enabled()) {
-		if (NativeRayTracing::TlasSource source; NativeRayTracing::FindTlasSource(program.info, source)) {
-			const auto& user = cs_regs.cs_user_sgpr.value;
-			const auto  pointer =
-			    uint64_t {user[source.user_sgpr]} | (uint64_t {user[source.user_sgpr + 1]} << 32u);
-			native_rt.Prepare(vk_buffer, pointer, source, m_context.GetGpu().GetFrameNum());
-		}
-	}
+	PrepareNativeRayTracing(m_context, vk_buffer, cs_regs, bindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
@@ -700,6 +708,7 @@ void RenderExecutor::DispatchIndirectThreads(uint64_t submit_id, CommandBuffer& 
 	    m_context.GetBufferCache().ObtainBuffer(args_addr, ArgsSize, false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
+	PrepareNativeRayTracing(m_context, buffer.Handle(), cs_regs, bindings);
 	const auto& shader_data = bindings.shader_data_buffer;
 	const bool  thread_limit =
 	    program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart;
@@ -836,6 +845,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
+	PrepareNativeRayTracing(m_context, buffer.Handle(), cs_regs, bindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const auto vk_buffer = buffer.Handle();
