@@ -212,8 +212,36 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	AttachImageVersion(id);
 	RegisterImage(id);
 	return id;
+}
+
+TextureCache::ImageVersions::~ImageVersions() {
+	for (auto& chunk: m_chunks) {
+		delete chunk.load(std::memory_order_relaxed);
+	}
+}
+
+std::atomic<uint32_t>& TextureCache::ImageVersions::Counter(uint32_t index) {
+	EXIT_IF((index >> kChunkBits) >= kMaxChunks);
+	auto& slot  = m_chunks[index >> kChunkBits];
+	auto* chunk = slot.load(std::memory_order_acquire);
+	if (chunk == nullptr) {
+		auto* created = new Chunk {};
+		if (slot.compare_exchange_strong(chunk, created, std::memory_order_acq_rel)) {
+			chunk = created;
+		} else {
+			delete created;
+		}
+	}
+	return (*chunk)[index & (kChunkSize - 1)];
+}
+
+void TextureCache::AttachImageVersion(ImageId id) {
+	auto& image   = m_slot_images[id];
+	image.version = &m_image_versions.Counter(id.index);
+	image.StateChanged();
 }
 
 TextureCache::RegisteredPageCounts::~RegisteredPageCounts() {
@@ -254,6 +282,7 @@ void TextureCache::RegisterImage(ImageId id) {
 		m_registered_pages.Add(page, 1);
 	});
 	image.registered = true;
+	image.StateChanged();
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	image.lru_tick   = m_gc_tick;
 	const auto epoch = ++m_image_set_epoch;
@@ -380,6 +409,7 @@ ImageId TextureCache::CopyDepthForFeedback(ImageId depth_id, const ImageSubresou
 		info.stencil  = {};
 		info.metadata = {};
 		entry->second = m_slot_images.insert(m_graphics, m_scheduler, info);
+		AttachImageVersion(entry->second);
 	}
 	// References after the insertion: it may move the images.
 	auto& depth = m_slot_images[depth_id];
@@ -493,6 +523,7 @@ void TextureCache::TrackImage(ImageId id) {
 	if (!image.IsTracked()) {
 		image.track_addr     = image_begin;
 		image.track_addr_end = image_end;
+		image.StateChanged();
 		m_page_manager.UpdatePageWatchers<true>(image_begin, image.info.data.size);
 		return;
 	}
@@ -518,6 +549,7 @@ void TextureCache::TrackImageHead(ImageId id) {
 	}
 	const auto size  = image.track_addr - image_begin;
 	image.track_addr = image_begin;
+	image.StateChanged();
 	m_page_manager.UpdatePageWatchers<true>(image_begin, size);
 }
 
@@ -536,6 +568,7 @@ void TextureCache::TrackImageTail(ImageId id) {
 	const auto address   = image.track_addr_end;
 	const auto size      = image_end - address;
 	image.track_addr_end = image_end;
+	image.StateChanged();
 	m_page_manager.UpdatePageWatchers<true>(address, size);
 }
 
@@ -548,6 +581,7 @@ void TextureCache::UntrackImage(ImageId id) {
 	const auto size      = image.track_addr_end - image.track_addr;
 	image.track_addr     = 0;
 	image.track_addr_end = 0;
+	image.StateChanged();
 	if (size != 0) {
 		m_page_manager.UpdatePageWatchers<false>(address, size);
 	}
@@ -997,8 +1031,10 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	const auto replacement_id = InsertImage(info);
 	auto&      replacement    = m_slot_images[replacement_id];
 	replacement.usage         = cached.usage;
+	replacement.StateChanged();
 	if (cached.binding.is_bound || cached.binding.is_target) {
 		cached.binding.needs_rebind = true;
+		cached.StateChanged();
 	}
 	if (cached.backing.samples == replacement.backing.samples) {
 		const bool copy_supported =
@@ -1071,6 +1107,7 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 		}
 	}
 	cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
+	cached.StateChanged();
 	cache.FreeImage(cached_id);
 }
 
@@ -1210,6 +1247,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		}
 		cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
 		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
+		cached.StateChanged();
+		m_slot_images[merged_id].StateChanged();
 		CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(mip),
 		             static_cast<uint32_t>(layer));
 		FreeImage(cached_id);
@@ -1227,6 +1266,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	auto&      source      = m_slot_images[source_id];
 	if (source.binding.is_bound || source.binding.is_target) {
 		source.binding.needs_rebind = true;
+		source.StateChanged();
 	}
 	InitializeImage(expanded_id);
 	const int32_t mip = source.info.MipOf(info);
@@ -1584,6 +1624,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		record.info                 = plane;
 		record.depth_id             = depth_id;
 		record.stencil_subresources = depth.stencil_subresources;
+		record.StateChanged();
 	}
 
 	return association;
@@ -1614,6 +1655,7 @@ ImageId TextureCache::FindDepthCopy(ImageId color_id, const ImageInfo& requested
 	info.stencil      = {};
 	info.metadata     = {};
 	const auto copy_id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	AttachImageVersion(copy_id);
 	auto&      copy    = m_slot_images[copy_id];
 	copy.is_depth_copy     = true;
 	copy.depth_copy_source = color_id;
@@ -1660,6 +1702,7 @@ void TextureCache::ReleaseDepthCopies(ImageId color_id) {
 		copy.depth_copy_source = {};
 		// Bindings of the copy resolve their T# again.
 		copy.binding.needs_rebind = true;
+		copy.StateChanged();
 		// The copy is never registered: queued work may still sample it.
 		if (m_scheduler.Active()) {
 			m_scheduler.DeferHostOperation([this, copy_id] { m_slot_images.erase(copy_id); });
@@ -1912,7 +1955,10 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
 	}
 	TouchImage(image);
-	image.usage.render_target = true;
+	if (!image.usage.render_target) {
+		image.usage.render_target = true;
+		image.StateChanged();
+	}
 	RefreshImage(id);
 	CommitGpuWrite(image);
 	TrackImageDownload(id, image);

@@ -283,6 +283,8 @@ private:
 		// The PrepareBindings() call that last bound the element, and its index there.
 		uint64_t       prepared_stamp = 0;
 		uint32_t       prepared_index = 0;
+		// The element's counter in m_table_element_versions (kept while the element lives).
+		uint32_t       version_slot  = UINT32_MAX;
 		bool           permanent     = false; // Null for the root's view, whatever the memory.
 		bool           volatile_dcc  = false;
 		// A resolved element depends on the guest backing only through whether its data and
@@ -325,6 +327,13 @@ private:
 	                    uint64_t stamp, TableElementResolution* known = nullptr);
 	[[nodiscard]] TableResolution& FindTableResolution(const ShaderRecompiler::IR::ImageResource& root);
 	[[nodiscard]] bool TableElementBackingReadable(const TableElementResolution& element);
+	// Advances the element's counter: its texture, view or layout changed (see
+	// TableBindingState::Checked).
+	void TableElementChanged(const TableElementResolution& element) {
+		if (element.version_slot < m_table_element_versions.size()) {
+			m_table_element_versions[element.version_slot]++;
+		}
+	}
 
 	// The bindless tables a program bound last. GTA V's ray tracing dispatches bind ~16k slots
 	// naming ~8k textures each, and almost all of them stay the same from frame to frame: while
@@ -385,6 +394,20 @@ private:
 		// Elements marked for a visit by this binding.
 		std::vector<uint64_t>                marks;
 		uint64_t                             mark_stamp = 0;
+		// What RebindReusedTables() last found an element unchanged with: the version of its
+		// image (TextureCache::ImageVersion()) and of its resolution (TableElementChanged()).
+		// While both hold and the operation does not bind the image itself, the element is still
+		// unchanged: the check reads neither the resolution nor the image (GTA V's ray tracing
+		// tables have ~16 000 elements, scattered in memory, and almost none change).
+		struct Checked {
+			static constexpr uint32_t None      = UINT32_MAX; // Check the element.
+			static constexpr uint32_t NullImage = UINT32_MAX - 1;
+			uint32_t                  image           = None; // ImageId index, or NullImage.
+			uint32_t                  image_version   = 0;
+			uint32_t                  element         = 0; // TableElementResolution::version_slot.
+			uint32_t                  element_version = 0;
+		};
+		std::vector<Checked>                 checked;
 		uint64_t                             generation = 0;
 		uint64_t                             set_epoch  = 0;
 		uint64_t                             backing_epoch = 0;
@@ -537,8 +560,18 @@ private:
 		uint32_t index = 0;
 	};
 	std::vector<ChangedTableSlot>                      m_table_changed_slots;
-	// RebindReusedTables(): the elements whose binding changed, one byte per element.
+	// RebindReusedTables(): the elements whose versions moved, and whether their binding changed
+	// (one byte per element checked).
+	std::vector<uint32_t>                              m_table_checks;
 	std::vector<uint8_t>                               m_table_flags;
+	// A counter per table element resolution (TableElementResolution::version_slot); freed
+	// counters are reused.
+	std::vector<uint32_t>                              m_table_element_versions;
+	std::vector<uint32_t>                              m_free_table_element_versions;
+	// RebindReusedTables(): the images the operation binds so far (m_bound_images), by ImageId
+	// index: their binding state is the operation's.
+	std::vector<uint64_t>                              m_bound_image_marks;
+	uint64_t                                           m_bound_image_stamp = 0;
 	// See BeginGuestOperation().
 	uint32_t                                           m_guest_queue             = 0;
 	bool                                               m_deferred_barrier        = false;
