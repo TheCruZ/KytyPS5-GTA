@@ -1817,6 +1817,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		task_params  = stream.BufferDeviceAddress() + stream.Copy(&params, sizeof(params), 8);
 	}
 
+	// Occlusion counters of the command buffer under the ranges the draw reads.
+	m_context.GetOcclusionQueries().WriteForReaders();
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
