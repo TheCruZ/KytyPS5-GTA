@@ -154,6 +154,9 @@ struct EmitterState {
 	// and sites whose opacity comes from the geometry only (RayQueryInitGeometryOpacity).
 	std::array<bool, 4>                              ray_query_alpha_lane {};
 	std::array<bool, 4>                              ray_query_geometry_opacity {};
+	// The format of the guest data each site's alpha test reads (RayQueryAlpha's last argument,
+	// Decoder::RayTracingAlphaFields::Pack()).
+	std::array<uint32_t, 4>                          ray_query_alpha_format {};
 	const IR::Inst*                                  ray_query_alpha_sample = nullptr;
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;

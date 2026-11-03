@@ -215,6 +215,57 @@ void LoadTriangle(uint64_t node, uint type, out vec3 p[3]) {
 	}
 }
 
+// A guest TLAS instance record (128 bytes), laid out as the traversal shader that traces through
+// the TLAS reads it (Decoder::RayTracingLayout::Pack(), derived from its code): the rows of the
+// world to object 3x4 transform, the BLAS address and root node, the instance mask (0xff when the
+// shader traces every instance) and flags (bit 0 opaque, bit 1 alpha tested anyway, bit 2 both
+// facings, bit 3 the culled facing; 0 when the shader never reads them).
+struct GuestInstance {
+	vec4     rows[3];
+	uint64_t blas;
+	uint     root;
+	uint     mask;
+	uint     flags;
+};
+
+// The header field holding the offset of the instance records from the header.
+uint LayoutInstanceOffset(uvec4 instance_layout) {
+	return ((instance_layout.y >> 16) & 15u) * 8u;
+}
+
+// Whether, with flags bit 3 clear, the guest accepts the triangles the host sees from the back.
+bool LayoutFlipFacing(uvec4 instance_layout) {
+	return ((instance_layout.y >> 29) & 1u) != 0;
+}
+
+GuestInstance LoadGuestInstance(uint64_t record, uvec4 instance_layout) {
+	const uvec4 q0 = LoadGuestU32x4(record);
+	const uvec4 q1 = LoadGuestU32x4(record + 16);
+	const uvec4 q2 = LoadGuestU32x4(record + 32);
+	const uvec4 q3 = LoadGuestU32x4(record + 48);
+	const uint  words[16] =
+	    uint[16](q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w, q2.x, q2.y, q2.z, q2.w, q3.x, q3.y, q3.z, q3.w);
+	GuestInstance instance;
+	for (uint r = 0; r < 3; r++) {
+		vec4 row;
+		for (uint c = 0; c < 4; c++) {
+			const uint index = r * 4 + c;
+			row[c] = uintBitsToFloat(words[(instance_layout[index / 8] >> ((index % 8) * 4)) & 15u]);
+		}
+		instance.rows[r] = row;
+	}
+	const uint blas = (instance_layout.y >> 20) & 15u;
+	const uint lo   = words[blas];
+	const uint hi   = words[min(blas + 1u, 15u)];
+	instance.blas   = ((instance_layout.y >> 24) & 1u) != 0 ? (uint64_t(lo) | (uint64_t(hi & 0x3fffffu) << 32)) << 3
+	                                                : uint64_t(lo) | (uint64_t(hi) << 32);
+	instance.root   = words[(instance_layout.y >> 25) & 15u];
+	instance.mask   = ((instance_layout.z >> 19) & 1u) != 0 ? (words[instance_layout.z & 15u] >> ((instance_layout.z >> 4) & 31u)) & 0xffu
+	                                                       : 0xffu;
+	instance.flags  = ((instance_layout.z >> 13) & 1u) != 0 ? words[(instance_layout.z >> 9) & 15u] >> ((instance_layout.z >> 14) & 31u) : 0u;
+	return instance;
+}
+
 // A cheap mix of 32-bit words for signatures.
 uint Mix(uint hash, uint value) {
 	hash ^= value + 0x9e3779b9u + (hash << 6) + (hash >> 2);
