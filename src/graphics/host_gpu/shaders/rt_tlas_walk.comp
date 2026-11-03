@@ -230,7 +230,7 @@ void main() {
 					} else {
 						atomicOr(state.overflow, 1u);
 					}
-				} else if (type < 4u) {
+				} else if (type < 4u || LayoutInline(pc.instance_layout, child)) {
 					const uint index = atomicAdd(state.instance_count, 1u);
 					if (index < pc.instance_capacity) {
 						U32Ref(pc.instance_nodes + uint64_t(index) * 4).v = child;
@@ -258,10 +258,12 @@ void main() {
 	const uint count = min(state.instance_count, pc.instance_capacity);
 	for (uint i = lid; i < count; i += gl_WorkGroupSize.x) {
 		const uint     node   = U32Ref(pc.instance_nodes + uint64_t(i) * 4).v;
-		const uint64_t record = instance_base + (uint64_t(node >> 3) << 7);
+		const uint64_t      record = InstanceRecord(header, instance_base, node, pc.instance_layout);
 		const GuestInstance guest  = LoadGuestInstance(record, pc.instance_layout);
 		const uint64_t      blas   = guest.blas;
-		const uint          root   = guest.root;
+		const uint          root   = LayoutInline(pc.instance_layout, node)
+		                                 ? LayoutInlineRoot(pc.instance_layout)
+		                                 : guest.root;
 		const uint          mask   = guest.mask;
 		// Instance flags: bit 0 opaque, bit 1 alpha tested anyway, bit 2 both faces, bit 3 which
 		// face is culled. Host instance flags: 1 = facing cull disable, 2 = flip facing, 4 = force
