@@ -44,7 +44,8 @@ public:
 	static void PinCurrent(int logical_cpu);
 	// Keeps the threads of the process that pick no processors themselves off the physical cores
 	// of `logical_cpus` (and their SMT siblings), for threads pinned there, when at least six
-	// other physical cores remain.
+	// other physical cores remain: those running now and those that start later get a hard
+	// affinity to the other processors.
 	static void ReserveCores(std::span<const int> logical_cpus);
 
 	// Get current thread id
