@@ -11,6 +11,9 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
+// ShaderInfo::ray_query_header_slots before the first RayQueryInit.
+constexpr uint32_t UnsetRayQuerySlot = 0xfffffffeu;
+
 [[noreturn]] void Fail(std::string_view message) {
 	EXIT("shader info collection failed: %s", std::string(message).c_str());
 	std::abort();
@@ -538,7 +541,24 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		case ValueOpcode::BvhIntersect: info.bvh = true; break;
 		case ValueOpcode::Bvh8Intersect: info.bvh8 = true; break;
 		case ValueOpcode::BvhStack: info.bvh_stack = true; break;
-		case ValueOpcode::RayQueryInit:
+		case ValueOpcode::RayQueryInit: {
+			// Where its TLAS header address comes from: the flattened SRT dwords, when the guest
+			// loads it from its user data. Every site must read the same ones.
+			auto& slots = info.ray_query_header_slots;
+			for (uint32_t word = 0; word < 2; word++) {
+				const auto* read = inst.Arg(8 + word).Resolve().TryInstruction();
+				const auto  slot = read != nullptr && read->GetOpcode() == ValueOpcode::ReadConst &&
+				                          read->NumArgs() == 2 && read->Arg(1).Resolve().IsImmediate()
+				                       ? read->Arg(1).Resolve().U32()
+				                       : ShaderInfo::NoRayQuerySlot;
+				slots[word] = slots[word] == UnsetRayQuerySlot || slots[word] == slot
+				                  ? slot
+				                  : ShaderInfo::NoRayQuerySlot;
+			}
+			info.ray_query = true;
+			info.ray_query_sites |= 1u << RayQuerySite(inst.Flags<uint32_t>());
+			break;
+		}
 		case ValueOpcode::RayQueryNext:
 		case ValueOpcode::RayQueryMatch:
 		case ValueOpcode::RayQuerySelectedLeaf:
@@ -615,8 +635,9 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	for (auto& buffer: info.buffers) buffer.live = false;
 	info.has_bitwise_xor = info.uses_lds = info.uses_gds = info.uses_flattened_srt =
 	    info.uses_dispatch_threads = info.uses_swizzle = false;
-	info.ray_query       = false;
-	info.ray_query_sites = 0;
+	info.ray_query              = false;
+	info.ray_query_sites        = 0;
+	info.ray_query_header_slots = {UnsetRayQuerySlot, UnsetRayQuerySlot};
 	info.bvh = info.subgroup_ballot = info.subgroup_vote = info.subgroup_barrier =
 	    info.subgroup_shuffle = info.subgroup_arithmetic = info.helper_invocation =
 	    info.subgroup_local_invocation_id = info.compute_derivatives = info.image_gather_extended =
@@ -632,6 +653,9 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	}
 	for (uint32_t index = 0; index < inputs.user_data.size(); index++) {
 		if (inputs.user_data[index]) info.user_data_registers.push_back(index);
+	}
+	for (auto& slot: info.ray_query_header_slots) {
+		if (slot == UnsetRayQuerySlot) slot = ShaderInfo::NoRayQuerySlot;
 	}
 	for (uint32_t index = 0; index < info.buffers.size(); index++) {
 		auto& buffer         = info.buffers[index];
