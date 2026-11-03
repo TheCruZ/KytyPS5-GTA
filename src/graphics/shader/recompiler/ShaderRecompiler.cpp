@@ -605,6 +605,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		ir.info.ray_query_user_sgpr     = decoded.ray_tracing_source.user_sgpr;
 		ir.info.ray_query_header_offset = decoded.ray_tracing_source.header_offset;
 		ir.info.ray_query_root          = decoded.ray_tracing_source.root;
+		ir.info.ray_query_layout        = decoded.ray_tracing_source.layout;
 	}
 	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",

@@ -26,6 +26,7 @@ namespace Libs::Graphics {
 
 namespace {
 
+// QueueCapacity and MissingCapacity are kQueueCapacity and kMissingCapacity of rt_tlas_walk.comp.
 constexpr uint32_t QueueCapacity    = 1u << 16u;
 constexpr uint32_t InstanceCapacity = 1u << 16u;
 constexpr uint32_t TableEntries     = 1u << 17u;
@@ -147,15 +148,14 @@ struct TlasPush {
 	uint64_t verify_list;
 	uint32_t header_offset;
 	uint32_t root;
-	uint32_t queue_capacity;
 	uint32_t instance_capacity;
 	uint32_t table_mask;
-	uint32_t missing_capacity;
 	uint32_t prepare_id;
 	uint32_t verify;
-	uint32_t flip_parity;
-	uint32_t pad;
+	// The layout of the instance records (Decoder::RayTracingLayout::Pack()).
+	std::array<uint32_t, 4> layout;
 };
+static_assert(sizeof(TlasPush) == 128 && offsetof(TlasPush, layout) % 16 == 0);
 
 struct HleTlasPush {
 	uint64_t input_va;
@@ -358,7 +358,7 @@ bool NativeRayTracing::FindTlasSource(const ShaderRecompiler::IR::ShaderInfo& in
 	if (!info.ray_query || !PatchShaders()) {
 		return false;
 	}
-	source = {info.ray_query_user_sgpr, info.ray_query_header_offset, info.ray_query_root};
+	source = {info.ray_query_user_sgpr, info.ray_query_header_offset, info.ray_query_root, info.ray_query_layout};
 	return true;
 }
 
@@ -1403,19 +1403,15 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 	    .verify_list       = m_verify_list->BufferDeviceAddress(),
 	    .header_offset     = source.header_offset,
 	    .root              = source.root,
-	    .queue_capacity    = QueueCapacity,
 	    .instance_capacity = tlas_count,
 	    .table_mask        = TableEntries - 1,
-	    .missing_capacity  = MissingCapacity,
 	    .prepare_id        = m_prepare_id,
 	    .verify            = 1u,
-	    // The game's triangle test accepts the faces the instance flag selects: with bit 3 clear the
-	    // ones whose test sign is set, which are the host's back faces (see the leaf code that
-	    // compares the sign with flags bit 3 after IMAGE_BVH_INTERSECT_RAY). Not flipping the
-	    // facing culled the wrong face of every instance without both faces: single sided
-	    // geometry (a ped, roofs, walls) cast no shadow.
-	    .flip_parity       = 1u,
-	    .pad               = 0,
+	    // The facing of each instance follows the game's triangle test (the layout's flip bit: GTA
+	    // V 01.011's accepts, with flags bit 3 clear, the triangles whose test sign is set, the
+	    // host's back faces; not flipping them culled the wrong face of every instance without both
+	    // faces, and single sided geometry such as peds, roofs and walls cast no shadow).
+	    .layout            = source.layout,
 	};
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_tlas_pipeline);
 	command.pushConstants(m_tlas_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(tlas_push),

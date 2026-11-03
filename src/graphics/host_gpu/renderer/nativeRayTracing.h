@@ -70,11 +70,13 @@ public:
 	static void SetDeviceSupport(bool supported) noexcept;
 
 	// The guest TLAS of a known tracing shader: its header's address is the 64-bit value at
-	// user data pointer (user SGPR pair `user_sgpr`) + `header_offset`; `root` its root node.
+	// user data pointer (user SGPR pair `user_sgpr`) + `header_offset`; `root` its root node,
+	// `layout` how the shader reads its instance records (Decoder::RayTracingLayout::Pack()).
 	struct TlasSource {
-		uint32_t user_sgpr     = 0;
-		uint32_t header_offset = 0;
-		uint32_t root          = 0;
+		uint32_t                user_sgpr     = 0;
+		uint32_t                header_offset = 0;
+		uint32_t                root          = 0;
+		std::array<uint32_t, 4> layout {};
 	};
 	// The source of a program that traces through a guest TLAS (its info), or false.
 	[[nodiscard]] static bool FindTlasSource(const ShaderRecompiler::IR::ShaderInfo& info,

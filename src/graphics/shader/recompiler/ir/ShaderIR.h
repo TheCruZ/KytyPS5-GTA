@@ -663,6 +663,8 @@ struct ShaderInfo {
 	uint32_t                        ray_query_user_sgpr           = 0;
 	uint32_t                        ray_query_header_offset       = 0;
 	uint32_t                        ray_query_root                = 0;
+	// How its instance records are laid out (Decoder::RayTracingLayout::Pack()).
+	std::array<uint32_t, 4>         ray_query_layout {};
 	bool                            subgroup_ballot               = false;
 	bool                            subgroup_vote                 = false;
 	bool                            subgroup_barrier              = false;

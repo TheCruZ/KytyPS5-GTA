@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 
+#include <array>
 #include <magic_enum.hpp>
 #include <span>
 #include <string_view>
@@ -945,10 +946,12 @@ struct Program {
 	// The guest TLAS of the native ray tracing patch (see RayTracingPatch.h), when applied: the
 	// header address is the 64-bit value at user data pointer `user_sgpr` + `header_offset`.
 	struct RayTracingSource {
-		uint32_t user_sgpr     = 0;
-		uint32_t header_offset = 0;
-		uint32_t root          = 0;
-		bool     valid         = false;
+		uint32_t                user_sgpr     = 0;
+		uint32_t                header_offset = 0;
+		uint32_t                root          = 0;
+		// How its instance records are laid out (RayTracingLayout::Pack()).
+		std::array<uint32_t, 4> layout {};
+		bool                    valid         = false;
 	} ray_tracing_source;
 };
 

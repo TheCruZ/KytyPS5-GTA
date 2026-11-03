@@ -345,15 +345,16 @@ VALUE_OPCODE(Bvh8Intersect, Bvh8Result, U32x4, ImageAddress, U1)
 VALUE_OPCODE(Bvh8Extract, U32, Bvh8Result, U32)
 VALUE_OPCODE(BvhStack, U32x2, U32, U32, U32x4, U32x4, U1)
 // Native ray tracing (RayTracingPatch.h); the flags hold the site and the variant (RayQueryOp).
-VALUE_OPCODE(RayQueryInit, U1, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U1)
+VALUE_OPCODE(RayQueryInit, U1, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U1, U1)
 VALUE_OPCODE(RayQueryNext, U32x4)
 VALUE_OPCODE(RayQueryMatch, U1)
 VALUE_OPCODE(RayQuerySelectedLeaf, U32)
 VALUE_OPCODE(RayQueryResult, U32)
 VALUE_OPCODE(RayQueryFlag, U1)
 VALUE_OPCODE(RayQueryMark, Void, U1)
-// Level of detail term, cone spread, threshold factor, material V#, buffer table V#, threshold, level offset.
-VALUE_OPCODE(RayQueryAlpha, Void, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32)
+// Level of detail term, cone spread, threshold factor, material V#, buffer table V#, threshold, level offset,
+// format of the guest data (immediate).
+VALUE_OPCODE(RayQueryAlpha, Void, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32)
 VALUE_OPCODE(ImageQueryLod, U32x4, ImageResource, SamplerResource, ImageAddress)
 VALUE_OPCODE(ImageRead, U32x4, ImageResource, ImageAddress, U1)
 VALUE_OPCODE(ImageWrite, Void, ImageResource, ImageAddress, U32x4, U1)
