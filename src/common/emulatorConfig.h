@@ -108,6 +108,7 @@ struct ConfigOptions {
 	bool                   tessellation_enabled        = true;
 	bool                   occlusion_queries_enabled   = true;
 	bool                   async_pipelines_enabled     = true;
+	bool                   native_ray_tracing_enabled  = false;
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled            = false;
@@ -189,6 +190,10 @@ bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 // Draws whose new pipeline the driver is still compiling are skipped instead of waiting for it.
 bool AsyncPipelinesEnabled();
+// Experimental: the ray tracing passes the shader recompiler recognizes trace with the host's ray
+// tracing hardware (see NativeRayTracing). Off, the device enables no ray tracing feature and no
+// shader is patched.
+bool NativeRayTracingEnabled();
 bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
 bool PlayGoHackEnabled();
