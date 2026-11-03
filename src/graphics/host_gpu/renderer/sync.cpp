@@ -80,15 +80,32 @@ static void InterruptEventTriggerFunc(LibKernel::EventQueue::KernelEqueueEvent* 
                                       void*                                     trigger_data) {
 	EXIT_IF(event == nullptr);
 
-	auto triggered_event = event->event;
-	triggered_event.fflags++;
-	triggered_event.data = reinterpret_cast<intptr_t>(trigger_data);
+	const auto data = reinterpret_cast<intptr_t>(trigger_data);
+	// An interrupt of a context the guest has an unread interrupt of adds to it (its count in
+	// fflags), as a kqueue event that triggers again before it is read: the guest learns the
+	// GPU's progress from the labels the interrupts follow. Queuing every one grew without bound
+	// when the guest reads fewer than the GPU raises (ASTRO BOT: ~45,000 a second, 1.4 GB after
+	// 15 minutes); now there is at most one unread interrupt per context.
 	if (event->triggered) {
+		if (event->event.data == data) {
+			event->event.fflags++;
+			return;
+		}
+		for (auto& pending: event->pending_events) {
+			if (pending.data == data) {
+				pending.fflags++;
+				return;
+			}
+		}
+		auto triggered_event   = event->event;
+		triggered_event.fflags = 1;
+		triggered_event.data   = data;
 		event->pending_events.push_back(triggered_event);
-	} else {
-		event->event     = triggered_event;
-		event->triggered = true;
+		return;
 	}
+	event->event.fflags++;
+	event->event.data = data;
+	event->triggered  = true;
 }
 
 int AddEqEvent(RenderContext& renderer, LibKernel::EventQueue::KernelEqueue eq, int id,
