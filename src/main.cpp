@@ -123,6 +123,9 @@ static void PrintUsage() {
 	::printf(
 	    "  --no-async-pipelines                 Wait for new pipelines instead of skipping the\n"
 	    "                                       draws that need them while they compile.\n");
+	::printf("  --native-raytracing                  Experimental: trace the ray tracing passes of\n"
+	         "                                       supported games (GTA V, ASTRO BOT) with the host\n"
+	         "                                       GPU's ray tracing hardware. Default: off.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
 	::printf("  --command-buffer-dump                Enable command buffer dumps.\n");
@@ -263,6 +266,7 @@ static constexpr Flag FLAGS[] = {
     {"--no-occlusion-queries", &ConfigOptions::occlusion_queries_enabled, false},
     {"--async-pipelines", &ConfigOptions::async_pipelines_enabled},
     {"--no-async-pipelines", &ConfigOptions::async_pipelines_enabled, false},
+    {"--native-raytracing", &ConfigOptions::native_ray_tracing_enabled},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},
     {"--graphics-debug-dump", &ConfigOptions::graphics_debug_dump_enabled},
     {"--profile", &ConfigOptions::profiler_enabled},
