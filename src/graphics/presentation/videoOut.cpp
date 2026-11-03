@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/presentation/frameStepHack.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
@@ -1144,6 +1145,7 @@ bool FlipQueue::Flip() {
 		}
 		if (record_flip) {
 			Graphics::PerformanceOverlayRecordFlip(m_width, m_height);
+			FrameStepHack::OnPresentedFrame();
 		}
 		due = lock_ports();
 	}
