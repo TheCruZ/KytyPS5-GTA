@@ -18,6 +18,7 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 //      blas_packed << 24; root_dword << 25; flip_facing << 29
 //   2: mask_dword; mask_shift << 4; flags_dword << 9; has flags << 13; flags_shift << 14;
 //      has mask << 19
+//   3: inline_offset / 8; inline_root << 8; inline_type << 16; has an inline type << 19
 std::array<uint32_t, 4> RayTracingLayout::Pack() const {
 	std::array<uint32_t, 4> words {};
 	for (uint32_t i = 0; i < 12; i++) {
@@ -29,6 +30,9 @@ std::array<uint32_t, 4> RayTracingLayout::Pack() const {
 	const bool mask  = mask_dword != NoRegister;
 	words[2] = (mask ? mask_dword & 15u : 0u) | (mask_shift & 31u) << 4u | (flags ? flags_dword & 15u : 0u) << 9u |
 	           (flags ? 1u : 0u) << 13u | (flags_shift & 31u) << 14u | (mask ? 1u : 0u) << 19u;
+	if (inline_type != NoRegister) {
+		words[3] = ((inline_offset / 8u) & 0xffu) | (inline_root & 0xffu) << 8u | (inline_type & 7u) << 16u | 1u << 19u;
+	}
 	return words;
 }
 
@@ -49,6 +53,8 @@ bool Packable(const RayTracingLayout& layout) {
 	       layout.instance_offset % 8 == 0 && layout.instance_offset < 128 && small(layout.blas_dword + 1) &&
 	       small(layout.root_dword) && (layout.mask_dword == NoRegister || small(layout.mask_dword)) &&
 	       layout.mask_shift < 32 &&
+	       (layout.inline_type == NoRegister ||
+	        (layout.inline_offset % 8 == 0 && layout.inline_offset < 0x800 && layout.inline_root < 0x100)) &&
 	       (layout.flags_dword == NoRegister || (small(layout.flags_dword) && layout.flags_shift < 32));
 }
 
@@ -305,7 +311,15 @@ void AddClosestTraversal(Layout& layout, const RayTracingSite& site, uint32_t in
 	}
 	// Every triangle opaque, or the opaque ones by their primitive word and the alpha test.
 	init.src1  = Constant(site.alpha.valid ? 0 : 1);
-	init.dmask = 1 | (site.alpha.valid ? 2 : 0); // Both facings (and opacity from the geometry).
+	// Both facings, or the facing of the instance flags (and opacity from the geometry).
+	init.dmask = (site.both_facings ? 1u : 0u) | (site.alpha.valid ? 2u : 0u);
+	if (site.facing_sgpr != NoRegister) {
+		init.src3 = Sgpr(site.facing_sgpr);
+		init.dmask |= 4u;
+	} else if (site.facing_mask != NoRegister) {
+		init.src3 = Sgpr(site.facing_mask);
+		init.dmask |= 8u;
+	}
 	layout.AddBranch(Opcode::S_CBRANCH_SCC0, Layout::Target::Guest, site.loop_pc);
 	const auto loop_label = layout.NewLabel(), exit_label = layout.NewLabel();
 	// Runs the queries to their end (an opaque only query has no candidates; one would be dropped).
@@ -323,7 +337,7 @@ void AddClosestTraversal(Layout& layout, const RayTracingSite& site, uint32_t in
 	commit.image_nsa_addr[0] = site.result_t;
 	commit.image_nsa_addr[1] = site.result_word;
 	commit.image_nsa_addr[2] = site.result_instance;
-	commit.image_nsa_addr[3] = site.result_instance + 1;
+	commit.image_nsa_addr[3] = site.result_instance != NoRegister ? site.result_instance + 1 : NoRegister;
 	commit.image_nsa_addr[4] = site.result_u;
 	commit.image_nsa_addr[5] = site.result_v;
 	commit.image_nsa_addr[6] = site.result_node;
@@ -532,9 +546,11 @@ public:
 		std::vector<RayTracingSite> sites;
 		uint32_t                    user_sgpr = NoRegister, header_offset = 0, root = 0;
 		RayTracingLayout            layout;
+		// The end of the last site's loop: loops inside it (its BLAS walk) are part of it.
+		size_t site_end = 0;
 		for (size_t header = 1; header < m_inst.size(); header++) {
 			const auto back = BackwardBranchTo(header);
-			if (back == npos) {
+			if (back == npos || header < site_end) {
 				continue;
 			}
 			RayTracingSite site;
@@ -595,6 +611,7 @@ public:
 				}
 			}
 			layout        = merged;
+			site_end      = back;
 			user_sgpr     = site_user;
 			header_offset = site_offset;
 			root          = site_root;
@@ -1764,8 +1781,14 @@ private:
 			return false;
 		}
 		site.exit_pc = m_inst[exit].branch_target;
+		// The instance records (see DeriveLayout).
+		Field record;
+		if (!DeriveLayout(header, back, site, m_inst[header + 1].src0.reg, site.layout, record)) {
+			return false;
+		}
 		// The nearest hit: the distance test, then the moves of the hit, right after it (every
-		// triangle opaque) or after the alpha test of the triangles not marked opaque.
+		// triangle opaque) or after the alpha test of the triangles not marked opaque; or, in a
+		// wave-wide walk, V_CNDMASK_B32 of the hit's registers (see ClosestSelectHit).
 		size_t compare = npos, accept = npos;
 		for (size_t i = header; i + 3 < back && accept == npos; i++) {
 			const auto& cmp = m_inst[i];
@@ -1779,23 +1802,29 @@ private:
 				accept  = save + 2;
 			}
 		}
-		if (accept == npos || m_inst[compare].src0.kind != OperandKind::Vgpr) {
+		site.alpha        = {};
+		site.both_facings = true;
+		if (accept == npos) {
+			// The selected key goes to an SGPR pair the program does not use.
+			const auto scratch = UnusedPair();
+			if (!ClosestSelectHit(header, back, record.pair, site) || scratch == NoRegister) {
+				return false;
+			}
+			site.both_facings  = false;
+			site.instance_sgpr = scratch;
+		} else if (m_inst[compare].src0.kind != OperandKind::Vgpr) {
 			return false;
 		}
 		size_t moves_end = accept;
 		while (moves_end < back && m_inst[moves_end].opcode != Opcode::S_MOV_B64) {
 			moves_end++;
 		}
-		site.alpha          = {};
 		uint32_t entry_base = NoRegister;
-		if (!HitMoves(header, back, accept, moves_end, {NoRegister, NoRegister}, site, entry_base) &&
-		    !ClosestAlphaHit(header, back, compare, accept, site)) {
-			return false;
-		}
-		// The instance records (see DeriveLayout); the hit moves copy the record pair.
-		Field record;
-		if (!DeriveLayout(header, back, site, m_inst[header + 1].src0.reg, site.layout, record) ||
-		    record.pair != site.instance_sgpr) {
+		if (accept != npos &&
+		    ((!HitMoves(header, back, accept, moves_end, {NoRegister, NoRegister}, site, entry_base) &&
+		      !ClosestAlphaHit(header, back, compare, accept, site)) ||
+		     record.pair != site.instance_sgpr)) {
+			// The hit moves copy the record pair.
 			return false;
 		}
 		// The instance mask: the guest skips the instances whose mask (record dword >> shift) has
@@ -2146,6 +2175,8 @@ private:
 	struct Form {
 		std::array<uint32_t, 3> factor {NoRegister, NoRegister, NoRegister};
 		uint32_t                constant = NoRegister;
+		// A load of the record (the first field found).
+		size_t                  load     = npos;
 	};
 
 	bool FormTerm(size_t i, const Operand& a, const Operand& b, size_t from, const std::array<uint32_t, 3>& inputs,
@@ -2166,6 +2197,7 @@ private:
 			}
 			pair   = field.pair;
 			factor = field.dword;
+			form.load = form.load == npos ? field.load : form.load;
 			return true;
 		}
 		return false;
@@ -2179,6 +2211,7 @@ private:
 		}
 		pair          = field.pair;
 		form.constant = field.dword;
+		form.load     = form.load == npos ? field.load : form.load;
 		return true;
 	}
 
@@ -2258,6 +2291,7 @@ private:
 		const std::array<uint32_t, 3> origin {site.origin[0], site.origin[1], site.origin[2]};
 		const std::array<uint32_t, 3> direction {site.direction[0], site.direction[1], site.direction[2]};
 		uint32_t                      pair = NoRegister;
+		size_t                        load = npos;
 		for (uint32_t r = 0; r < 3; r++) {
 			Form o, d;
 			if (!LinearForm(test, AddressReg(m_inst[test], 2 + r), header, origin, pair, o) ||
@@ -2270,9 +2304,11 @@ private:
 				layout.transform[r * 4 + c] = static_cast<uint8_t>(o.factor[c]);
 			}
 			layout.transform[r * 4 + 3] = static_cast<uint8_t>(o.constant);
+			load                        = load == npos ? o.load : load;
 		}
-		// The record address (from one of its loads).
-		if (!RecordFieldOf(test, pair, header, record)) {
+		// The record address (from one of the loads of the transform).
+		record = {pair, load, 0};
+		if (load == npos) {
 			return false;
 		}
 		uint32_t record_node = NoRegister;
@@ -2313,29 +2349,106 @@ private:
 		}
 		layout.blas_dword = lo.dword;
 		// The BLAS root: the node the BLAS walk starts at, a record dword moved into the node VGPR
-		// of the BLAS test (per lane walks) or pushed on the node stack the BLAS loop pops it from
-		// with V_READLANE_B32 (wave-wide walks).
-		const auto node_vgpr = AddressReg(m_inst[test], 0);
-		bool       root      = false;
-		for (size_t i = header; i < test && !root; i++) {
-			const auto& inst = m_inst[i];
-			Field       field;
-			if (inst.opcode == Opcode::V_MOV_B32 && inst.dst.kind == OperandKind::Vgpr && inst.dst.reg == node_vgpr &&
-			    OperandField(i, inst.src0, header, field) && same_record(field)) {
+		// of a test of the BLAS (per lane walks; through S_CSELECT_B32 of a constant root, for
+		// walks that also take a BLAS without a record) or pushed on the node stack the BLAS loop
+		// pops it from with V_READLANE_B32 (wave-wide walks).
+		// The root of the record, or a constant one (the S_CSELECT_B32 of the constant and the
+		// record field; `inline_root` gets the constant).
+		uint32_t   inline_root = NoRegister;
+		const auto root_field  = [&](size_t i, const Operand& operand, Field& field) {
+			if (OperandField(i, operand, header, field)) {
+				return same_record(field);
+			}
+			const auto select = ScalarSource(i, operand, Opcode::S_CSELECT_B32, header);
+			if (select == npos) {
+				return false;
+			}
+			const auto& sel = m_inst[select];
+			const bool  c0  = sel.src0.kind == OperandKind::IntegerInlineConstant || sel.src0.kind == OperandKind::LiteralConstant;
+			const bool  c1  = sel.src1.kind == OperandKind::IntegerInlineConstant || sel.src1.kind == OperandKind::LiteralConstant;
+			if (c0 == c1 || !OperandField(select, c0 ? sel.src1 : sel.src0, header, field) || !same_record(field)) {
+				return false;
+			}
+			inline_root = (c0 ? sel.src0 : sel.src1).value;
+			return true;
+		};
+		bool root = false;
+		// A BLAS walked wave-wide: the value of the node SGPR of the inner loop (S_AND_B32 vcc_lo,
+		// <node>, 7 ...) before it.
+		for (size_t inner = header + 3; inner + 1 < back && !root; inner++) {
+			Field field;
+			if (IsNodeType(inner) && m_inst[inner].src0.kind == OperandKind::Sgpr &&
+			    root_field(inner, m_inst[inner].src0, field) && ScalarWriter(inner, m_inst[inner].src0.reg, header) != npos &&
+			    BackwardBranchTo(inner - 1) != npos) {
 				layout.root_dword = field.dword;
 				root              = true;
-			} else if (inst.opcode == Opcode::V_WRITELANE_B32 && inst.dst.kind == OperandKind::Vgpr &&
-			           OperandField(i, inst.src0, header, field) && same_record(field)) {
-				const auto move = VectorWriter(test, node_vgpr, header);
-				if (move == npos || m_inst[move].opcode != Opcode::V_MOV_B32 || ScalarIndex(m_inst[move].src0) == NoRegister) {
-					continue;
-				}
-				const auto pop = ScalarWriter(move, ScalarIndex(m_inst[move].src0), header);
-				if (pop != npos && m_inst[pop].opcode == Opcode::V_READLANE_B32 && m_inst[pop].src0.kind == OperandKind::Vgpr &&
-				    m_inst[pop].src0.reg == inst.dst.reg) {
+			}
+		}
+		for (size_t blas_test = header; blas_test < back && !root; blas_test++) {
+			const auto& candidate = m_inst[blas_test];
+			if (candidate.opcode != Opcode::IMAGE_BVH_INTERSECT_RAY || candidate.src1.kind != OperandKind::Sgpr) {
+				continue;
+			}
+			const auto blas_bfe = ScalarSource(blas_test, candidate.src1, Opcode::S_BFE_U64, header);
+			if (blas_bfe == npos || !IsConstant(m_inst[blas_bfe].src1, 0x280008)) {
+				continue;
+			}
+			const auto node_vgpr = AddressReg(candidate, 0);
+			for (size_t i = header; i < blas_test && !root; i++) {
+				const auto& inst = m_inst[i];
+				Field       field;
+				if (inst.opcode == Opcode::V_MOV_B32 && inst.dst.kind == OperandKind::Vgpr && inst.dst.reg == node_vgpr &&
+				    root_field(i, inst.src0, field)) {
 					layout.root_dword = field.dword;
 					root              = true;
+				} else if (inst.opcode == Opcode::V_WRITELANE_B32 && inst.dst.kind == OperandKind::Vgpr &&
+				           OperandField(i, inst.src0, header, field) && same_record(field)) {
+					const auto move = VectorWriter(blas_test, node_vgpr, header);
+					if (move == npos || m_inst[move].opcode != Opcode::V_MOV_B32 || ScalarIndex(m_inst[move].src0) == NoRegister) {
+						continue;
+					}
+					const auto pop = ScalarWriter(move, ScalarIndex(m_inst[move].src0), header);
+					if (pop != npos && m_inst[pop].opcode == Opcode::V_READLANE_B32 &&
+					    m_inst[pop].src0.kind == OperandKind::Vgpr && m_inst[pop].src0.reg == inst.dst.reg) {
+						layout.root_dword = field.dword;
+						root              = true;
+					}
 				}
+			}
+		}
+		// Instance leaves of another node type whose record is at a fixed offset of the header,
+		// with a constant root: S_CMP_LG/EQ_U32 <type>, <node & 7> selecting
+		// S_MOV_B64 <record pair>, <header + offset> (S_ADD_U32 / S_ADDC_U32 of the header pair).
+		layout.inline_type = NoRegister;
+		for (size_t i = header; i < record.load && root && inline_root != NoRegister; i++) {
+			const auto& move = m_inst[i];
+			if (move.opcode != Opcode::S_MOV_B64 || ScalarIndex(move.dst) != pair || ScalarIndex(move.src0) == NoRegister) {
+				continue;
+			}
+			const auto source = ScalarIndex(move.src0);
+			const auto lo     = ScalarWriter(i, source, 0);
+			const auto hi     = ScalarWriter(i, source + 1, 0);
+			if (lo == npos || hi == npos || m_inst[lo].opcode != Opcode::S_ADD_U32 || m_inst[hi].opcode != Opcode::S_ADDC_U32 ||
+			    !IsSgpr(m_inst[lo].src0, site.header_sgpr) || m_inst[lo].src1.kind != OperandKind::LiteralConstant ||
+			    !IsSgpr(m_inst[hi].src0, site.header_sgpr + 1) || !IsConstant(m_inst[hi].src1, 0)) {
+				continue;
+			}
+			// The type compare before it.
+			for (size_t c = i; c-- > header;) {
+				const auto& cmp = m_inst[c];
+				if (cmp.opcode != Opcode::S_CMP_LG_U32 && cmp.opcode != Opcode::S_CMP_EQ_U32) {
+					continue;
+				}
+				const auto* type  = cmp.src0.kind == OperandKind::IntegerInlineConstant ? &cmp.src0 : &cmp.src1;
+				const auto* value = type == &cmp.src0 ? &cmp.src1 : &cmp.src0;
+				const auto  bits  = ScalarSource(c, *value, Opcode::S_AND_B32, header);
+				if (type->kind == OperandKind::IntegerInlineConstant && type->value < 8 && bits != npos &&
+				    IsConstant(m_inst[bits].src1, 7) && IsSgpr(m_inst[bits].src0, node)) {
+					layout.inline_type   = type->value;
+					layout.inline_offset = m_inst[lo].src1.value;
+					layout.inline_root   = inline_root;
+				}
+				break;
 			}
 		}
 		layout.flags_dword = NoRegister;
@@ -2349,6 +2462,14 @@ private:
 	bool ConstantMaskTest(size_t i, size_t from, Field& field, uint32_t& shift, uint32_t& mask) const {
 		const auto& test = m_inst[i];
 		const auto  next = NextReal(i);
+		// Any bit of the top byte: S_CMP_GT_U32 <dword>, (1 << shift) - 1; S_CBRANCH_SCC0.
+		if (test.opcode == Opcode::S_CMP_GT_U32 && test.src1.kind == OperandKind::LiteralConstant && next != npos &&
+		    m_inst[next].opcode == Opcode::S_CBRANCH_SCC0 && OperandField(i, test.src0, from, field)) {
+			const auto below = test.src1.value;
+			shift            = static_cast<uint32_t>(std::popcount(below));
+			mask             = 0xffu;
+			return (below & (below + 1u)) == 0 && shift >= 24u;
+		}
 		if (test.opcode != Opcode::S_AND_B32 || test.src1.kind != OperandKind::LiteralConstant || test.src1.value == 0 ||
 		    next == npos || m_inst[next].opcode != Opcode::S_CBRANCH_SCC0 || !OperandField(i, test.src0, from, field)) {
 			return false;
@@ -2434,11 +2555,14 @@ private:
 		return false;
 	}
 
-	// ---- The facing a Packet site's leaf code accepts. ----
+	// ---- The facing a traversal's leaf code accepts. ----
 	//
 	// After the triangle test the leaf code keeps the lanes with a hit (first result not +inf)
 	// whose facing is the accepted one, or with a hit when they do not cull:
-	//   hit & (facing | !cull)  with cull = !(flags bit 2) & enable
+	//   accept = hit & (facing | !cull)  with cull = !(flags bit 2) & enable
+	// as the EXEC of the code that takes the hit (wave-wide walks of a Packet site) or as the
+	// negated mask of the V_CNDMASK_B32s that keep the nearest hit, with the lanes beyond t max:
+	//   reject = !exec | !accept | t > t max.
 	// facing: V_CMP_EQ/NE of flags bit 3 (S_BFE_U32) and the sign of the first result
 	// (V_LSHRREV_B32 31); NE accepts, with the bit clear, the triangles whose sign is set (the host's
 	// back faces). The selector of the two cases is a lane mask: S_CSELECT_B64 exec, 0 of SCC, or
@@ -2446,28 +2570,40 @@ private:
 	// lane, a wave-wide boolean (S_CSELECT_B32 1, 0) or a lane mask (V_CNDMASK_B32 0, 1, <mask>)
 	// that keep their values from the site entry.
 
-	// A lane mask (an SGPR pair) as a truth table over three atoms, the instructions that write
-	// them (bit c of the table: its value with atom k = bit k of c), made of S_AND_B64,
-	// S_ANDN2_B64 and S_OR_B64.
-	bool MaskTable(size_t i, uint32_t reg, size_t from, std::array<size_t, 3>& atoms, uint32_t& table,
+	static constexpr size_t ExecAtom = SIZE_MAX - 1;
+
+	// A lane mask (an SGPR pair) as a truth table over up to five atoms, the instructions that
+	// write them or EXEC (bit c of the table: its value with atom k = bit k of c), made of
+	// S_AND_B64, S_ANDN2_B64 and S_OR_B64.
+	bool MaskTable(size_t i, const Operand& operand, size_t from, std::array<size_t, 5>& atoms, uint32_t& table,
 	               uint32_t depth = 0) const {
-		const auto w = reg != NoRegister ? ScalarWriter(i, reg, from) : npos;
+		static constexpr std::array<uint32_t, 5> AtomTables {0xaaaaaaaau, 0xccccccccu, 0xf0f0f0f0u, 0xff00ff00u,
+		                                                     0xffff0000u};
+		const auto reg = ScalarIndex(operand);
+		size_t     w   = operand.kind == OperandKind::ExecLo ? ExecAtom : reg != NoRegister ? ScalarWriter(i, reg, from) : npos;
 		if (w == npos || depth > 8) {
 			return false;
 		}
-		const auto& inst = m_inst[w];
-		if ((inst.opcode == Opcode::S_AND_B64 || inst.opcode == Opcode::S_ANDN2_B64 || inst.opcode == Opcode::S_OR_B64) &&
-		    ScalarIndex(inst.dst) == reg) {
-			uint32_t a = 0, b = 0;
-			if (!MaskTable(w, ScalarIndex(inst.src0), from, atoms, a, depth + 1) ||
-			    !MaskTable(w, ScalarIndex(inst.src1), from, atoms, b, depth + 1)) {
-				return false;
+		if (w != ExecAtom) {
+			const auto& inst = m_inst[w];
+			const auto op = inst.opcode;
+			if ((op == Opcode::S_AND_B64 || op == Opcode::S_ANDN2_B64 || op == Opcode::S_OR_B64 || op == Opcode::S_ORN2_B64 ||
+			     op == Opcode::S_NOR_B64 || op == Opcode::S_NAND_B64) &&
+			    ScalarIndex(inst.dst) == reg) {
+				uint32_t a = 0, b = 0;
+				if (!MaskTable(w, inst.src0, from, atoms, a, depth + 1) || !MaskTable(w, inst.src1, from, atoms, b, depth + 1)) {
+					return false;
+				}
+				table = op == Opcode::S_AND_B64     ? a & b
+				        : op == Opcode::S_ANDN2_B64 ? a & ~b
+				        : op == Opcode::S_OR_B64    ? a | b
+				        : op == Opcode::S_ORN2_B64  ? a | ~b
+				        : op == Opcode::S_NOR_B64   ? ~(a | b)
+				                                    : ~(a & b);
+				return true;
 			}
-			table = inst.opcode == Opcode::S_AND_B64 ? a & b : inst.opcode == Opcode::S_ANDN2_B64 ? a & ~b & 0xffu : a | b;
-			return true;
 		}
-		static constexpr std::array<uint32_t, 3> AtomTables {0xaau, 0xccu, 0xf0u};
-		for (uint32_t k = 0; k < 3; k++) {
+		for (uint32_t k = 0; k < atoms.size(); k++) {
 			if (atoms[k] == w || atoms[k] == npos) {
 				atoms[k] = w;
 				table    = AtomTables[k];
@@ -2475,6 +2611,140 @@ private:
 			}
 		}
 		return false;
+	}
+
+	// The facing compare of a triangle test's leaf code (see above) at `i`: whether it is one, and
+	// whether it accepts with NE (flip). Gives the flags dword and shift of its bit 3.
+	bool FacingCompare(size_t i, size_t test, size_t from, Field& flags, uint32_t& bit, bool& ne) const {
+		const auto& cmp = m_inst[i];
+		ne              = cmp.opcode == Opcode::V_CMP_NE_U32 || cmp.opcode == Opcode::V_CMP_NE_I32;
+		if (!ne && cmp.opcode != Opcode::V_CMP_EQ_U32 && cmp.opcode != Opcode::V_CMP_EQ_I32) {
+			return false;
+		}
+		for (const auto& [a, b]: {std::pair {&cmp.src0, &cmp.src1}, std::pair {&cmp.src1, &cmp.src0}}) {
+			if (b->kind != OperandKind::Vgpr || !Plain(*a) || !Plain(*b)) {
+				continue;
+			}
+			const auto sign = VectorSource(i, *b, Opcode::V_LSHRREV_B32, from);
+			if (sign == npos || !IsConstant(m_inst[sign].src0, 31) || m_inst[sign].src1.kind != OperandKind::Vgpr ||
+			    VectorWriter(sign, m_inst[sign].src1.reg, from) != test || m_inst[test].dst.reg != m_inst[sign].src1.reg) {
+				continue;
+			}
+			const auto bfe = ScalarSource(i, *a, Opcode::S_BFE_U32, from);
+			if (bfe == npos || m_inst[bfe].src1.kind != OperandKind::LiteralConstant ||
+			    (m_inst[bfe].src1.value >> 16u) != 1u || (m_inst[bfe].src1.value & 0xffffu) < 3u ||
+			    !OperandField(bfe, m_inst[bfe].src0, from, flags)) {
+				continue;
+			}
+			bit = m_inst[bfe].src1.value & 0xffffu;
+			return true;
+		}
+		return false;
+	}
+
+	// The facing condition of the mask SGPR `reg` read at `at` (see above), from the triangle
+	// test `test`; `reject`: the mask is the reject form. Sets the layout's flags (when the site
+	// has none yet) and flip, and the site's facing enable.
+	bool LeafFacingTable(size_t test, size_t at, size_t from, size_t back, uint32_t reg, bool reject, RayTracingSite& site) const {
+		Operand mask;
+		mask.kind = OperandKind::Sgpr;
+		mask.reg  = reg;
+		if (reg == 106u) {
+			mask.kind = OperandKind::VccLo;
+		}
+		std::array<size_t, 5> atoms {npos, npos, npos, npos, npos};
+		uint32_t              table = 0;
+		if (!MaskTable(at, mask, from, atoms, table)) {
+			return false;
+		}
+		// What each atom is.
+		uint32_t facing = 5, hit = 5, selector = 5, far = 5, exec = 5;
+		Field    flags;
+		uint32_t bit = 0;
+		bool     ne  = false;
+		for (uint32_t k = 0; k < atoms.size() && atoms[k] != npos; k++) {
+			if (atoms[k] == ExecAtom) {
+				exec = k;
+				continue;
+			}
+			const auto& c = m_inst[atoms[k]];
+			Field       f;
+			uint32_t    b = 0;
+			bool        n = false;
+			if (facing == 5 && FacingCompare(atoms[k], test, from, f, b, n)) {
+				facing = k, flags = f, bit = b, ne = n;
+				continue;
+			}
+			const bool compare = c.family == Family::VOPC || magic_enum::enum_name(c.opcode).starts_with("V_CMP_");
+			const auto reads   = [&](uint32_t vgpr) {
+				return (c.src0.kind == OperandKind::Vgpr && c.src0.reg == vgpr) ||
+				       (c.src1.kind == OperandKind::Vgpr && c.src1.reg == vgpr);
+			};
+			if (compare && hit == 5 && reads(m_inst[test].dst.reg) && VectorWriter(atoms[k], m_inst[test].dst.reg, from) == test) {
+				hit = k;
+			} else if (compare && far == 5 && c.opcode == Opcode::V_CMP_GT_F32 && reads(site.t_max)) {
+				far = k;
+			} else if (selector == 5) {
+				selector = k;
+			} else {
+				return false;
+			}
+		}
+		if (facing == 5 || hit == 5 || selector == 5 || (!reject && exec != 5)) {
+			return false;
+		}
+		// Lanes outside EXEC do not count (the V_CNDMASK_B32s do not write them).
+		const auto value = [&](uint32_t k, uint32_t c) { return k < 5 && ((c >> k) & 1u) != 0; };
+		uint32_t   both_table = 0, cull_table = 0, care = 0;
+		for (uint32_t c = 0; c < 32; c++) {
+			const bool f = value(facing, c), h = value(hit, c), s = value(selector, c);
+			const bool g = value(far, c);
+			const bool both = h && (f || s), cull = h && (f || !s);
+			care |= exec == 5 || value(exec, c) ? 1u << c : 0u;
+			both_table |= (reject ? (!both || g) : (both && !g)) ? 1u << c : 0u;
+			cull_table |= (reject ? (!cull || g) : (cull && !g)) ? 1u << c : 0u;
+		}
+		const bool is_both = ((table ^ both_table) & care) == 0, is_cull = ((table ^ cull_table) & care) == 0;
+		if (is_both == is_cull) {
+			return false;
+		}
+		// The flags (the opacity test may have given them already).
+		auto& layout = site.layout;
+		if (layout.flags_dword == NoRegister) {
+			layout.flags_dword = flags.dword;
+			layout.flags_shift = bit - 3u;
+		} else if (flags.dword != layout.flags_dword || bit != layout.flags_shift + 3u) {
+			return false;
+		}
+		// The selector's condition, as cull = !(flags bit 2) & enable.
+		const auto& sel = m_inst[atoms[selector]];
+		Condition   cond;
+		if (sel.opcode == Opcode::S_CSELECT_B64 && sel.src0.kind == OperandKind::ExecLo && IsConstant(sel.src1, 0)) {
+			if (!SccCondition(atoms[selector], from, layout, back, cond, 0)) {
+				return false;
+			}
+		} else if (sel.opcode == Opcode::V_CMP_NE_U32 || sel.opcode == Opcode::V_CMP_NE_I32) {
+			const auto* x = IsConstant(sel.src0, 0) ? &sel.src1 : IsConstant(sel.src1, 0) ? &sel.src0 : nullptr;
+			if (x == nullptr || !LaneCondition(atoms[selector], *x, from, layout, back, cond)) {
+				return false;
+			}
+		} else {
+			return false;
+		}
+		if (is_both) {
+			// The selector is "both facings": only flags bit 2 negates.
+			if (cond.both != 1 || cond.uniform != NoRegister || cond.lanes != NoRegister) {
+				return false;
+			}
+			cond.both = -1;
+		}
+		if (cond.both != -1) {
+			return false;
+		}
+		site.facing_sgpr   = cond.uniform;
+		site.facing_mask   = cond.lanes;
+		layout.flip_facing = ne;
+		return true;
 	}
 
 	// A condition that is a conjunction of: flags bit 2 (or its negation), a wave-wide boolean
@@ -2616,99 +2886,21 @@ private:
 		return true;
 	}
 
+	// The facing of a Packet site's leaf code: the EXEC the code that takes a hit runs with (the
+	// first S_AND_SAVEEXEC_B64 after a triangle test that depends on a facing compare).
 	bool LeafFacing(size_t leaf, size_t tail, size_t from, size_t back, RayTracingSite& site) const {
-		auto& layout = site.layout;
-		for (size_t i = leaf; i < tail; i++) {
-			const auto& cmp = m_inst[i];
-			const bool  ne  = cmp.opcode == Opcode::V_CMP_NE_U32 || cmp.opcode == Opcode::V_CMP_NE_I32;
-			if (!ne && cmp.opcode != Opcode::V_CMP_EQ_U32 && cmp.opcode != Opcode::V_CMP_EQ_I32) {
+		for (size_t test = leaf; test < tail; test++) {
+			if (m_inst[test].opcode != Opcode::IMAGE_BVH_INTERSECT_RAY) {
 				continue;
 			}
-			for (const auto& [a, b]: {std::pair {&cmp.src0, &cmp.src1}, std::pair {&cmp.src1, &cmp.src0}}) {
-				if (b->kind != OperandKind::Vgpr || !Plain(*a) || !Plain(*b)) {
-					continue;
-				}
-				const auto sign = VectorSource(i, *b, Opcode::V_LSHRREV_B32, leaf);
-				if (sign == npos || !IsConstant(m_inst[sign].src0, 31) || m_inst[sign].src1.kind != OperandKind::Vgpr) {
-					continue;
-				}
-				const auto test = VectorWriter(sign, m_inst[sign].src1.reg, leaf);
-				if (test == npos || m_inst[test].opcode != Opcode::IMAGE_BVH_INTERSECT_RAY ||
-				    m_inst[test].dst.reg != m_inst[sign].src1.reg) {
-					continue;
-				}
-				const auto bit = ScalarSource(i, *a, Opcode::S_BFE_U32, from);
-				Field      field;
-				if (bit == npos || !IsConstant(m_inst[bit].src1, (1u << 16u) | (layout.flags_shift + 3u)) ||
-				    !OperandField(bit, m_inst[bit].src0, from, field) || field.dword != layout.flags_dword) {
-					continue;
-				}
-				// The lanes the leaf keeps: hit & (facing | !cull).
-				const auto save = Next(i, Opcode::S_AND_SAVEEXEC_B64, tail);
-				std::array<size_t, 3> atoms {i, npos, npos};
-				uint32_t              table = 0;
-				if (save == npos || !MaskTable(save, ScalarIndex(m_inst[save].src0), leaf, atoms, table) ||
-				    atoms[1] == npos || atoms[2] == npos) {
-					return false;
-				}
-				// The hit: a compare of the test's first result.
-				const auto is_hit = [&](size_t k) {
-					const auto& c = m_inst[atoms[k]];
-					return c.family == Family::VOPC || (c.family == Family::VOP3 &&
-					                                    magic_enum::enum_name(c.opcode).starts_with("V_CMP_"))
-					           ? (c.src0.kind == OperandKind::Vgpr && VectorWriter(atoms[k], c.src0.reg, leaf) == test) ||
-					                 (c.src1.kind == OperandKind::Vgpr && VectorWriter(atoms[k], c.src1.reg, leaf) == test)
-					           : false;
-				};
-				const uint32_t hit = is_hit(1) ? 1u : is_hit(2) ? 2u : 0u;
-				if (hit == 0) {
-					return false;
-				}
-				const uint32_t selector = 3u - hit;
-				const auto     value    = [&](uint32_t k, uint32_t c) { return ((c >> k) & 1u) != 0; };
-				uint32_t       both_table = 0, cull_table = 0;
-				for (uint32_t c = 0; c < 8; c++) {
-					const bool f = value(0, c), h = value(hit, c), s = value(selector, c);
-					both_table |= (h && (f || s)) ? 1u << c : 0u;
-					cull_table |= (h && (f || !s)) ? 1u << c : 0u;
-				}
-				if (table != both_table && table != cull_table) {
-					return false;
-				}
-				// The selector's condition, as cull = !(flags bit 2) & enable.
-				const auto& sel = m_inst[atoms[selector]];
-				Condition   cond;
-				if (sel.opcode == Opcode::S_CSELECT_B64 && sel.src0.kind == OperandKind::ExecLo && IsConstant(sel.src1, 0)) {
-					if (!SccCondition(atoms[selector], from, layout, back, cond, 0)) {
-						return false;
-					}
-				} else if (sel.opcode == Opcode::V_CMP_NE_U32 || sel.opcode == Opcode::V_CMP_NE_I32) {
-					const auto* x = IsConstant(sel.src0, 0) ? &sel.src1 : IsConstant(sel.src1, 0) ? &sel.src0 : nullptr;
-					if (x == nullptr || !LaneCondition(atoms[selector], *x, from, layout, back, cond)) {
-						return false;
-					}
-				} else {
-					return false;
-				}
-				if (table == both_table) {
-					// The selector is "both facings": only flags bit 2 negates.
-					if (cond.both != 1 || cond.uniform != NoRegister || cond.lanes != NoRegister) {
-						return false;
-					}
-					cond.both = -1;
-				}
-				if (cond.both != -1) {
-					return false;
-				}
-				site.facing_sgpr   = cond.uniform;
-				site.facing_mask   = cond.lanes;
-				layout.flip_facing = ne;
+			const auto save = Next(test, Opcode::S_AND_SAVEEXEC_B64, tail);
+			if (save != npos && ScalarIndex(m_inst[save].src0) != NoRegister &&
+			    LeafFacingTable(test, save, from, back, ScalarIndex(m_inst[save].src0), false, site)) {
 				return true;
 			}
 		}
 		return false;
 	}
-
 	// The flags of the instance a Packet site's leaf code reads: the opacity test
 	// S_OR_B32 <x>, <flags>, <word >> 30>; S_BITCMP1_B32 <x>, 0 with flags a record dword, shifted
 	// right or not.
@@ -2745,6 +2937,157 @@ private:
 					return true;
 				}
 			}
+		}
+		return false;
+	}
+
+	// The mask operand of V_CNDMASK_B32 (VCC without a third operand).
+	static Operand CndmaskMask(const Instruction& inst) {
+		if (inst.src_count >= 3u) {
+			return inst.src2;
+		}
+		Operand operand;
+		operand.kind = OperandKind::VccLo;
+		return operand;
+	}
+
+	// An SGPR pair the program never reads or writes (NoRegister: none).
+	uint32_t UnusedPair() const {
+		std::array<bool, 106> used {};
+		const auto mark = [&](const Operand& operand, uint32_t count) {
+			const auto reg = operand.kind == OperandKind::Sgpr ? operand.reg : NoRegister;
+			for (uint32_t k = 0; reg != NoRegister && k < count && reg + k < used.size(); k++) {
+				used[reg + k] = true;
+			}
+		};
+		for (const auto& inst: m_inst) {
+			// Conservatively wide: whole descriptors and pairs.
+			const uint32_t width = inst.family == Family::SMEM || inst.family == Family::MIMG ? 16u : 2u;
+			for (const auto* operand: {&inst.src0, &inst.src1, &inst.src2, &inst.src3}) {
+				mark(*operand, width);
+			}
+			mark(inst.dst, inst.family == Family::SMEM ? std::max(inst.data_dwords, 1u) : 2u);
+			mark(inst.dst2, 2u);
+		}
+		for (uint32_t pair = 104; pair >= 2; pair -= 2) {
+			if (!used[pair] && !used[pair + 1]) {
+				return pair;
+			}
+		}
+		return NoRegister;
+	}
+
+	// The nearest hit of a closest hit traversal whose box and leaf walks are wave-wide (scalar
+	// nodes; Astro Bot): the leaf code keeps the nearest hit in VGPRs,
+	//   V_CNDMASK_B32 <t max>, <t>, <t max>, <reject>   V_CNDMASK_B32 <word>, <entry word>, <word>, <reject>
+	// with reject = !exec | !(hit & (facing | !cull)) | t > t max (facing and cull as in LeafFacing;
+	// every triangle opaque). The site traces with the hardware and commits t and the word.
+	bool ClosestSelectHit(size_t header, size_t back, uint32_t record_pair, RayTracingSite& site) const {
+		for (size_t i = header; i < back; i++) {
+			const auto& keep_t = m_inst[i];
+			const auto  mask_t = CndmaskMask(keep_t);
+			if (keep_t.opcode != Opcode::V_CNDMASK_B32 || keep_t.dst.kind != OperandKind::Vgpr ||
+			    keep_t.dst.reg != site.t_max || keep_t.src1.kind != OperandKind::Vgpr || keep_t.src1.reg != site.t_max ||
+			    keep_t.src0.kind != OperandKind::Vgpr || !Plain(keep_t.src0) || !Plain(keep_t.src1) ||
+			    ScalarIndex(mask_t) == NoRegister) {
+				continue;
+			}
+			const auto reject = ScalarWriter(i, ScalarIndex(mask_t), header);
+			// The word kept with the same mask.
+			size_t keep_word = npos;
+			for (size_t j = i + 1; j-- > header + 1 && keep_word == npos;) {
+				const auto& keep = m_inst[j];
+				const auto  mask = CndmaskMask(keep);
+				if (j != i && keep.opcode == Opcode::V_CNDMASK_B32 && keep.dst.kind == OperandKind::Vgpr &&
+				    keep.src1.kind == OperandKind::Vgpr && keep.src1.reg == keep.dst.reg && ScalarIndex(mask) != NoRegister &&
+				    ScalarWriter(j, ScalarIndex(mask), header) == reject && keep.dst.reg != site.t_max) {
+					keep_word = j;
+				}
+			}
+			if (keep_word == npos) {
+				continue;
+			}
+			// The triangle test of the leaf (its first result is the hit's numerator).
+			const auto t_value = keep_t.src0.reg;
+			const auto mul     = VectorWriter(i, t_value, header);
+			if (mul == npos || m_inst[mul].opcode != Opcode::V_MUL_F32) {
+				return false;
+			}
+			size_t test = npos;
+			for (const auto* operand: {&m_inst[mul].src0, &m_inst[mul].src1}) {
+				const auto w = operand->kind == OperandKind::Vgpr ? VectorWriter(mul, operand->reg, header) : npos;
+				if (w != npos && m_inst[w].opcode == Opcode::IMAGE_BVH_INTERSECT_RAY && m_inst[w].dst.reg == operand->reg) {
+					test = w;
+				}
+			}
+			if (test == npos) {
+				return false;
+			}
+			if (!LeafFacingTable(test, i, header, back, ScalarIndex(mask_t), true, site)) {
+				return false;
+			}
+			site.result_t        = site.t_max;
+			site.result_word     = m_inst[keep_word].dst.reg;
+			site.result_instance = NoRegister;
+			site.result_u = site.result_v = site.result_node = NoRegister;
+			return true;
+		}
+		// Or the moves of the nearest hit under EXEC = accept & !(t > t max):
+		//   S_AND_SAVEEXEC_B64 <s>, <accept>; S_CBRANCH_EXECZ; V_MOV_B32s of t into t max, of the
+		//   instance record pair and of the list entry (triangle node, primitive word).
+		for (size_t i = header; i + 2 < back; i++) {
+			const auto& save = m_inst[i];
+			if (save.opcode != Opcode::S_AND_SAVEEXEC_B64 || m_inst[i + 1].opcode != Opcode::S_CBRANCH_EXECZ ||
+			    ScalarIndex(save.src0) == NoRegister) {
+				continue;
+			}
+			uint32_t t_value = NoRegister, instance = NoRegister, entry = NoRegister, node = NoRegister, word = NoRegister;
+			bool     ok      = true;
+			const auto waits = [&](size_t j) {
+				return m_inst[j].opcode == Opcode::S_WAITCNT || m_inst[j].opcode == Opcode::S_NOP;
+			};
+			for (size_t j = i + 2; j < back && (m_inst[j].opcode == Opcode::V_MOV_B32 || waits(j)) && ok; j++) {
+				const auto& move = m_inst[j];
+				if (waits(j)) {
+					continue;
+				}
+				if (move.dst.kind != OperandKind::Vgpr || !Plain(move.src0)) {
+					ok = false;
+				} else if (move.dst.reg == site.t_max && move.src0.kind == OperandKind::Vgpr) {
+					t_value = move.src0.reg;
+				} else if (move.src0.kind == OperandKind::Sgpr && move.src0.reg == record_pair) {
+					instance = instance == NoRegister ? move.dst.reg : NoRegister;
+				} else if (move.src0.kind == OperandKind::Sgpr && move.src0.reg == record_pair + 1) {
+					ok = move.dst.reg == instance + 1;
+				} else if (move.src0.kind == OperandKind::Sgpr && (entry == NoRegister || (move.src0.reg | 1u) == (entry | 1u))) {
+					// The two dwords of the list entry: the triangle node, then the word.
+					entry = std::min(entry, move.src0.reg);
+					((move.src0.reg & 1u) == 0 ? node : word) = move.dst.reg;
+				} else {
+					ok = false;
+				}
+			}
+			if (!ok || t_value == NoRegister || instance == NoRegister || node == NoRegister || word == NoRegister) {
+				continue;
+			}
+			const auto mul = VectorWriter(i, t_value, header);
+			size_t     test = npos;
+			for (const auto* operand: {&m_inst[mul].src0, &m_inst[mul].src1}) {
+				const auto w = mul != npos && operand->kind == OperandKind::Vgpr ? VectorWriter(mul, operand->reg, header) : npos;
+				if (w != npos && m_inst[w].opcode == Opcode::IMAGE_BVH_INTERSECT_RAY && m_inst[w].dst.reg == operand->reg) {
+					test = w;
+				}
+			}
+			if (mul == npos || m_inst[mul].opcode != Opcode::V_MUL_F32 || test == npos ||
+			    !LeafFacingTable(test, i, header, back, ScalarIndex(save.src0), false, site)) {
+				return false;
+			}
+			site.result_t        = site.t_max;
+			site.result_word     = word;
+			site.result_instance = instance;
+			site.result_node     = node;
+			site.result_u = site.result_v = NoRegister;
+			return true;
 		}
 		return false;
 	}
