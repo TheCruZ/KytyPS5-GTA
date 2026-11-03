@@ -3,6 +3,7 @@
 
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -25,8 +26,10 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 // acceleration structure for the TLAS the shader traces.
 //
 // Pseudo instructions (Instruction::offset = site):
-//   RT_INIT    image_nsa_addr[0..7] = origin xyz, direction xyz, t max and cull mask VGPRs,
-//              src0 = SGPR pair of the guest TLAS header address. SCC = native traversal.
+//   RT_INIT    image_nsa_addr[0..7] = origin xyz, direction xyz, t max and cull mask VGPRs ([8]
+//              the constant mask without a mask VGPR, src2 the SGPR mask), src0 = SGPR pair of the
+//              guest TLAS header address, src1 = alpha test off, src3 = the SGPR (dmask 4) or lane
+//              mask (dmask 8) of the lanes that cull facings. SCC = native traversal.
 //   RT_SELECT  dst = SGPR of the instance node, dst2 = SGPR pair of the lane mask; advances the
 //              queries, picks the candidate of the first lane that has one and sets EXEC (and
 //              the mask) to the lanes with the same candidate. SCC = some lane has a candidate.
@@ -80,13 +83,64 @@ enum class RayTracingAlphaLayout : uint32_t {
 	Lane = 1,
 };
 
+// How the guest's top-level BVH is laid out, as the traversal code reads it (see DeriveLayout in
+// RayTracingPatch.cpp); versions of the BVH library differ. The instance records are 128 bytes at
+// header + the 64-bit offset at header + `instance_offset`, one per instance leaf (node >> 3).
+// Fields are record dwords:
+//   transform    the world to object 3x4 matrix: row r (object x, y, z) and column c (world x,
+//                y, z, then the translation) at transform[r * 4 + c]
+//   BLAS         the BLAS address: dwords blas, blas + 1 as they are (raw), or packed as
+//                ((lo | (hi & 0x3fffff) << 32) << 3)
+//   root         the BLAS root node
+//   mask         the instance mask: (dword >> mask_shift) & 0xff (NoRegister: the traversal tests
+//                no mask, every instance counts)
+//   flags        the instance flags: (dword >> flags_shift); bit 0 opaque, bit 1 alpha tested
+//                anyway, bit 2 both facings, bit 3 the culled facing (NoRegister: the program never
+//                reads them; its sites do not depend on them)
+// `flip_facing`: whether the guest's triangle test accepts, with flags bit 3 clear, the triangles
+// whose test sign is set (the host's back faces).
+struct RayTracingLayout {
+	bool                    valid           = false;
+	uint32_t                instance_offset = 0;
+	std::array<uint8_t, 12> transform {};
+	uint32_t                blas_dword      = 0;
+	bool                    blas_packed     = false;
+	uint32_t                root_dword      = 0;
+	uint32_t                mask_dword      = 0;
+	uint32_t                mask_shift      = 0;
+	uint32_t                flags_dword     = 0xffffffffu;
+	uint32_t                flags_shift     = 0;
+	bool                    flip_facing     = true;
+
+	bool operator==(const RayTracingLayout&) const = default;
+	// Four words for the host passes (see LoadGuestInstance in rt_common.inc).
+	[[nodiscard]] std::array<uint32_t, 4> Pack() const;
+};
+
+// The fields of the guest BVH the alpha tests read beyond the instance record's (see
+// RayTracingAlphaTest): record dword of the material base, BLAS header dwords of the table of the
+// geometry of each triangle node and of the first triangle node, and how the vertex offsets are
+// formed: (M1 & mask) + index * (M0 & mask), aligned down to 4 bytes when `align`.
+struct RayTracingAlphaFields {
+	uint32_t material_dword = 0;
+	uint32_t table_dword    = 0;
+	uint32_t first_dword    = 0;
+	uint32_t vertex_mask    = 0xfc;
+	bool     vertex_align   = false;
+	// Packed with the BLAS location of the layout into one word (RayQueryAlpha's format).
+	[[nodiscard]] uint32_t Pack(const RayTracingLayout& layout) const;
+};
+
 struct RayTracingAlphaTest {
 	bool                  valid  = false;
 	RayTracingAlphaLayout layout = RayTracingAlphaLayout::Scalar;
-	// The lane's level of detail term (VGPR), the cone spread (an SGPR, or a VGPR in the Lane
-	// layout) and the threshold factor (SGPR, Scalar layout) or reference (VGPR, Lane layout).
+	RayTracingAlphaFields fields;
+	// The lane's level of detail term (VGPR), the cone spread (an SGPR, or in the Lane layout an
+	// SGPR or a VGPR) and the threshold factor (SGPR, Scalar layout) or reference (VGPR, Lane
+	// layout).
 	uint32_t lod_vgpr       = 0;
 	uint32_t spread_reg     = 0;
+	bool     spread_vector  = false;
 	uint32_t factor_sgpr    = 0;
 	uint32_t reference_vgpr = NoRegister;
 	// The V#s of the material table and of the vertex and index buffer table: 16 bytes at user
@@ -109,13 +163,20 @@ struct RayTracingSite {
 	uint32_t origin[3] {};
 	uint32_t direction[3] {};
 	uint32_t t_max     = 0;
-	// The VGPR of the ray's instance mask (NoRegister: the constant mask below).
+	// The VGPR of the ray's instance mask (NoRegister: the SGPR or, without one, the constant
+	// mask below).
 	uint32_t cull_mask = 0;
+	uint32_t cull_mask_sgpr     = NoRegister;
 	uint32_t cull_mask_constant = 0xff;
 	// SGPR pair of the TLAS header address at entry_pc.
 	uint32_t header_sgpr = 0;
 	// SGPR that turns the alpha test off (every triangle opaque) when not 0 (NoAlphaOff: none).
 	uint32_t alpha_off_sgpr = 0;
+	// The lanes that cull the facing the instance flags select (Packet sites; closest hit sites
+	// take both facings): all of them, those of the SGPR pair `facing_mask`, or none when SGPR
+	// `facing_sgpr` is 0 (NoRegister: not a condition).
+	uint32_t facing_sgpr = NoRegister;
+	uint32_t facing_mask = NoRegister;
 	// The VGPRs of an accepted hit: distance, primitive word, instance record address (pair).
 	uint32_t result_t        = 0;
 	uint32_t result_word     = 0;
@@ -145,6 +206,8 @@ struct RayTracingSite {
 	uint32_t exit_pc = 0;
 	// The alpha test the native traversal runs instead of the leaf code.
 	RayTracingAlphaTest alpha;
+	// The instance records as this site reads them.
+	RayTracingLayout layout;
 };
 
 constexpr uint32_t NoAlphaOff = 0xffffffffu;
@@ -155,6 +218,7 @@ struct RayTracingPatch {
 	uint32_t                    user_sgpr     = 0;
 	uint32_t                    header_offset = 0;
 	uint32_t                    root          = 0;
+	RayTracingLayout            layout;
 };
 
 // Finds the traversal loops of a decoded program by their structure (see RayTracingPatch.cpp);
