@@ -71,6 +71,10 @@ public:
 	// through the backing store, which never faults; the caches then treat it as a CPU write,
 	// except on pages the GPU owns.
 	void WriteFromCompletion(void* destination, const void* data, uint64_t size) noexcept;
+	// WriteFromCompletion() of values[i] at destination + i * stride (8-byte aligned qwords),
+	// values[0] last.
+	void WriteQwordsFromCompletion(void* destination, const uint64_t* values, uint32_t count,
+	                               uint64_t stride) noexcept;
 	// Execution thread, before each operation (see PrepareBda()).
 	void NoteOperation(uint64_t submit_id, bool after_wait) noexcept {
 		if (submit_id != m_bda_submit || after_wait) {

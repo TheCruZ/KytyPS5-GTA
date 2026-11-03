@@ -905,6 +905,11 @@ void CommandProcessor::ExecuteDmaData(bool dst_gds, uint64_t dst_address_or_offs
 		    static_cast<uint32_t>(src_address_or_offset_or_immediate & 0xffffffffu), dst_gds);
 		return;
 	}
+	if (!src_gds) {
+		// The copy reads occlusion counters once the GPU wrote them, as later work does.
+		m_renderer.GetOcclusionQueries().WaitForCounters(src_address_or_offset_or_immediate,
+		                                                 num_bytes);
+	}
 	buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, num_bytes,
 	                        dst_gds, src_gds);
 }

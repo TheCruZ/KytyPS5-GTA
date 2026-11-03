@@ -138,6 +138,33 @@ void RenderContext::WriteFromCompletion(void* destination, const void* data,
 	}
 }
 
+void RenderContext::WriteQwordsFromCompletion(void* destination, const uint64_t* values,
+                                              uint32_t count, uint64_t stride) noexcept {
+	const auto vaddr = reinterpret_cast<uint64_t>(destination);
+	if (count == 0) {
+		return;
+	}
+	const auto size = uint64_t {count - 1u} * stride + sizeof(uint64_t);
+	// One lookup of the backing store for all of them; the caches learn of each write as in
+	// WriteFromCompletion().
+	if (GuestRange {vaddr, size}.Valid() &&
+	    LibKernel::Memory::TryWriteBackingQwords(vaddr, values, count, stride)) {
+		for (uint32_t i = 0; i < count; i++) {
+			const auto address = vaddr + i * stride;
+			if (m_page_manager.IsWatched(address & ~(TRACKER_PAGE_SIZE - 1))) {
+				m_buffer_cache.InvalidateUnlessGpuModified(address, sizeof(uint64_t));
+				m_texture_cache.InvalidateMemory(address, sizeof(uint64_t));
+				m_image_heap.InvalidateMemory(address, sizeof(uint64_t));
+			}
+		}
+		return;
+	}
+	for (uint32_t i = count; i-- > 0;) {
+		WriteFromCompletion(static_cast<uint8_t*>(destination) + i * stride, &values[i],
+		                    sizeof(uint64_t));
+	}
+}
+
 void RenderContext::PrepareGpuWrite(const void* destination, uint64_t size) noexcept {
 	const auto vaddr     = reinterpret_cast<uint64_t>(destination);
 	const auto page_size = TRACKER_PAGE_SIZE;

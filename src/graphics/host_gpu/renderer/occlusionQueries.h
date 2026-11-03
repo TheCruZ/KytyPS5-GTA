@@ -5,13 +5,16 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <vector>
 
 namespace Libs::Graphics {
 
+class Buffer;
 class CommandRecorder;
 class CommandScheduler;
 class RenderContext;
@@ -123,7 +126,9 @@ private:
 // writes them, in dump order and ahead of any later completion that tells the guest the GPU got
 // there (a suspend point, a flip). The execution thread also publishes the dumps it finds
 // finished, and at a flip, while the GPU is more than a frame behind, waits for it: the counters
-// of a frame reach guest memory by the next frame's flip.
+// of a frame reach guest memory by the next frame's flip. GPU work that reads the counters later
+// in the stream does not wait for that: the copy of memory it reads gets them on the GPU, from
+// the host query results, right before it runs (see PrepareRead()).
 class OcclusionQueries {
 public:
 	explicit OcclusionQueries(RenderContext& context);
@@ -155,6 +160,24 @@ public:
 	// Whether the samples of the draws recorded now reach a guest occlusion counter.
 	[[nodiscard]] bool Counting() const noexcept { return Enabled() && m_segments.Counting(); }
 
+	// GPU work reads guest memory after earlier dumps there, as on the console, where a dump's
+	// counters are in memory before later work of the stream runs. Execution thread, for each
+	// range the operation being prepared reads, before its copy of the range is obtained: true
+	// when dumps the GPU may not have finished are under it, and then NoteReadTarget() gives the
+	// copy the operation reads, which WriteForReaders() fills before the operation's commands.
+	[[nodiscard]] bool PrepareRead(uint64_t address, uint64_t size);
+	void               NoteReadTarget(uint64_t address, uint64_t size, const Buffer& buffer,
+	                                  uint64_t offset);
+	void               WriteForReaders();
+	// A new operation: copies noted for an operation that recorded no commands are dropped.
+	void DropReadTargets() noexcept {
+		m_read_targets.clear();
+		m_read_dumps.clear();
+	}
+	// A read whose copy cannot be filled on the GPU (a CP DMA source): waits for the GPU to get past
+	// the dumps under [address, address + size) and publishes them.
+	void WaitForCounters(uint64_t address, uint64_t size);
+
 private:
 	void BeginQuery(const CommandRecorder& recorder);
 	void EndQuery(const CommandRecorder& recorder);
@@ -162,12 +185,46 @@ private:
 		OcclusionCounters::Segments::Dump dump;
 		uint64_t                          tick  = 0;
 		uint64_t                          frame = 0;
+		uint64_t                          seq   = 0;
 		bool                              write = true;
 	};
+	// Pages with dumps the GPU may not have finished, for a cheap first look at every read. An
+	// entry stays valid until the dumps up to `last_seq` are published; `chunks` marks the 64-byte
+	// chunks of the page that those dumps write.
+	struct PendingPage {
+		uint64_t page     = UINT64_MAX;
+		uint64_t last_seq = 0;
+		uint64_t chunks   = 0;
+	};
+	static constexpr size_t PendingPageCount = 4096;
+	struct ReadDump {
+		uint64_t address = 0;
+		uint64_t seq     = 0;
+	};
+	struct ReadTarget {
+		uint64_t address        = 0;
+		uint64_t size           = 0;
+		uint64_t device_address = 0;
+		size_t   first_dump     = 0;
+		size_t   end_dump       = 0;
+	};
 
-	void                   Publish(const PendingDump& pending);
-	[[nodiscard]] uint64_t ReadSamples(uint64_t first_slot, uint64_t end_slot);
+	// Publishes the first `count` pending dumps, which the GPU finished.
+	void                   PublishFront(size_t count);
+	// The results of the host queries in slots [first_slot, end_slot) into m_results; false
+	// when the driver could not give them.
+	[[nodiscard]] bool     ReadResults(uint64_t first_slot, uint64_t end_slot);
+	// The counters of a dump at `address` with the running total.
+	void                   WriteCounters(uint64_t address);
 	void                   ResetSlots(uint64_t first_slot, uint64_t end_slot);
+	// Resets and frees the slots of published dumps before `end_slot`, except those a command
+	// buffer the GPU has not finished copies the results of.
+	void                   ReleaseSlots(uint64_t end_slot);
+	void                   NotePendingPages(uint64_t address, uint64_t seq);
+	[[nodiscard]] bool     MayReadPendingDump(uint64_t address, uint64_t size) const;
+	// Waits for the GPU to finish `tick` and publishes what it finished.
+	void                   WaitAndPublish(uint64_t tick);
+	void                   CreateCounterPipeline();
 
 	RenderContext&              m_context;
 	vk::Device                  m_device = nullptr;
@@ -186,6 +243,35 @@ private:
 	uint64_t                    m_completion_tick = 0;
 	std::deque<PendingDump>     m_pending;
 	std::vector<uint64_t>       m_results;
+	// Slots of published dumps end at m_published_slot, reset ones at m_reset_slot. A hold keeps
+	// the slots from `slot` on until the GPU finishes `tick`, whose command buffer copies their
+	// results (WriteForReaders()).
+	struct SlotHold {
+		uint64_t tick = 0;
+		uint64_t slot = 0;
+	};
+	uint64_t                    m_published_slot = 0;
+	uint64_t                    m_reset_slot     = 0;
+	std::deque<SlotHold>        m_holds;
+	// Sequence number of the last dump (execution thread) and of the last one published.
+	uint64_t                    m_dump_seq = 0;
+	std::atomic<uint64_t>       m_published_seq {0};
+	// Execution thread: pages of unpublished dumps, and the newest dump whose page entry another
+	// page took (until it is published every read takes the exact look).
+	std::vector<PendingPage>    m_pending_pages;
+	uint64_t                    m_evicted_seq = 0;
+	// Execution thread: bounds of the dumps recorded since all earlier ones were published.
+	uint64_t                    m_pending_low  = 0;
+	uint64_t                    m_pending_high = 0;
+	// Execution thread: the copies the operation being prepared reads under dumps of the command
+	// buffer being recorded, and those dumps.
+	std::vector<ReadTarget>     m_read_targets;
+	std::vector<ReadDump>       m_read_dumps;
+	// GPU side of WriteForReaders(): the host query results by slot and the running totals.
+	std::unique_ptr<Buffer>     m_slot_results;
+	std::unique_ptr<Buffer>     m_totals;
+	vk::PipelineLayout          m_counter_layout   = nullptr;
+	vk::Pipeline                m_counter_pipeline = nullptr;
 };
 
 } // namespace Libs::Graphics
