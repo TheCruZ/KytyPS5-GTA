@@ -599,7 +599,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	// Host ray tracing of guest BVHs (see NativeRayTracing).
 	vk::PhysicalDeviceAccelerationStructureFeaturesKHR acceleration_structure {};
 	vk::PhysicalDeviceRayQueryFeaturesKHR              ray_query {};
-	if (HasExtension(available_extensions, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+	if (Config::NativeRayTracingEnabled() &&
+	    HasExtension(available_extensions, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
 	    HasExtension(available_extensions, VK_KHR_RAY_QUERY_EXTENSION_NAME) &&
 	    HasExtension(available_extensions, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME)) {
 		vk::StructureChain<vk::PhysicalDeviceFeatures2,
