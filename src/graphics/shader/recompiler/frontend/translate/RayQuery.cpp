@@ -51,18 +51,28 @@ void Translator::EmitRayTracing(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::RT_INIT: {
 			std::array<IR::U32, 8> ray;
 			for (uint32_t i = 0; i < 8; i++) {
-				// A site without a mask register has a constant mask.
-				ray[i] = i == 7 && inst.image_nsa_addr[i] == Decoder::NoRegister
-				             ? IR::U32(IR::Value(inst.image_nsa_addr[8]))
-				             : ReadU32(VectorOperand(inst.image_nsa_addr[i]));
+				// A site without a mask VGPR has a wave-wide mask (src2) or a constant one.
+				if (i == 7 && inst.image_nsa_addr[i] == Decoder::NoRegister) {
+					ray[i] = inst.src2.kind == Decoder::OperandKind::Sgpr ? ReadU32(inst.src2)
+					                                                      : IR::U32(IR::Value(inst.image_nsa_addr[8]));
+					continue;
+				}
+				ray[i] = ReadU32(VectorOperand(inst.image_nsa_addr[i]));
 			}
 			const auto header    = ReadU32Pair(inst.src0);
 			const auto alpha_off = ReadU32(inst.src1);
-			const auto native    = IR::U1(ir.Emit(
-                IR::ValueOpcode::RayQueryInit,
-                {ray[0], ray[1], ray[2], ray[3], ray[4], ray[5], ray[6], ray[7], header[0], header[1],
-                 alpha_off, ir.GetExec()},
-                flags(inst.dmask)));
+			// The lanes that cull facings: every lane, none when an SGPR is 0, or those of a mask.
+			auto cull = IR::U1(IR::Value(true));
+			if ((inst.dmask & 4u) != 0) {
+				cull = ir.INotEqual(ReadU32(inst.src3), IR::U32(IR::Value(0u)));
+			} else if ((inst.dmask & 8u) != 0) {
+				cull = ReadMask(inst.src3);
+			}
+			const auto native = IR::U1(ir.Emit(
+			    IR::ValueOpcode::RayQueryInit,
+			    {ray[0], ray[1], ray[2], ray[3], ray[4], ray[5], ray[6], ray[7], header[0], header[1], alpha_off,
+			     ir.GetExec(), cull},
+			    flags(inst.dmask & 3u)));
 			// The same in every lane: the host has (or not) the TLAS of the header.
 			ir.SetScc(any_lane(native));
 			return;
@@ -149,7 +159,8 @@ void Translator::EmitRayTracing(const Decoder::Instruction& inst) {
 			// The values the per-lane alpha test reads (see RayTracingAlphaTest): the level of
 			// detail term, the cone spread, the threshold factor (1.0 without one), the V#s of the
 			// material table and of the buffer table, which the guest leaf code loads from user
-			// data, and the threshold (the lane's reference when the site has one).
+			// data, the threshold (the lane's reference when the site has one) and the format of
+			// the guest data (Decoder::RayTracingAlphaFields::Pack()).
 			const auto material = LoadScalarAddressDwords(inst.src2.reg, inst.image_nsa_addr[1], 4, inst.pc);
 			const auto buffers  = LoadScalarAddressDwords(inst.src3.reg, inst.image_nsa_addr[2], 4, inst.pc);
 			const auto factor   = inst.src1.kind == Decoder::OperandKind::Sgpr ? ReadU32(inst.src1)
@@ -160,7 +171,7 @@ void Translator::EmitRayTracing(const Decoder::Instruction& inst) {
 			ir.Emit(IR::ValueOpcode::RayQueryAlpha,
 			        {ReadU32(VectorOperand(inst.image_nsa_addr[0])), ReadU32(inst.src0), factor, material[0],
 			         material[1], material[2], material[3], buffers[0], buffers[1], buffers[2], buffers[3], threshold,
-			         IR::U32(IR::Value(inst.image_nsa_addr[4]))},
+			         IR::U32(IR::Value(inst.image_nsa_addr[4])), IR::U32(IR::Value(inst.image_nsa_addr[6]))},
 			        flags(inst.dmask));
 			return;
 		}

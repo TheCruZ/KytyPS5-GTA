@@ -1,8 +1,9 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
-// Native ray tracing: walks the guest's top-level AMD BVH (GTA V layout: a header with the
-// instance array offset at +48, box nodes from the header, instance leaves whose node index is
-// the instance index) and writes one host acceleration structure instance per leaf. BLASes the
+// Native ray tracing: walks the guest's top-level AMD BVH (box nodes from the header, instance
+// leaves whose node index is the instance index; the instance records at the offset a header field
+// holds, laid out as the tracing shader reads them, see GuestInstance in rt_common.inc) and writes
+// one host acceleration structure instance per leaf. BLASes the
 // host has no slot for yet are reported once each (see nativeRayTracing.cpp), and the built ones
 // the TLAS references are listed for verification.
 
@@ -47,15 +48,17 @@ layout(push_constant, std430) uniform Push {
 	uint64_t verify_list;
 	uint     header_offset;
 	uint     root;
-	uint     queue_capacity;
 	uint     instance_capacity;
 	uint     table_mask;
-	uint     missing_capacity;
 	uint     prepare_id;
 	uint     verify;
-	uint     flip_parity;
-	uint     pad;
+	// The layout of the instance records (Decoder::RayTracingLayout::Pack()).
+	uvec4    instance_layout;
 } pc;
+
+// QueueCapacity and MissingCapacity in nativeRayTracing.cpp.
+const uint kQueueCapacity   = 1u << 16;
+const uint kMissingCapacity = 256;
 
 shared uint s_head;
 shared uint s_tail;
@@ -83,7 +86,7 @@ uint SlotOf(TableEntry entry) {
 // list is full the entry is given back so the BLAS is reported again next time.
 uint ReportMissing(TableEntry entry, uint index, uint64_t previous, uint64_t blas_va, uint root) {
 	const uint missing = atomicAdd(RtState(pc.state).missing_count, 1u);
-	if (missing < pc.missing_capacity) {
+	if (missing < kMissingCapacity) {
 		MissingEntry report = MissingEntry(pc.missing + uint64_t(missing) * kMissingStride);
 		report.blas_va      = blas_va;
 		report.root         = root;
@@ -182,7 +185,7 @@ void main() {
 		s_valid               = header != 0 && (header & 255) == 0 && HostAddress(header) != 0 ? 1u : 0u;
 		state.header_va       = header;
 		if (s_valid != 0) {
-			state.instance_base = header + LoadGuestU64(header + 48);
+			state.instance_base = header + LoadGuestU64(header + LayoutInstanceOffset(pc.instance_layout));
 			state.node_limit    = LoadGuestU32(header + 88);
 		}
 		U32Ref(pc.queue).v = pc.root;
@@ -222,7 +225,7 @@ void main() {
 				const uint type = NodeType(child);
 				if (type == 4u || type == 5u) {
 					const uint slot = atomicAdd(s_next_tail, 1u);
-					if (slot < pc.queue_capacity) {
+					if (slot < kQueueCapacity) {
 						U32Ref(pc.queue + uint64_t(slot) * 4).v = child;
 					} else {
 						atomicOr(state.overflow, 1u);
@@ -240,7 +243,7 @@ void main() {
 		barrier();
 		if (lid == 0) {
 			s_head = tail;
-			s_tail = min(s_next_tail, pc.queue_capacity);
+			s_tail = min(s_next_tail, kQueueCapacity);
 		}
 		depth++;
 		barrier();
@@ -256,18 +259,16 @@ void main() {
 	for (uint i = lid; i < count; i += gl_WorkGroupSize.x) {
 		const uint     node   = U32Ref(pc.instance_nodes + uint64_t(i) * 4).v;
 		const uint64_t record = instance_base + (uint64_t(node >> 3) << 7);
-		const uvec4    r0     = LoadGuestU32x4(record);
-		const uvec4    r1     = LoadGuestU32x4(record + 16);
-		const uvec4    r2     = LoadGuestU32x4(record + 32);
-		const uvec4    extra  = LoadGuestU32x4(record + 48);
-		const uint64_t blas   = ((uint64_t(extra.x) | (uint64_t(extra.y & 0x3fffffu) << 32)) << 3);
-		const uint     root   = extra.z;
-		const uint     mask   = extra.w >> 24;
-		// Instance flags (the guest shader's s[12] = extra.y >> 22): bit 0 opaque, bit 1 alpha
-		// tested anyway, bit 2 both faces, bit 3 which face is culled. Host instance flags:
-		// 1 = facing cull disable, 2 = flip facing, 4 = force opaque, 8 = force no opaque.
-		const uint     guest_flags = extra.y >> 22;
-		uint           host_flags  = (guest_flags & 4u) != 0 ? 1u : ((((guest_flags >> 3) ^ pc.flip_parity) & 1u) != 0 ? 2u : 0u);
+		const GuestInstance guest  = LoadGuestInstance(record, pc.instance_layout);
+		const uint64_t      blas   = guest.blas;
+		const uint          root   = guest.root;
+		const uint          mask   = guest.mask;
+		// Instance flags: bit 0 opaque, bit 1 alpha tested anyway, bit 2 both faces, bit 3 which
+		// face is culled. Host instance flags: 1 = facing cull disable, 2 = flip facing, 4 = force
+		// opaque, 8 = force no opaque.
+		const uint guest_flags = guest.flags;
+		const uint flip        = LayoutFlipFacing(pc.instance_layout) ? 1u : 0u;
+		uint       host_flags  = (guest_flags & 4u) != 0 ? 1u : ((((guest_flags >> 3) ^ flip) & 1u) != 0 ? 2u : 0u);
 		host_flags |= (guest_flags & 2u) != 0 ? 8u : ((guest_flags & 1u) != 0 ? 4u : 0u);
 		InstanceRef    out_instance = InstanceRef(pc.instances + uint64_t(i) * 64);
 		uint64_t       reference    = 0;
@@ -291,10 +292,11 @@ void main() {
 			}
 		}
 		// The guest matrix maps world to object space; the host instance needs its inverse.
-		const mat3 a  = mat3(uintBitsToFloat(uvec3(r0.x, r1.x, r2.x)),
-		                     uintBitsToFloat(uvec3(r0.y, r1.y, r2.y)),
-		                     uintBitsToFloat(uvec3(r0.z, r1.z, r2.z)));
-		const vec3 t  = uintBitsToFloat(uvec3(r0.w, r1.w, r2.w));
+		const vec4 r0 = guest.rows[0];
+		const vec4 r1 = guest.rows[1];
+		const vec4 r2 = guest.rows[2];
+		const mat3 a  = mat3(vec3(r0.x, r1.x, r2.x), vec3(r0.y, r1.y, r2.y), vec3(r0.z, r1.z, r2.z));
+		const vec3 t  = vec3(r0.w, r1.w, r2.w);
 		const float d = determinant(a);
 		if (reference == 0 || !(abs(d) > 1e-30) || isnan(d) || isinf(d)) {
 			atomicAdd(state.inactive, 1u);
@@ -337,7 +339,7 @@ void main() {
 	memoryBarrierBuffer();
 	barrier();
 	if (lid == 0) {
-		const uint missing = min(state.missing_count, pc.missing_capacity);
+		const uint missing = min(state.missing_count, kMissingCapacity);
 		state.dispatch_x   = missing;
 		state.dispatch_y   = 1;
 		state.dispatch_z   = 1;
