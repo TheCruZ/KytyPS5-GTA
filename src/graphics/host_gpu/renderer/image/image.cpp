@@ -225,6 +225,13 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		           barrier.srcAccessMask == vk::AccessFlagBits2::eShaderRead;
 	    })) {
 		HeapChanged();
+	} else if (state.layout != destination_layout || state.access_mask != destination_access ||
+	           std::ranges::any_of(barriers, [](const vk::ImageMemoryBarrier2& barrier) {
+		           return barrier.oldLayout != barrier.newLayout ||
+		                  barrier.srcAccessMask != barrier.dstAccessMask;
+	           })) {
+		// A layout or access change (repeated writes keep both).
+		StateChanged();
 	}
 	state = {destination_stage, destination_access, destination_layout};
 	return barriers;
