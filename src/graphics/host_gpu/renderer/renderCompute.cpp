@@ -14,6 +14,7 @@
 #include "gpu_tiler_shaders/indirect_thread_dispatch_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
+#include "graphics/host_gpu/renderer/occlusionQueries.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -468,6 +469,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	RebindImages(bindings);
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
+	m_context.GetOcclusionQueries().WriteForReaders();
 
 	const auto vk_buffer = buffer.Handle();
 	PrepareNativeRayTracing(m_context, vk_buffer, cs_regs, bindings);
@@ -704,6 +706,7 @@ void RenderExecutor::DispatchIndirectThreads(CommandBuffer& buffer, uint64_t arg
 	    m_context.GetBufferCache().ObtainBuffer(args_addr, ArgsSize, false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
+	m_context.GetOcclusionQueries().WriteForReaders();
 	PrepareNativeRayTracing(m_context, buffer.Handle(), cs_regs, bindings);
 	const auto& shader_data = bindings.shader_data_buffer;
 	const bool  thread_limit =
@@ -839,6 +842,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF((args_offset & 3u) != 0);
 	RebindBuffers(bindings);
+	m_context.GetOcclusionQueries().WriteForReaders();
 	PrepareNativeRayTracing(m_context, buffer.Handle(), cs_regs, bindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
