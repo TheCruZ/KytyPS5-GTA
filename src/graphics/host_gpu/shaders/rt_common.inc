@@ -233,6 +233,26 @@ uint LayoutInstanceOffset(uvec4 instance_layout) {
 	return ((instance_layout.y >> 16) & 15u) * 8u;
 }
 
+// Whether instance leaf `node` is of the layout's inline type: its record is at header +
+// LayoutInlineOffset() and its BLAS root LayoutInlineRoot().
+bool LayoutInline(uvec4 instance_layout, uint node) {
+	return ((instance_layout.w >> 19) & 1u) != 0 && NodeType(node) == ((instance_layout.w >> 16) & 7u);
+}
+
+uint LayoutInlineOffset(uvec4 instance_layout) {
+	return (instance_layout.w & 0xffu) * 8u;
+}
+
+uint LayoutInlineRoot(uvec4 instance_layout) {
+	return (instance_layout.w >> 8) & 0xffu;
+}
+
+// The record of instance leaf `node`.
+uint64_t InstanceRecord(uint64_t header, uint64_t instance_base, uint node, uvec4 instance_layout) {
+	return LayoutInline(instance_layout, node) ? header + LayoutInlineOffset(instance_layout)
+	                                           : instance_base + (uint64_t(node >> 3) << 7);
+}
+
 // Whether, with flags bit 3 clear, the guest accepts the triangles the host sees from the back.
 bool LayoutFlipFacing(uvec4 instance_layout) {
 	return ((instance_layout.y >> 29) & 1u) != 0;
