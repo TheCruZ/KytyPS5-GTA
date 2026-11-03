@@ -820,7 +820,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	vk::PhysicalDeviceAccelerationStructureFeaturesKHR acceleration_structure {};
 	vk::PhysicalDeviceRayQueryFeaturesKHR              ray_query {};
-	if (HasExtension(device_extensions, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+	if (Config::NativeRayTracingEnabled() &&
+	    HasExtension(device_extensions, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
 	    HasExtension(device_extensions, VK_KHR_RAY_QUERY_EXTENSION_NAME)) {
 		vk::PhysicalDeviceAccelerationStructureFeaturesKHR supported_acceleration {};
 		vk::PhysicalDeviceRayQueryFeaturesKHR              supported_query {};
@@ -1229,8 +1230,9 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
 		}
 		Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
-		// Host ray tracing of guest BVHs (see NativeRayTracing).
-		if (HasExtension(available_extensions, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+		// Host ray tracing of guest BVHs (see NativeRayTracing), when it is enabled.
+		if (Config::NativeRayTracingEnabled() &&
+		    HasExtension(available_extensions, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_KHR_RAY_QUERY_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
