@@ -243,7 +243,8 @@ void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
 	code.L(done);
 }
 
-// Nonzero: a walk ahead of execution does not read this zero-tested bound (see SrtRuntime).
+// Nonzero: a walk ahead of execution does not read this load, whose value only decides control
+// flow (see SrtRuntime).
 uint64_t KYTY_SYSV_ABI ProbeZeroTestedLoad(uint64_t address) {
 	return t_walker_ahead && t_gpu_produced != nullptr && address >= GuestMemoryStart && t_gpu_produced(address)
 	           ? 1u
@@ -547,7 +548,8 @@ private:
 	uint32_t m_user_data = 0, m_captures = 0;
 	// By node: the flattened SRT dword that is the only use of its value, else NoFlatSlot.
 	std::vector<uint32_t> m_flat_slots;
-	// Loads whose only use is the bound of a zero test (see SrtRuntime::gpu_produced).
+	// Loads whose value only decides control flow, such as the bound of a zero test (see
+	// SrtRuntime::gpu_produced).
 	std::vector<bool>     m_zero_tested;
 };
 
@@ -691,6 +693,40 @@ void WalkerCompiler::FindFlatOnlyNodes(std::span<const Operand> conditions,
 	}
 	for (const auto& operand: outputs) count_use(operand);
 	for (const auto& operand: reads) count_use(operand);
+	// Nodes whose value only decides control flow: no descriptor word, output, flattened SRT read
+	// or EXEC mask uses them, and every node using them tests them as a zero-test bound or decides
+	// only control flow itself (branch conditions do). Unknown, they leave both sides reachable.
+	std::vector<bool> control(m_nodes.size(), true);
+	const auto not_control = [&](const Operand& operand) {
+		if (operand.kind == Kind::Node && operand.value < control.size()) control[operand.value] = false;
+	};
+	for (const auto& words: descriptors) {
+		for (const auto& operand: words) not_control(operand);
+	}
+	for (const auto& operand: outputs) not_control(operand);
+	for (const auto& operand: reads) not_control(operand);
+	for (size_t index = 0; index < m_nodes.size(); ++index) {
+		if (m_nodes[index].referenced || masks.contains(m_nodes[index].inst)) control[index] = false;
+	}
+	for (bool changed = true; changed;) {
+		changed = false;
+		for (size_t index = 0; index < m_nodes.size(); ++index) {
+			const auto& node = m_nodes[index];
+			if (node.result != Operand {Kind::Node, index} || control[index]) continue;
+			const auto op        = node.inst->GetOpcode();
+			const bool zero_test = (op == ValueOpcode::ULessThan32 || op == ValueOpcode::ULessThanEqual32) &&
+			                       node.args.size() == 2 && node.args[1].kind == Kind::Unknown;
+			for (size_t k = 0; k < node.args.size(); ++k) {
+				const auto& arg = node.args[k];
+				if ((zero_test && k == 0) || arg.kind != Kind::Node || arg.value >= control.size() ||
+				    !control[arg.value]) {
+					continue;
+				}
+				control[arg.value] = false;
+				changed            = true;
+			}
+		}
+	}
 	m_zero_tested.assign(m_nodes.size(), false);
 	for (size_t index = 0; index < m_nodes.size(); ++index) {
 		const auto& node = m_nodes[index];
@@ -698,7 +734,7 @@ void WalkerCompiler::FindFlatOnlyNodes(std::span<const Operand> conditions,
 		const bool  load = !node.referenced && !masks.contains(node.inst) &&
 		                  (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
 		                   op == ValueOpcode::LoadBufferU32);
-		m_zero_tested[index] = load && uses[index] != 0 && uses[index] == zero_uses[index];
+		m_zero_tested[index] = load && uses[index] != 0 && (uses[index] == zero_uses[index] || control[index]);
 		if (used[index] || !load) {
 			m_flat_slots[index] = NoFlatSlot;
 		}
