@@ -134,6 +134,7 @@ struct EmitterState {
 	std::array<std::array<uint32_t, 2>, 4>           ray_query_counts {};
 	std::array<std::array<uint32_t, 2>, 4>           ray_query_currents {};
 	std::array<std::array<uint32_t, 2>, 4>           ray_query_bases {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_inline_records {};
 	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_t {};
 	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_word {};
 	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_instance {};

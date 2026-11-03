@@ -73,7 +73,22 @@ struct LaneVariables {
 	// The arguments of the site's RayQueryAlpha (AlphaArgument) and the alpha test's cache.
 	uint32_t alpha           = 0;
 	uint32_t alpha_cache     = 0;
+	// The record of the instance leaves of the layout's inline type (header + offset).
+	uint32_t inline_record   = 0;
 };
+
+// The inline instance leaves of the program's layout (Decoder::RayTracingLayout::Pack() word 3):
+// whether it has them, their node type, and their record's offset from the TLAS header.
+struct InlineLayout {
+	bool     valid  = false;
+	uint32_t type   = 0;
+	uint32_t offset = 0;
+};
+
+InlineLayout ProgramInlineLayout(const EmitterState& s) {
+	const auto word = s.program.info.ray_query_layout[3];
+	return {((word >> 19u) & 1u) != 0, (word >> 16u) & 7u, (word & 0xffu) * 8u};
+}
 
 // The arguments of RayQueryAlpha, in order.
 enum class AlphaArgument : uint32_t {
@@ -103,7 +118,8 @@ LaneVariables Lane(EmitterState& s, uint32_t site, uint32_t half) {
 	        s.ray_query_result_t[site][half],  s.ray_query_result_word[site][half],
 	        s.ray_query_result_instance[site][half], s.ray_query_result_u[site][half],
 	        s.ray_query_result_v[site][half],  s.ray_query_result_node[site][half],
-	        s.ray_query_alpha[site][half],     s.ray_query_alpha_cache[site][half]};
+	        s.ray_query_alpha[site][half],     s.ray_query_alpha_cache[site][half],
+	        s.ray_query_inline_records[site][half]};
 }
 
 uint32_t Load(EmitterState& s, uint32_t type, uint32_t pointer) {
@@ -705,12 +721,16 @@ void Refill(ValueEmitContext& ctx, uint32_t site) {
 				    GuestBarycentrics(s, lane, CommittedIntersection, hit_entry.remap);
 				Store(s, lane.result_u, Unary(s, spv::OpBitcast, u, bary_u));
 				Store(s, lane.result_v, Unary(s, spv::OpBitcast, u, bary_v));
-				Store(s, lane.result_instance,
-				      Binary(s, spv::OpIAdd, wide, Load(s, wide, lane.base),
-				             Binary(s, spv::OpShiftLeftLogical, wide,
-				                    Unary(s, spv::OpUConvert, wide,
-				                          Binary(s, spv::OpShiftRightLogical, u, node, U32(s, 3))),
-				                    ConstantU64(s, 7))));
+				auto instance_record = Binary(s, spv::OpIAdd, wide, Load(s, wide, lane.base),
+				                              Binary(s, spv::OpShiftLeftLogical, wide,
+				                                     Unary(s, spv::OpUConvert, wide,
+				                                           Binary(s, spv::OpShiftRightLogical, u, node, U32(s, 3))),
+				                                     ConstantU64(s, 7)));
+				if (const auto inline_layout = ProgramInlineLayout(s); inline_layout.valid) {
+					instance_record = Select(s, wide, Equal(s, And(s, node, 7u), U32(s, inline_layout.type)),
+					                         Load(s, wide, lane.inline_record), instance_record);
+				}
+				Store(s, lane.result_instance, instance_record);
 				ClearKeys(s, lane);
 				Store(s, lane.state, Or(s, Load(s, u, lane.state), U32(s, CommittedBit)));
 			});
@@ -846,6 +866,7 @@ void DeclareRayQueryVariables(EmitterState& s) {
 			declare(u, s.ray_query_counts[site][half]);
 			declare(u, s.ray_query_currents[site][half]);
 			declare(TypeU64(s), s.ray_query_bases[site][half]);
+			declare(TypeU64(s), s.ray_query_inline_records[site][half]);
 			declare(u, s.ray_query_result_t[site][half]);
 			declare(u, s.ray_query_result_word[site][half]);
 			declare(TypeU64(s), s.ray_query_result_instance[site][half]);
@@ -979,6 +1000,9 @@ uint32_t EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst) {
 		Store(s, lane.nodes, LoadAddressU64(s, AddressPlus(s, context, ContextInstanceNodes)));
 		Store(s, lane.slots, LoadAddressU64(s, AddressPlus(s, context, ContextSlots)));
 		Store(s, lane.base, LoadAddressU64(s, AddressPlus(s, context, ContextInstanceBase)));
+		if (const auto inline_layout = ProgramInlineLayout(s); inline_layout.valid) {
+			Store(s, lane.inline_record, AddressPlus(s, header, inline_layout.offset));
+		}
 		const auto structure = Unary(s, spv::OpConvertUToAccelerationStructureKHR,
 		                             s.builder.Type(spv::OpTypeAccelerationStructureKHR), tlas);
 		const auto origin = s.builder.AllocateId();

@@ -111,6 +111,11 @@ struct RayTracingLayout {
 	uint32_t                flags_dword     = 0xffffffffu;
 	uint32_t                flags_shift     = 0;
 	bool                    flip_facing     = true;
+	// Instance leaves of node type `inline_type` (NoRegister: none) have their record at header
+	// + `inline_offset` and the BLAS root `inline_root`.
+	uint32_t                inline_type     = 0xffffffffu;
+	uint32_t                inline_offset   = 0;
+	uint32_t                inline_root     = 0;
 
 	bool operator==(const RayTracingLayout&) const = default;
 	// Four words for the host passes (see LoadGuestInstance in rt_common.inc).
@@ -177,6 +182,9 @@ struct RayTracingSite {
 	// `facing_sgpr` is 0 (NoRegister: not a condition).
 	uint32_t facing_sgpr = NoRegister;
 	uint32_t facing_mask = NoRegister;
+	// Closest hit sites: every triangle counts with both facings (else the instance flags and
+	// the facing condition above select the facing, as for Packet sites).
+	bool     both_facings = true;
 	// The VGPRs of an accepted hit: distance, primitive word, instance record address (pair).
 	uint32_t result_t        = 0;
 	uint32_t result_word     = 0;
