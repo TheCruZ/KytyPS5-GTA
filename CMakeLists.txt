@@ -414,6 +414,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${buffer_scatter_shader_header}")
+# Occlusion counters written on the GPU timeline (see OcclusionQueries::WriteForReaders()).
+set(occlusion_counters_shader_source "${gpu_tiler_shader_dir}/occlusion_counters.comp")
+set(occlusion_counters_shader_spv "${gpu_tiler_generated_dir}/occlusion_counters.spv")
+set(occlusion_counters_shader_header "${gpu_tiler_generated_dir}/occlusion_counters_spv.h")
+add_custom_command(
+	OUTPUT "${occlusion_counters_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${occlusion_counters_shader_spv}" "${occlusion_counters_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${occlusion_counters_shader_spv} -DOUTPUT=${occlusion_counters_shader_header}
+	        -DSYMBOL=OCCLUSION_COUNTERS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${occlusion_counters_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${occlusion_counters_shader_header}")
 # Native ray tracing: walks of the guest BVHs (see nativeRayTracing.h).
 foreach(shader_name IN ITEMS rt_tlas_walk rt_blas_walk hle_tlas hle_blas_refit)
 	set(shader_source "${gpu_tiler_shader_dir}/${shader_name}.comp")
