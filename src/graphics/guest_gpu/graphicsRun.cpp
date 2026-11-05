@@ -1696,12 +1696,23 @@ bool CommandProcessor::HleBlasDispatch(uint64_t data_addr) {
 	                          shader == Shader::QbvhFanRefitAsync ||
 	                          shader == Shader::QbvhFanRefitRecoverAabbs ||
 	                          shader == Shader::QbvhRefitBottomLevel;
-	// Other shaders run meanwhile.
+	// Shaders of the game run meanwhile; another pass of the library inside a window is a refit
+	// the replacement does not know (GTA V runs none there).
 	if (!refit_shader) {
+		if (m_hle_refit_window && shader != Shader::None) {
+			Psr::StopReplacement("a BLAS refit runs a pass the native refit does not replace",
+			                     ShaderRegisteredName(data_addr));
+			// Every build starts with psr_morton_capture_memory: the refits are over without the
+			// passes that end them. The BLASes seen are refitted.
+			if (shader == Shader::MortonCaptureMemory) {
+				m_hle_refit_window = false;
+				EmitHleRefit();
+			}
+		}
 		return false;
 	}
 	if (!m_hle_refit_window) {
-		if (shader != Shader::QbvhFanRefitCopyDispatchArgs) {
+		if (shader != Shader::QbvhFanRefitCopyDispatchArgs || !Psr::ReplacementEnabled()) {
 			return false;
 		}
 		m_hle_refit_window = true;
@@ -1772,7 +1783,9 @@ void CommandProcessor::EmitHleRefit() {
 
 // Games using sce::Psr (GTA V builds the four TLASes of its ray tracing passes every frame) build
 // TLASes in the kBase format with Psr_Gpu_TopLevelBvh_Build: 18 Psr shaders, each dispatched
-// once per TLAS (psr_morton_rotate_tree_top more often), several of which wait for the GPU. With
+// once per TLAS (psr_morton_rotate_tree_top more often; a TLAS of one or two instances, like the
+// one of Nightreign's title screen, takes psr_morton_init_one_instance_root_node instead of the
+// sort and the hierarchy passes), several of which wait for the GPU. With
 // native ray tracing, the stage is replaced by NativeRayTracing::RecordHleTlas(): its dispatches
 // are dropped; the instance list of each build (the V# at s[6:9] and the count at s8 of
 // psr_morton_compute_bounding_box_for_instances, written by the game's CPU) is kept with the TLAS
@@ -1781,16 +1794,40 @@ void CommandProcessor::EmitHleRefit() {
 // dropped. A list the native build cannot read (records shorter than 96 bytes, no list, more than
 // NativeRayTracing::HleTlasMaxInstances instances) is seen at the stage's first dispatch: the game
 // builds that TLAS itself, from that dispatch to its last pass.
+bool CommandProcessor::HleTlasBuild::Native() const {
+	// An empty list still makes an empty TLAS.
+	return count == 0 || (input != 0 && stride >= 96 && count <= NativeRayTracing::HleTlasMaxInstances);
+}
+
 bool CommandProcessor::HleTlasDispatch(uint64_t data_addr) {
 	if (data_addr == 0 || !m_renderer.GetNativeRayTracing().Enabled()) {
 		return false;
 	}
 	using Psr::Shader;
 	const auto shader = ComputePsrShader(data_addr);
+	if (shader == Shader::None) {
+		return false;
+	}
 	// Some of the stage's shaders (sorts, scans) also serve other builds: only the dispatches
 	// from the stage's first list (used only there) to the end of its last build are the TLAS
-	// builds. Other shaders run meanwhile (the stage reads nothing they write).
+	// builds. Shaders of the game run meanwhile (the stage reads nothing they write), but no other
+	// pass of the library does in GTA V: one in a window is a build the replacement does not know
+	// (rebraiding, kTrinity...), and from then on the builds are emulated.
 	if (!Psr::IsTopLevelBuildShader(shader)) {
+		if (m_hle_tlas_window) {
+			Psr::StopReplacement("a top level build runs a pass the native build does not replace",
+			                     ShaderRegisteredName(data_addr));
+			// Every build starts with psr_morton_capture_memory: the window's builds are over
+			// without the passes that end them. The ones that ended are replaced; the others keep
+			// what their TLAS held.
+			if (shader == Shader::MortonCaptureMemory) {
+				m_hle_tlas_window = false;
+				if (!m_hle_tlas_observe) {
+					m_hle_tlas_builds.resize(m_hle_tlas_finished);
+					EmitHleTlas();
+				}
+			}
+		}
 		return false;
 	}
 	const auto& user = GetShCtx().GetCs().cs_user_sgpr.value;
@@ -1798,11 +1835,6 @@ bool CommandProcessor::HleTlasDispatch(uint64_t data_addr) {
 		return HleTlasBuild {.input  = uint64_t {user[6]} | (uint64_t {user[7] & 0xffffu} << 32u),
 		                     .stride = (user[7] >> 16u) & 0x3fffu,
 		                     .count  = user[8]};
-	};
-	// An empty list still makes an empty TLAS.
-	const auto native = [](const HleTlasBuild& build) {
-		return build.count == 0 ||
-		       (build.input != 0 && build.stride >= 96 && build.count <= NativeRayTracing::HleTlasMaxInstances);
 	};
 	if (m_guest_tlas_builds != 0) {
 		// The game's own builds run to their last passes.
@@ -1814,16 +1846,28 @@ bool CommandProcessor::HleTlasDispatch(uint64_t data_addr) {
 		return false;
 	}
 	if (!m_hle_tlas_window) {
-		if (shader != Shader::MortonComputeBoundingBoxForInstances) {
+		if (shader != Shader::MortonComputeBoundingBoxForInstances || !Psr::ReplacementEnabled()) {
 			return false;
 		}
-		if (!native(list())) {
+		if (!list().Native()) {
 			m_guest_tlas_builds = 1;
 			return false;
 		}
 		m_hle_tlas_window = true;
 		m_hle_tlas_builds.clear();
 		m_hle_tlas_finished = 0;
+		// The first window runs as the game dispatches it: its passes show whether its builds are
+		// the ones the replacement knows before any is dropped.
+		m_hle_tlas_observe = !m_hle_tlas_known;
+	}
+	if (m_hle_tlas_observe) {
+		if (shader == Shader::MortonComputeBoundingBoxForInstances) {
+			m_hle_tlas_builds.emplace_back();
+		} else if (shader == Shader::CollapseToQbvhSimpleTop && ++m_hle_tlas_finished >= m_hle_tlas_builds.size()) {
+			m_hle_tlas_window = false;
+			m_hle_tlas_known  = Psr::ReplacementEnabled();
+		}
+		return false;
 	}
 	if (shader == Shader::MortonComputeBoundingBoxForInstances) {
 		m_hle_tlas_builds.push_back(list());
@@ -1840,11 +1884,16 @@ bool CommandProcessor::HleTlasDispatch(uint64_t data_addr) {
 		return true;
 	}
 	m_hle_tlas_window = false;
-	EmitHostCommand([this, builds = m_hle_tlas_builds, native] {
+	EmitHleTlas();
+	return true;
+}
+
+void CommandProcessor::EmitHleTlas() {
+	EmitHostCommand([this, builds = m_hle_tlas_builds] {
 		auto& context = m_renderer;
 		auto& cache   = context.GetBufferCache();
 		for (const auto& build: builds) {
-			if (build.header == 0 || !native(build)) {
+			if (build.header == 0 || !build.Native()) {
 				// [HACK] No build: a TLAS without an address, or a list the native build cannot read
 				// that started while other builds of the stage were already native (their first
 				// dispatches were dropped, so this one cannot go back to the game's build either).
@@ -1873,14 +1922,13 @@ bool CommandProcessor::HleTlasDispatch(uint64_t data_addr) {
 		auto& command = context.GetCommandScheduler().Current();
 		command.EndRendering();
 		for (const auto& build: builds) {
-			if (build.header != 0 && native(build)) {
+			if (build.header != 0 && build.Native()) {
 				context.GetNativeRayTracing().RecordHleTlas(command.Handle(), build.input,
 				                                            build.count, build.stride,
 				                                            build.header);
 			}
 		}
 	});
-	return true;
 }
 
 // Games using sce::Psr build the BLASes of their triangle geometry with
@@ -1911,6 +1959,14 @@ void CommandProcessor::PsrBlasDispatch(uint64_t data_addr) {
 	}
 	using Psr::Shader;
 	const auto shader = ComputePsrShader(data_addr);
+	if (shader == Shader::Trinity) {
+		Psr::StopReplacement("the game builds kTrinity BVHs", ShaderRegisteredName(data_addr));
+	}
+	if (!Psr::ReplacementEnabled()) {
+		m_psr_blas_builds.clear();
+		m_psr_captured.clear();
+		return;
+	}
 	if (shader != Shader::MortonComputeBoundingBoxForVertices && shader != Shader::MortonComputeCodeForMesh &&
 	    shader != Shader::CollapseToQbvhSimpleBottom && shader != Shader::MortonCaptureMemory &&
 	    shader != Shader::DecompressHeaderBase && shader != Shader::DecompressComputeFanNode) {
