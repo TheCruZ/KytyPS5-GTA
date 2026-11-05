@@ -25,6 +25,9 @@ enum class Shader : uint8_t {
 	SinglePassScanUint32,
 	MortonComputeValidInstanceIndices,
 	MortonSetupIndirectArgsTop,
+	// Only in builds of one or two instances: their root node, instead of the sort and the passes
+	// that build and rotate the hierarchy.
+	MortonInitOneInstanceRootNode,
 	MortonComputeCodeForInstances,
 	BitonicSortPassKeyValueIndirect,
 	MortonBuildQbvhHierarchyForInstances,
@@ -61,6 +64,13 @@ enum class Shader : uint8_t {
 	DecompressHeaderBase,
 	DecompressComputeFanNode,
 
+	// Any other shader of the library (generation known): a pass of a build or refit the emulator
+	// does not replace or watch.
+	Other,
+	// A shader of the library's kTrinity builds (the BVH format of the PS5 Pro), which neither the
+	// replacements nor the native traversal produce.
+	Trinity,
+
 	Count
 };
 
@@ -81,6 +91,14 @@ enum class Generation : uint8_t {
 
 // Whether `shader` belongs to the top level (kBase) build.
 [[nodiscard]] bool IsTopLevelBuildShader(Shader shader);
+
+// Whether the emulator may still replace the library's work with its own (the TLAS builds and
+// refits of CommandProcessor::HleTlasDispatch() and HleBlasDispatch()) and follow its BLAS
+// builds. A game that builds kTrinity BVHs, or whose builds run passes in an order the
+// replacements do not expect, turns that off for the rest of the session (StopReplacement()): its
+// builds are emulated as they are.
+[[nodiscard]] bool ReplacementEnabled();
+void               StopReplacement(const char* reason, const char* shader_name);
 
 } // namespace Libs::Graphics::Psr
 
