@@ -1778,7 +1778,9 @@ void CommandProcessor::EmitHleRefit() {
 // psr_morton_compute_bounding_box_for_instances, written by the game's CPU) is kept with the TLAS
 // address (s[0:1] of psr_collapse_to_qbvh_simple_top, the stage's last shader), user data of
 // generation Base460, and there one host command builds every TLAS. True when the dispatch is
-// dropped.
+// dropped. A list the native build cannot read (records shorter than 96 bytes, no list, more than
+// NativeRayTracing::HleTlasMaxInstances instances) is seen at the stage's first dispatch: the game
+// builds that TLAS itself, from that dispatch to its last pass.
 bool CommandProcessor::HleTlasDispatch(uint64_t data_addr) {
 	if (data_addr == 0 || !m_renderer.GetNativeRayTracing().Enabled()) {
 		return false;
@@ -1791,19 +1793,40 @@ bool CommandProcessor::HleTlasDispatch(uint64_t data_addr) {
 	if (!Psr::IsTopLevelBuildShader(shader)) {
 		return false;
 	}
+	const auto& user = GetShCtx().GetCs().cs_user_sgpr.value;
+	const auto  list = [&] {
+		return HleTlasBuild {.input  = uint64_t {user[6]} | (uint64_t {user[7] & 0xffffu} << 32u),
+		                     .stride = (user[7] >> 16u) & 0x3fffu,
+		                     .count  = user[8]};
+	};
+	// An empty list still makes an empty TLAS.
+	const auto native = [](const HleTlasBuild& build) {
+		return build.count == 0 ||
+		       (build.input != 0 && build.stride >= 96 && build.count <= NativeRayTracing::HleTlasMaxInstances);
+	};
+	if (m_guest_tlas_builds != 0) {
+		// The game's own builds run to their last passes.
+		if (shader == Shader::MortonComputeBoundingBoxForInstances) {
+			m_guest_tlas_builds++;
+		} else if (shader == Shader::CollapseToQbvhSimpleTop) {
+			m_guest_tlas_builds--;
+		}
+		return false;
+	}
 	if (!m_hle_tlas_window) {
 		if (shader != Shader::MortonComputeBoundingBoxForInstances) {
+			return false;
+		}
+		if (!native(list())) {
+			m_guest_tlas_builds = 1;
 			return false;
 		}
 		m_hle_tlas_window = true;
 		m_hle_tlas_builds.clear();
 		m_hle_tlas_finished = 0;
 	}
-	const auto& user = GetShCtx().GetCs().cs_user_sgpr.value;
 	if (shader == Shader::MortonComputeBoundingBoxForInstances) {
-		m_hle_tlas_builds.push_back({.input  = uint64_t {user[6]} | (uint64_t {user[7] & 0xffffu} << 32u),
-		                             .stride = (user[7] >> 16u) & 0x3fffu,
-		                             .count  = user[8]});
+		m_hle_tlas_builds.push_back(list());
 	}
 	if (shader != Shader::CollapseToQbvhSimpleTop) {
 		return true;
@@ -1817,14 +1840,15 @@ bool CommandProcessor::HleTlasDispatch(uint64_t data_addr) {
 		return true;
 	}
 	m_hle_tlas_window = false;
-	EmitHostCommand([this, builds = m_hle_tlas_builds] {
+	EmitHostCommand([this, builds = m_hle_tlas_builds, native] {
 		auto& context = m_renderer;
 		auto& cache   = context.GetBufferCache();
 		for (const auto& build: builds) {
-			// An empty list still makes an empty TLAS.
-			if (build.header == 0 || (build.count != 0 && (build.input == 0 || build.stride < 96))) {
-				// [HACK] No build for a list the native build cannot read: the guest's own build was
-				// dropped, so the TLAS keeps what it held.
+			if (build.header == 0 || !native(build)) {
+				// [HACK] No build: a TLAS without an address, or a list the native build cannot read
+				// that started while other builds of the stage were already native (their first
+				// dispatches were dropped, so this one cannot go back to the game's build either).
+				// The TLAS keeps what it held.
 				Common::HackNotice::Report(
 				    "native TLAS build skipped for an instance list it cannot read",
 				    "CommandProcessor::HleTlasDispatch", 0, build.stride,
@@ -1849,7 +1873,7 @@ bool CommandProcessor::HleTlasDispatch(uint64_t data_addr) {
 		auto& command = context.GetCommandScheduler().Current();
 		command.EndRendering();
 		for (const auto& build: builds) {
-			if (build.header != 0 && (build.count == 0 || (build.input != 0 && build.stride >= 96))) {
+			if (build.header != 0 && native(build)) {
 				context.GetNativeRayTracing().RecordHleTlas(command.Handle(), build.input,
 				                                            build.count, build.stride,
 				                                            build.header);
