@@ -1490,58 +1490,6 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 	}
 }
 
-namespace {
-
-// Passes the instructions of a hack mark to `emit`, each as its opcode and operands.
-template <typename Emit>
-void HackMarkInstructions(EmitterState& state, HackMark mark, Emit&& emit) {
-	EXIT_IF(state.fault_buffer_variable == 0);
-	const auto hash  = state.program.shader_hash;
-	const auto first = BufferCache::HACK_MARKS_OFFSET / sizeof(uint32_t) +
-	                   uint64_t {BufferCache::HackMarkEntry(hash)} * BufferCache::HACK_MARK_DWORDS;
-	static_assert(BufferCache::FAULT_BUFFER_SIZE / sizeof(uint32_t) <= UINT32_MAX);
-	const auto low  = static_cast<uint32_t>(hash);
-	const auto high = static_cast<uint32_t>(hash >> 32u);
-	// The hash and its complement (ORed), then the count of the workaround (added).
-	const std::array<std::pair<uint32_t, uint32_t>, 5> updates {{
-	    {0, low},
-	    {1, high},
-	    {2, ~low},
-	    {3, ~high},
-	    {BufferCache::HACK_MARK_COUNTS + static_cast<uint32_t>(mark), 1},
-	}};
-	const auto pointer_type = TypeStorageBufferElementPointer(state);
-	const auto scope        = ConstantU32(state, spv::ScopeDevice);
-	const auto relaxed      = ConstantU32(state, spv::MemorySemanticsMaskNone);
-	for (const auto& [dword, value]: updates) {
-		const auto pointer = state.builder.AllocateId();
-		emit(spv::OpAccessChain, {pointer_type, pointer, state.fault_buffer_variable, ConstantU32(state, 0),
-		                          ConstantU32(state, static_cast<uint32_t>(first + dword))});
-		emit(dword < BufferCache::HACK_MARK_COUNTS ? spv::OpAtomicOr : spv::OpAtomicIAdd,
-		     {TypeU32(state), state.builder.AllocateId(), pointer, scope, relaxed, ConstantU32(state, value)});
-	}
-}
-
-} // namespace
-
-std::vector<uint32_t> HackMarkWords(EmitterState& state, HackMark mark) {
-	std::vector<uint32_t> words;
-	HackMarkInstructions(state, mark, [&](spv::Op opcode, std::initializer_list<uint32_t> operands) {
-		words.push_back((static_cast<uint32_t>(operands.size() + 1) << spv::WordCountShift) | opcode);
-		words.insert(words.end(), operands);
-	});
-	return words;
-}
-
-void EmitHackMark(EmitterState& state, HackMark mark) {
-	// One AddFunction() per instruction: it takes one instruction, the bare opcode first.
-	HackMarkInstructions(state, mark, [&](spv::Op opcode, std::initializer_list<uint32_t> operands) {
-		std::vector<uint32_t> words {static_cast<uint32_t>(opcode)};
-		words.insert(words.end(), operands);
-		state.builder.AddFunction(words);
-	});
-}
-
 void DefineGetBdaPointer(EmitterState& state) {
 	if (!state.program.info.uses_dma) {
 		return;

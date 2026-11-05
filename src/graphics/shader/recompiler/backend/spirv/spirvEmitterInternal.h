@@ -24,10 +24,6 @@
 #include <utility>
 #include <vector>
 
-namespace Libs::Graphics {
-enum class HackMark : uint32_t;
-} // namespace Libs::Graphics
-
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 struct InputBinding : IR::StageInput {
@@ -150,8 +146,6 @@ struct EmitterState {
 	std::array<uint32_t, 4>                          ray_query_selected_leaf {};
 	std::array<uint32_t, 4>                          ray_query_setup_instance {};
 	std::array<uint32_t, 4>                          ray_query_reuse {};
-	// Rounds of a site's native traversal (a wave never runs more than MaxRayQueryRounds).
-	std::array<uint32_t, 4>                          ray_query_rounds {};
 	// The per-lane alpha test (RayQueryAlpha): per site and half, its arguments; the guest leaf
 	// code's sample of the bindless table it samples (nullptr: the sites run the leaf code).
 	std::array<std::array<uint32_t, 2>, 4>           ray_query_alpha {};
@@ -588,10 +582,6 @@ uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits);
 void EmitProgram(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
-// Marks the entry of the program's shader hash in the fault buffer's hack marks (see
-// BufferCache::HACK_MARKS_OFFSET): the instructions, to insert after the program, or emitted.
-std::vector<uint32_t> HackMarkWords(EmitterState& state, HackMark mark);
-void                  EmitHackMark(EmitterState& state, HackMark mark);
 void DefineIndirectBufferLoads(ValueEmitContext& ctx);
 void DefineBvhIntersect(EmitterState& state);
 void DefineTrinityBvhIntersect(EmitterState& state);

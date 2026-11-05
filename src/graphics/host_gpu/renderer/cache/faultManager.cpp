@@ -36,10 +36,7 @@ struct HackMarkNotice {
 	const char* site;
 	const char* what;
 };
-constexpr std::array<HackMarkNotice, static_cast<size_t>(HackMark::Count)> HackMarkNotices {{
-    {"native RT wave drops its alpha tested candidates after 256 rounds", "EmitRayQueryNext",
-     "lanes of waves that reached the limit with candidates left"},
-}};
+constexpr std::array<HackMarkNotice, static_cast<size_t>(HackMark::Count)> HackMarkNotices {};
 
 } // namespace
 
