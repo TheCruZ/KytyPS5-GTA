@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include "common/assert.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include <algorithm>
 #include <string>
@@ -353,9 +354,21 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				return;
 			}
 			const auto condition = ctx.Def(block->condition);
+			auto&      state     = ctx.state;
+			const auto loop_exit = [&](const IR::Block* target) {
+				return state.loop_headers_by_merge.contains(target);
+			};
+			const bool true_exits  = loop_exit(true_block);
+			const bool false_exits = loop_exit(false_block);
+			const auto insert      = state.builder.FunctionWordCount();
 			emit_merge();
-			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
-			                              true_block->Definition(), false_block->Definition());
+			if (true_exits != false_exits) {
+				state.pending_loop_exits.push_back({true_exits ? true_block : false_block, insert,
+				                                    state.builder.FunctionWordCount() + 1u,
+				                                    condition, true_exits});
+			}
+			state.builder.AddFunction(spv::OpBranchConditional, condition,
+			                          true_block->Definition(), false_block->Definition());
 			return;
 		}
 		default: EmitReturn(ctx); return;
@@ -518,6 +531,9 @@ void EmitDispatcherInstruction(ValueEmitContext& ctx, const DispatcherFunctionSt
 template <typename EmitInstruction>
 void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& emit_instruction) {
 	ctx.state.current_block = block;
+	if (!ctx.state.loop_headers_by_merge.empty()) {
+		ctx.state.block_device_address_mark.try_emplace(block, ctx.state.device_address_calls);
+	}
 	EmitLabel(ctx.state, block->Definition());
 	bool emitted_non_phi = false;
 	for (const auto& inst: *block) {
@@ -712,6 +728,7 @@ void EmitOutlinedFunction(ValueEmitContext& ctx, OutlinedRegion& region) {
 
 void EmitOutlinedCall(ValueEmitContext& ctx, OutlinedRegion& region) {
 	auto& state = ctx.state;
+	state.device_address_calls++; // the region may access device addresses
 	const auto lanes = state.lane_count;
 	state.current_block = region.entry;
 	EmitLabel(state, region.entry->Definition());
@@ -1019,6 +1036,93 @@ const IR::ExportInfo& ValueEmitContext::Export(const IR::Inst& inst) const {
 	std::abort();
 }
 
+// A loop that walks guest memory until it finds a value (a list terminator) never ends when its
+// reads find no cached page and return zeros (get_bda_pointer), and the dispatch hangs the GPU
+// before the faulted pages can be cached. The exits of loops with device-address accesses are
+// taken once an invocation of the wave has read BdaFaultedReadsBeforeLoopExit dwords of zeros
+// this way, which a loop that ends on its own does not reach.
+void FinishBdaLoopExits(EmitterState& state) {
+	const auto accesses_device_addresses = [&](const IR::Block* merge) {
+		const auto& marks = state.block_device_address_mark;
+		const auto  end   = marks.find(merge);
+		const auto  after = end != marks.end() ? end->second : state.device_address_calls;
+		return std::ranges::any_of(state.loop_headers_by_merge.at(merge), [&](const IR::Block* header) {
+			const auto begin = marks.find(header);
+			return begin != marks.end() && begin->second < after;
+		});
+	};
+	std::vector<EmitterState::PendingLoopExit> exits;
+	for (const auto& exit: state.pending_loop_exits) {
+		if (accesses_device_addresses(exit.merge)) {
+			exits.push_back(exit);
+		}
+	}
+	if (exits.empty() || state.bda_fault_count_insert == SIZE_MAX) {
+		return;
+	}
+	auto&      builder  = state.builder;
+	const auto u32      = TypeU32(state);
+	const auto boolean  = TypeBool(state);
+	const auto limit    = ConstantU32(state, EmitterState::BdaFaultedReadsBeforeLoopExit);
+	const auto one      = ConstantU32(state, 1);
+	const auto variable = builder.AllocateId();
+	builder.DefineGlobalVariable(variable, TypePointer(state, spv::StorageClassPrivate, u32),
+	                             spv::StorageClassPrivate, ConstantU32(state, 0));
+	builder.AddName(variable, "bda_faulted_reads");
+	// Guest branches are scalar: the whole wave takes the exit, as the lanes the guest code keeps
+	// together (subgroup operations, a lane that reads nothing) would otherwise loop alone.
+	builder.RequireCapability(spv::CapabilityGroupNonUniform);
+	builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
+	const auto subgroup = ConstantU32(state, spv::ScopeSubgroup);
+	// Later offsets first: an insertion moves the words after it.
+	std::ranges::sort(exits, std::ranges::greater {}, &EmitterState::PendingLoopExit::insert);
+	for (const auto& exit: exits) {
+		const auto faults = builder.AllocateId();
+		const auto lane   = builder.AllocateId();
+		const auto stuck  = builder.AllocateId();
+		const auto taken  = builder.AllocateId();
+		std::vector<uint32_t> words {(4u << spv::WordCountShift) | spv::OpLoad, u32, faults, variable,
+		                             (5u << spv::WordCountShift) | spv::OpUGreaterThanEqual, boolean,
+		                             lane, faults, limit,
+		                             (5u << spv::WordCountShift) | spv::OpGroupNonUniformAny, boolean,
+		                             stuck, subgroup, lane};
+		if (exit.exits_on_true) {
+			words.insert(words.end(), {(5u << spv::WordCountShift) | spv::OpLogicalOr, boolean, taken,
+			                           exit.condition, stuck});
+		} else {
+			const auto running = builder.AllocateId();
+			words.insert(words.end(), {(4u << spv::WordCountShift) | spv::OpLogicalNot, boolean,
+			                           running, stuck, (5u << spv::WordCountShift) | spv::OpLogicalAnd,
+			                           boolean, taken, exit.condition, running});
+		}
+		builder.PatchFunctionWord(exit.condition_word, exit.condition, taken);
+		builder.InsertFunctionWords(exit.insert, words);
+	}
+	// The increment, and the mark of the invocation whose count reaches the limit: its loops end
+	// (FaultManager reports it). The fault path of get_bda_pointer then reaches the merge from the
+	// block after the mark.
+	const auto faults  = builder.AllocateId();
+	const auto counted = builder.AllocateId();
+	const auto reached = builder.AllocateId();
+	const auto marking = builder.AllocateId();
+	const auto marked  = builder.AllocateId();
+	std::vector<uint32_t> increment {
+	    (4u << spv::WordCountShift) | spv::OpLoad,  u32,      faults,  variable,
+	    (5u << spv::WordCountShift) | spv::OpIAdd,  u32,      counted, faults, one,
+	    (3u << spv::WordCountShift) | spv::OpStore, variable, counted,
+	    (5u << spv::WordCountShift) | spv::OpIEqual, boolean, reached, counted, limit,
+	    (3u << spv::WordCountShift) | spv::OpSelectionMerge, marked,
+	    static_cast<uint32_t>(spv::SelectionControlMaskNone),
+	    (4u << spv::WordCountShift) | spv::OpBranchConditional, reached, marking, marked,
+	    (2u << spv::WordCountShift) | spv::OpLabel, marking};
+	const auto mark = HackMarkWords(state, HackMark::BdaLoopExit);
+	increment.insert(increment.end(), mark.begin(), mark.end());
+	increment.insert(increment.end(), {(2u << spv::WordCountShift) | spv::OpBranch, marked,
+	                                   (2u << spv::WordCountShift) | spv::OpLabel, marked});
+	builder.PatchFunctionWord(state.bda_fault_phi_parent, state.bda_fault_label, marked);
+	builder.InsertFunctionWords(state.bda_fault_count_insert, increment);
+}
+
 void EmitProgram(EmitterState& state) {
 	const auto&      program = state.program;
 	ValueEmitContext ctx(state);
@@ -1095,6 +1199,13 @@ void EmitProgram(EmitterState& state) {
 		dispatch.merge_label        = state.builder.AllocateId();
 		ctx.dispatcher_spills       = &dispatch.spills[0];
 		high.dispatcher_spills      = &dispatch.spills[1];
+	}
+	if (program.info.uses_dma) {
+		for (const auto* block: program.blocks) {
+			if (block->terminator.loop_header && block->terminator.merge_block != nullptr) {
+				state.loop_headers_by_merge[block->terminator.merge_block].push_back(block);
+			}
+		}
 	}
 	DefineGetBdaPointer(state);
 	DefineIndirectBufferLoads(ctx);
@@ -1197,6 +1308,7 @@ void EmitProgram(EmitterState& state) {
 	}
 	state.builder.AddFunction(spv::OpFunctionEnd);
 	state.current_block = nullptr;
+	FinishBdaLoopExits(state);
 	if (state.program.stage == ShaderType::Mesh) {
 		EmitMeshEntryPoint(state);
 	}

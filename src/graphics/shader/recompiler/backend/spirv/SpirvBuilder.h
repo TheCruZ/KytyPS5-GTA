@@ -59,6 +59,8 @@ public:
 
 	uint32_t DefineGlobalVariable(uint32_t pointer_type, spv::StorageClass storage_class);
 	void DefineGlobalVariable(uint32_t id, uint32_t pointer_type, spv::StorageClass storage_class);
+	void DefineGlobalVariable(uint32_t id, uint32_t pointer_type, spv::StorageClass storage_class,
+	                          uint32_t initializer);
 
 	void AddMemoryModel(spv::AddressingModel addressing_model, spv::MemoryModel memory_model);
 	void AddEntryPoint(spv::ExecutionModel execution_model, uint32_t entry_point, const char* name,
@@ -82,6 +84,11 @@ public:
 	}
 
 	void        AddFunction(std::span<const uint32_t> words);
+	// Function words emitted so far, and words inserted at such a position later (once every
+	// deferred Phi is patched: their offsets would move).
+	[[nodiscard]] size_t FunctionWordCount() const noexcept { return m_functions.size(); }
+	void                 InsertFunctionWords(size_t offset, std::span<const uint32_t> words);
+	void                 PatchFunctionWord(size_t offset, uint32_t expected, uint32_t value);
 	DeferredPhi AddDeferredPhi(uint32_t type, uint32_t result, size_t incoming_count);
 	void        PatchDeferredPhi(DeferredPhi phi, size_t incoming, uint32_t value, uint32_t parent);
 

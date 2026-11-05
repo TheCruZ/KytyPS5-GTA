@@ -358,6 +358,7 @@ uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 	           inverse = vector(node_words + 7u);
 	return EmitValueOrDefaultIfCondition(s, ctx.Arg(inst, 2), TypeU32Vector(s, 4),
 	    ConstantU32CompositeZero(s, 4), [&] {
+		s.device_address_calls++;
 		const auto result = s.builder.AllocateId();
 		s.builder.AddFunction(spv::OpFunctionCall, TypeU32Vector(s, 4), result,
 		    s.bvh_intersect_function, descriptor, node, extent, origin, direction, inverse);
