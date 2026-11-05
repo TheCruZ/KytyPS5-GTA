@@ -36,8 +36,6 @@ struct HackMarkNotice {
 	const char* what;
 };
 constexpr std::array<HackMarkNotice, static_cast<size_t>(HackMark::Count)> HackMarkNotices {{
-    {"native RT wave drops its alpha tested candidates after 256 rounds", "EmitRayQueryNext",
-     "lanes of waves that reached the limit with candidates left"},
     {"loops that keep reading uncached device addresses end early", "FinishBdaLoopExits",
      "lanes that read 4096 dwords of zeros from uncached pages and left their loops"},
 }};

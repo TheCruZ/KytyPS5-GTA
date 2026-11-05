@@ -878,7 +878,6 @@ void DeclareRayQueryVariables(EmitterState& s) {
 		declare(u, s.ray_query_selected_leaf[site]);
 		declare(u, s.ray_query_setup_instance[site]);
 		declare(u, s.ray_query_reuse[site]);
-		declare(u, s.ray_query_rounds[site]);
 	}
 	// The per-lane alpha test samples the bindless table of the guest leaf code's sample (one
 	// table for every site).
@@ -995,9 +994,6 @@ uint32_t EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst) {
 	ClearKeys(s, lane);
 	Store(s, s.ray_query_setup_instance[site], U32(s, None));
 	if (ctx.half == 0) {
-		Store(s, s.ray_query_rounds[site], U32(s, 0));
-	}
-	if (ctx.half == 0) {
 	}
 	EmitIfCondition(s, lane_ok, [&] {
 		const auto tlas = LoadAddressU64(s, AddressPlus(s, context, ContextTlas));
@@ -1063,18 +1059,10 @@ uint32_t EmitRayQueryNext(ValueEmitContext& ctx, const IR::Inst& inst) {
 			local_leaf         = Select(s, u, smaller, leaf, local_leaf);
 		}
 	}
-	// [HACK] A wave that keeps selecting keys (a lane whose key the leaf code never retires) stops
-	// after MaxRounds instead of hanging the GPU: its remaining candidates are dropped. The lanes
-	// that drop some mark the fault buffer, which the host reports (FaultManager).
-	constexpr uint32_t MaxRounds = 256;
-	const auto rounds  = Add(s, Load(s, u, s.ray_query_rounds[site]), U32(s, 1));
-	Store(s, s.ray_query_rounds[site], rounds);
-	const auto running  = Less(s, rounds, U32(s, MaxRounds));
-	const auto smallest = GroupMin(s, local_instance);
-	const auto dropping = LogicalAnd(s, LogicalNot(s, running),
-	                                 Binary(s, spv::OpINotEqual, b, smallest, U32(s, None)));
-	EmitIfCondition(s, dropping, [&] { EmitHackMark(s, HackMark::RayQueryRounds); });
-	const auto instance = Select(s, u, running, smallest, U32(s, None));
+	// Every round retires the selected key in each lane that has it (RayQueryMark Resolve or
+	// CullResolve) and a query reports each alpha tested triangle once: the wave ends after as many
+	// rounds as its lanes have candidates, like the guest's own traversal, which has no limit.
+	const auto instance = GroupMin(s, local_instance);
 	const auto leaf =
 	    GroupMin(s, Select(s, u, Equal(s, local_instance, instance), local_leaf, U32(s, None)));
 	const auto has   = Binary(s, spv::OpINotEqual, b, instance, U32(s, None));

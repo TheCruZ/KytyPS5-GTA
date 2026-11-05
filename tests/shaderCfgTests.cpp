@@ -9143,9 +9143,9 @@ void TestTypedSpirvSerialization() {
                       0x80000000u);
 }
 
-// A hack mark is ten whole instructions, emitted in place (a ray query wave that drops its
-// candidates) or as words to insert after the program (a loop that reads uncached device
-// addresses): AddFunction() takes a single instruction.
+// A hack mark is ten whole instructions, emitted in place or as words to insert after the
+// program (a loop that reads uncached device addresses): AddFunction() takes a single
+// instruction.
 void TestHackMarkInstructions() {
   using namespace ShaderRecompiler;
   IR::Program program;
@@ -9153,8 +9153,8 @@ void TestHackMarkInstructions() {
   program.shader_hash = 0x0b41af19bddf132cull;
   Spirv::Emitter::EmitterState state(program, {}, Spirv::DefaultProfile);
   state.fault_buffer_variable = state.builder.AllocateId();
-  Spirv::Emitter::EmitHackMark(state, HackMark::RayQueryRounds);
-  const auto inserted = Spirv::Emitter::HackMarkWords(state, HackMark::RayQueryRounds);
+  Spirv::Emitter::EmitHackMark(state, HackMark::BdaLoopExit);
+  const auto inserted = Spirv::Emitter::HackMarkWords(state, HackMark::BdaLoopExit);
   const auto count_instructions = [](std::span<const uint32_t> words,
                                      std::map<uint32_t, uint32_t> &opcodes) {
     for (size_t at = 0; at < words.size();) {

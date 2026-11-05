@@ -176,8 +176,6 @@ struct EmitterState {
 	std::array<uint32_t, 4>                          ray_query_selected_leaf {};
 	std::array<uint32_t, 4>                          ray_query_setup_instance {};
 	std::array<uint32_t, 4>                          ray_query_reuse {};
-	// Rounds of a site's native traversal (a wave never runs more than MaxRayQueryRounds).
-	std::array<uint32_t, 4>                          ray_query_rounds {};
 	// The per-lane alpha test (RayQueryAlpha): per site and half, its arguments; the guest leaf
 	// code's sample of the bindless table it samples (nullptr: the sites run the leaf code).
 	std::array<std::array<uint32_t, 2>, 4>           ray_query_alpha {};
