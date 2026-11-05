@@ -15,11 +15,12 @@
 // and the triangle index of its primitive word (bits 0-29), at the geometry's first host
 // primitive plus that index, in the host geometry of the guest geometry's opacity. Positions no
 // list entry names keep the inactive triangle the host filled them with, and a triangle named by
-// several leaves (split) is written once per leaf with the same values. An entry that does not
-// match the layout (no geometry, an index past the geometry's triangles, an opacity other than the
-// geometry's) is counted and fails the build. So does memory that no longer holds the BLAS the
-// layout describes (a header without the magic and version 9, or with another geometry count:
-// released and reused, or rebuilt since), without placing anything. The host gives up such slots.
+// several leaves (split) is written once per leaf with the same values (a build without a layout
+// writes it once, see EmitLeaf). An entry that does not match the layout (no geometry, an index
+// past the geometry's triangles, an opacity other than the geometry's) is counted and fails the
+// build. So does memory that no longer holds the BLAS the layout describes (a header without the
+// magic and version 9, or with another geometry count: released and reused, or rebuilt since),
+// without placing anything. The host gives up such slots.
 
 #include "rt_common.inc"
 
@@ -117,6 +118,23 @@ shared uint     s_layout_invalid;
 // The box of the whole BLAS (lo > hi: unknown).
 shared vec3 s_root_lo;
 shared vec3 s_root_hi;
+// Builds without a layout: the triangles of the leaves whose boxes do not hold them, an open
+// addressing set (empty: kInvalidNode) that writes each of them once (see EmitLeaf).
+const uint kSplitSetSize = 2048;
+shared uint s_split_set[kSplitSetSize];
+
+// True for the first leaf entry of the walk that names triangle `tri` (and when the set is full).
+bool FirstSplitEntry(uint tri) {
+	uint at = (tri * 0x9e3779b1u) >> 21;
+	for (uint probe = 0; probe < 32; probe++) {
+		const uint old = atomicCompSwap(s_split_set[at], kInvalidNode, tri);
+		if (old == kInvalidNode || old == tri) {
+			return old == kInvalidNode;
+		}
+		at = (at + 1) & (kSplitSetSize - 1);
+	}
+	return true;
+}
 
 // The host position of a list entry of a layout build (see the top), or kInvalidNode when it
 // does not match the layout.
@@ -172,26 +190,35 @@ void EmitLeaf(uint64_t blas_va, uint64_t base, uint leaf, Job job, vec3 lo, vec3
 				for (uint v = 0; v < 3; v++) {
 					usable = usable && !any(isnan(p[v])) && all(lessThan(abs(p[v]), vec3(1e18)));
 				}
-				// A triangle outside its box is from a node the guest was writing. Of a BLAS the game
-				// refits (job.pad 1: vehicles, peds) the box is the leaf's, which keeps the triangles
-				// of half written nodes out; of the others (buildings) it is the box of the whole
-				// BLAS, because the boxes of the leaves of those leave out triangles of their lists
-				// (dropping them left the sun lighting the inside of a garage).
-				// [HACK] The leaf's box drops triangles the game's boxes do not hold too: counted
-				// (RtState.leaf_box_dropped), the host reports them.
-				const bool leaf_box = job.pad != 0;
-				const vec3 box_lo   = leaf_box ? lo : s_root_lo;
-				const vec3 box_hi   = leaf_box ? hi : s_root_hi;
-				if (all(lessThanEqual(box_lo, box_hi))) {
-					const vec3 margin = (box_hi - box_lo) * 1e-3 + vec3(1e-3);
-					const bool sane   = usable;
+				// A triangle outside the box of the whole BLAS (its root's children) is from a node the
+				// guest is rewriting: the game's BVH bounds every triangle it can hit (its refits skip
+				// only degenerate ones, which nothing hits). The box of the triangle's own leaf is not
+				// such a bound: the game's builder splits triangles among leaves, each leaf box holding
+				// its part of the triangle, and the guest's traversal tests the whole triangle in any
+				// leaf the ray enters (dropping those left the sun lighting the inside of a garage, and
+				// a third of the triangles of the foliage the game rebuilds every frame).
+				if (all(lessThanEqual(s_root_lo, s_root_hi))) {
+					const vec3 margin = (s_root_hi - s_root_lo) * 1e-3 + vec3(1e-3);
 					for (uint v = 0; v < 3; v++) {
-						usable = usable && all(greaterThanEqual(p[v], box_lo - margin)) &&
-						         all(lessThanEqual(p[v], box_hi + margin));
+						usable = usable && all(greaterThanEqual(p[v], s_root_lo - margin)) &&
+						         all(lessThanEqual(p[v], s_root_hi + margin));
 					}
-					if (leaf_box && sane && !usable) {
-						atomicAdd(RtState(pc.state).leaf_box_dropped, 1u);
+				}
+				// A split triangle is in the list of each of those leaves (the same triangle node): a
+				// build without a layout takes it once, from the first of its entries the walk reaches,
+				// and leaves the others inactive, also for gathers (entry kInvalidNode); one with a
+				// layout places all of them at the same position. Copies would be candidates the ray
+				// queries test again (two entries per split triangle in GTA V's foliage).
+				bool split_copy = false;
+				if (usable && job.layout_va == 0 && all(lessThanEqual(lo, hi))) {
+					const vec3 margin = (hi - lo) * 1e-3 + vec3(1e-3);
+					bool       inside = true;
+					for (uint v = 0; v < 3; v++) {
+						inside = inside && all(greaterThanEqual(p[v], lo - margin)) &&
+						         all(lessThanEqual(p[v], hi + margin));
 					}
+					split_copy = !inside && !FirstSplitEntry(tri);
+					usable     = usable && !split_copy;
 				}
 				for (uint v = 0; v < 3; v++) {
 					const vec3 q = usable ? p[v] : vec3(uintBitsToFloat(0x7fc00000u));
@@ -203,7 +230,7 @@ void EmitLeaf(uint64_t blas_va, uint64_t base, uint leaf, Job job, vec3 lo, vec3
 				// The barycentric remap of the triangle (node word 15, 8 bits per triangle type).
 				const uint remap = (LoadGuestU32(node + 60) >> (NodeType(tri) * 8u)) & 0xffu;
 				EntryRef(job.entries + uint64_t(table_index) * 16).v =
-				    uvec4((first + k) << 3, word, tri, remap);
+				    uvec4(split_copy ? kInvalidNode : (first + k) << 3, word, tri, remap);
 			}
 		}
 		if ((word & 0x80000000u) != 0) {
@@ -350,6 +377,11 @@ void main() {
 		} else if (IsBoxNode(root)) {
 			U32Ref(pc.pool + uint64_t(s_queue_base) * 4).v = root;
 			s_tail = 1;
+		}
+	}
+	if (pc.mode == MODE_BUILD) {
+		for (uint i = lid; i < kSplitSetSize; i += gl_WorkGroupSize.x) {
+			s_split_set[i] = kInvalidNode;
 		}
 	}
 	barrier();

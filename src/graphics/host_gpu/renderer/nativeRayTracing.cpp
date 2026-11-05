@@ -1,7 +1,6 @@
 #include "graphics/host_gpu/renderer/nativeRayTracing.h"
 
 #include "common/assert.h"
-#include "common/hackNotice.h"
 #include "common/logging/log.h"
 #include "gpu_tiler_shaders/hle_blas_refit_spv.h"
 #include "gpu_tiler_shaders/hle_tlas_spv.h"
@@ -120,8 +119,7 @@ struct RtState {
 	uint32_t changed_count;
 	uint32_t pool_cursor;
 	uint32_t pool_overflow;
-	uint32_t leaf_box_dropped;
-	uint32_t pad;
+	uint32_t pad[2];
 };
 static_assert(sizeof(RtState) == StateSize);
 constexpr uint32_t StateDispatch = offsetof(RtState, dispatch);
@@ -1003,11 +1001,9 @@ void NativeRayTracing::RecordBuilds(const CommandRecorder& command) {
 			pool_use += queue;
 			slot.needs_build = false;
 			scratch += size;
-			// The game refits (or just changed) the BLAS: see EmitLeaf in rt_blas_walk.comp.
-			const uint32_t refit = slot.refit_seq != 0 || slot.dynamic_until != 0 ? 1u : 0u;
 			Job job {slot.blas_va, slot.root, index, slot.vertices0.address,
 			         slot.vertices1.address, slot.entries.address, slot.capacity0,
-			         slot.capacity1, 0, refit, 0, 0, 0};
+			         slot.capacity1, 0, 0, 0, 0, 0};
 			if (!slot.layout.empty()) {
 				job.layout       = m_layouts->BufferDeviceAddress() + uint64_t {layouts.size()} * 16;
 				job.layout_count = static_cast<uint32_t>(slot.layout.size());
@@ -1633,13 +1629,6 @@ void NativeRayTracing::ProcessReadback(Readback& readback) {
 		}
 	}
 	m_last_instance_counts[readback.source_key] = state.instance_count;
-	if (state.leaf_box_dropped != 0) {
-		// [HACK] See rt_blas_walk.comp. Not the shader of the draw that runs this completion.
-		Common::HackNotice::ScopedShader no_shader(0);
-		Common::HackNotice::Report("native RT drops refit BLAS triangles outside their leaf box",
-		                           "rt_blas_walk EmitLeaf", 0, 0,
-		                           fmt::format("{} triangles in one preparation", state.leaf_box_dropped));
-	}
 	readback.tick = 0;
 }
 

@@ -142,10 +142,8 @@ layout(buffer_reference, std430, buffer_reference_align = 8) buffer RtState {
 	uint     changed_count;
 	uint     pool_cursor;
 	uint     pool_overflow;
-	// Triangles of BLASes the game refits that the walk dropped for lying outside their leaf's
-	// box (rt_blas_walk.comp).
-	uint     leaf_box_dropped;
-	uint     pad;
+	uint     pad0;
+	uint     pad1;
 };
 
 // A host BLAS: the guest BLAS it mirrors and its acceleration structure of triangles, in two
