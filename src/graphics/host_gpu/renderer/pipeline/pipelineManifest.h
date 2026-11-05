@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdint>
 #include <span>
+#include <string>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -67,9 +68,12 @@ void NormalizeManifestInput(ManifestModule& module);
 // The file: a header line, then the records in their canonical order.
 [[nodiscard]] std::vector<uint8_t> SaveManifest(const PipelineManifest& manifest);
 // False, with `manifest` empty, for another format or damaged bytes.
-// Records that do not read (or name modules that do not) are left out and counted in `skipped`.
+// Records that do not read (or name modules that do not) are left out and counted in `skipped`,
+// as are the pipelines that no draw creates from the modules they name (stages that a draw does
+// not link, or a vertex input or patch size that is not their modules'): `unlinked` gets their
+// stage fields and why.
 bool LoadManifest(std::span<const uint8_t> bytes, PipelineManifest& manifest,
-                  uint32_t* skipped = nullptr);
+                  uint32_t* skipped = nullptr, std::vector<std::string>* unlinked = nullptr);
 
 // Equal for the records of one module or of one pipeline, whatever stage input fields outside
 // the static key they hold. `static_state` is the stage's static key on the running host.
