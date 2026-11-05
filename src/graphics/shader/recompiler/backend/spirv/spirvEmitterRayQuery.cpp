@@ -87,7 +87,7 @@ struct InlineLayout {
 
 InlineLayout ProgramInlineLayout(const EmitterState& s) {
 	const auto word = s.program.info.ray_query_layout[3];
-	return {((word >> 19u) & 1u) != 0, (word >> 16u) & 7u, (word & 0xffu) * 8u};
+	return {((word >> 19u) & 1u) != 0, (word >> 16u) & 7u, (word & 0xffu) * 8u + ((word >> 28u) & 1u) * 4u};
 }
 
 // The arguments of RayQueryAlpha, in order.
@@ -134,6 +134,17 @@ void Store(EmitterState& s, uint32_t pointer, uint32_t value) {
 
 uint32_t U32(EmitterState& s, uint32_t value) {
 	return ConstantU32(s, value);
+}
+
+// The record of instance leaf `node` after the records' base (the 64-bit variable `base`): 128
+// bytes each, or the stride of the program's layout (word 1).
+uint32_t InstanceRecordAddress(EmitterState& s, uint32_t base, uint32_t node) {
+	const auto wide   = TypeU64(s);
+	const auto index  = Unary(s, spv::OpUConvert, wide, Binary(s, spv::OpShiftRightLogical, TypeU32(s), node, U32(s, 3)));
+	const auto stride = 128u + ((s.program.info.ray_query_layout[1] >> 30u) & 3u) * 32u;
+	const auto offset = stride == 128u ? Binary(s, spv::OpShiftLeftLogical, wide, index, ConstantU64(s, 7))
+	                                   : Binary(s, spv::OpIMul, wide, index, ConstantU64(s, stride));
+	return Binary(s, spv::OpIAdd, wide, Load(s, wide, base), offset);
 }
 
 uint32_t And(EmitterState& s, uint32_t value, uint32_t mask) {
@@ -505,12 +516,7 @@ uint32_t AlphaTest(ValueEmitContext& ctx, const LaneVariables& lane, const Guest
 	// The instance record (R) and its BLAS (B header).
 	const auto node = InstanceNode(s, lane, CandidateIntersection);
 	EmitIfCondition(s, Binary(s, spv::OpINotEqual, b, node, cache(AlphaCache::Instance)), [&] {
-		const auto record = EmitGuestObject(
-		    ctx,
-		    Binary(s, spv::OpIAdd, wide, Load(s, wide, lane.base),
-		           Binary(s, spv::OpShiftLeftLogical, wide, Unary(s, spv::OpUConvert, wide, shr(node, 3)),
-		                  ConstantU64(s, 7))),
-		    0x80);
+		const auto record = EmitGuestObject(ctx, InstanceRecordAddress(s, lane.base, node), 0x80);
 		// The BLAS address: two record dwords, as they are or packed (see RayTracingLayout).
 		const auto blas_low  = EmitGuestObjectDword(ctx, record, blas_dword * 4);
 		const auto blas_high = EmitGuestObjectDword(ctx, record, blas_dword * 4 + 4);
@@ -721,11 +727,7 @@ void Refill(ValueEmitContext& ctx, uint32_t site) {
 				    GuestBarycentrics(s, lane, CommittedIntersection, hit_entry.remap);
 				Store(s, lane.result_u, Unary(s, spv::OpBitcast, u, bary_u));
 				Store(s, lane.result_v, Unary(s, spv::OpBitcast, u, bary_v));
-				auto instance_record = Binary(s, spv::OpIAdd, wide, Load(s, wide, lane.base),
-				                              Binary(s, spv::OpShiftLeftLogical, wide,
-				                                     Unary(s, spv::OpUConvert, wide,
-				                                           Binary(s, spv::OpShiftRightLogical, u, node, U32(s, 3))),
-				                                     ConstantU64(s, 7)));
+				auto instance_record = InstanceRecordAddress(s, lane.base, node);
 				if (const auto inline_layout = ProgramInlineLayout(s); inline_layout.valid) {
 					instance_record = Select(s, wide, Equal(s, And(s, node, 7u), U32(s, inline_layout.type)),
 					                         Load(s, wide, lane.inline_record), instance_record);

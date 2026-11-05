@@ -215,8 +215,9 @@ void LoadTriangle(uint64_t node, uint type, out vec3 p[3]) {
 	}
 }
 
-// A guest TLAS instance record (128 bytes), laid out as the traversal shader that traces through
-// the TLAS reads it (Decoder::RayTracingLayout::Pack(), derived from its code): the rows of the
+// A guest TLAS instance record (128 bytes, or the stride of the layout), laid out as the traversal
+// shader that traces through the TLAS reads it (Decoder::RayTracingLayout::Pack(), derived from
+// its code; record dwords take 4 bits in their field and 2 more in word 3): the rows of the
 // world to object 3x4 transform, the BLAS address and root node, the instance mask (0xff when the
 // shader traces every instance) and flags (bit 0 opaque, bit 1 alpha tested anyway, bit 2 both
 // facings, bit 3 the culled facing; 0 when the shader never reads them).
@@ -240,7 +241,22 @@ bool LayoutInline(uvec4 instance_layout, uint node) {
 }
 
 uint LayoutInlineOffset(uvec4 instance_layout) {
-	return (instance_layout.w & 0xffu) * 8u;
+	return (instance_layout.w & 0xffu) * 8u + ((instance_layout.w >> 28) & 1u) * 4u;
+}
+
+uint LayoutRecordStride(uvec4 instance_layout) {
+	return 128u + ((instance_layout.y >> 30) & 3u) * 32u;
+}
+
+// Whether the BVH headers hold their node count at +80 (the size of the T# plus one) instead of
+// the size at +88.
+bool LayoutNodeCountAt80(uvec4 instance_layout) {
+	return ((instance_layout.w >> 29) & 1u) != 0;
+}
+
+// A record dword of the layout: `low` (4 bits) and `high` (2 bits) above it.
+uint LayoutDword(uint low, uint high) {
+	return (low & 15u) | ((high & 3u) << 4);
 }
 
 uint LayoutInlineRoot(uvec4 instance_layout) {
@@ -250,7 +266,7 @@ uint LayoutInlineRoot(uvec4 instance_layout) {
 // The record of instance leaf `node`.
 uint64_t InstanceRecord(uint64_t header, uint64_t instance_base, uint node, uvec4 instance_layout) {
 	return LayoutInline(instance_layout, node) ? header + LayoutInlineOffset(instance_layout)
-	                                           : instance_base + (uint64_t(node >> 3) << 7);
+	                                           : instance_base + uint64_t(node >> 3) * LayoutRecordStride(instance_layout);
 }
 
 // Whether, with flags bit 3 clear, the guest accepts the triangles the host sees from the back.
@@ -259,30 +275,41 @@ bool LayoutFlipFacing(uvec4 instance_layout) {
 }
 
 GuestInstance LoadGuestInstance(uint64_t record, uvec4 instance_layout) {
-	const uvec4 q0 = LoadGuestU32x4(record);
-	const uvec4 q1 = LoadGuestU32x4(record + 16);
-	const uvec4 q2 = LoadGuestU32x4(record + 32);
-	const uvec4 q3 = LoadGuestU32x4(record + 48);
-	const uint  words[16] =
-	    uint[16](q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w, q2.x, q2.y, q2.z, q2.w, q3.x, q3.y, q3.z, q3.w);
+	// The first 64 bytes, and the rest of a record longer than 128 bytes.
+	uint words[40];
+	for (uint q = 0; q < 10; q++) {
+		const uvec4 v = q < 4u || LayoutRecordStride(instance_layout) > 128u ? LoadGuestU32x4(record + q * 16u) : uvec4(0u);
+		words[q * 4u]      = v.x;
+		words[q * 4u + 1u] = v.y;
+		words[q * 4u + 2u] = v.z;
+		words[q * 4u + 3u] = v.w;
+	}
 	GuestInstance instance;
+	const uint    base = (instance_layout.z >> 20) & 31u;
 	for (uint r = 0; r < 3; r++) {
 		vec4 row;
 		for (uint c = 0; c < 4; c++) {
 			const uint index = r * 4 + c;
-			row[c] = uintBitsToFloat(words[(instance_layout[index / 8] >> ((index % 8) * 4)) & 15u]);
+			row[c] = uintBitsToFloat(words[min(base + ((instance_layout[index / 8] >> ((index % 8) * 4)) & 15u), 39u)]);
 		}
 		instance.rows[r] = row;
 	}
-	const uint blas = (instance_layout.y >> 20) & 15u;
+	const uint blas = LayoutDword(instance_layout.y >> 20, instance_layout.w >> 20);
 	const uint lo   = words[blas];
-	const uint hi   = words[min(blas + 1u, 15u)];
+	const uint hi   = words[min(blas + 1u, 39u)];
 	instance.blas   = ((instance_layout.y >> 24) & 1u) != 0 ? (uint64_t(lo) | (uint64_t(hi & 0x3fffffu) << 32)) << 3
 	                                                : uint64_t(lo) | (uint64_t(hi) << 32);
-	instance.root   = words[(instance_layout.y >> 25) & 15u];
-	instance.mask   = ((instance_layout.z >> 19) & 1u) != 0 ? (words[instance_layout.z & 15u] >> ((instance_layout.z >> 4) & 31u)) & 0xffu
-	                                                       : 0xffu;
-	instance.flags  = ((instance_layout.z >> 13) & 1u) != 0 ? words[(instance_layout.z >> 9) & 15u] >> ((instance_layout.z >> 14) & 31u) : 0u;
+	instance.root   = words[LayoutDword(instance_layout.y >> 25, instance_layout.w >> 22)];
+	// The mask the ray's selects, or (with a width) every ray when any of its bits is set.
+	const uint mask_bits  = words[LayoutDword(instance_layout.z, instance_layout.w >> 24)] >> ((instance_layout.z >> 4) & 31u);
+	const uint mask_width = (instance_layout.z >> 25) & 31u;
+	instance.mask         = ((instance_layout.z >> 19) & 1u) == 0 ? 0xffu
+	                        : mask_width == 0u                    ? mask_bits & 0xffu
+	                        : (mask_bits & ((1u << mask_width) - 1u)) != 0u ? 0xffu
+	                                                                        : 0u;
+	instance.flags = ((instance_layout.z >> 13) & 1u) != 0
+	                     ? words[LayoutDword(instance_layout.z >> 9, instance_layout.w >> 26)] >> ((instance_layout.z >> 14) & 31u)
+	                     : 0u;
 	return instance;
 }
 

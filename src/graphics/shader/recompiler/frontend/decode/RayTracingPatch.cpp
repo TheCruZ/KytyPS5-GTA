@@ -12,28 +12,44 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 
-// The words of the layout (LoadGuestInstance in rt_common.inc):
-//   0: transform[0..7], 4 bits each
-//   1: transform[8..11], 4 bits each; instance_offset / 8 << 16; blas_dword << 20;
-//      blas_packed << 24; root_dword << 25; flip_facing << 29
+// The words of the layout (LoadGuestInstance in rt_common.inc). Record dwords take 6 bits: the low
+// 4 in their field and the high 2 in word 3; the transform's are relative to a base dword.
+//   0: transform[0..7] - base, 4 bits each
+//   1: transform[8..11] - base, 4 bits each; instance_offset / 8 << 16; blas_dword << 20;
+//      blas_packed << 24; root_dword << 25; flip_facing << 29; (record_stride - 128) / 32 << 30
 //   2: mask_dword; mask_shift << 4; flags_dword << 9; has flags << 13; flags_shift << 14;
-//      has mask << 19
-//   3: inline_offset / 8; inline_root << 8; inline_type << 16; has an inline type << 19
+//      has mask << 19; base << 20; mask_width << 25
+//   3: inline_offset / 8; inline_root << 8; inline_type << 16; has an inline type << 19;
+//      blas_dword >> 4 << 20; root_dword >> 4 << 22; mask_dword >> 4 << 24; flags_dword >> 4 << 26;
+//      inline_offset bit 2 << 28; node_count_80 << 29
+// A layout of the first 16 dwords of a 128-byte record, without the newer fields, packs as
+// before they existed.
 std::array<uint32_t, 4> RayTracingLayout::Pack() const {
 	std::array<uint32_t, 4> words {};
+	const uint32_t          base = TransformBase();
 	for (uint32_t i = 0; i < 12; i++) {
-		words[i / 8] |= (transform[i] & 15u) << ((i % 8) * 4);
+		words[i / 8] |= ((transform[i] - base) & 15u) << ((i % 8) * 4);
 	}
 	words[1] |= ((instance_offset / 8u) & 15u) << 16u | (blas_dword & 15u) << 20u | (blas_packed ? 1u : 0u) << 24u |
-	            (root_dword & 15u) << 25u | (flip_facing ? 1u : 0u) << 29u;
+	            (root_dword & 15u) << 25u | (flip_facing ? 1u : 0u) << 29u | ((record_stride - 128u) / 32u & 3u) << 30u;
 	const bool flags = flags_dword != NoRegister;
 	const bool mask  = mask_dword != NoRegister;
 	words[2] = (mask ? mask_dword & 15u : 0u) | (mask_shift & 31u) << 4u | (flags ? flags_dword & 15u : 0u) << 9u |
-	           (flags ? 1u : 0u) << 13u | (flags_shift & 31u) << 14u | (mask ? 1u : 0u) << 19u;
+	           (flags ? 1u : 0u) << 13u | (flags_shift & 31u) << 14u | (mask ? 1u : 0u) << 19u | (base & 31u) << 20u |
+	           (mask ? mask_width & 31u : 0u) << 25u;
 	if (inline_type != NoRegister) {
-		words[3] = ((inline_offset / 8u) & 0xffu) | (inline_root & 0xffu) << 8u | (inline_type & 7u) << 16u | 1u << 19u;
+		words[3] = ((inline_offset / 8u) & 0xffu) | (inline_root & 0xffu) << 8u | (inline_type & 7u) << 16u | 1u << 19u |
+		           ((inline_offset >> 2u) & 1u) << 28u;
 	}
+	words[3] |= (blas_dword >> 4u & 3u) << 20u | (root_dword >> 4u & 3u) << 22u | (mask ? mask_dword >> 4u & 3u : 0u) << 24u |
+	            (flags ? flags_dword >> 4u & 3u : 0u) << 26u | (node_count_80 ? 1u : 0u) << 29u;
 	return words;
+}
+
+// The dword the transform's are counted from: 0 when they all are in the first 16 dwords.
+uint32_t RayTracingLayout::TransformBase() const {
+	const auto [low, high] = std::ranges::minmax(transform);
+	return high < 16 ? 0u : low;
 }
 
 // The format word of RayQueryAlpha: material_dword, table_dword << 6, first_dword << 12,
@@ -46,15 +62,19 @@ uint32_t RayTracingAlphaFields::Pack(const RayTracingLayout& layout) const {
 
 namespace {
 
-// Whether the layout fits the packed words (record fields in the first 64 bytes).
+// Whether the layout fits the packed words (record fields in the first 160 bytes of the record).
 bool Packable(const RayTracingLayout& layout) {
-	const auto small = [](uint32_t dword) { return dword < 16; };
-	return std::ranges::all_of(layout.transform, [](uint8_t dword) { return dword < 16; }) &&
-	       layout.instance_offset % 8 == 0 && layout.instance_offset < 128 && small(layout.blas_dword + 1) &&
-	       small(layout.root_dword) && (layout.mask_dword == NoRegister || small(layout.mask_dword)) &&
-	       layout.mask_shift < 32 &&
+	const auto small = [&](uint32_t dword) { return dword < std::min(40u, layout.record_stride / 4u); };
+	const auto base  = layout.TransformBase();
+	return std::ranges::all_of(layout.transform, [&](uint8_t dword) { return dword >= base && dword - base < 16 && small(dword); }) &&
+	       base < 32 && layout.instance_offset % 8 == 0 && layout.instance_offset < 128 &&
+	       layout.record_stride % 32 == 0 && layout.record_stride >= 128 && layout.record_stride <= 224 &&
+	       small(layout.blas_dword + 1) && small(layout.root_dword) &&
+	       (layout.mask_dword == NoRegister ||
+	        (small(layout.mask_dword) && layout.mask_shift < 32 && layout.mask_width < 32 &&
+	         layout.mask_shift + layout.mask_width <= 32)) &&
 	       (layout.inline_type == NoRegister ||
-	        (layout.inline_offset % 8 == 0 && layout.inline_offset < 0x800 && layout.inline_root < 0x100)) &&
+	        (layout.inline_offset % 4 == 0 && layout.inline_offset < 0x800 && layout.inline_root < 0x100)) &&
 	       (layout.flags_dword == NoRegister || (small(layout.flags_dword) && layout.flags_shift < 32));
 }
 
@@ -529,7 +549,7 @@ bool SameOperand(const Operand& a, const Operand& b) {
 
 class SiteFinder {
 public:
-	explicit SiteFinder(const Program& program): m_inst(program.instructions) {}
+	SiteFinder(const Program& program, uint32_t wave_size): m_inst(program.instructions), m_wave32(wave_size == 32) {}
 
 	// The sites of the program and its TLAS source; false when a traversal loop does not match.
 	bool Find(RayTracingPatch& patch) {
@@ -596,8 +616,10 @@ public:
 				if (merged.mask_dword == NoRegister) {
 					merged.mask_dword = other.mask_dword;
 					merged.mask_shift = other.mask_shift;
+					merged.mask_width = other.mask_width;
 				} else if (other.mask_dword != NoRegister &&
-				           (other.mask_dword != merged.mask_dword || other.mask_shift != merged.mask_shift)) {
+				           (other.mask_dword != merged.mask_dword || other.mask_shift != merged.mask_shift ||
+				            other.mask_width != merged.mask_width)) {
 					return false;
 				}
 				auto check        = other;
@@ -606,6 +628,7 @@ public:
 				check.flip_facing = merged.flip_facing;
 				check.mask_dword  = merged.mask_dword;
 				check.mask_shift  = merged.mask_shift;
+				check.mask_width  = merged.mask_width;
 				if (!(check == merged)) {
 					return false;
 				}
@@ -692,13 +715,48 @@ private:
 	}
 
 	bool IsPacketHeader(size_t i) const {
-		return i + 3 < m_inst.size() && m_inst[i].opcode == Opcode::S_AND_B64 &&
+		return !m_wave32 && i + 3 < m_inst.size() && m_inst[i].opcode == Opcode::S_AND_B64 &&
 		       m_inst[i + 1].opcode == Opcode::S_AND_SAVEEXEC_B64 && IsNodeType(i + 2);
 	}
 
+	// The node type test of a loop header at `i`: S_AND_B32 <t>, <node>, 7, S_ADD_I32 vcc_lo, <t>, -4
+	// and S_CMP_LE_U32 vcc_lo, 2 (box nodes 4 to 6) or 1 (4 and 5), with other instructions between
+	// them that write neither; `cmp` is the compare.
+	bool NodeTypeTest(size_t i, size_t& cmp) const {
+		if (i >= m_inst.size()) {
+			return false;
+		}
+		const auto& type = m_inst[i];
+		const auto  t    = ScalarIndex(type.dst);
+		if (type.opcode != Opcode::S_AND_B32 || t == NoRegister || type.src0.kind != OperandKind::Sgpr ||
+		    !IsConstant(type.src1, 7)) {
+			return false;
+		}
+		size_t add = npos;
+		for (size_t j = i + 1; j < m_inst.size() && j <= i + 3 && add == npos; j++) {
+			const auto& inst = m_inst[j];
+			if (inst.opcode == Opcode::S_ADD_I32 && IsVccLo(inst.dst) && ScalarIndex(inst.src0) == t &&
+			    inst.src1.kind == OperandKind::IntegerInlineConstant && inst.src1.signed_val == -4) {
+				add = j;
+			} else if (WritesScalar(inst, t) || WritesScalar(inst, 106u) || IsDirectBranch(inst.opcode)) {
+				return false;
+			}
+		}
+		if (add == npos || add + 1 >= m_inst.size()) {
+			return false;
+		}
+		cmp              = add + 1;
+		const auto& test = m_inst[cmp];
+		return test.opcode == Opcode::S_CMP_LE_U32 && IsVccLo(test.src0) &&
+		       (IsConstant(test.src1, 2) || IsConstant(test.src1, 1));
+	}
+
+	// A closest hit loop header: the copy of EXEC (S_MOV_B64 <s>, exec, or S_MOV_B32 <s>, exec_lo
+	// in waves of 32 lanes), then the node type test.
 	bool IsClosestHeader(size_t i) const {
-		return i + 2 < m_inst.size() && m_inst[i].opcode == Opcode::S_MOV_B64 &&
-		       m_inst[i].src0.kind == OperandKind::ExecLo && IsNodeType(i + 1);
+		size_t cmp = npos;
+		return i + 2 < m_inst.size() && m_inst[i].opcode == Lane(Opcode::S_MOV_B64) &&
+		       m_inst[i].src0.kind == OperandKind::ExecLo && NodeTypeTest(i + 1, cmp);
 	}
 
 	// The box test after `from`: the first IMAGE_BVH_INTERSECT_RAY, its ray registers, and the
@@ -927,17 +985,18 @@ private:
 		}
 	}
 
-	// Whether the instruction writes SGPR `reg` (lane masks and 64-bit results are pairs; loads
-	// write their dwords).
-	static bool WritesScalar(const Instruction& inst, uint32_t reg) {
-		const auto name  = magic_enum::enum_name(inst.opcode);
-		const bool wide  = name.find("64") != std::string_view::npos || name.starts_with("V_CMP");
-		const auto count = inst.family == Family::SMEM ? std::max(inst.data_dwords, 1u) : (wide ? 2u : 1u);
-		const auto covers = [&](const Operand& dst, uint32_t n) {
+	// Whether the instruction writes SGPR `reg` (64-bit results are pairs, lane masks pairs in
+	// waves of 64; loads write their dwords).
+	bool WritesScalar(const Instruction& inst, uint32_t reg) const {
+		const auto name      = magic_enum::enum_name(inst.opcode);
+		const bool lane_mask = name.starts_with("V_CMP");
+		const bool wide      = lane_mask ? !m_wave32 : name.find("64") != std::string_view::npos;
+		const auto count     = inst.family == Family::SMEM ? std::max(inst.data_dwords, 1u) : (wide ? 2u : 1u);
+		const auto covers    = [&](const Operand& dst, uint32_t n) {
 			const auto first = ScalarIndex(dst);
 			return first != NoRegister && reg >= first && reg < first + n;
 		};
-		return covers(inst.dst, count) || covers(inst.dst2, 2u);
+		return covers(inst.dst, count) || covers(inst.dst2, m_wave32 ? 1u : 2u);
 	}
 
 	// Whether the instruction writes VGPR `reg` (conservatively wide for image results).
@@ -1743,8 +1802,8 @@ private:
 		site.loop_pc        = m_inst[header].pc;
 		site.cull_mask      = NoRegister;
 		site.alpha_off_sgpr = NoAlphaOff;
-		const auto le       = header + 3;
-		if (le >= back || m_inst[le].opcode != Opcode::S_CMP_LE_U32 || !IsConstant(m_inst[le].src1, 2)) {
+		size_t le           = npos;
+		if (!NodeTypeTest(header + 1, le) || le >= back) {
 			return false;
 		}
 		// The box test of the TLAS: the intersection whose T# is built from the header before the
@@ -1770,9 +1829,10 @@ private:
 		if (box == npos) {
 			return false;
 		}
-		// The exit: the branch that skips the loop's backward branch.
+		// The exit: the branch that skips the loop's backward branch (at the end of the code that pops
+		// the next node, which may read it from one of two stack VGPRs).
 		size_t exit = npos;
-		for (size_t i = back; i-- > header && i + 4 > back && exit == npos;) {
+		for (size_t i = back; i-- > header && i + 16 > back && exit == npos;) {
 			if (m_inst[i].opcode == Opcode::S_CBRANCH_SCC0 && m_inst[i].branch_target == EndPc(m_inst[back])) {
 				exit = i;
 			}
@@ -1796,7 +1856,7 @@ private:
 			    cmp.src1.kind != OperandKind::Vgpr || cmp.src1.reg != site.t_max) {
 				continue;
 			}
-			const auto save = Next(i, Opcode::S_AND_SAVEEXEC_B64, i + 4);
+			const auto save = Next(i, Lane(Opcode::S_AND_SAVEEXEC_B64), i + 4);
 			if (save != npos && m_inst[save + 1].opcode == Opcode::S_CBRANCH_EXECZ) {
 				compare = i;
 				accept  = save + 2;
@@ -1816,7 +1876,7 @@ private:
 			return false;
 		}
 		size_t moves_end = accept;
-		while (moves_end < back && m_inst[moves_end].opcode != Opcode::S_MOV_B64) {
+		while (moves_end < back && m_inst[moves_end].opcode != Lane(Opcode::S_MOV_B64)) {
 			moves_end++;
 		}
 		uint32_t entry_base = NoRegister;
@@ -1832,12 +1892,13 @@ private:
 		bool mask = false;
 		for (size_t i = header; i + 1 < back && !mask; i++) {
 			Field    field;
-			uint32_t shift = 0, bits = 0;
-			if (ConstantMaskTest(i, header, field, shift, bits) && field.pair == record.pair &&
+			uint32_t shift = 0, bits = 0, width = 0;
+			if (ConstantMaskTest(i, header, field, shift, bits, width) && field.pair == record.pair &&
 			    ScalarWriter(field.load, record.pair, 0) == ScalarWriter(record.load, record.pair, 0)) {
 				site.cull_mask_constant = bits;
 				site.layout.mask_dword  = field.dword;
 				site.layout.mask_shift  = shift;
+				site.layout.mask_width  = width;
 				mask                    = true;
 			}
 		}
@@ -1845,7 +1906,10 @@ private:
 		if (!mask) {
 			site.layout.mask_dword = NoRegister;
 			site.layout.mask_shift = 0;
+			site.layout.mask_width = 0;
 		}
+		// Where the BVH headers hold their node count.
+		site.layout.node_count_80 = NodeCountAt80(box, site.header_sgpr);
 		// The pair is free at the exit (the selected key goes there).
 		site.mask_sgpr = site.instance_sgpr;
 		return true;
@@ -1933,7 +1997,7 @@ private:
 		}
 		const auto  word_vgpr = m_inst[shift].src1.reg;
 		const auto& saved     = m_inst[split - 1];
-		if (saved.opcode != Opcode::S_MOV_B64 || saved.src0.kind != OperandKind::ExecLo ||
+		if (saved.opcode != Lane(Opcode::S_MOV_B64) || saved.src0.kind != OperandKind::ExecLo ||
 		    saved.dst.kind != OperandKind::Sgpr || m_inst[split + 1].opcode != Opcode::S_CBRANCH_EXECZ) {
 			return false;
 		}
@@ -1943,7 +2007,7 @@ private:
 		}
 		const auto& restore   = m_inst[join];
 		const auto& flag_test = m_inst[join + 1];
-		if (restore.opcode != Opcode::S_MOV_B64 || restore.dst.kind != OperandKind::ExecLo ||
+		if (restore.opcode != Lane(Opcode::S_MOV_B64) || restore.dst.kind != OperandKind::ExecLo ||
 		    !IsSgpr(restore.src0, saved.dst.reg) || flag_test.opcode != Opcode::V_CMPX_NE_U32 ||
 		    !IsConstant(flag_test.src0, 0) || flag_test.src1.kind != OperandKind::Vgpr ||
 		    m_inst[join + 2].opcode != Opcode::S_CBRANCH_EXECZ) {
@@ -2093,7 +2157,7 @@ private:
 			return false;
 		}
 		field = {load.src0.reg, j, (static_cast<uint32_t>(load.offset) >> 2u) + (reg - first)};
-		return field.dword < 32;
+		return field.dword < 64;
 	}
 
 	// The record field operand `operand` of instruction `i` reads (an SGPR, VCC included).
@@ -2102,10 +2166,67 @@ private:
 		return reg != NoRegister && Plain(operand) && RecordField(i, reg, from, field);
 	}
 
+	// A record field operand read through S_AND_B32s with constants; `mask` is their AND (every bit
+	// without one).
+	bool MaskedField(size_t i, const Operand& operand, size_t from, Field& field, uint32_t& mask) const {
+		mask             = ~0u;
+		const Operand* x = &operand;
+		for (uint32_t depth = 0; depth < 4; depth++) {
+			if (OperandField(i, *x, from, field)) {
+				return true;
+			}
+			const auto a = ScalarSource(i, *x, Opcode::S_AND_B32, from);
+			if (a == npos || !Plain(*x)) {
+				return false;
+			}
+			const auto& inst = m_inst[a];
+			const bool  c0   = inst.src0.kind == OperandKind::IntegerInlineConstant ||
+			                inst.src0.kind == OperandKind::LiteralConstant;
+			const bool c1 = inst.src1.kind == OperandKind::IntegerInlineConstant ||
+			                inst.src1.kind == OperandKind::LiteralConstant;
+			if (c0 == c1) {
+				return false;
+			}
+			mask &= (c0 ? inst.src0 : inst.src1).value;
+			x = c0 ? &inst.src1 : &inst.src0;
+			i = a;
+		}
+		return false;
+	}
+
+	// Whether the T# of the box test `box` (built from the TLAS header pair `header_sgpr`) takes its
+	// size from the 64-bit node count at header + 80, less one: S_LOAD_DWORDX2 <c>, <header>, 0x50;
+	// S_ADD_U32 / S_ADDC_U32 <c>, -1; S_BFE_U64 <size>, <c>, 0x2a0000. Otherwise the size is at
+	// header + 88.
+	bool NodeCountAt80(size_t box, uint32_t header_sgpr) const {
+		const auto& test = m_inst[box];
+		const auto  size = test.src1.kind == OperandKind::Sgpr ? test.src1.reg + 2u : NoRegister;
+		const auto  bfe  = ScalarWriter(box, size, 0);
+		if (bfe == npos || m_inst[bfe].opcode != Opcode::S_BFE_U64 || ScalarIndex(m_inst[bfe].dst) != size ||
+		    !IsConstant(m_inst[bfe].src1, 0x2a0000u)) {
+			return false;
+		}
+		const auto pair = ScalarIndex(m_inst[bfe].src0);
+		const auto lo   = ScalarWriter(bfe, pair, 0);
+		const auto hi   = pair != NoRegister ? ScalarWriter(bfe, pair + 1, 0) : npos;
+		if (lo == npos || hi == npos || m_inst[lo].opcode != Opcode::S_ADD_U32 ||
+		    m_inst[hi].opcode != Opcode::S_ADDC_U32 || !IsConstant(m_inst[lo].src1, ~0u) ||
+		    !IsConstant(m_inst[hi].src1, ~0u)) {
+			return false;
+		}
+		const auto count_lo = ScalarIndex(m_inst[lo].src0);
+		const auto count    = ScalarRangeSource(lo, count_lo, 2, Opcode::S_LOAD_DWORDX2, 0);
+		return count != npos && count_lo != NoRegister && ScalarIndex(m_inst[hi].src0) == count_lo + 1 &&
+		       ScalarWriter(hi, count_lo + 1, 0) == count && IsSgpr(m_inst[count].src0, header_sgpr) &&
+		       m_inst[count].offset == 0x50 &&
+		       (m_inst[count].src1.kind == OperandKind::Unknown || m_inst[count].src1.kind == OperandKind::Null);
+	}
+
 	// The instance record address: the pair `field.pair` (as `field.load` reads it) holds
-	// base + (node >> 3) << 7 with base = header + the 64-bit value at header + offset, header
-	// the TLAS header pair `header_sgpr`. Gives that offset and the node register.
-	bool RecordAddress(const Field& field, uint32_t header_sgpr, uint32_t& instance_offset, uint32_t& node) const {
+	// base + (node >> 3) * stride with base = header + the 64-bit value at header + offset, header
+	// the TLAS header pair `header_sgpr`. Gives that offset, the stride and the node register.
+	bool RecordAddress(const Field& field, uint32_t header_sgpr, uint32_t& instance_offset, uint32_t& stride,
+	                   uint32_t& node) const {
 		const auto lo = ScalarWriter(field.load, field.pair, 0);
 		const auto hi = ScalarWriter(field.load, field.pair + 1, 0);
 		if (lo == npos || hi == npos || m_inst[lo].opcode != Opcode::S_ADD_U32 || m_inst[hi].opcode != Opcode::S_ADDC_U32 ||
@@ -2123,9 +2244,15 @@ private:
 			}
 			return false;
 		};
-		// (node >> 3) << 7: S_LSHL_B64 <pair>, <n>, 7 with n = (S_LSHR_B32 node, 3; 0).
+		// (node >> 3) << 7: S_LSHL_B64 <pair>, <n>, 7 with n = (S_LSHR_B32 node, 3; 0); or
+		// (node >> 3) * stride: S_MUL_HI_U32 <hi>, <n>, stride and S_MULK_I32 <n>, stride with
+		// n = S_LSHR_B32 node, 3.
 		const auto is_index = [&](size_t add_lo, const Operand& a, size_t add_hi, const Operand& b) {
 			const auto shift = ScalarWriter(add_lo, ScalarIndex(a), 0);
+			if (shift != npos && m_inst[shift].opcode == Opcode::S_MULK_I32) {
+				return StrideIndex(shift, add_hi, a, b, stride, node);
+			}
+			stride = 128;
 			if (shift == npos || m_inst[shift].opcode != Opcode::S_LSHL_B64 || ScalarIndex(m_inst[shift].dst) != ScalarIndex(a) ||
 			    ScalarIndex(b) != ScalarIndex(a) + 1 || ScalarWriter(add_hi, ScalarIndex(b), 0) != shift ||
 			    !IsConstant(m_inst[shift].src1, 7)) {
@@ -2167,6 +2294,29 @@ private:
 			return pair_operands(base_lo, base_hi, is_offset, is_header);
 		};
 		return pair_operands(lo, hi, is_index, is_base);
+	}
+
+	// The index of a record of `stride` bytes (see RecordAddress): S_MULK_I32 at `mul_lo` writes the
+	// low dword `a`, S_MUL_HI_U32 the high dword `b` that `add_hi` reads.
+	bool StrideIndex(size_t mul_lo, size_t add_hi, const Operand& a, const Operand& b, uint32_t& stride,
+	                 uint32_t& node) const {
+		const auto& lo = m_inst[mul_lo];
+		const auto  n  = ScalarIndex(a);
+		const auto  hi = ScalarWriter(add_hi, ScalarIndex(b), 0);
+		if (n == NoRegister || ScalarIndex(lo.dst) != n || ScalarIndex(lo.src0) != n || hi == npos ||
+		    m_inst[hi].opcode != Opcode::S_MUL_HI_U32 || ScalarIndex(m_inst[hi].dst) != ScalarIndex(b)) {
+			return false;
+		}
+		const auto& high = m_inst[hi];
+		const auto* by   = ScalarIndex(high.src0) == n ? &high.src1 : ScalarIndex(high.src1) == n ? &high.src0 : nullptr;
+		const auto  lsr  = ScalarWriter(mul_lo, n, 0);
+		if (by == nullptr || !IsConstant(*by, lo.src1.value) || lsr == npos || ScalarWriter(hi, n, 0) != lsr ||
+		    !IsScalarConstantOp(lsr, Opcode::S_LSHR_B32, 3) || ScalarIndex(m_inst[lsr].dst) != n) {
+			return false;
+		}
+		stride = lo.src1.value;
+		node   = ScalarIndex(m_inst[lsr].src0);
+		return node != NoRegister;
 	}
 
 	// The affine form of a value of the object space ray: per world component (the VGPRs
@@ -2312,7 +2462,8 @@ private:
 			return false;
 		}
 		uint32_t record_node = NoRegister;
-		if (!RecordAddress(record, site.header_sgpr, layout.instance_offset, record_node) || record_node != node) {
+		if (!RecordAddress(record, site.header_sgpr, layout.instance_offset, layout.record_stride, record_node) ||
+		    record_node != node) {
 			return false;
 		}
 		const auto same_record = [&](const Field& field) {
@@ -2357,7 +2508,26 @@ private:
 		uint32_t   inline_root = NoRegister;
 		const auto root_field  = [&](size_t i, const Operand& operand, Field& field) {
 			if (OperandField(i, operand, header, field)) {
-				return same_record(field);
+				if (!same_record(field)) {
+					return false;
+				}
+				// A constant root for the leaves whose record a branch skips the load of:
+				// S_MOV_B32 <root>, <constant>, then the branch, then S_LOAD_DWORD <root>.
+				const auto  reg  = ScalarIndex(operand);
+				const auto& load = m_inst[field.load];
+				const auto  move = load.opcode == Opcode::S_LOAD_DWORD && ScalarIndex(load.dst) == reg
+				                       ? ScalarWriter(field.load, reg, header)
+				                       : npos;
+				if (move != npos && m_inst[move].opcode == Opcode::S_MOV_B32 &&
+				    (m_inst[move].src0.kind == OperandKind::IntegerInlineConstant ||
+				     m_inst[move].src0.kind == OperandKind::LiteralConstant)) {
+					for (size_t j = move + 1; j < field.load; j++) {
+						if (IsConditionalBranch(m_inst[j].opcode) && m_inst[j].branch_target > load.pc) {
+							inline_root = m_inst[move].src0.value;
+						}
+					}
+				}
+				return true;
 			}
 			const auto select = ScalarSource(i, operand, Opcode::S_CSELECT_B32, header);
 			if (select == npos) {
@@ -2373,13 +2543,14 @@ private:
 			return true;
 		};
 		bool root = false;
-		// A BLAS walked wave-wide: the value of the node SGPR of the inner loop (S_AND_B32 vcc_lo,
-		// <node>, 7 ...) before it.
+		// A BLAS walked wave-wide: the value of the node SGPR of the inner loop (S_AND_B32 <t>,
+		// <node>, 7 ...; its backward branch goes to the copy of EXEC before it or to it) before it.
 		for (size_t inner = header + 3; inner + 1 < back && !root; inner++) {
-			Field field;
-			if (IsNodeType(inner) && m_inst[inner].src0.kind == OperandKind::Sgpr &&
+			Field  field;
+			size_t cmp = npos;
+			if (NodeTypeTest(inner, cmp) && m_inst[inner].src0.kind == OperandKind::Sgpr &&
 			    root_field(inner, m_inst[inner].src0, field) && ScalarWriter(inner, m_inst[inner].src0.reg, header) != npos &&
-			    BackwardBranchTo(inner - 1) != npos) {
+			    (BackwardBranchTo(inner - 1) != npos || BackwardBranchTo(inner) != npos)) {
 				layout.root_dword = field.dword;
 				root              = true;
 			}
@@ -2458,17 +2629,26 @@ private:
 	}
 
 	// The instance mask test of a per lane walk: (dword >> shift) & mask, mask a constant:
-	// S_AND_B32 <s>, <dword>, <mask << shift>; S_CBRANCH_SCC0.
-	bool ConstantMaskTest(size_t i, size_t from, Field& field, uint32_t& shift, uint32_t& mask) const {
+	// S_AND_B32 <s>, <dword>, <mask << shift>; S_CBRANCH_SCC0. A contiguous mask of more than 8 bits
+	// gives its `width` (the instance counts when any of them is set) and mask 0xff.
+	bool ConstantMaskTest(size_t i, size_t from, Field& field, uint32_t& shift, uint32_t& mask, uint32_t& width) const {
+		width = 0;
 		const auto& test = m_inst[i];
 		const auto  next = NextReal(i);
-		// Any bit of the top byte: S_CMP_GT_U32 <dword>, (1 << shift) - 1; S_CBRANCH_SCC0.
-		if (test.opcode == Opcode::S_CMP_GT_U32 && test.src1.kind == OperandKind::LiteralConstant && next != npos &&
-		    m_inst[next].opcode == Opcode::S_CBRANCH_SCC0 && OperandField(i, test.src0, from, field)) {
+		// Any bit from `shift` up: S_CMP_GT_U32 <dword>, (1 << shift) - 1; S_CBRANCH_SCC0, or
+		// S_CMP_LE_U32 (S_CMPK_LE_U32) <dword>, (1 << shift) - 1; S_CBRANCH_SCC1. Below the top byte
+		// that is a mask of 32 - shift bits.
+		const bool constant = test.src1.kind == OperandKind::LiteralConstant ||
+		                      test.src1.kind == OperandKind::IntegerInlineConstant;
+		if (constant && next != npos &&
+		    ((test.opcode == Opcode::S_CMP_GT_U32 && m_inst[next].opcode == Opcode::S_CBRANCH_SCC0) ||
+		     (test.opcode == Opcode::S_CMP_LE_U32 && m_inst[next].opcode == Opcode::S_CBRANCH_SCC1)) &&
+		    OperandField(i, test.src0, from, field)) {
 			const auto below = test.src1.value;
 			shift            = static_cast<uint32_t>(std::popcount(below));
 			mask             = 0xffu;
-			return (below & (below + 1u)) == 0 && shift >= 24u;
+			width            = shift < 24u ? 32u - shift : 0u;
+			return (below & (below + 1u)) == 0 && shift >= 1u && shift < 32u;
 		}
 		if (test.opcode != Opcode::S_AND_B32 || test.src1.kind != OperandKind::LiteralConstant || test.src1.value == 0 ||
 		    next == npos || m_inst[next].opcode != Opcode::S_CBRANCH_SCC0 || !OperandField(i, test.src0, from, field)) {
@@ -2476,7 +2656,13 @@ private:
 		}
 		shift = static_cast<uint32_t>(std::countr_zero(test.src1.value));
 		mask  = test.src1.value >> shift;
-		return mask <= 0xffu;
+		if (mask <= 0xffu) {
+			return true;
+		}
+		width                 = static_cast<uint32_t>(std::popcount(mask));
+		const bool contiguous = (mask & (mask + 1u)) == 0;
+		mask                  = 0xffu;
+		return contiguous;
 	}
 
 	bool SameRecord(const Field& field, const Field& record) const {
@@ -2587,19 +2773,27 @@ private:
 		if (w != ExecAtom) {
 			const auto& inst = m_inst[w];
 			const auto op = inst.opcode;
-			if ((op == Opcode::S_AND_B64 || op == Opcode::S_ANDN2_B64 || op == Opcode::S_OR_B64 || op == Opcode::S_ORN2_B64 ||
-			     op == Opcode::S_NOR_B64 || op == Opcode::S_NAND_B64) &&
+			if (op == Lane(Opcode::S_NOT_B64) && ScalarIndex(inst.dst) == reg) {
+				uint32_t a = 0;
+				if (!MaskTable(w, inst.src0, from, atoms, a, depth + 1)) {
+					return false;
+				}
+				table = ~a;
+				return true;
+			}
+			if ((op == Lane(Opcode::S_AND_B64) || op == Lane(Opcode::S_ANDN2_B64) || op == Lane(Opcode::S_OR_B64) ||
+			     op == Lane(Opcode::S_ORN2_B64) || op == Lane(Opcode::S_NOR_B64) || op == Lane(Opcode::S_NAND_B64)) &&
 			    ScalarIndex(inst.dst) == reg) {
 				uint32_t a = 0, b = 0;
 				if (!MaskTable(w, inst.src0, from, atoms, a, depth + 1) || !MaskTable(w, inst.src1, from, atoms, b, depth + 1)) {
 					return false;
 				}
-				table = op == Opcode::S_AND_B64     ? a & b
-				        : op == Opcode::S_ANDN2_B64 ? a & ~b
-				        : op == Opcode::S_OR_B64    ? a | b
-				        : op == Opcode::S_ORN2_B64  ? a | ~b
-				        : op == Opcode::S_NOR_B64   ? ~(a | b)
-				                                    : ~(a & b);
+				table = op == Lane(Opcode::S_AND_B64)     ? a & b
+				        : op == Lane(Opcode::S_ANDN2_B64) ? a & ~b
+				        : op == Lane(Opcode::S_OR_B64)    ? a | b
+				        : op == Lane(Opcode::S_ORN2_B64)  ? a | ~b
+				        : op == Lane(Opcode::S_NOR_B64)   ? ~(a | b)
+				                                          : ~(a & b);
 				return true;
 			}
 		}
@@ -2631,13 +2825,21 @@ private:
 				continue;
 			}
 			const auto bfe = ScalarSource(i, *a, Opcode::S_BFE_U32, from);
-			if (bfe == npos || m_inst[bfe].src1.kind != OperandKind::LiteralConstant ||
-			    (m_inst[bfe].src1.value >> 16u) != 1u || (m_inst[bfe].src1.value & 0xffffu) < 3u ||
-			    !OperandField(bfe, m_inst[bfe].src0, from, flags)) {
-				continue;
+			if (bfe != npos && m_inst[bfe].src1.kind == OperandKind::LiteralConstant &&
+			    (m_inst[bfe].src1.value >> 16u) == 1u && (m_inst[bfe].src1.value & 0xffffu) >= 3u &&
+			    OperandField(bfe, m_inst[bfe].src0, from, flags)) {
+				bit = m_inst[bfe].src1.value & 0xffffu;
+				return true;
 			}
-			bit = m_inst[bfe].src1.value & 0xffffu;
-			return true;
+			// Or S_LSHR_B32 <flags dword & mask>, <bit>, with no bit of the mask above it.
+			const auto lsr  = ScalarSource(i, *a, Opcode::S_LSHR_B32, from);
+			uint32_t   mask = 0;
+			if (lsr != npos && m_inst[lsr].src1.kind == OperandKind::IntegerInlineConstant &&
+			    m_inst[lsr].src1.value >= 3u && m_inst[lsr].src1.value < 32u &&
+			    MaskedField(lsr, m_inst[lsr].src0, from, flags, mask) && (mask >> m_inst[lsr].src1.value) == 1u) {
+				bit = m_inst[lsr].src1.value;
+				return true;
+			}
 		}
 		return false;
 	}
@@ -2719,7 +2921,7 @@ private:
 		// The selector's condition, as cull = !(flags bit 2) & enable.
 		const auto& sel = m_inst[atoms[selector]];
 		Condition   cond;
-		if (sel.opcode == Opcode::S_CSELECT_B64 && sel.src0.kind == OperandKind::ExecLo && IsConstant(sel.src1, 0)) {
+		if (sel.opcode == Lane(Opcode::S_CSELECT_B64) && sel.src0.kind == OperandKind::ExecLo && IsConstant(sel.src1, 0)) {
 			if (!SccCondition(atoms[selector], from, layout, back, cond, 0)) {
 				return false;
 			}
@@ -2833,11 +3035,13 @@ private:
 		if (inst.opcode != Opcode::S_AND_B32 || ScalarIndex(inst.dst) != reg) {
 			return false;
 		}
-		// Flags bit 2: S_AND_B32 <x>, <flags dword>, 1 << (shift + 2).
+		// Flags bit 2: S_AND_B32 <x>, <flags dword (masked)>, 1 << (shift + 2).
 		const uint32_t bit = 1u << (layout.flags_shift + 2u);
 		for (const auto& [a, b]: {std::pair {&inst.src0, &inst.src1}, std::pair {&inst.src1, &inst.src0}}) {
-			Field field;
-			if (IsConstant(*b, bit) && OperandField(w, *a, from, field) && field.dword == layout.flags_dword) {
+			Field    field;
+			uint32_t mask = 0;
+			if (IsConstant(*b, bit) && MaskedField(w, *a, from, field, mask) && (mask & bit) != 0 &&
+			    field.dword == layout.flags_dword) {
 				cond      = {};
 				cond.both = 1;
 				return true;
@@ -2942,6 +3146,18 @@ private:
 	}
 
 	// The mask operand of V_CNDMASK_B32 (VCC without a third operand).
+	static bool IsConditionalBranch(Opcode opcode) {
+		switch (opcode) {
+			case Opcode::S_CBRANCH_SCC0:
+			case Opcode::S_CBRANCH_SCC1:
+			case Opcode::S_CBRANCH_VCCZ:
+			case Opcode::S_CBRANCH_VCCNZ:
+			case Opcode::S_CBRANCH_EXECZ:
+			case Opcode::S_CBRANCH_EXECNZ: return true;
+			default: return false;
+		}
+	}
+
 	static Operand CndmaskMask(const Instruction& inst) {
 		if (inst.src_count >= 3u) {
 			return inst.src2;
@@ -2949,6 +3165,27 @@ private:
 		Operand operand;
 		operand.kind = OperandKind::VccLo;
 		return operand;
+	}
+
+	// The opcode of a lane mask operation in the program's waves: `op64`, or its 32-bit form in
+	// waves of 32 lanes.
+	Opcode Lane(Opcode op64) const {
+		if (!m_wave32) {
+			return op64;
+		}
+		switch (op64) {
+			case Opcode::S_AND_B64: return Opcode::S_AND_B32;
+			case Opcode::S_ANDN2_B64: return Opcode::S_ANDN2_B32;
+			case Opcode::S_OR_B64: return Opcode::S_OR_B32;
+			case Opcode::S_ORN2_B64: return Opcode::S_ORN2_B32;
+			case Opcode::S_NOR_B64: return Opcode::S_NOR_B32;
+			case Opcode::S_NAND_B64: return Opcode::S_NAND_B32;
+			case Opcode::S_NOT_B64: return Opcode::S_NOT_B32;
+			case Opcode::S_MOV_B64: return Opcode::S_MOV_B32;
+			case Opcode::S_CSELECT_B64: return Opcode::S_CSELECT_B32;
+			case Opcode::S_AND_SAVEEXEC_B64: return Opcode::S_AND_SAVEEXEC_B32;
+			default: return op64;
+		}
 	}
 
 	// An SGPR pair the program never reads or writes (NoRegister: none).
@@ -2961,10 +3198,22 @@ private:
 			}
 		};
 		for (const auto& inst: m_inst) {
-			// Conservatively wide: whole descriptors and pairs.
-			const uint32_t width = inst.family == Family::SMEM || inst.family == Family::MIMG ? 16u : 2u;
-			for (const auto* operand: {&inst.src0, &inst.src1, &inst.src2, &inst.src3}) {
-				mark(*operand, width);
+			// Conservatively wide: whole descriptors and pairs. A scalar memory access reads its
+			// base pair or buffer descriptor and an offset, an image access its resource (eight
+			// SGPRs) and sampler (four).
+			if (inst.family == Family::SMEM) {
+				mark(inst.src0, 4u);
+				mark(inst.src1, 1u);
+			} else if (inst.family == Family::MIMG) {
+				mark(inst.src0, 2u);
+				mark(inst.src1, 8u);
+				mark(inst.src2, 4u);
+				mark(inst.src3, 2u);
+			} else {
+				const uint32_t width = inst.family == Family::MUBUF || inst.family == Family::MTBUF ? 4u : 2u;
+				for (const auto* operand: {&inst.src0, &inst.src1, &inst.src2, &inst.src3}) {
+					mark(*operand, width);
+				}
 			}
 			mark(inst.dst, inst.family == Family::SMEM ? std::max(inst.data_dwords, 1u) : 2u);
 			mark(inst.dst2, 2u);
@@ -2993,9 +3242,9 @@ private:
 				continue;
 			}
 			const auto reject = ScalarWriter(i, ScalarIndex(mask_t), header);
-			// The word kept with the same mask.
+			// The word kept with the same mask (before or after t).
 			size_t keep_word = npos;
-			for (size_t j = i + 1; j-- > header + 1 && keep_word == npos;) {
+			for (size_t j = header + 1; j < back && keep_word == npos; j++) {
 				const auto& keep = m_inst[j];
 				const auto  mask = CndmaskMask(keep);
 				if (j != i && keep.opcode == Opcode::V_CNDMASK_B32 && keep.dst.kind == OperandKind::Vgpr &&
@@ -3035,18 +3284,35 @@ private:
 		// Or the moves of the nearest hit under EXEC = accept & !(t > t max):
 		//   S_AND_SAVEEXEC_B64 <s>, <accept>; S_CBRANCH_EXECZ; V_MOV_B32s of t into t max, of the
 		//   instance record pair and of the list entry (triangle node, primitive word).
+		// The far test can also come after the S_AND_SAVEEXEC_B64, with t computed there:
+		//   V_RCP_F32 / V_MUL_F32 of t; V_CMPX_LE_F32 <t>, <t max>; S_CBRANCH_EXECZ; the moves.
 		for (size_t i = header; i + 2 < back; i++) {
 			const auto& save = m_inst[i];
-			if (save.opcode != Opcode::S_AND_SAVEEXEC_B64 || m_inst[i + 1].opcode != Opcode::S_CBRANCH_EXECZ ||
+			if (save.opcode != Lane(Opcode::S_AND_SAVEEXEC_B64) || m_inst[i + 1].opcode != Opcode::S_CBRANCH_EXECZ ||
 			    ScalarIndex(save.src0) == NoRegister) {
 				continue;
+			}
+			size_t first = i + 2, far_test = npos;
+			for (size_t j = first; j + 1 < back && j < i + 6; j++) {
+				const auto& c = m_inst[j];
+				if (c.opcode == Opcode::V_CMPX_LE_F32 && m_inst[j + 1].opcode == Opcode::S_CBRANCH_EXECZ &&
+				    c.src0.kind == OperandKind::Vgpr && c.src1.kind == OperandKind::Vgpr && c.src1.reg == site.t_max &&
+				    c.src0.reg != site.t_max && Plain(c.src0) && Plain(c.src1)) {
+					far_test = j;
+					first    = j + 2;
+					break;
+				}
+				if ((c.opcode != Opcode::V_RCP_F32 && c.opcode != Opcode::V_MUL_F32) || c.dst.kind != OperandKind::Vgpr ||
+				    c.dst.reg == site.t_max) {
+					break;
+				}
 			}
 			uint32_t t_value = NoRegister, instance = NoRegister, entry = NoRegister, node = NoRegister, word = NoRegister;
 			bool     ok      = true;
 			const auto waits = [&](size_t j) {
 				return m_inst[j].opcode == Opcode::S_WAITCNT || m_inst[j].opcode == Opcode::S_NOP;
 			};
-			for (size_t j = i + 2; j < back && (m_inst[j].opcode == Opcode::V_MOV_B32 || waits(j)) && ok; j++) {
+			for (size_t j = first; j < back && (m_inst[j].opcode == Opcode::V_MOV_B32 || waits(j)) && ok; j++) {
 				const auto& move = m_inst[j];
 				if (waits(j)) {
 					continue;
@@ -3067,10 +3333,11 @@ private:
 					ok = false;
 				}
 			}
-			if (!ok || t_value == NoRegister || instance == NoRegister || node == NoRegister || word == NoRegister) {
+			if (!ok || t_value == NoRegister || instance == NoRegister || node == NoRegister || word == NoRegister ||
+			    (far_test != npos && m_inst[far_test].src0.reg != t_value)) {
 				continue;
 			}
-			const auto mul = VectorWriter(i, t_value, header);
+			const auto mul = VectorWriter(far_test != npos ? far_test : i, t_value, header);
 			size_t     test = npos;
 			for (const auto* operand: {&m_inst[mul].src0, &m_inst[mul].src1}) {
 				const auto w = mul != npos && operand->kind == OperandKind::Vgpr ? VectorWriter(mul, operand->reg, header) : npos;
@@ -3093,15 +3360,17 @@ private:
 	}
 
 	const std::vector<Instruction>& m_inst;
+	// Lane masks are one SGPR (EXEC_LO, VCC_LO) instead of a pair.
+	const bool m_wave32;
 };
 
 } // namespace
 
-bool DeriveRayTracingPatch(const Program& program, RayTracingPatch& patch) {
-	if (program.instructions.empty()) {
+bool DeriveRayTracingPatch(const Program& program, RayTracingPatch& patch, uint32_t wave_size) {
+	if (program.instructions.empty() || (wave_size != 32 && wave_size != 64)) {
 		return false;
 	}
-	SiteFinder finder(program);
+	SiteFinder finder(program, wave_size);
 	if (!finder.Find(patch)) {
 		return false;
 	}
