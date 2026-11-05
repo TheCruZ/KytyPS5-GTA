@@ -36,6 +36,8 @@ inline constexpr BufferId NULL_BUFFER_ID {0};
 enum class HackMark : uint32_t {
 	// A ray query wave reached its round limit with candidates left and dropped them.
 	RayQueryRounds,
+	// An invocation read so many zeros from uncached device addresses that its loops end.
+	BdaLoopExit,
 	Count,
 };
 

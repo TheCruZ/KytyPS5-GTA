@@ -1593,6 +1593,9 @@ struct TestCase {
   // Guest addresses whose caching page V#-table stores must (true) or must not
   // (false) have marked in the fault buffer's write bitmap.
   std::vector<std::pair<uint64_t, bool>> expected_bda_writes;
+  // Lanes whose loops ended after reading zeros from uncached device addresses,
+  // counted in the fault buffer's hack marks (HackMark::BdaLoopExit).
+  std::optional<u32> expected_loop_exit_marks;
   bool expand_shader_data_storage = false;
   bool expected_force_point_sampler = false;
   float expected_float_tolerance = 0.0f;
@@ -19927,6 +19930,42 @@ public:
     return bits;
   }
 
+  // The fault buffer's hack marks after the last dispatch.
+  std::vector<u32> ReadHackMarks(const char *shader_name) {
+    auto words = CreateHostBuffer(shader_name, BufferCache::HACK_MARKS_SIZE,
+                                  vk::BufferUsageFlagBits::eTransferDst, {});
+    vk::CommandBuffer cmd = BeginCommands(shader_name, "hack marks");
+    vk::BufferMemoryBarrier before{};
+    before.sType = vk::StructureType::eBufferMemoryBarrier;
+    before.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+    before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+    before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    before.buffer = m_fault_buffer.buffer;
+    before.offset = BufferCache::HACK_MARKS_OFFSET;
+    before.size = BufferCache::HACK_MARKS_SIZE;
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1,
+                        &before, 0, nullptr);
+    const vk::BufferCopy copy{BufferCache::HACK_MARKS_OFFSET, 0,
+                              BufferCache::HACK_MARKS_SIZE};
+    cmd.copyBuffer(m_fault_buffer.buffer, words.buffer, 1, &copy);
+    vk::BufferMemoryBarrier after = before;
+    after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    after.buffer = words.buffer;
+    after.offset = 0;
+    after.size = words.size;
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                        vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1,
+                        &after, 0, nullptr);
+    EndSubmitAndFree(shader_name, "hack marks", cmd);
+    auto values = ReadBuffer(shader_name, words,
+                             BufferCache::HACK_MARKS_SIZE / sizeof(u32));
+    DestroyBuffer(&words);
+    return values;
+  }
+
   std::vector<u32> ReadBuffer(const char *shader_name, const Buffer &buffer,
                               size_t dword_count, size_t first_dword = 0) {
     if (!buffer.coherent) {
@@ -24712,6 +24751,24 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
                   ? "a V# table store did not mark its page written"
                   : "a page without V# table stores was marked written");
     }
+  }
+  if (test.expected_loop_exit_marks) {
+    const auto marks = vulkan->ReadHackMarks(test.name);
+    u32 lanes = 0;
+    for (u32 entry = 0; entry < BufferCache::HACK_MARK_ENTRIES; entry++) {
+      const auto *mark = marks.data() + entry * BufferCache::HACK_MARK_DWORDS;
+      const auto count = mark[BufferCache::HACK_MARK_COUNTS +
+                              static_cast<u32>(HackMark::BdaLoopExit)];
+      if (count == 0) {
+        continue;
+      }
+      Require(test.name, "hack marks",
+              (mark[0] ^ mark[2]) == ~0u && (mark[1] ^ mark[3]) == ~0u,
+              "a hack mark entry does not hold one shader hash");
+      lanes += count;
+    }
+    Require(test.name, "hack marks", lanes == *test.expected_loop_exit_marks,
+            "the lanes whose loops the uncached reads ended were not marked once each");
   }
   if (!test.expected_gds.empty()) {
     const auto gds_actual =
@@ -39318,6 +39375,8 @@ TestCase ScalarBufferFromLoopReadlane(u32 wave_size) {
                    0, 0, 0, 0};
   test.bda_mappings = {{GuestBase, 512}};
   test.required_spirv = {"get_bda_pointer", "OpLoopMerge", "OpGroupNonUniformShuffle"};
+  // Its loop gets the exit for uncached reads, but reads cached memory: no mark.
+  test.expected_loop_exit_marks = 0;
   test.forbidden_spirv = {"flattened_srt"};
   test.opcodes = {O::V_LSHLREV_B32, O::BUFFER_LOAD_DWORD, O::S_MOV_B32,
                   O::S_MOV_B64, O::S_LOAD_DWORDX8, O::S_BUFFER_LOAD_DWORDX4,
@@ -39328,6 +39387,45 @@ TestCase ScalarBufferFromLoopReadlane(u32 wave_size) {
   test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+// A loop that reads device addresses until it finds a nonzero dword (as ASTRO's
+// PLAYROOM walks its BVH leaf lists), over memory without a cached buffer: every
+// read returns zero, so only the exit that get_bda_pointer's count takes ends it,
+// and the invocation that reaches the count marks its hack mark entry once.
+TestCase BdaLoopOverUncachedPagesEnds() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x10000;
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 20, static_cast<u32>(GuestBase + 0x100000u));
+  AppendSMovLiteral(&code, 21, 0);
+  const auto loop = static_cast<u32>(code.size());
+  code.push_back(EncodeSmem0(0x00, 22, 10)); // s_load_dword s22, s[20:21]
+  code.push_back(EncodeSmem1(0, 125));
+  code.push_back(EncodeSop2(0x00, 20, 20, InlineU32(4)));
+  code.push_back(EncodeSopc(0x06, 22, InlineU32(0))); // s_cmp_eq_u32 s22, 0
+  code.push_back(EncodeSopp(0x05, loop - static_cast<u32>(code.size()) - 1u));
+  AppendStoreSgpr(&code, 22, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BdaLoopOverUncachedPagesEnds";
+  test.code = std::move(code);
+  test.initial = {0xcafef00du};
+  test.expected = {0};
+  test.bda_mappings = {{GuestBase, 0}};
+  test.expected_loop_exit_marks = 1;
+  test.required_spirv = {"get_bda_pointer", "bda_faulted_reads", "OpLoopMerge",
+                         "OpGroupNonUniformAny", "OpAtomicIAdd"};
+  test.opcodes = {O::S_MOV_B32, O::S_LOAD_DWORD, O::S_ADD_U32, O::S_CMP_EQ_U32,
+                  O::S_CBRANCH_SCC1, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.compute_info.wave_size = 32;
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
   test.has_compute_info = true;
   return test;
 }
@@ -49327,6 +49425,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
   AddCase(ScalarLoadAlignsComponentsAndMasksAddress);
   AddCase(ScalarLoadAlignsDynamicBase);
+  AddCase(BdaLoopOverUncachedPagesEnds);
   cases.push_back(ScalarBufferFromLoopReadlane(32));
   cases.push_back(ScalarBufferFromLoopReadlane(64));
   AddCase(BufferLoadStore);

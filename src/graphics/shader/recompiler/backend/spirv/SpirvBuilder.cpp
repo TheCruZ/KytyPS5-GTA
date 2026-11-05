@@ -105,6 +105,11 @@ void Builder::DefineGlobalVariable(uint32_t id, uint32_t pointer_type,
 	AppendInstruction(m_declarations, spv::OpVariable, pointer_type, id, storage_class);
 }
 
+void Builder::DefineGlobalVariable(uint32_t id, uint32_t pointer_type,
+                                   spv::StorageClass storage_class, uint32_t initializer) {
+	AppendInstruction(m_declarations, spv::OpVariable, pointer_type, id, storage_class, initializer);
+}
+
 void Builder::AppendString(std::vector<uint32_t>& words, const char* text) {
 	const auto len        = text != nullptr ? std::strlen(text) : 0;
 	const auto word_count = (len + 1u + 3u) / 4u;
@@ -165,6 +170,16 @@ void Builder::AddName(uint32_t target, const char* name) {
 
 void Builder::AddFunction(std::span<const uint32_t> words) {
 	AppendInstructionWords(m_functions, words.data(), words.size());
+}
+
+void Builder::InsertFunctionWords(size_t offset, std::span<const uint32_t> words) {
+	EXIT_IF(offset > m_functions.size() || m_unpatched_phi_incomings != 0);
+	m_functions.insert(m_functions.begin() + static_cast<std::ptrdiff_t>(offset), words.begin(), words.end());
+}
+
+void Builder::PatchFunctionWord(size_t offset, uint32_t expected, uint32_t value) {
+	EXIT_IF(offset >= m_functions.size() || m_functions[offset] != expected);
+	m_functions[offset] = value;
 }
 
 DeferredPhi Builder::AddDeferredPhi(uint32_t type, uint32_t result, size_t incoming_count) {

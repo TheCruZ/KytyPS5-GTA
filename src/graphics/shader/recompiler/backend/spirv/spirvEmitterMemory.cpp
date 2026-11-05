@@ -1270,6 +1270,7 @@ uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compon
 			    const auto function = state.indirect_buffer_load_functions.at(
 			        {mem.data_bits, components, uint32_t(mem.coherent), uint32_t(mem.formatted)});
 			    const auto args = IndirectBufferArgs(ctx, inst);
+			    state.device_address_calls++;
 			    const auto result = state.builder.AllocateId();
 			    state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(state, components),
 			                              result, function, args);
@@ -1432,6 +1433,7 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 } // namespace
 
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address) {
+	state.device_address_calls++;
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpFunctionCall, TypeU64(state), result,
 	                          state.bda_pointer_function, address);
@@ -1578,6 +1580,11 @@ void DefineGetBdaPointer(EmitterState& state) {
 
 	EmitLabel(state, fault_label);
 	RecordBdaFault(state, page);
+	// The access reads zeros, not guest memory: shaders with loops that access device addresses
+	// count it here (FinishBdaLoopExits).
+	if (!state.loop_headers_by_merge.empty()) {
+		state.bda_fault_count_insert = state.builder.FunctionWordCount();
+	}
 	state.builder.AddFunction(spv::OpBranch, merge_label);
 
 	EmitLabel(state, available_label);
@@ -1588,6 +1595,10 @@ void DefineGetBdaPointer(EmitterState& state) {
 
 	EmitLabel(state, merge_label);
 	const auto result = state.builder.AllocateId();
+	if (state.bda_fault_count_insert != SIZE_MAX) {
+		state.bda_fault_phi_parent = state.builder.FunctionWordCount() + 4;
+		state.bda_fault_label      = fault_label;
+	}
 	state.builder.AddFunction(spv::OpPhi, type, result, ConstantU64(state, 0), fault_label,
 	                          available, available_label);
 	state.builder.AddFunction(spv::OpReturnValue, result);
