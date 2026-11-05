@@ -50495,6 +50495,121 @@ void CheckTessellationPatchConstants() {
 #endif
 }
 
+// PPSA25381 (HS 1554cda5fbe937c4, f00136a119cad6b0): with one output control point, the HS
+// output address is the patch ordinal (an SDWA byte 0 of the packed HS ID) << 7 or times a
+// scalar constant, with no control point term, like the patch constants at
+// 0x8000 - (patch + 1) * 0x60. Only the patch ordinal tells them apart.
+void CheckTessellationSingleControlPoint() {
+  using namespace ShaderRecompiler;
+  using Attribute = IR::TessellationAttribute;
+  constexpr const char *name = "TessellationSingleControlPoint";
+  constexpr u32 ls_stride = 48, hs_stride = 128, patch_stride = 0x60;
+  std::vector<u32> local;
+  local.push_back(EncodeVop2(0x0b, 20, 255u, 3)); // v_mul_u32_u24 v20, ls_stride, v3
+  local.push_back(ls_stride);
+  local.push_back(EncodeDs0(0xdf, 16)); // ds_write_b128 v20, v[2:5] offset:16
+  local.push_back(EncodeDs1(0, 2, 20));
+  local.push_back(EncodeSop1(0x20, 0, 6));
+
+  std::vector<u32> control;
+  control.push_back(EncodeVop2(0x1b, 32, 255u, 1)); // v_and_b32 v32, 0xff, v1
+  control.push_back(0xffu);
+  // v_lshlrev_b32_sdwa v33, 7, v1 src1_sel:BYTE_0
+  control.push_back(EncodeVop2(0x1a, 33, 249u, 1));
+  control.push_back(EncodeVop2Sdwa(InlineU32(7), 6, 0, 6, 0, 0, 0, 0, 0, 0, 0, 1));
+  // HS f00136a119cad6b0 scales the ordinal by a scalar instead:
+  // s_movk_i32 vcc_lo, hs_stride; v_mul_u32_u24_sdwa v34, vcc_lo, v1 src1_sel:BYTE_0
+  control.push_back(EncodeSopk(0x00, 106, hs_stride));
+  control.push_back(EncodeSmem0(0x02u, 24, 4)); // s_load_dwordx4 s[24:27], s[8:9], 0
+  control.push_back(EncodeSmem1(0));
+  control.push_back(EncodeVop2(0x0b, 34, 249u, 1));
+  control.push_back(EncodeVop2Sdwa(106, 6, 0, 6, 0, 0, 0, 0, 0, 0, 0, 1));
+  control.push_back(EncodeVop2(0x0b, 14, 255u, 32)); // v_mul_u32_u24 v14, ls_stride, v32
+  control.push_back(ls_stride);
+  // ds_read2_b32 v[10:11], v14 offset0:4 offset1:5
+  control.push_back(EncodeDs0(0x37, (5u << 8u) | 4u));
+  control.push_back(EncodeDs1(10, 0, 14));
+  // buffer_store_dwordx2 v[10:11], v33, s[8:11], s2 offen offset:16
+  control.push_back(EncodeMubuf0(0x1d, 16));
+  control.push_back(EncodeMubuf1(10, 2, 33, 2));
+  // The control point's last dword: buffer_store_dword v10, v33, s[8:11], s2 offen offset:124
+  control.push_back(EncodeMubuf0(0x1c, hs_stride - 4));
+  control.push_back(EncodeMubuf1(10, 2, 33, 2));
+  // buffer_store_dword v11, v34, s[8:11], s2 offen offset:8
+  control.push_back(EncodeMubuf0(0x1c, 8));
+  control.push_back(EncodeMubuf1(11, 2, 34, 2));
+  control.push_back(EncodeVop2(0x0b, 4, InlineU32(24), 32)); // v_mul_u32_u24 v4, 24, v32
+  for (u32 i = 0; i < 4; i++) {
+    AppendVMovLiteral(&control, i, std::bit_cast<u32>(static_cast<float>(i + 1)));
+  }
+  AppendVMovLiteral(&control, 6, std::bit_cast<u32>(5.0f));
+  AppendVMovLiteral(&control, 7, std::bit_cast<u32>(6.0f));
+  control.push_back(EncodeMubuf0(0x1e)); // buffer_store_dwordx4 v[0:3], v4, s[8:11], s4 offen
+  control.push_back(EncodeMubuf1(0, 2, 4, 4));
+  control.push_back(EncodeMubuf0(0x1d, 16)); // buffer_store_dwordx2 v[6:7], ... offset:16
+  control.push_back(EncodeMubuf1(6, 2, 4, 4));
+  control.push_back(EncodeVop2(0x25, 20, InlineU32(1), 32)); // v_add_nc_u32 v20, 1, v32
+  control.push_back(EncodeVop2(0x0b, 20, 255u, 20));         // v_mul_u32_u24 v20, 0x60, v20
+  control.push_back(patch_stride);
+  control.push_back(EncodeVop2(0x26, 20, 255u, 20)); // v_sub_nc_u32 v20, 0x8000, v20
+  control.push_back(0x8000u);
+  for (u32 offset : {0u, 16u}) { // buffer_store_dword v0, v20, s[8:11], s2 offen offset:...
+    control.push_back(EncodeMubuf0(0x1c, offset));
+    control.push_back(EncodeMubuf1(0, 2, 20, 2));
+  }
+  AppendEnd(&control);
+
+  std::vector<u32> evaluation;
+  AppendVop3(&evaluation, 0x169, 24, 255u, Vgpr(7)); // v_mul_lo_u32 v24, hs_stride, v7
+  evaluation.push_back(hs_stride);
+  evaluation.push_back(EncodeVop2(0x25, 2, InlineU32(1), 7)); // v_add_nc_u32 v2, 1, v7
+  evaluation.push_back(EncodeVop2(0x0b, 2, 255u, 2));
+  evaluation.push_back(patch_stride);
+  evaluation.push_back(EncodeVop2(0x26, 2, 255u, 2));
+  evaluation.push_back(0x8000u);
+  evaluation.push_back(EncodeMubuf0(0x0d, 16)); // control point dwords 4-5
+  evaluation.push_back(EncodeMubuf1(10, 2, 24, 4));
+  evaluation.push_back(EncodeMubuf0(0x0d, 0)); // patch constant dwords 0-1
+  evaluation.push_back(EncodeMubuf1(12, 2, 2, 4));
+  evaluation.push_back(EncodeVop2(0x03, 10, Vgpr(12), 10)); // v_add_f32 v10, v12, v10
+  evaluation.push_back(EncodeVop2(0x03, 11, Vgpr(13), 11));
+  evaluation.push_back(EncodeExp0(0x0c, 0xf));
+  evaluation.push_back(EncodeExp1(5, 6, 10, 11));
+  AppendEnd(&evaluation);
+
+  ShaderTessellationInputInfo tess{.input_control_points = 1,
+                                  .output_control_points = 1,
+                                  .domain = 2,
+                                  .partitioning = 2,
+                                  .output_topology = 2};
+  AnalyzeTessellationPrograms(local, control, tess);
+  Require(name, "reflected interface",
+          tess.ls_stride == ls_stride && tess.hs_stride == hs_stride &&
+              tess.patch_base == 0x7fa0u && tess.patch_size == 20u,
+          "the patch ordinal must separate the control point's outputs from patch constants");
+
+  auto ls = CompileTessellationStage(name, local, ShaderType::Local, tess);
+  auto hs = CompileTessellationStage(name, control, ShaderType::TessellationControl, tess);
+  auto ds = CompileTessellationStage(name, evaluation, ShaderType::TessellationEvaluation, tess);
+  Require(name, "control point outputs",
+          hs.addresses[Attribute::ControlOutput] == std::set<u32>{8, 16, 20, hs_stride - 4} &&
+              hs.addresses[Attribute::ControlInput] == std::set<u32>{16, 20},
+          "byte 0 addressed outputs must stay control point outputs");
+  Require(name, "patch outputs",
+          hs.addresses[Attribute::PatchOutput] == std::set<u32>{0x7fa0, 0x7fb0} &&
+              hs.addresses[Attribute::Factor] == std::set<u32>{0, 4, 8, 12, 16, 20},
+          "patch constants and quad factors must keep their places");
+  Require(name, "evaluation inputs",
+          ds.addresses[Attribute::EvaluationInput] == std::set<u32>{16, 20} &&
+              ds.addresses[Attribute::PatchInput] == std::set<u32>{0x7fa0, 0x7fa4},
+          "TES reads must split into control point and patch inputs");
+  Require(name, "matching patch interface",
+          HasPatchInterface(hs.assembly, "Output", 2, 8) &&
+              HasPatchInterface(ds.assembly, "Input", 2, 8),
+          "HS and TES patch variables must follow the control point's outputs");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckTessellationPrograms() {
   CheckTessellationProgram("TessellationShiftedStride", 124, 128);
   CheckTessellationProgram("TessellationMultipliedStride", 108, 112);
@@ -50503,6 +50618,7 @@ void CheckTessellationPrograms() {
   CheckTessellationProgram("TessellationFractionalEvenQuads", 36, 128, 2, 2, 3);
   CheckTessellationProgram("TessellationMaskedControlPoint", 32, 256, 2);
   CheckTessellationPatchConstants();
+  CheckTessellationSingleControlPoint();
 }
 
 void CheckEmbeddedFetchVertexOffset() {

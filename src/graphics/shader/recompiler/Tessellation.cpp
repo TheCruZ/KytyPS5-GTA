@@ -29,20 +29,65 @@ struct TessellationAddress {
 	bool operator==(const TessellationAddress&) const = default;
 };
 
+// An HS store to the control-point ring, by pc: its address register and immediate offset.
+struct TessellationStore {
+	TessellationAddress address;
+	uint32_t            offset = 0;
+	uint32_t            bytes  = 0;
+};
+using TessellationStores = std::unordered_map<uint32_t, TessellationStore>;
+
+// The integer operations ReflectTessellationLayout follows: they write only their VGPR.
+bool IsAddressOpcode(Decoder::Opcode opcode) {
+	using Decoder::Opcode;
+	switch (opcode) {
+		case Opcode::V_BFE_U32:
+		case Opcode::V_AND_B32:
+		case Opcode::V_ADD_NC_U32:
+		case Opcode::V_MUL_LO_U32:
+		case Opcode::V_MUL_U32_U24:
+		case Opcode::V_MAD_U32_U24:
+		case Opcode::V_LSHL_ADD_U32:
+		case Opcode::V_LSHLREV_B32:
+		case Opcode::V_SUB_NC_U32: return true;
+		default: return false;
+	}
+}
+
 // Reflects the LS output stride, or the HS output stride and patch constant range.
+// With `ordinal_stores`, it only collects the HS ring stores, with the patch ordinal (the low
+// byte of the packed HS ID) as the variable of their addresses instead of the control point.
 void ReflectTessellationLayout(const Decoder::Program& program, bool local,
-                               ShaderTessellationInputInfo& info) {
+                               ShaderTessellationInputInfo& info,
+                               TessellationStores*          ordinal_stores = nullptr) {
 	using namespace Decoder;
 	using Address   = TessellationAddress;
 	using Kind      = Address::Kind;
 	using Registers = std::array<Address, IR::NumVectorRegs>;
 
 	const auto control_points = local ? info.input_control_points : info.output_control_points;
+	const bool ordinal        = ordinal_stores != nullptr;
+	// The largest value of the variable: the last control point, or the last patch ordinal.
+	const auto variable_max = ordinal ? 0xffu : control_points - 1u;
+	TessellationStores walked;
+	auto&              stores = ordinal ? *ordinal_stores : walked;
 	Registers  entry {}, registers;
 	entry[local ? 3u : 1u] =
 	    local ? Address {Kind::Affine, 1u, 0u} : Address {Kind::PackedControlPoint};
 	const auto constant = [](uint32_t value) { return Address {Kind::Affine, 0u, value}; };
-	const auto read     = [&](const Operand& operand) -> Address {
+	const auto patch    = [&] { return ordinal ? Address {Kind::Affine, 1u, 0u} : constant(0u); };
+	// By patch ordinal, the scalar constants it is multiplied by (s_movk_i32 vcc_lo, 0xd0 in
+	// Nightreign's HS f00136a119cad6b0); folded to 0, the ordinal gives 0 whatever the scalar.
+	// One holds from the s_mov that sets it until a join, or until an instruction that may write
+	// scalar registers other than a scalar load's own.
+	std::unordered_map<uint32_t, uint32_t> scalars;
+	const auto scalar_key = [](const Operand& operand) -> std::optional<uint32_t> {
+		if (operand.kind != OperandKind::Sgpr && operand.kind != OperandKind::VccLo &&
+		    operand.kind != OperandKind::VccHi)
+			return std::nullopt;
+		return static_cast<uint32_t>(operand.kind) << 8u | operand.reg;
+	};
+	const auto read = [&](const Operand& operand) -> Address {
 		if (operand.absolute || operand.negate || operand.sdwa_sext || operand.op_sel ||
 		    operand.op_sel_hi || operand.negate_hi || operand.dpp)
 			return {};
@@ -52,10 +97,13 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 			value = constant(operand.value);
 		} else if (operand.kind == OperandKind::Vgpr) {
 			value = registers.at(operand.reg);
+		} else if (const auto key = scalar_key(operand); ordinal && key) {
+			if (const auto found = scalars.find(*key); found != scalars.end())
+				value = constant(found->second);
 		}
 		// The native packed HS ID's low byte is the patch ordinal. The logical
 		// interface addresses one patch, as in the frontend's v1 initialization.
-		if (value.kind == Kind::PackedControlPoint && operand.sdwa_sel == 0u) return constant(0u);
+		if (value.kind == Kind::PackedControlPoint && operand.sdwa_sel == 0u) return patch();
 		return operand.sdwa_sel == 6u ? value : Address {};
 	};
 	const auto affine = [](uint64_t coefficient, uint64_t offset) {
@@ -84,8 +132,7 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 		if (value.kind == Kind::Affine && value.coefficient == 0u)
 			return constant(value.constant & 0xffffffu);
 		return value.kind == Kind::Affine &&
-		               uint64_t {value.coefficient} * (control_points - 1u) + value.constant <=
-		                   0xffffffu
+		               uint64_t {value.coefficient} * variable_max + value.constant <= 0xffffffu
 		           ? value
 		           : Address {};
 	};
@@ -106,7 +153,27 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 	for (bool repeat = true; repeat;) {
 		repeat    = false;
 		registers = entry;
+		scalars.clear();
 		for (const auto& inst: program.instructions) {
+			if (ordinal) {
+				const auto key = scalar_key(inst.dst);
+				if (joins.contains(inst.pc) || loops.contains(inst.pc)) scalars.clear();
+				if ((inst.opcode == Opcode::S_MOVK_I32 || inst.opcode == Opcode::S_MOV_B32) &&
+				    key && (inst.src0.kind == OperandKind::IntegerInlineConstant ||
+				            inst.src0.kind == OperandKind::LiteralConstant)) {
+					scalars.insert_or_assign(*key, inst.src0.value);
+				} else if (inst.family == Family::SMEM && inst.dst.kind == OperandKind::Sgpr) {
+					for (uint32_t index = 0; index < std::max(inst.data_dwords, 1u); index++) {
+						auto dword = inst.dst;
+						dword.reg += index;
+						scalars.erase(*scalar_key(dword));
+					}
+				} else if (inst.family != Family::SOPP && inst.family != Family::DS &&
+				           inst.family != Family::MUBUF &&
+				           !(inst.dst.kind == OperandKind::Vgpr && IsAddressOpcode(inst.opcode))) {
+					scalars.clear();
+				}
+			}
 			if (const auto join = joins.find(inst.pc); join != joins.end()) {
 				merge(registers, join->second);
 				joins.erase(join);
@@ -129,6 +196,11 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 			                           inst.src2.kind == OperandKind::Sgpr && inst.src2.reg == 2u;
 			if ((local && local_store) || control_store) {
 				const auto address = read(inst.src0);
+				if (control_store) {
+					stores.insert_or_assign(inst.pc,
+					                        TessellationStore {address, inst.offset, 4u * inst.data_dwords});
+				}
+				if (ordinal) continue;
 				if (address.kind != Kind::Affine) {
 					EXIT("%s tessellation address is not affine at pc 0x%08x\n",
 					     local ? "LS" : "HS", inst.pc);
@@ -155,9 +227,10 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 					if (lhs.kind == Kind::PackedControlPoint && rhs.kind == Kind::Affine &&
 					    rhs.coefficient == 0u && third.kind == Kind::Affine &&
 					    third.coefficient == 0u) {
+						// By patch ordinal, the control point is the only one, 0.
 						if (rhs.constant == 8u && third.constant == 5u)
-							value = {Kind::Affine, 1u, 0u};
-						if (rhs.constant == 0u && third.constant == 8u) value = constant(0u);
+							value = ordinal ? constant(0u) : Address {Kind::Affine, 1u, 0u};
+						if (rhs.constant == 0u && third.constant == 8u) value = patch();
 					}
 					break;
 				case Opcode::V_AND_B32: {
@@ -168,12 +241,15 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 						return operand.kind == Kind::Affine && operand.coefficient == 0u &&
 						       (operand.constant & ~0xffu) == 0u;
 					};
+					// By patch ordinal, only the whole byte is the ordinal itself.
 					if ((lhs.kind == Kind::PackedControlPoint && mask_of(rhs)) ||
 					    (rhs.kind == Kind::PackedControlPoint && mask_of(lhs)))
-						value = constant(0u);
+						value = !ordinal ? constant(0u)
+						        : lhs == constant(0xffu) || rhs == constant(0xffu) ? patch()
+						                                                         : Address {};
 					if ((lhs.kind == Kind::PackedControlPoint && rhs == constant(0x1f00u)) ||
 					    (rhs.kind == Kind::PackedControlPoint && lhs == constant(0x1f00u)))
-						value = {Kind::Affine, 256u, 0u};
+						value = ordinal ? constant(0u) : Address {Kind::Affine, 256u, 0u};
 					break;
 				}
 				case Opcode::V_ADD_NC_U32: value = add(lhs, rhs); break;
@@ -207,6 +283,30 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 				registers[inst.dst.reg + index] = {};
 			}
 			registers.at(inst.dst.reg) = value;
+		}
+	}
+	if (ordinal) return;
+	if (!local && stride == 0u && control_points == 1u) {
+		// With one output control point, no HS output address depends on the control point, so the
+		// walk above takes the control point's outputs for patch constants too (Nightreign's HS
+		// 1554cda5fbe937c4). The patch ordinal separates them: patch P's control point is at
+		// P * stride, while its patch constants count down from the end of the ring.
+		TessellationStores ordinals;
+		ReflectTessellationLayout(program, false, info, &ordinals);
+		patch_begin = UINT32_MAX;
+		patch_end   = 0;
+		for (const auto& [pc, store]: walked) {
+			const auto& by_ordinal = ordinals.at(pc).address;
+			const auto  begin      = store.address.constant + store.offset;
+			if (by_ordinal.kind == Kind::Affine && by_ordinal.coefficient != 0u) {
+				EXIT_NOT_IMPLEMENTED((by_ordinal.coefficient & 3u) != 0u ||
+				                     (stride != 0u && stride != by_ordinal.coefficient) ||
+				                     begin + store.bytes > by_ordinal.coefficient);
+				stride = by_ordinal.coefficient;
+			} else {
+				patch_begin = std::min(patch_begin, begin);
+				patch_end   = std::max(patch_end, begin + store.bytes);
+			}
 		}
 	}
 	EXIT_NOT_IMPLEMENTED(!joins.empty() || stride == 0u);
