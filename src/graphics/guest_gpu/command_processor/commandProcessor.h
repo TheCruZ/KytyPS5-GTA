@@ -127,6 +127,7 @@ public:
 	// is dropped.
 	bool HleBlasDispatch(uint64_t data_addr);
 	void EmitHleRefit();
+	void EmitHleTlas();
 	// sce::Psr's BLAS builds, seen (not replaced) so the native ray tracing follows them (see
 	// graphicsRun.cpp).
 	void PsrBlasDispatch(uint64_t data_addr);
@@ -284,6 +285,10 @@ private:
 	// TLAS builds the game runs itself (lists the native build cannot read) whose last pass has not
 	// come yet.
 	uint32_t                               m_guest_tlas_builds = 0;
+	// The window runs as the game dispatches it (the first one), and whether a window did with
+	// only the passes the replacement knows.
+	bool                                   m_hle_tlas_observe  = false;
+	bool                                   m_hle_tlas_known    = false;
 	// The BLAS refits of the current refit window (see HleBlasDispatch()).
 	struct HleRefitGeometryRef {
 		uint64_t blas     = 0;
