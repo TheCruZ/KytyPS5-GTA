@@ -195,7 +195,8 @@ void main() {
 		state.header_va       = header;
 		if (s_valid != 0) {
 			state.instance_base = header + LoadGuestU64(header + LayoutInstanceOffset(pc.instance_layout));
-			state.node_limit    = LoadGuestU32(header + 88);
+			state.node_limit    = LayoutNodeCountAt80(pc.instance_layout) ? LoadGuestU32(header + 80) - 1u
+			                                                              : LoadGuestU32(header + 88);
 		}
 		U32Ref(pc.queue).v = pc.root;
 		s_head             = 0;
