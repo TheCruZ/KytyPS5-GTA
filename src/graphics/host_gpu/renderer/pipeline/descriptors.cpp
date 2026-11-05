@@ -221,7 +221,9 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 	if (descriptor.MsaaDepth() && !IsMultisampledTexture(descriptor.Type())) {
 		return false;
 	}
-	const auto metadata_control = descriptor.fields[6] & 0x00ffffffu;
+	// Bits 0..7 name the mip-statistics counter (MipStatsCntId), which only counts LODs and leaves
+	// the sampled data and its metadata alone.
+	const auto metadata_control = descriptor.fields[6] & 0x00ffff00u;
 	if (metadata_control == 0) {
 		return true;
 	}
