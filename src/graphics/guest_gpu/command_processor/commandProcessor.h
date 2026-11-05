@@ -277,6 +277,9 @@ private:
 	std::vector<HleTlasBuild>              m_hle_tlas_builds;
 	uint32_t                               m_hle_tlas_finished = 0;
 	bool                                   m_hle_tlas_window   = false;
+	// TLAS builds the game runs itself (lists the native build cannot read) whose last pass has not
+	// come yet.
+	uint32_t                               m_guest_tlas_builds = 0;
 	// The BLAS refits of the current refit window (see HleBlasDispatch()).
 	struct HleRefitGeometryRef {
 		uint64_t blas     = 0;

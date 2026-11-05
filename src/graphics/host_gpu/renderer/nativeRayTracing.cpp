@@ -1644,13 +1644,7 @@ void NativeRayTracing::ProcessReadback(Readback& readback) {
 }
 
 uint32_t NativeRayTracing::HleTlasHeader(uint32_t count, std::array<uint32_t, 32>& header) noexcept {
-	if (count > HleTlasMaxInstances) {
-		// [HACK] One workgroup builds the TLAS (hle_tlas.comp): the instances past the limit are
-		// left out of it.
-		Common::HackNotice::Report("native TLAS build keeps only its first 4096 instances",
-		                           "NativeRayTracing::HleTlasHeader", 0, HleTlasMaxInstances,
-		                           fmt::format("{} instances", count));
-	}
+	// Larger lists keep the game's own build (CommandProcessor::HleTlasDispatch()).
 	count          = std::min(count, HleTlasMaxInstances);
 	uint32_t nodes = 0;
 	for (uint32_t n = std::max((count + 3u) / 4u, 1u);; n = (n + 3u) / 4u) {
