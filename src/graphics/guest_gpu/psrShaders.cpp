@@ -17,17 +17,18 @@ struct NamedShader {
 };
 
 // The registered names of the listed shaders. The library keeps byte-identical copies of a few
-// shaders under two names (psr_morton_initialize_indirect_args_top and its _trinity copy, the
-// _uint32 and _float descriptor initializations of the scan): both names do the same thing.
+// shaders under two names (the _uint32 and _float descriptor initializations of the scan): both
+// names do the same thing. The _trinity copy of psr_morton_initialize_indirect_args_top is left
+// to the kTrinity builds that use it (Shader::Trinity).
 constexpr NamedShader Names[] = {
     {"psr_morton_compute_bounding_box_for_instances", Shader::MortonComputeBoundingBoxForInstances},
     {"psr_morton_initialize_indirect_args_top", Shader::MortonInitializeIndirectArgsTop},
-    {"psr_morton_initialize_indirect_args_top_trinity", Shader::MortonInitializeIndirectArgsTop},
     {"psr_single_pass_scan_initialize_descriptors_uint32", Shader::SinglePassScanInitializeDescriptors},
     {"psr_single_pass_scan_initialize_descriptors_float", Shader::SinglePassScanInitializeDescriptors},
     {"psr_single_pass_scan_uint32", Shader::SinglePassScanUint32},
     {"psr_morton_compute_valid_instance_indices", Shader::MortonComputeValidInstanceIndices},
     {"psr_morton_setup_indirect_args_top", Shader::MortonSetupIndirectArgsTop},
+    {"psr_morton_init_one_instance_root_node", Shader::MortonInitOneInstanceRootNode},
     {"psr_morton_compute_code_for_instances", Shader::MortonComputeCodeForInstances},
     {"psr_bitonic_sort_pass_key_value_indirect", Shader::BitonicSortPassKeyValueIndirect},
     {"psr_morton_build_qbvh_hierarchy_for_instances", Shader::MortonBuildQbvhHierarchyForInstances},
@@ -68,6 +69,7 @@ constexpr NamedShader Names[] = {
 
 std::atomic<Generation> g_generation {Generation::Unknown};
 std::atomic<bool>       g_generation_known {false};
+std::atomic<bool>       g_replacement_stopped {false};
 
 // The generation of a library that registered its shaders. Generation Base460 has shaders the
 // next one removed (the vertex bounds of the Morton build, the rebraiding instance copies) and
@@ -108,7 +110,18 @@ Shader IdentifyShader(uint64_t code_address) {
 			return entry.shader;
 		}
 	}
-	return Shader::None;
+	return std::string_view(name).find("trinity") != std::string_view::npos ? Shader::Trinity : Shader::Other;
+}
+
+bool ReplacementEnabled() {
+	return !g_replacement_stopped.load(std::memory_order_acquire);
+}
+
+void StopReplacement(const char* reason, const char* shader_name) {
+	if (!g_replacement_stopped.exchange(true, std::memory_order_acq_rel)) {
+		LOGF("Psr: %s (%s): its BVH builds and refits are emulated from now on\n", reason,
+		     shader_name != nullptr ? shader_name : "?");
+	}
 }
 
 bool IsTopLevelBuildShader(Shader shader) {
