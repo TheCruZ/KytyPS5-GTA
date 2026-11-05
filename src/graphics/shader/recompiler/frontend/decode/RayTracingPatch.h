@@ -12,7 +12,8 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 // Native ray tracing of guest BVH traversal loops.
 //
 // Games using sce::Psr traverse its BVHs in software, with a traversal loop of the library
-// compiled into their shaders (the variants GTA V uses are recognized; Astro Bot's are not yet).
+// compiled into their shaders (the variants of GTA V, Astro Bot and Astro's Playroom are
+// recognized, in waves of 64 or 32 lanes).
 // In the packet variant a wave-wide loop pops a node from a stack kept in
 // VGPR lanes, tests it with IMAGE_BVH_INTERSECT_RAY and pushes the children the lanes hit. Box nodes
 // are 9 of 10 node visits. The patch keeps the guest code that sets up an instance (object
@@ -84,16 +85,18 @@ enum class RayTracingAlphaLayout : uint32_t {
 };
 
 // How the guest's top-level BVH is laid out, as the traversal code reads it (see DeriveLayout in
-// RayTracingPatch.cpp); versions of the BVH library differ. The instance records are 128 bytes at
-// header + the 64-bit offset at header + `instance_offset`, one per instance leaf (node >> 3).
-// Fields are record dwords:
+// RayTracingPatch.cpp); versions of the BVH library differ. The instance records are
+// `record_stride` bytes at header + the 64-bit offset at header + `instance_offset`, one per
+// instance leaf (node >> 3). Fields are record dwords:
 //   transform    the world to object 3x4 matrix: row r (object x, y, z) and column c (world x,
 //                y, z, then the translation) at transform[r * 4 + c]
 //   BLAS         the BLAS address: dwords blas, blas + 1 as they are (raw), or packed as
 //                ((lo | (hi & 0x3fffff) << 32) << 3)
 //   root         the BLAS root node
-//   mask         the instance mask: (dword >> mask_shift) & 0xff (NoRegister: the traversal tests
-//                no mask, every instance counts)
+//   mask         the instance mask: (dword >> mask_shift) & 0xff, which the ray's mask selects
+//                (NoRegister: the traversal tests no mask, every instance counts); with a
+//                `mask_width`, the instance counts for every ray when any of the `mask_width` bits
+//                from `mask_shift` is set
 //   flags        the instance flags: (dword >> flags_shift); bit 0 opaque, bit 1 alpha tested
 //                anyway, bit 2 both facings, bit 3 the culled facing (NoRegister: the program never
 //                reads them; its sites do not depend on them)
@@ -102,12 +105,14 @@ enum class RayTracingAlphaLayout : uint32_t {
 struct RayTracingLayout {
 	bool                    valid           = false;
 	uint32_t                instance_offset = 0;
+	uint32_t                record_stride   = 128;
 	std::array<uint8_t, 12> transform {};
 	uint32_t                blas_dword      = 0;
 	bool                    blas_packed     = false;
 	uint32_t                root_dword      = 0;
 	uint32_t                mask_dword      = 0;
 	uint32_t                mask_shift      = 0;
+	uint32_t                mask_width      = 0;
 	uint32_t                flags_dword     = 0xffffffffu;
 	uint32_t                flags_shift     = 0;
 	bool                    flip_facing     = true;
@@ -116,10 +121,14 @@ struct RayTracingLayout {
 	uint32_t                inline_type     = 0xffffffffu;
 	uint32_t                inline_offset   = 0;
 	uint32_t                inline_root     = 0;
+	// Where the guest's BVH headers (the TLAS's and the BLASes') hold their node count: the T#
+	// size at header + 88, or (`node_count_80`) the count at header + 80, one more than that size.
+	bool                    node_count_80   = false;
 
 	bool operator==(const RayTracingLayout&) const = default;
 	// Four words for the host passes (see LoadGuestInstance in rt_common.inc).
 	[[nodiscard]] std::array<uint32_t, 4> Pack() const;
+	[[nodiscard]] uint32_t                TransformBase() const;
 };
 
 // The fields of the guest BVH the alpha tests read beyond the instance record's (see
@@ -229,10 +238,11 @@ struct RayTracingPatch {
 	RayTracingLayout            layout;
 };
 
-// Finds the traversal loops of a decoded program by their structure (see RayTracingPatch.cpp);
-// false when the program has none, or one that does not match in every detail (the program
-// keeps its own traversal).
-bool DeriveRayTracingPatch(const Program& program, RayTracingPatch& patch);
+// Finds the traversal loops of a decoded program of waves of `wave_size` lanes (lane masks of
+// 64 bits in two SGPRs, or of 32 bits in one) by their structure (see RayTracingPatch.cpp); false
+// when the program has none, or one that does not match in every detail (the program keeps its
+// own traversal).
+bool DeriveRayTracingPatch(const Program& program, RayTracingPatch& patch, uint32_t wave_size = 64);
 
 // Applies `patch` to a decoded program (and records its TLAS source in
 // Program::ray_tracing_source). Returns false, leaving the program unchanged, when the program
