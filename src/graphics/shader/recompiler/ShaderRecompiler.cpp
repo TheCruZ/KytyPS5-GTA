@@ -493,7 +493,7 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 		Decoder::DecodeProgram(code, source.decoded);
 		if (options.native_ray_tracing) {
 			Decoder::RayTracingPatch patch;
-			if (Decoder::DeriveRayTracingPatch(source.decoded, patch) &&
+			if (Decoder::DeriveRayTracingPatch(source.decoded, patch, options.wave_size) &&
 			    Decoder::ApplyRayTracingPatch(patch, source.decoded)) {
 				LOGF("%s native ray tracing patch: hash=0x%016" PRIx64 " sites=%" PRIu64
 				     " alpha=%" PRIu64 "\n",

@@ -202,8 +202,11 @@ struct BlasPush {
 	uint32_t job_count;
 	uint32_t changed_capacity;
 	uint32_t prepare_id;
-	uint32_t pad;
+	// BlasNodeCountAt80: the BLAS headers hold their node count at +80 (see RayTracingLayout).
+	uint32_t flags;
 };
+
+constexpr uint32_t BlasNodeCountAt80 = 1;
 
 // After the entry table of a slot (16 bytes per triangle), 32-byte aligned: the alpha records of
 // its alpha tested triangles, 32 bytes each, that the RT passes fill (see AlphaTest() of the ray
@@ -1096,7 +1099,8 @@ void NativeRayTracing::RecordBuilds(const CommandRecorder& command) {
 	                     m_slots->BufferDeviceAddress(),   m_state->BufferDeviceAddress(),
 	                     m_changed->BufferDeviceAddress(), ModeBuild,
 	                     PoolCapacity,                     walk_count,
-	                     ChangedCapacity,                  m_prepare_id};
+	                     ChangedCapacity,                  m_prepare_id,
+	                     m_blas_flags};
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_blas_pipeline);
 	command.pushConstants(m_blas_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
 	if (walk_count != jobs.size()) {
@@ -1412,6 +1416,8 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 	write.pBufferInfo     = &page_info;
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_blas_layout, 0, 1, &write);
 
+	// The BVHs of the traversal's layout (Decoder::RayTracingLayout::Pack() word 3).
+	m_blas_flags = ((source.layout[3] >> 29u) & 1u) != 0 ? BlasNodeCountAt80 : 0u;
 	RecordBuilds(command);
 
 	command.fillBuffer(m_instances->Handle(), 0, uint64_t {tlas_count} * InstanceStride, 0);
@@ -1461,7 +1467,8 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 	                    m_slots->BufferDeviceAddress(),   m_state->BufferDeviceAddress(),
 	                    m_changed->BufferDeviceAddress(), ModeCount,
 	                    PoolCapacity,                     0,
-	                    ChangedCapacity,                  m_prepare_id};
+	                    ChangedCapacity,                  m_prepare_id,
+	                    m_blas_flags};
 	command.pushConstants(m_blas_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(blas_push),
 	                      &blas_push);
 	command.dispatchIndirect(m_state->Handle(), StateDispatch);

@@ -76,8 +76,17 @@ layout(push_constant, std430) uniform Push {
 	uint     changed_capacity;
 	// The preparation (see SlotInfo::rebase).
 	uint     prepare_id;
-	uint     pad;
+	// FLAG_NODE_COUNT_AT_80: the BLAS headers hold their node count at +80 instead of the T# size
+	// (the count less one) at +88.
+	uint     flags;
 } pc;
+
+const uint FLAG_NODE_COUNT_AT_80 = 1u;
+
+// The node limit of the T# of a BLAS (the count of its nodes less one).
+uint BlasNodeLimit(uint64_t blas_va) {
+	return (pc.flags & FLAG_NODE_COUNT_AT_80) != 0 ? LoadGuestU32(blas_va + 80) - 1u : LoadGuestU32(blas_va + 88);
+}
 
 const uint MODE_COUNT  = 0u;
 const uint MODE_BUILD  = 1u;
@@ -368,7 +377,7 @@ void main() {
 		}
 		// Box nodes never outnumber the node limit of the BVH descriptor, nor (with at least one
 		// leaf or box child each) twice the leaves of a known BLAS.
-		const uint limit = LoadGuestU32(blas_va + 88) + 1;
+		const uint limit = BlasNodeLimit(blas_va) + 1;
 		s_queue_size = min(queue_size > 16 ? min(queue_size, limit) : limit, kMaxQueue);
 		if (pc.mode == MODE_COUNT) {
 			// The node limit of a BLAS can be huge: the BLASes counted together share a quarter
@@ -470,7 +479,7 @@ void main() {
 			missing.box_count    = s_tail;
 			missing.opaque_count = opaque;
 			missing.alpha_count  = alpha;
-			missing.node_limit   = LoadGuestU32(blas_va + 88);
+			missing.node_limit   = BlasNodeLimit(blas_va);
 			missing.flags        = s_overflow;
 		}
 		return;

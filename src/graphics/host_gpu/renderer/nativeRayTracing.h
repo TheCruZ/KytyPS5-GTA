@@ -414,6 +414,8 @@ private:
 	// The instance count of the last walk of each TLAS source (shaders trace different TLASes).
 	std::unordered_map<uint32_t, uint32_t> m_last_instance_counts;
 	uint32_t                  m_prepare_id          = 0;
+	// BlasPush::flags of the last preparation's layout.
+	uint32_t                  m_blas_flags          = 0;
 	uint64_t                  m_frame               = 0;
 	// The host table (see FindHostSlot in rt_tlas_walk.comp): the key of each entry, and the
 	// entries to write at the next preparation (index, key, slot + 1).
