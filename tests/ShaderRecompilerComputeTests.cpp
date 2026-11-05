@@ -51701,6 +51701,16 @@ void CheckDepthTextureEncoding() {
           IsSupportedDepthTextureEncoding(first_use_depth),
           "captured comparison texture required tracked HTILE metadata");
 
+  // PPSA25381 compares against an uncompressed depth target whose T# keeps metadata pipe
+  // alignment (dword 6 bit 19) with compression off and no metadata address.
+  const ShaderTextureResource pipe_aligned_uncompressed{{
+      0x035f0e00u, 0xc0700000u, 0x03ffc3ffu, 0x91800204u,
+      0x00000000u, 0x00700000u, 0x00080000u, 0x00000000u,
+  }};
+  Require("DepthTextureEncoding", "pipe-aligned uncompressed depth",
+          IsSupportedDepthTextureEncoding(pipe_aligned_uncompressed),
+          "metadata pipe alignment without compression required HTILE metadata");
+
   auto missing_metadata = compressed_descriptor;
   missing_metadata.fields[6] &= 0x00ffffffu;
   missing_metadata.fields[7] = 0;

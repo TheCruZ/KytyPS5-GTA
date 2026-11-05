@@ -224,7 +224,10 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 	// Bits 0..7 name the mip-statistics counter (MipStatsCntId), which only counts LODs and leaves
 	// the sampled data and its metadata alone.
 	const auto metadata_control = descriptor.fields[6] & 0x00ffff00u;
-	if (metadata_control == 0) {
+	// Metadata pipe alignment (bit 19) only shapes how HTILE is addressed; without compression
+	// (bit 21) there is no HTILE and the depth data is read as it is.
+	constexpr uint32_t meta_pipe_aligned = 1u << 19u;
+	if ((metadata_control & ~meta_pipe_aligned) == 0) {
 		return true;
 	}
 	constexpr uint32_t htile_control = 0x00280000u;
