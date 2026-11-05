@@ -1443,6 +1443,11 @@ void CheckPipelineManifestFormat() {
   pipeline.key.rendering.color_count = 1;
   pipeline.key.rendering.color_formats[0] = vk::Format::eR8G8B8A8Unorm;
   pipeline.key.static_params.blend_enable[0] = true;
+  // The vertex input of the vertex module's draws: its two attributes from one buffer.
+  pipeline.key.vertex_input.binding_count = 1;
+  pipeline.key.vertex_input.attribute_count = 2;
+  pipeline.key.vertex_input.bindings[0] = {.stride = 32};
+  pipeline.key.vertex_input.attributes[1] = {.offset = 16};
   ManifestPipeline mesh_pipeline{.stages = {1, ManifestPipeline::NoStage, ManifestPipeline::NoStage,
                                             ManifestPipeline::NoStage}};
   manifest.pipelines = {pipeline, mesh_pipeline};
@@ -1549,6 +1554,30 @@ void CheckPipelineManifestFormat() {
           load_text(truncated, partial, skipped) && skipped == 1 &&
               partial.tessellation_layouts.empty() && partial.pipelines.size() == 2,
           "a manifest cut short lost more than its last line");
+  // A pipeline that no draw creates from the modules it names is left out and reported: a TES as
+  // its vertex stage, fewer vertex attributes than its vertex module reads, or an attribute of a
+  // binding it does not have.
+  ManifestModule evaluation{.stage = ShaderType::TessellationEvaluation, .code_hash = 0x7777};
+  evaluation.input.emplace<ShaderVertexInputInfo>().logical_stage = ShaderType::TessellationEvaluation;
+  auto mixed = manifest;
+  mixed.modules.push_back(evaluation);
+  auto wrong_stage = pipeline;
+  wrong_stage.stages[0] = 4;
+  auto fewer_attributes = pipeline;
+  fewer_attributes.key.vertex_input.attribute_count = 1;
+  auto missing_binding = pipeline;
+  missing_binding.key.vertex_input.attributes[1].binding = 1;
+  mixed.pipelines = {pipeline, mesh_pipeline, wrong_stage, fewer_attributes, missing_binding};
+  PipelineManifest linked;
+  std::vector<std::string> unlinked;
+  Require(name, "unlinked",
+          LoadManifest(SaveManifest(mixed), linked, &skipped, &unlinked) && skipped == 3 &&
+              linked.modules.size() == 5 && linked.pipelines.size() == 2 && unlinked.size() == 3 &&
+              std::ranges::any_of(unlinked,
+                                  [](const std::string &line) {
+                                    return line.find("(stages tes,-,-,ps)") != std::string::npos;
+                                  }),
+          "a pipeline whose modules do not fit it loaded, or was not reported");
   std::printf("[host]    %-32s ok\n", name);
 }
 

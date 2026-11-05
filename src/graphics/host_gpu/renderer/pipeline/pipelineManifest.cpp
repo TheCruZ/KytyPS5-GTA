@@ -1044,6 +1044,62 @@ bool ReadPipeline(std::span<const std::string_view>                     tokens,
 	return r.ok;
 }
 
+// Why no draw creates `pipeline` from the modules it names, or empty. GetGraphicsPipeline() links
+// a VS or mesh stage, or an LS, HS and TES, with an optional PS; it takes the vertex input from the
+// VS or LS (a mesh stage has none) and the patch size from the LS, and a rectangle list draws
+// patches of 3 points. Creating a pipeline whose modules do not fit it reads what they do not
+// have: the vertex formats of a TES, or more of them than the VS has.
+std::string PipelineLinkError(const ManifestPipeline&         pipeline,
+                              std::span<const ManifestModule> modules) {
+	std::array<ShaderType, 4> stages {};
+	for (size_t i = 0; i < stages.size(); i++) {
+		stages[i] = pipeline.stages[i] == ManifestPipeline::NoStage
+		                ? ShaderType::Unknown
+		                : modules[pipeline.stages[i]].stage;
+	}
+	const bool tessellation = stages[0] == ShaderType::Local;
+	const bool mesh         = stages[0] == ShaderType::Mesh;
+	const bool linked       = tessellation ? stages[1] == ShaderType::TessellationControl &&
+	                                       stages[2] == ShaderType::TessellationEvaluation
+	                                       : (stages[0] == ShaderType::Vertex || mesh) &&
+	                                       stages[1] == ShaderType::Unknown &&
+	                                       stages[2] == ShaderType::Unknown;
+	if (!linked || (stages[3] != ShaderType::Unknown && stages[3] != ShaderType::Pixel)) {
+		std::string names;
+		for (const auto stage: stages) {
+			const auto name = StageName(stage);
+			names += fmt::format("{}{}", names.empty() ? "" : ",", name.empty() ? "-" : name);
+		}
+		return fmt::format("stages {}", names);
+	}
+	const auto&    vertex     = std::get<ShaderVertexInputInfo>(modules[pipeline.stages[0]].input);
+	const auto&    input      = pipeline.key.vertex_input;
+	const uint32_t attributes = input.attribute_count;
+	const uint32_t bindings   = input.binding_count;
+	const uint32_t expected   = mesh ? 0u : static_cast<uint32_t>(vertex.resources_num);
+	if (attributes != expected || (mesh && bindings != 0)) {
+		return fmt::format("{} vertex attributes for a {} stage that reads {}", attributes,
+		                   StageName(stages[0]), expected);
+	}
+	for (uint32_t i = 0; i < attributes; i++) {
+		const uint32_t binding = input.attributes[i].binding;
+		if (binding >= bindings) {
+			return fmt::format("vertex attribute {} reads binding {} of {}", i, binding, bindings);
+		}
+	}
+	const auto&    s        = pipeline.key.static_params;
+	const auto     topology = s.topology;
+	const uint32_t points   = s.patch_control_points;
+	const uint32_t drawn    = tessellation ? vertex.tess.input_control_points
+	                          : !mesh && topology == vk::PrimitiveTopology::ePatchList ? 3u
+	                                                                                   : 0u;
+	if (points != drawn ||
+	    (tessellation && (points == 0 || topology != vk::PrimitiveTopology::ePatchList))) {
+		return fmt::format("patches of {} points where its draws have {}", points, drawn);
+	}
+	return {};
+}
+
 std::string LayoutText(uint64_t key, ShaderTessellationInputInfo layout) {
 	std::string text = fmt::format("T {:016x}", key);
 	TextWriter  w(text);
@@ -1232,7 +1288,8 @@ std::vector<uint8_t> SaveManifest(const PipelineManifest& manifest) {
 	return {out.begin(), out.end()};
 }
 
-bool LoadManifest(std::span<const uint8_t> bytes, PipelineManifest& manifest, uint32_t* skipped) {
+bool LoadManifest(std::span<const uint8_t> bytes, PipelineManifest& manifest, uint32_t* skipped,
+                  std::vector<std::string>* unlinked) {
 	manifest               = {};
 	uint32_t   bad         = 0;
 	const auto set_skipped = [&] {
@@ -1286,20 +1343,28 @@ bool LoadManifest(std::span<const uint8_t> bytes, PipelineManifest& manifest, ui
 		if (tokens.empty() || tokens[0].starts_with("#") || tokens[0] == "M") continue;
 		if (tokens[0] == "P") {
 			ManifestPipeline pipeline;
-			const auto       valid = [&](uint32_t index, bool pixel) {
-				return index == ManifestPipeline::NoStage ||
-				       ((manifest.modules[index].stage == ShaderType::Pixel) == pixel &&
-				        manifest.modules[index].stage != ShaderType::Compute);
-			};
-			if (ReadPipeline(std::span(tokens).subspan(1), modules, pipeline) &&
-			    pipeline.stages[0] != ManifestPipeline::NoStage &&
-			    valid(pipeline.stages[0], false) && valid(pipeline.stages[1], false) &&
-			    valid(pipeline.stages[2], false) && valid(pipeline.stages[3], true) &&
-			    (!pipeline.plain_pixel || pipeline.stages[3] != ManifestPipeline::NoStage)) {
-				manifest.pipelines.push_back(pipeline);
-			} else {
+			if (!ReadPipeline(std::span(tokens).subspan(1), modules, pipeline) ||
+			    pipeline.stages[0] == ManifestPipeline::NoStage ||
+			    (pipeline.plain_pixel && pipeline.stages[3] == ManifestPipeline::NoStage)) {
 				bad++;
+				continue;
 			}
+			if (auto error = PipelineLinkError(pipeline, manifest.modules); !error.empty()) {
+				bad++;
+				if (unlinked != nullptr) {
+					std::string ids;
+					for (const auto token: std::span(tokens).subspan(1)) {
+						if (std::ranges::any_of(PipelineStageKeys, [&](std::string_view key) {
+							    return token.starts_with(key) && token.substr(key.size(), 1) == "=";
+						    })) {
+							ids += fmt::format("{}{}", ids.empty() ? "" : " ", token);
+						}
+					}
+					unlinked->push_back(fmt::format("{} ({})", ids, error));
+				}
+				continue;
+			}
+			manifest.pipelines.push_back(pipeline);
 		} else if (tokens[0] == "T") {
 			std::pair<uint64_t, ShaderTessellationInputInfo> layout;
 			if (ReadLayout(std::span(tokens).subspan(1), layout)) {
@@ -1452,7 +1517,8 @@ void PipelineCache::OpenManifest() {
 		PipelineManifest loaded;
 		uint32_t         skipped = 0;
 		const auto       start   = std::chrono::steady_clock::now();
-		if (!LoadManifest(ReadFile(path), loaded, &skipped)) {
+		std::vector<std::string> unlinked;
+		if (!LoadManifest(ReadFile(path), loaded, &skipped, &unlinked)) {
 			ManifestLog("Pipeline manifest: ignoring {} (another format)",
 			            Common::PathToString(path));
 			continue;
@@ -1487,6 +1553,11 @@ void PipelineCache::OpenManifest() {
 		            loaded.modules.size(), loaded.pipelines.size(), Common::PathToString(path),
 		            Seconds(load_time) * 1000.0,
 		            skipped != 0 ? fmt::format(", {} records left out", skipped) : std::string {});
+		if (!unlinked.empty()) {
+			ManifestLog("Pipeline manifest: left out {} pipelines of {} that no draw creates from "
+			            "the modules they name, such as {}",
+			            unlinked.size(), Common::PathToString(path), unlinked.front());
+		}
 	}
 	if (files.empty()) {
 		ManifestLog("Pipeline manifest: none for {}", name);
