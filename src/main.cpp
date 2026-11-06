@@ -128,6 +128,9 @@ static void PrintUsage() {
 	::printf("  --native-raytracing                  Experimental: trace the ray tracing passes of\n"
 	         "                                       supported games (GTA V, ASTRO BOT) with the host\n"
 	         "                                       GPU's ray tracing hardware. Default: off.\n");
+	::printf("  --rt-stats                           With --native-raytracing: count on the GPU the\n"
+	         "                                       rays that go back to the game's own traversal\n"
+	         "                                       (in the [RT] summaries of the log).\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
 	::printf("  --command-buffer-dump                Enable command buffer dumps.\n");
@@ -271,6 +274,7 @@ static constexpr Flag FLAGS[] = {
     {"--async-pipelines", &ConfigOptions::async_pipelines_enabled},
     {"--no-async-pipelines", &ConfigOptions::async_pipelines_enabled, false},
     {"--native-raytracing", &ConfigOptions::native_ray_tracing_enabled},
+    {"--rt-stats", &ConfigOptions::rt_stats_enabled},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},
     {"--graphics-debug-dump", &ConfigOptions::graphics_debug_dump_enabled},
     {"--profile", &ConfigOptions::profiler_enabled},
