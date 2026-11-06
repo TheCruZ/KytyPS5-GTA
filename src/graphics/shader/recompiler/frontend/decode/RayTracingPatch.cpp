@@ -106,6 +106,14 @@ bool CheckSite(const Program& program, const RayTracingSite& site) {
 		return entry != nullptr && EndPc(*entry) == site.loop_pc && !IsDirectBranch(entry->opcode) &&
 		       expect(site.loop_pc, Opcode::UNKNOWN) && expect(site.exit_pc, Opcode::UNKNOWN);
 	}
+	if (site.kind == RayTracingKind::ClosestLeaf) {
+		return entry != nullptr && EndPc(*entry) == site.loop_pc && !IsDirectBranch(entry->opcode) &&
+		       site.setup_pc == site.loop_pc && expect(site.loop_pc, Opcode::UNKNOWN) &&
+		       expect(site.cull_exit_pc, Opcode::UNKNOWN) && expect(site.blas_head_pc, Opcode::UNKNOWN) &&
+		       site.leaf_pc == site.blas_head_pc && expect(site.tail_pc, Opcode::UNKNOWN) &&
+		       site.blas_end_pc > site.tail_pc && expect(site.exit_pc, Opcode::UNKNOWN) &&
+		       (site.after_leaf_pc == 0 || expect(site.after_leaf_pc, Opcode::V_READLANE_B32));
+	}
 	return entry != nullptr && EndPc(*entry) == site.loop_pc && !IsDirectBranch(entry->opcode) &&
 	       expect(site.loop_pc, Opcode::S_AND_B64) && expect(site.setup_pc, Opcode::UNKNOWN) &&
 	       expect(site.cull_exit_pc, Opcode::S_CMP_EQ_U32) &&
@@ -124,6 +132,8 @@ public:
 		Instruction inst;
 		Target      target = Target::None;
 		uint32_t    value  = 0;
+		// The pc of the guest instruction it places (UINT32_MAX: an inserted one).
+		uint32_t    origin = UINT32_MAX;
 	};
 
 	uint32_t NewLabel() { return m_next_label++; }
@@ -132,6 +142,7 @@ public:
 
 	Instruction& AddGuest(const Instruction& inst) {
 		Item item {inst};
+		item.origin = inst.pc;
 		// The guest code stays where it is in memory: PC-relative addresses (S_GETPC_B64 reads
 		// of data after the program) keep their guest pc.
 		if (item.inst.guest_pc == UINT32_MAX) {
@@ -148,6 +159,7 @@ public:
 	// A guest instruction placed again elsewhere (its branches set by the caller).
 	Instruction& AddCopy(const Instruction& inst) {
 		m_items.push_back({inst});
+		m_items.back().origin = inst.pc;
 		return m_items.back().inst;
 	}
 	void SetBranch(Target target, uint32_t value) {
@@ -171,8 +183,9 @@ public:
 		return m_items.back().inst;
 	}
 
-	// Assigns the pcs from `first_pc`; false when a target is unknown.
-	bool Finish(uint32_t first_pc, uint32_t guest_end_pc, std::vector<Instruction>& out) {
+	// Assigns the pcs from `first_pc`; false when a target is unknown. `origins`: the guest pc each
+	// output instruction places (UINT32_MAX: inserted).
+	bool Finish(uint32_t first_pc, uint32_t guest_end_pc, std::vector<Instruction>& out, std::vector<uint32_t>& origins) {
 		std::vector<uint32_t> pcs(m_items.size() + 1);
 		uint32_t              pc = first_pc;
 		for (size_t i = 0; i < m_items.size(); i++) {
@@ -186,7 +199,10 @@ public:
 		}
 		out.clear();
 		out.reserve(m_items.size());
+		origins.clear();
+		origins.reserve(m_items.size());
 		for (size_t i = 0; i < m_items.size(); i++) {
+			origins.push_back(m_items[i].origin);
 			auto inst = m_items[i].inst;
 			inst.pc   = pcs[i];
 			if (m_items[i].target == Target::Guest) {
@@ -230,8 +246,11 @@ bool AddRangeCopy(Layout& layout, const Program& program, uint32_t begin, uint32
 	std::unordered_map<uint32_t, uint32_t> copy_labels;
 	std::vector<const Instruction*>        range;
 	for (auto it = first; it != program.instructions.end() && it->pc < end; ++it) {
+		// The end of an inlined call whose target is none of the expanded ones (S_TRAP; S_ENDPGM,
+		// see ShaderFunctionExpander) is copied as it is.
+		const bool call_miss = it->opcode == Opcode::S_ENDPGM && it != first && std::prev(it)->opcode == Opcode::S_TRAP;
 		if (it->opcode == Opcode::S_SETPC_B64 || it->opcode == Opcode::S_GETPC_B64 ||
-		    it->opcode == Opcode::S_ENDPGM || it->opcode == Opcode::UNSUPPORTED) {
+		    (it->opcode == Opcode::S_ENDPGM && !call_miss) || it->opcode == Opcode::UNSUPPORTED) {
 			return false;
 		}
 		copy_labels.emplace(it->pc, layout.NewLabel());
@@ -247,7 +266,11 @@ bool AddRangeCopy(Layout& layout, const Program& program, uint32_t begin, uint32
 			continue;
 		}
 		const auto target = inst->branch_target;
-		if (backward_to_end && target <= inst->pc && copy_labels.contains(target)) {
+		// A loop of an inlined call stays a loop.
+		const bool in_call = std::ranges::any_of(program.call_bodies, [&](const InlinedCallBody& body) {
+			return body.begin <= target && inst->pc < body.end;
+		});
+		if (backward_to_end && target <= inst->pc && copy_labels.contains(target) && !in_call) {
 			const auto label = outside(end);
 			if (label == UINT32_MAX) {
 				return false;
@@ -406,9 +429,26 @@ bool AddNativeTraversal(Layout& layout, const Program& program, const RayTracing
 	const auto exit_check_label = layout.NewLabel();
 	// The instruction that undoes the instance setup's spills (none: nothing to undo).
 	const auto restore = [&] {
-		if (site.after_leaf_pc != 0) {
-			layout.AddCopy(*FindInstruction(program, site.after_leaf_pc));
+		if (site.after_leaf_pc == 0) {
+			return;
 		}
+		const auto end = site.after_leaf_end_pc != 0 ? site.after_leaf_end_pc : EndPc(*FindInstruction(program, site.after_leaf_pc));
+		for (auto pc = site.after_leaf_pc; pc < end;) {
+			const auto* inst = FindInstruction(program, pc);
+			layout.AddCopy(*inst);
+			pc = EndPc(*inst);
+		}
+	};
+	// A closest hit site's leaf code keeps the nearest hit itself: lanes that accept one keep
+	// searching. It has no lane mask of its own (EXEC is the lanes that enter the leaf).
+	const bool closest = site.kind == RayTracingKind::ClosestLeaf;
+	const auto mask    = [&] {
+		if (!closest) {
+			return Sgpr(site.mask_sgpr);
+		}
+		Operand exec;
+		exec.kind = OperandKind::ExecLo;
+		return exec;
 	};
 
 	// Loop header: the wave's next (instance, leaf), with the lanes that have it, or the exit.
@@ -426,10 +466,12 @@ bool AddNativeTraversal(Layout& layout, const Program& program, const RayTracing
 	restore();
 	layout.Bind(setup_label);
 	// The guest instance setup; it continues with the selected leaf instead of the BLAS stack.
+	// A closest hit site's setup starts at the loop header (it copies EXEC there); the header's
+	// branch to the box code is never taken for an instance node.
 	if (!AddRangeCopy(layout, program, site.setup_pc, site.blas_head_pc, [&](uint32_t target) {
-		    return target == site.blas_head_pc  ? leaf_label
-		           : target == site.cull_exit_pc ? cull_label
-		                                         : UINT32_MAX;
+		    return target == site.blas_head_pc            ? leaf_label
+		           : target == site.cull_exit_pc || closest ? cull_label
+		                                                   : UINT32_MAX;
 	    })) {
 		return false;
 	}
@@ -437,40 +479,50 @@ bool AddNativeTraversal(Layout& layout, const Program& program, const RayTracing
 	auto& leaf = layout.AddPseudo(Opcode::RT_LEAF, index);
 	leaf.dst   = Sgpr(site.leaf_sgpr);
 	leaf.dst2  = Sgpr(site.saved_exec_sgpr);
-	leaf.src0  = Sgpr(site.mask_sgpr);
+	leaf.src0  = mask();
 	// The guest leaf code; it ends at the BLAS loop latch. The guest loops over the rest of the
 	// leaf list until an entry marked last; here it tests only the selected entry (the hardware
 	// reports the other triangles as candidates of their own). A selected entry from a list the
 	// guest rewrote meanwhile could otherwise run past the end of the BLAS, where the loads read
 	// zeros and no entry is ever the last one.
+	// A closest hit site's leaf code leaves through the rest of the BLAS loop (its box code and
+	// the pop of its next node).
 	if (!AddRangeCopy(
 	        layout, program, site.leaf_pc, site.tail_pc,
-	        [&](uint32_t target) { return target == site.tail_pc ? tail_label : UINT32_MAX; },
+	        [&](uint32_t target) {
+		        return target == site.tail_pc || (closest && target > site.tail_pc && target < site.blas_end_pc)
+		                   ? tail_label
+		                   : UINT32_MAX;
+	        },
 	        true)) {
 		return false;
 	}
-	// The end of an iteration: lanes that accepted a hit in the leaf stop.
+	// The end of an iteration: lanes that accepted a hit in the leaf stop (or, closest hit, keep
+	// searching).
 	layout.Bind(tail_label);
 	auto& resolve = layout.AddPseudo(Opcode::RT_RESOLVE, index);
-	resolve.src0  = Sgpr(site.mask_sgpr);
+	resolve.src0  = mask();
+	resolve.dmask = closest ? 2u : 0u;
 	layout.AddBranch(Opcode::S_BRANCH, Layout::Target::Label, loop_label);
 	// The instance mask culled every selected lane (before the setup spilled anything).
 	layout.Bind(cull_label);
 	auto& skip = layout.AddPseudo(Opcode::RT_RESOLVE, index);
-	skip.src0  = Sgpr(site.mask_sgpr);
+	skip.src0  = mask();
 	skip.dmask = 1;
 	layout.AddBranch(Opcode::S_BRANCH, Layout::Target::Label, loop_label);
 
-	// The exit: opaque hits the hardware found, then undo the last setup's spills.
+	// The exit: opaque hits the hardware found (closest hit: when nearer than the leaf code's),
+	// then undo the last setup's spills.
 	layout.Bind(exit_check_label);
 	auto& commit = layout.AddPseudo(Opcode::RT_COMMIT, index);
 	commit.image_nsa_addr[0] = site.result_t;
 	commit.image_nsa_addr[1] = site.result_word;
 	commit.image_nsa_addr[2] = site.result_instance;
 	commit.image_nsa_addr[3] = site.result_instance + 1;
-	commit.image_nsa_addr[4] = NoRegister;
-	commit.image_nsa_addr[5] = NoRegister;
-	commit.image_nsa_addr[6] = NoRegister;
+	commit.image_nsa_addr[4] = closest ? site.result_u : NoRegister;
+	commit.image_nsa_addr[5] = closest ? site.result_v : NoRegister;
+	commit.image_nsa_addr[6] = closest ? site.result_node : NoRegister;
+	commit.dmask             = closest ? 1u : 0u;
 	layout.AddPseudo(Opcode::RT_EXIT_CHECK, index);
 	layout.AddBranch(Opcode::S_CBRANCH_SCC0, Layout::Target::Label, exit_label);
 	restore();
@@ -550,7 +602,8 @@ bool SameOperand(const Operand& a, const Operand& b) {
 
 class SiteFinder {
 public:
-	SiteFinder(const Program& program, uint32_t wave_size): m_inst(program.instructions), m_wave32(wave_size == 32) {}
+	SiteFinder(const Program& program, uint32_t wave_size)
+	    : m_inst(program.instructions), m_bodies(program.call_bodies), m_wave32(wave_size == 32) {}
 
 	// The sites of the program and its TLAS source; false when a traversal loop does not match.
 	bool Find(RayTracingPatch& patch) {
@@ -655,6 +708,7 @@ public:
 
 private:
 	static constexpr size_t npos = SIZE_MAX;
+	struct Field;
 
 
 	const Instruction& At(size_t i) const { return m_inst[i]; }
@@ -1021,16 +1075,46 @@ private:
 	}
 
 	// The last instruction in [from, i) that writes SGPR `reg` (npos: none).
+	// An SGPR the compiler spilled into a lane of a VGPR (V_WRITELANE_B32 <v>, <s>, lane) and read back
+	// (V_READLANE_B32 <reg>, <v>, lane, both lanes constants) counts as written where the spilled
+	// SGPR was, by the instruction that wrote that one.
 	size_t ScalarWriter(size_t i, uint32_t reg, size_t from) const {
 		if (reg == NoRegister) {
 			return npos;
 		}
 		for (size_t j = i; j-- > from;) {
 			if (WritesScalar(m_inst[j], reg)) {
-				return j;
+				const auto spill = m_inst[j].opcode == Opcode::V_READLANE_B32 ? SpilledFrom(j, from) : npos;
+				return spill != npos ? ScalarWriter(spill, m_inst[spill].src0.reg, from) : j;
 			}
 		}
 		return npos;
+	}
+
+	// The V_WRITELANE_B32 of the SGPR that V_READLANE_B32 `read` reads back from its constant lane
+	// (npos: none, or the VGPR may have changed otherwise).
+	size_t SpilledFrom(size_t read, size_t from) const {
+		const auto& inst = m_inst[read];
+		if (inst.src0.kind != OperandKind::Vgpr || !IsLaneConstant(inst.src1)) {
+			return npos;
+		}
+		for (size_t j = read; j-- > from;) {
+			const auto& write = m_inst[j];
+			if (!WritesVector(write, inst.src0.reg)) {
+				continue;
+			}
+			if (write.opcode != Opcode::V_WRITELANE_B32 || write.dst.reg != inst.src0.reg || !IsLaneConstant(write.src1)) {
+				return npos;
+			}
+			if (write.src1.value == inst.src1.value) {
+				return write.src0.kind == OperandKind::Sgpr ? j : npos;
+			}
+		}
+		return npos;
+	}
+
+	static bool IsLaneConstant(const Operand& operand) {
+		return operand.kind == OperandKind::IntegerInlineConstant || operand.kind == OperandKind::LiteralConstant;
 	}
 
 	// The writer of SGPR operand `operand` of instruction `i`, when it has `opcode` (npos: other).
@@ -1866,14 +1950,23 @@ private:
 		}
 		site.alpha        = {};
 		site.both_facings = true;
+		bool leaf_walk    = false;
 		if (accept == npos) {
-			// The selected key goes to an SGPR pair the program does not use.
-			const auto scratch = UnusedPair();
-			if (!ClosestSelectHit(header, back, record.pair, site) || scratch == NoRegister) {
-				return false;
+			// A wave-wide walk whose leaf code keeps the nearest hit (ClosestLeafWalk), or whose
+			// leaf code selects it (ClosestSelectHit).
+			auto walk = site;
+			if (ClosestLeafWalk(header, back, record, walk)) {
+				site      = walk;
+				leaf_walk = true;
+			} else {
+				// The selected key goes to an SGPR pair the program does not use.
+				const auto scratch = UnusedPair();
+				if (!ClosestSelectHit(header, back, record.pair, site) || scratch == NoRegister) {
+					return false;
+				}
+				site.both_facings  = false;
+				site.instance_sgpr = scratch;
 			}
-			site.both_facings  = false;
-			site.instance_sgpr = scratch;
 		} else if (m_inst[compare].src0.kind != OperandKind::Vgpr) {
 			return false;
 		}
@@ -1913,8 +2006,255 @@ private:
 		// Where the BVH headers hold their node count.
 		site.layout.node_count_80 = NodeCountAt80(box, site.header_sgpr);
 		// The pair is free at the exit (the selected key goes there).
-		site.mask_sgpr = site.instance_sgpr;
+		if (!leaf_walk) {
+			site.mask_sgpr = site.instance_sgpr;
+		}
 		return true;
+	}
+
+	// ---- Closest hit walks whose instance code walks the BLAS itself (ClosestLeaf). ----
+	//
+	// Past the loop header's node type test (whose S_CBRANCH_SCC1 goes to the box code) comes the
+	// instance code, which holds a second loop of the same form, the BLAS walk:
+	//   setup      [loop header, BLAS header): the instance record and its mask, whose tests leave
+	//              for the cull exit; the object space ray, the BLAS T#, SGPRs it spills with
+	//              V_WRITELANE_B32, and the BLAS root in the BLAS loop's node register
+	//   leaf code  [BLAS header, the target of its node type test's S_CBRANCH_SCC1): one triangle
+	//              test, the opacity test, the call of the any-hit function, then V_CMPX_* and
+	//              S_CBRANCH_EXECZ before the V_MOV_B32s of an accepted hit (see LeafHit); it
+	//              leaves only into the rest of the BLAS loop
+	//   restores   after the BLAS loop (the S_CBRANCH_SCC0 just before its backward branch that
+	//              skips it): V_READLANE_B32s of every SGPR the setup spilled
+	bool ClosestLeafWalk(size_t header, size_t back, const Field& record, RayTracingSite& site) const {
+		size_t tlas_test = npos;
+		if (!NodeTypeTest(header + 1, tlas_test) || tlas_test + 1 >= back ||
+		    m_inst[tlas_test + 1].opcode != Opcode::S_CBRANCH_SCC1) {
+			return false;
+		}
+		// The BLAS loop.
+		size_t blas = npos, blas_back = npos;
+		for (size_t i = tlas_test + 2; i < back && blas == npos; i++) {
+			const auto b = IsClosestHeader(i) ? BackwardBranchTo(i) : npos;
+			if (b != npos && b < back) {
+				blas      = i;
+				blas_back = b;
+			}
+		}
+		size_t blas_test = npos;
+		if (blas == npos || !NodeTypeTest(blas + 1, blas_test) ||
+		    m_inst[blas_test + 1].opcode != Opcode::S_CBRANCH_SCC1) {
+			return false;
+		}
+		const auto tail = IndexOf(m_inst[blas_test + 1].branch_target);
+		if (tail == npos || tail <= blas_test + 1 || tail >= blas_back) {
+			return false;
+		}
+		const auto blas_end  = EndPc(m_inst[blas_back]);
+		const auto leaf_sgpr = m_inst[blas + 1].src0.reg;
+		// The setup falls through into the BLAS walk; its other exits are the box code (the
+		// header's branch) and the cull exit.
+		size_t cull = npos;
+		for (size_t i = header; i < blas; i++) {
+			const auto& inst = m_inst[i];
+			if (!IsDirectBranch(inst.opcode) || i == tlas_test + 1 ||
+			    (inst.branch_target > m_inst[header].pc && inst.branch_target < m_inst[blas].pc)) {
+				continue;
+			}
+			const auto target = IndexOf(inst.branch_target);
+			if (inst.opcode == Opcode::S_BRANCH || target == npos || (cull != npos && target != cull)) {
+				return false;
+			}
+			cull = target;
+		}
+		if (cull == npos || ScalarWriter(blas, leaf_sgpr, header) == npos) {
+			return false;
+		}
+		// The leaf code: one triangle test; it leaves only into the rest of the BLAS loop.
+		size_t test = npos;
+		for (size_t i = blas; i < tail; i++) {
+			const auto& inst = m_inst[i];
+			if (inst.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY) {
+				if (test != npos) {
+					return false;
+				}
+				test = i;
+			}
+			if (IsDirectBranch(inst.opcode) &&
+			    (inst.branch_target < m_inst[blas].pc || inst.branch_target >= blas_end)) {
+				return false;
+			}
+		}
+		if (test == npos) {
+			return false;
+		}
+		// The restores after the BLAS loop.
+		size_t blas_exit = npos;
+		for (size_t i = blas_back; i-- > tail && i + 16 > blas_back && blas_exit == npos;) {
+			if (m_inst[i].opcode == Opcode::S_CBRANCH_SCC0 && m_inst[i].branch_target == blas_end) {
+				blas_exit = i;
+			}
+		}
+		if (blas_exit == npos) {
+			return false;
+		}
+		const auto spill_of = [&](const Instruction& save, const Instruction& restore) {
+			return save.opcode == Opcode::V_WRITELANE_B32 && save.src0.kind == OperandKind::Sgpr &&
+			       restore.opcode == Opcode::V_READLANE_B32 && IsSgpr(restore.dst, save.src0.reg) &&
+			       SameOperand(save.dst, restore.src0) && SameOperand(save.src1, restore.src1);
+		};
+		const auto spilled = [&](size_t k) {
+			for (size_t j = header; j < blas; j++) {
+				if (spill_of(m_inst[j], m_inst[k])) {
+					return true;
+				}
+			}
+			return false;
+		};
+		size_t restores_end = blas_back + 1;
+		while (restores_end < m_inst.size() && spilled(restores_end)) {
+			restores_end++;
+		}
+		for (size_t j = header; j < blas; j++) {
+			const auto& save = m_inst[j];
+			if (save.opcode != Opcode::V_WRITELANE_B32 || save.src0.kind != OperandKind::Sgpr) {
+				continue;
+			}
+			bool restored = false;
+			for (size_t k = blas_back + 1; k < restores_end && !restored; k++) {
+				restored = spill_of(save, m_inst[k]);
+			}
+			if (!restored) {
+				return false;
+			}
+		}
+		site.after_leaf_pc     = restores_end > blas_back + 1 ? m_inst[blas_back + 1].pc : 0;
+		site.after_leaf_end_pc = restores_end > blas_back + 1 ? EndPc(m_inst[restores_end - 1]) : 0;
+		// The accepted hit, the instance flags and the facing the triangle test accepts.
+		uint32_t   word_sgpr = NoRegister;
+		const auto scratch   = UnusedPair();
+		if (scratch == NoRegister || !LeafHit(blas, tail, test, record, site, word_sgpr) ||
+		    !LeafFlags(blas, tail, header, word_sgpr, record, site.layout) ||
+		    !LeafFacing(blas, tail, header, back, site)) {
+			return false;
+		}
+		site.kind            = RayTracingKind::ClosestLeaf;
+		site.setup_pc        = m_inst[header].pc;
+		site.cull_exit_pc    = m_inst[cull].pc;
+		site.blas_head_pc    = m_inst[blas].pc;
+		site.leaf_pc         = m_inst[blas].pc;
+		site.tail_pc         = m_inst[tail].pc;
+		site.blas_end_pc     = blas_end;
+		site.leaf_sgpr       = leaf_sgpr;
+		site.instance_sgpr   = m_inst[header + 1].src0.reg;
+		site.mask_sgpr       = scratch;
+		site.saved_exec_sgpr = scratch;
+		site.alpha_off_sgpr  = NoAlphaOff;
+		site.both_facings    = false;
+		return true;
+	}
+
+	// Whether instruction `i` is in an inlined call (the function's own code).
+	bool InCall(size_t i) const {
+		return std::ranges::any_of(m_bodies, [&](const InlinedCallBody& body) {
+			return body.begin <= m_inst[i].pc && m_inst[i].pc < body.end;
+		});
+	}
+
+	// The last instruction in [from, i) outside inlined calls that writes VGPR `reg` (a called
+	// function keeps the registers its caller reads after the call).
+	size_t CallerVectorWriter(size_t i, uint32_t reg, size_t from) const {
+		for (size_t j = i; j-- > from;) {
+			if (!InCall(j) && WritesVector(m_inst[j], reg)) {
+				return j;
+			}
+		}
+		return npos;
+	}
+
+	// The accepted hit of a ClosestLeaf site's leaf code: after V_CMPX_*; S_CBRANCH_EXECZ, a run
+	// of V_MOV_B32s of the distance (into t max), the instance record pair (the record's SGPRs),
+	// the triangle node (the SGPR the triangle test's node VGPR was moved from), the primitive
+	// word (the other SGPR) and the barycentrics (V_MUL_F32s of the test's second and third
+	// results). Gives the SGPR of the primitive word.
+	bool LeafHit(size_t leaf, size_t tail, size_t test, const Field& record, RayTracingSite& site,
+	             uint32_t& word_sgpr) const {
+		const auto move = [&](size_t i) {
+			const auto& inst = m_inst[i];
+			return inst.opcode == Opcode::V_MOV_B32 && inst.dst.kind == OperandKind::Vgpr && Plain(inst.src0) &&
+			       (inst.src0.kind == OperandKind::Vgpr || inst.src0.kind == OperandKind::Sgpr);
+		};
+		size_t t_move = npos;
+		for (size_t i = test + 1; i < tail && t_move == npos; i++) {
+			if (move(i) && m_inst[i].dst.reg == site.t_max && m_inst[i].src0.kind == OperandKind::Vgpr && !InCall(i)) {
+				t_move = i;
+			}
+		}
+		if (t_move == npos) {
+			return false;
+		}
+		size_t begin = t_move, end = t_move + 1;
+		while (begin > test + 1 && move(begin - 1)) {
+			begin--;
+		}
+		while (end < tail && move(end)) {
+			end++;
+		}
+		if (begin < test + 3 || m_inst[begin - 1].opcode != Opcode::S_CBRANCH_EXECZ ||
+		    !magic_enum::enum_name(m_inst[begin - 2].opcode).starts_with("V_CMPX_")) {
+			return false;
+		}
+		const auto node_move = CallerVectorWriter(test, AddressReg(m_inst[test], 0), leaf);
+		if (node_move == npos || m_inst[node_move].opcode != Opcode::V_MOV_B32 ||
+		    m_inst[node_move].src0.kind != OperandKind::Sgpr) {
+			return false;
+		}
+		const auto node_sgpr = m_inst[node_move].src0.reg;
+		const auto result    = m_inst[test].dst.reg;
+		uint32_t   high      = NoRegister;
+		site.result_t = site.result_word = site.result_instance = NoRegister;
+		site.result_u = site.result_v = site.result_node = NoRegister;
+		word_sgpr = NoRegister;
+		for (size_t i = begin; i < end; i++) {
+			const auto& inst = m_inst[i];
+			const auto  dst  = inst.dst.reg;
+			if (inst.src0.kind == OperandKind::Vgpr) {
+				if (dst == site.t_max) {
+					site.result_t = dst;
+					continue;
+				}
+				// A barycentric: the product of the test's second or third result.
+				const auto mul = CallerVectorWriter(i, inst.src0.reg, test + 1);
+				if (mul == npos || m_inst[mul].opcode != Opcode::V_MUL_F32) {
+					return false;
+				}
+				const auto reads = [&](uint32_t reg) {
+					const auto& m = m_inst[mul];
+					return ((m.src0.kind == OperandKind::Vgpr && m.src0.reg == reg) ||
+					        (m.src1.kind == OperandKind::Vgpr && m.src1.reg == reg)) &&
+					       CallerVectorWriter(mul, reg, test) == test;
+				};
+				const bool u = reads(result + 2), v = !u && reads(result + 3);
+				auto&      bary = u ? site.result_u : site.result_v;
+				if ((!u && !v) || bary != NoRegister) {
+					return false;
+				}
+				bary = dst;
+			} else if (inst.src0.reg == record.pair) {
+				site.result_instance = dst;
+			} else if (inst.src0.reg == record.pair + 1) {
+				high = dst;
+			} else if (inst.src0.reg == node_sgpr) {
+				site.result_node = dst;
+			} else if (word_sgpr == NoRegister) {
+				word_sgpr        = inst.src0.reg;
+				site.result_word = dst;
+			} else {
+				return false;
+			}
+		}
+		return site.result_t != NoRegister && site.result_instance != NoRegister && high == site.result_instance + 1 &&
+		       site.result_u != NoRegister && site.result_v != NoRegister && site.result_node != NoRegister &&
+		       site.result_word != NoRegister;
 	}
 
 	// The registers a closest hit site's leaf code writes for an accepted hit, from the V_MOV_B32s
@@ -2652,6 +2992,14 @@ private:
 			width            = shift < 24u ? 32u - shift : 0u;
 			return (below & (below + 1u)) == 0 && shift >= 1u && shift < 32u;
 		}
+		// One bit: S_BITCMP1_B32 <dword>, <bit>; S_CBRANCH_SCC0 (mask 1).
+		if (test.opcode == Opcode::S_BITCMP1_B32 && test.src1.kind == OperandKind::IntegerInlineConstant &&
+		    test.src1.value < 32u && next != npos && m_inst[next].opcode == Opcode::S_CBRANCH_SCC0 &&
+		    OperandField(i, test.src0, from, field)) {
+			shift = test.src1.value;
+			mask  = 1u;
+			return true;
+		}
 		if (test.opcode != Opcode::S_AND_B32 || test.src1.kind != OperandKind::LiteralConstant || test.src1.value == 0 ||
 		    next == npos || m_inst[next].opcode != Opcode::S_CBRANCH_SCC0 || !OperandField(i, test.src0, from, field)) {
 			return false;
@@ -3361,7 +3709,9 @@ private:
 		return false;
 	}
 
-	const std::vector<Instruction>& m_inst;
+	const std::vector<Instruction>&     m_inst;
+	// The functions the shader calls, inlined (expanded programs).
+	const std::vector<InlinedCallBody>& m_bodies;
 	// Lane masks are one SGPR (EXEC_LO, VCC_LO) instead of a pair.
 	const bool m_wave32;
 };
@@ -3410,8 +3760,38 @@ bool ApplyRayTracingPatch(const RayTracingPatch& patch, Program& program) {
 		}
 	}
 	std::vector<Instruction> patched;
-	if (!layout.Finish(program.instructions.front().pc, EndPc(program.instructions.back()), patched)) {
+	std::vector<uint32_t>    origins;
+	if (!layout.Finish(program.instructions.front().pc, EndPc(program.instructions.back()), patched, origins)) {
 		return fail(0, "a branch target is unknown");
+	}
+	// An expanded program's literals read at run time and the code of its inlined calls follow
+	// their instructions (and their copies).
+	if (!program.runtime_literals.empty() || !program.call_bodies.empty()) {
+		std::vector<RuntimeLiteral>  literals;
+		std::vector<InlinedCallBody> bodies;
+		for (size_t i = 0; i < patched.size(); i++) {
+			const auto origin = origins[i];
+			const auto literal = std::ranges::lower_bound(program.runtime_literals, origin, {}, &RuntimeLiteral::pc);
+			if (origin != UINT32_MAX && literal != program.runtime_literals.end() && literal->pc == origin) {
+				literals.push_back({patched[i].pc, literal->word});
+			}
+			// A body's code is placed in order from its first instruction (in the guest code and
+			// in each copy).
+			for (const auto& body: program.call_bodies) {
+				if (origin != body.begin) {
+					continue;
+				}
+				size_t end = i;
+				while (end < patched.size() && origins[end] >= body.begin && origins[end] < body.end) {
+					end++;
+				}
+				bodies.push_back(
+				    {patched[i].pc, end < patched.size() ? patched[end].pc : EndPc(patched.back()), body.address, body.aliases});
+			}
+		}
+		std::ranges::sort(literals, {}, &RuntimeLiteral::pc);
+		program.runtime_literals = std::move(literals);
+		program.call_bodies      = std::move(bodies);
 	}
 	program.instructions       = std::move(patched);
 	program.ray_tracing_source = {.user_sgpr     = patch.user_sgpr,

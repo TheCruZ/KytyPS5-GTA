@@ -111,6 +111,11 @@ void Translator::EmitRayTracing(const Decoder::Instruction& inst) {
 			return;
 		}
 		case Decoder::Opcode::RT_RESOLVE:
+			if (inst.dmask == 2u) {
+				// Closest hit: the leaf code keeps the nearest hit, every lane keeps searching.
+				mark(Mark::Resolve, IR::U1(IR::Value(true)));
+				return;
+			}
 			mark(inst.dmask != 0 ? Mark::CullResolve : Mark::Resolve, ReadMask(inst.src0));
 			return;
 		case Decoder::Opcode::RT_EXIT_CHECK: ir.SetScc(flag(Flag::NeedRestore)); return;
