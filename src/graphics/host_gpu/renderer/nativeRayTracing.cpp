@@ -142,6 +142,10 @@ constexpr uint64_t ReadbackSize    = ReadbackUsed + uint64_t {SlotCapacity} * 4;
 // rt_tlas_walk.comp).
 constexpr uint32_t HeaderInState = 0xffffffffu;
 
+// The descriptors of the walks (RT_RECORD_PAGES in rt_common.inc): the BDA page table, then the
+// fault bitmap of the fault buffer.
+constexpr uint32_t WalkBindings = 2;
+
 struct TlasPush {
 	uint64_t user_ptr_va;
 	uint64_t state;
@@ -379,13 +383,15 @@ struct RtStats {
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(NativeRayTracing::GuestDispatch::Count)> last_guest {};
 	uint32_t                                                                                        guest_calls = 0;
 	// Walks that published no context (rt_tlas_walk.comp): with a null TLAS header (read through
-	// the user data pointer, so the program without the patch could not be chosen), with a header
-	// that is not that of a TLAS in memory the host knows, or with TLAS memory the host has not
-	// cached. Their dispatches take the guest traversal. The last program of each.
+	// the user data pointer, so the program without the patch could not be chosen) or with a header
+	// that is not that of a TLAS. Their dispatches take the guest traversal. The last program.
 	RtCounter             walks_null_header;
 	RtCounter             walks_bad_header;
-	RtCounter             walks_uncached;
 	std::atomic<uint64_t> last_unpublished {0};
+	// Walks that found part of the TLAS in memory the host had not cached yet: they traced what
+	// they read, and the host caches the rest for the next walks. The last program.
+	RtCounter             walks_uncached;
+	std::atomic<uint64_t> last_uncached {0};
 	// --rt-stats: rays sent back to the guest traversal.
 	std::atomic<uint64_t>                guest_rays {0};
 	uint64_t                             guest_rays_reported = 0;
@@ -421,7 +427,7 @@ void SummarizeRayTracing() {
 	const auto null_header = stats.walks_null_header.TakeDelta();
 	const auto bad_header  = stats.walks_bad_header.TakeDelta();
 	const auto uncached    = stats.walks_uncached.TakeDelta();
-	const auto unpublished = null_header + bad_header + uncached;
+	const auto unpublished = null_header + bad_header;
 	const auto rays_total = stats.guest_rays.load(std::memory_order_relaxed);
 	const auto rays       = rays_total - stats.guest_rays_reported;
 	stats.guest_rays_reported  = rays_total;
@@ -430,7 +436,7 @@ void SummarizeRayTracing() {
 	const auto new_guest_sites = programs.guest_sites - stats.programs_reported.guest_sites;
 	stats.programs_reported    = programs;
 	// The first call starts the period; dispatches without a TLAS alone trace nothing.
-	if (next == 0 || unpatched + unpublished + rays + new_unpatched + new_guest_sites == 0) {
+	if (next == 0 || unpatched + unpublished + uncached + rays + new_unpatched + new_guest_sites == 0) {
 		return;
 	}
 	const auto log = [](const std::string& line) { ::Log::WriteToConsoleAndLog(line + "\n"); };
@@ -445,10 +451,14 @@ void SummarizeRayTracing() {
 	}
 	if (unpublished != 0) {
 		log(fmt::format("[RT]   {} TLAS walks published no context ({} with a null header, {} with a header that is "
-		                "not a TLAS the host knows, {} with TLAS memory not cached yet; last cs {}): their dispatches "
-		                "walked the guest BVH",
-		                unpublished, null_header, bad_header, uncached,
+		                "not a TLAS; last cs {}): their dispatches walked the guest BVH",
+		                unpublished, null_header, bad_header,
 		                RtShader(stats.last_unpublished.load(std::memory_order_relaxed))));
+	}
+	if (uncached != 0) {
+		log(fmt::format("[RT]   {} TLAS walks found TLAS memory not cached yet (last cs {}): their rays missed what "
+		                "it holds, cached for the next walks",
+		                uncached, RtShader(stats.last_uncached.load(std::memory_order_relaxed))));
 	}
 	if (rays != 0) {
 		log(fmt::format("[RT]   {} rays went back to the guest traversal (last cs {})", rays,
@@ -679,12 +689,16 @@ NativeRayTracing::~NativeRayTracing() {
 
 void NativeRayTracing::CreatePipelines() {
 	auto device = m_graphics.device;
-	const vk::DescriptorSetLayoutBinding binding {0, vk::DescriptorType::eStorageBuffer, 1,
-	                                              vk::ShaderStageFlagBits::eCompute, nullptr};
+	// The BDA page table, and the fault and use bitmaps the walks record their pages in (the HLE
+	// passes only read the page table).
+	std::array<vk::DescriptorSetLayoutBinding, WalkBindings> bindings {};
+	for (uint32_t i = 0; i < WalkBindings; i++) {
+		bindings[i] = {i, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr};
+	}
 	vk::DescriptorSetLayoutCreateInfo layout_info {};
 	layout_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
-	layout_info.bindingCount = 1;
-	layout_info.pBindings    = &binding;
+	layout_info.bindingCount = WalkBindings;
+	layout_info.pBindings    = bindings.data();
 	RequireVulkanSuccess(device.createDescriptorSetLayout(&layout_info, nullptr, &m_descriptor_layout),
 	                     "create native ray tracing descriptor layout");
 	const auto make = [&](std::span<const uint32_t> code, uint32_t push_size,
@@ -1537,14 +1551,24 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 		                  vk::AccessFlagBits2::eTransferWrite);
 	}
 
-	auto* page_table = m_buffer_cache.GetBdaPageTableBuffer();
-	const vk::DescriptorBufferInfo page_info {page_table->Handle(), 0, page_table->Size()};
-	vk::WriteDescriptorSet write {};
-	write.dstBinding      = 0;
-	write.descriptorCount = 1;
-	write.descriptorType  = vk::DescriptorType::eStorageBuffer;
-	write.pBufferInfo     = &page_info;
-	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_blas_layout, 0, 1, &write);
+	// The walks record the pages without a buffer that they read in the fault buffer, which must
+	// start clear (the program's own device-address accesses usually cleared it already).
+	m_buffer_cache.PrepareFaultBuffer();
+	auto*       page_table   = m_buffer_cache.GetBdaPageTableBuffer();
+	const auto* fault_buffer = m_buffer_cache.GetFaultBuffer();
+	const std::array<vk::DescriptorBufferInfo, WalkBindings> infos {{
+	    {page_table->Handle(), 0, page_table->Size()},
+	    {fault_buffer->Handle(), 0, BufferCache::WRITE_BITMAP_OFFSET},
+	}};
+	std::array<vk::WriteDescriptorSet, WalkBindings> writes {};
+	for (uint32_t i = 0; i < WalkBindings; i++) {
+		writes[i].dstBinding      = i;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType  = vk::DescriptorType::eStorageBuffer;
+		writes[i].pBufferInfo     = &infos[i];
+	}
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_blas_layout, 0, WalkBindings,
+	                             writes.data());
 
 	// The BVHs of the traversal's layout (Decoder::RayTracingLayout::Pack() word 3).
 	m_blas_flags = ((source.layout[3] >> 29u) & 1u) != 0 ? BlasNodeCountAt80 : 0u;
@@ -1554,7 +1578,8 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 	MemoryBarrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
 	              vk::PipelineStageFlagBits2::eComputeShader,
 	              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
-	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_tlas_layout, 0, 1, &write);
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_tlas_layout, 0, WalkBindings,
+	                             writes.data());
 
 	const TlasPush tlas_push {
 	    .user_ptr_va       = user_pointer,
@@ -1592,7 +1617,8 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 
 	// Counts the leaves of the BLASes the walk found missing, and checks the built ones it uses.
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_blas_pipeline);
-	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_blas_layout, 0, 1, &write);
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_blas_layout, 0, WalkBindings,
+	                             writes.data());
 	BlasPush blas_push {m_missing->BufferDeviceAddress(), m_pool->BufferDeviceAddress(),
 	                    m_slots->BufferDeviceAddress(),   m_state->BufferDeviceAddress(),
 	                    m_changed->BufferDeviceAddress(), ModeCount,
@@ -1671,13 +1697,13 @@ void NativeRayTracing::ProcessReadback(Readback& readback) {
 	std::vector<uint32_t>    retry;
 	Common::LockGuard        lock(m_mutex);
 	// The walk ends without publishing the context (nor the indirect BLAS dispatch) when the header
-	// is not that of a TLAS in memory the host knows.
-	if (state.dispatch[1] == 0 || (state.overflow & StateUnmapped) != 0) {
-		(state.dispatch[1] != 0 ? g_rt_stats.walks_uncached
-		 : state.header_va == 0 ? g_rt_stats.walks_null_header
-		                        : g_rt_stats.walks_bad_header)
-		    .Add();
+	// is not that of a TLAS; it publishes what it read when part of the TLAS is not cached yet.
+	if (state.dispatch[1] == 0) {
+		(state.header_va == 0 ? g_rt_stats.walks_null_header : g_rt_stats.walks_bad_header).Add();
 		g_rt_stats.last_unpublished.store(readback.shader_hash, std::memory_order_relaxed);
+	} else if ((state.overflow & StateUnmapped) != 0) {
+		g_rt_stats.walks_uncached.Add();
+		g_rt_stats.last_uncached.store(readback.shader_hash, std::memory_order_relaxed);
 	}
 	SummarizeRayTracing();
 	for (uint32_t i = 0; i < missing_count; i++) {
