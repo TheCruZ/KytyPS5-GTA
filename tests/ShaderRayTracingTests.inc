@@ -595,12 +595,35 @@ void TestRayTracingUniformOrigin() {
   }
 }
 
+// --rt-stats: the sites count the rays they send back to the guest traversal with a ballot per wave;
+// without it the program has no ballot count.
+void TestRayTracingStats() {
+  for (const bool stats : {false, true}) {
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.native_ray_tracing = true;
+    options.ray_stats          = stats;
+    auto translated = ShaderRecompiler::TranslateProgram(kClosestUniformOrigin, options);
+    const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+    ShaderRecompiler::IR::ResourceSpecialization specialization;
+    specialization.buffers.assign(plan.info.buffers.size(), {});
+    specialization.images.assign(plan.info.images.size(), {});
+    specialization.samplers.assign(plan.info.samplers.size(), {});
+    const auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+    // OpGroupNonUniformBallotBitCount
+    Check((SpirvInstructionOpcodeCount(compiled.spirv, 342u) != 0) == stats,
+          stats ? "a traversal compiled with ray statistics does not count its guest rays"
+                : "a traversal compiled without ray statistics counts its guest rays");
+    CheckSpirvBinaryValidates(compiled.spirv);
+  }
+}
+
 void TestRayTracingInstructions() {
   TestTrinityBvhInstruction();
   TestTrinityStackInstruction();
   TestRayTracingSiteWaveSizes();
   TestRayTracingClosestLeafCalls();
   TestRayTracingUniformOrigin();
+  TestRayTracingStats();
   namespace D = ShaderRecompiler::Decoder;
   const std::array code{
       0xf1989f01u, 0x00081014u,
