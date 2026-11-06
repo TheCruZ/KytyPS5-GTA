@@ -145,6 +145,47 @@ constexpr uint32_t kClosestPlayroomWave32[] = {
     0x00003837u, 0xbf840001u, 0xbf82ffa7u, 0xbf810000u,
 };
 
+// Closest hit traversals whose rays start at one point for every lane (camera rays), reduced from
+// ASTRO BOT's cs 9833d01b08e21d08 and ASTRO's PLAYROOM's cs 29289be6a0202b6d (waves of 64 lanes):
+// the world origin stays in SGPRs (s_buffer_load_dwordx4 before the loop), the loop copies it into
+// the TLAS box test's VGPRs with V_MOV_B32 right before the test, and the instance setup computes
+// the object space origin from those SGPRs (V_MAD_F32 <v>, <record dword>, <origin SGPR>, <v>).
+constexpr uint32_t kClosestUniformOrigin[] = {
+    0xf4040080u, 0xfa000028u, 0xf4040201u, 0xfa000030u, 0x9498ff02u, 0x00280008u, 0x802a0208u, 0xbe8c03a5u,
+    0x822b0309u, 0x802eff02u, 0x00000080u, 0x822f8003u, 0xbe84047eu, 0x876a870cu, 0x816ac46au, 0xbf0b826au,
+    0x872c870cu, 0xbf072c87u, 0xbea8042eu, 0x906a830cu, 0xbeeb0380u, 0x8fea876au, 0x80286a2au, 0x82296b2bu,
+    0xf4100114u, 0xfa000000u, 0xbeeb0311u, 0xbf08ff13u, 0x00ffffffu, 0xbf840044u, 0x10002604u, 0x10022608u,
+    0x1004260cu, 0x7e160207u, 0x7e10020bu, 0x7e18020fu, 0xd5410022u, 0x04023605u, 0xd5410023u, 0x04063609u,
+    0xd5410003u, 0x042c2804u, 0xd5410008u, 0x04202808u, 0xd541000cu, 0x0430280cu, 0xd5410024u, 0x040a360du,
+    0x8711ff11u, 0x003fffffu, 0xd5410003u, 0x040c2a05u, 0x8f848310u, 0xd5410008u, 0x04202a09u, 0xd541000cu,
+    0x04302a0du, 0x3e443806u, 0x3e46380au, 0x3e48380eu, 0xd541001fu, 0x040c2c06u, 0xd5410020u, 0x04202c0au,
+    0xd5410021u, 0x04302c0eu, 0x94a0ff04u, 0x00280008u, 0x851012a5u, 0x8702ff6bu, 0x01000000u, 0x9393ff6bu,
+    0x00010019u, 0x876a8710u, 0x816ac46au, 0xbf0b826au, 0xbf070280u, 0x858c807eu, 0xf1989f01u, 0x0008001du,
+    0x2c04009fu, 0x7d8a00f9u, 0x0686906au, 0x7d840413u, 0x10000300u, 0x878e0c10u, 0x87ea106au, 0x7c083cf9u,
+    0x06069000u, 0x8dea0e6au, 0x8dea6a10u, 0xbeea246au, 0xbf880004u, 0x7e1a020bu, 0x7e120228u, 0x7e1c020au,
+    0x7e3c0300u, 0xbf82ffe7u, 0x7e020214u, 0x7e040215u, 0x7e060216u, 0xf1989f07u, 0x00060000u, 0x0302011eu,
+    0x041c1b13u, 0x00000605u, 0xbf840001u, 0xbf82ffa0u, 0xbf810000u, 0xbf810000u,
+};
+
+constexpr uint32_t kClosestUniformOriginPlayroom[] = {
+    0xf4040080u, 0xfa000028u, 0xf4041a81u, 0xfa000050u, 0x8004c16au, 0x8205c16bu, 0xf4041a81u, 0xfa000028u,
+    0x9492ff04u, 0x002a0000u, 0xbe9403a5u, 0x9490ff02u, 0x00280008u, 0x80246a02u, 0x82256b03u, 0x802cff02u,
+    0x0000008cu, 0x822d8003u, 0xbe84047eu, 0x87068714u, 0x816ac406u, 0xbf0b816au, 0xbf070687u, 0xbea0042cu,
+    0xbea203a5u, 0xbf860008u, 0x906a8314u, 0x9aebff6au, 0x000000a0u, 0xb86a00a0u, 0x80206a24u, 0x82216b25u,
+    0xf4000890u, 0xfa000098u, 0xf40008d0u, 0xfa000000u, 0xb72300ffu, 0xbf850049u, 0xf4080610u, 0xfa000040u,
+    0xf40c0f10u, 0xfa000008u, 0xf4080510u, 0xfa000028u, 0xf4041a90u, 0xfa000038u, 0x7e020218u, 0x7e06021au,
+    0x7e180219u, 0x1000263eu, 0x10202640u, 0xd5410001u, 0x04047c0cu, 0xd5410003u, 0x040c800cu, 0xd541000cu,
+    0x04307e0cu, 0x1004263fu, 0xd5410017u, 0x040c280du, 0xd541000du, 0x0430860du, 0xd541000cu, 0x04023c42u,
+    0xd541000bu, 0x04041a42u, 0xd541000eu, 0x040a3c43u, 0x3e203c14u, 0xd5410017u, 0x045cd40eu, 0xd541000du,
+    0x04342e0eu, 0xd541000bu, 0x042c1c16u, 0x3e183e16u, 0x3e203e6au, 0x3e1c3e17u, 0x9488ff3cu, 0x00280008u,
+    0x87278c23u, 0x876a8722u, 0x816ac46au, 0xbf0b816au, 0x87288427u, 0x90298327u, 0xbf072880u, 0x8598807eu,
+    0xf1989f07u, 0x00020000u, 0x170d0b12u, 0x14100e0cu, 0x00001615u, 0x2c04009fu, 0x7d8a00f9u, 0x06869a6au,
+    0x7d840429u, 0x87ea1a6au, 0x8aa2186au, 0x87ea181au, 0x88ea6a22u, 0xbeea246au, 0xbf880007u, 0x10000300u,
+    0x7c262500u, 0xbf880004u, 0x7e240300u, 0x7e1e0217u, 0x7e080216u, 0x7e120220u, 0xbf82ffe2u, 0x7e06020cu,
+    0x7e02020du, 0x7e04020eu, 0xf1989f07u, 0x00040000u, 0x02010312u, 0x051f1e13u, 0x00000806u, 0xbf840001u,
+    0xbf82ff99u, 0xbf810000u, 0xbf810000u,
+};
+
 void TestRayTracingSiteWaveSizes() {
   namespace D = ShaderRecompiler::Decoder;
   const auto derive = [](std::span<const uint32_t> code, uint32_t wave_size, D::RayTracingPatch &patch) {
@@ -496,11 +537,70 @@ void TestRayTracingClosestLeafCalls() {
   CheckSpirvBinaryValidates(compiled.spirv);
 }
 
+void TestRayTracingUniformOrigin() {
+  namespace D = ShaderRecompiler::Decoder;
+  const auto derive = [](std::span<const uint32_t> code, D::RayTracingPatch &patch) {
+    D::Program decoded;
+    D::DecodeProgram(code, decoded);
+    return D::DeriveRayTracingPatch(decoded, patch, 64);
+  };
+  struct Case {
+    std::span<const uint32_t> code;
+    std::array<uint32_t, 3> origin;
+    std::array<uint32_t, 4> layout;
+  };
+  for (const auto &test : {Case{kClosestUniformOrigin, {20, 21, 22}, {0x76543210u, 0x1dc6ba98u, 0x000dbb8fu, 0x000f2510u}},
+                           Case{kClosestUniformOriginPlayroom, {12, 13, 14}, {0xd951c840u, 0x4c25ea62u, 0x30482080u, 0x308f2511u}}}) {
+    D::RayTracingPatch patch;
+    Check(derive(test.code, patch) && patch.sites.size() == 1, "closest hit traversal of uniform rays was not recognized");
+    const auto &site = patch.sites[0];
+    Check(std::ranges::equal(site.origin_sgpr, test.origin) &&
+              std::ranges::all_of(site.origin, [](uint32_t reg) { return reg == D::NoRegister; }) &&
+              patch.user_sgpr == 0 && patch.header_offset == 0x28 && patch.root == 37 && patch.layout.Pack() == test.layout,
+          "closest hit traversal of uniform rays has the wrong origin or layout");
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.native_ray_tracing = true;
+    auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
+    const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+    ShaderRecompiler::IR::ResourceSpecialization specialization;
+    specialization.buffers.assign(plan.info.buffers.size(), {});
+    specialization.images.assign(plan.info.images.size(), {});
+    specialization.samplers.assign(plan.info.samplers.size(), {});
+    const auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+    Check(compiled.program.info.ray_query && compiled.program.info.ray_query_sites == 1 &&
+              SpirvInstructionOpcodeCount(compiled.spirv, 4473u) != 0,
+          "patched traversal of uniform rays does not trace with ray queries");
+    CheckSpirvBinaryValidates(compiled.spirv);
+  }
+  // A copy into the box test from an SGPR the loop writes (the instance record's s4) is no uniform origin.
+  std::vector<uint32_t> rewritten(std::begin(kClosestUniformOrigin), std::end(kClosestUniformOrigin));
+  const auto copy = std::ranges::find(rewritten, 0x7e020214u); // v_mov_b32 v1, s20
+  Check(copy != rewritten.end(), "uniform origin test program changed");
+  *copy = 0x7e020204u; // v_mov_b32 v1, s4
+  D::RayTracingPatch patch;
+  Check(!derive(rewritten, patch), "an origin SGPR the traversal loop writes was taken as the ray origin");
+  // The user data pair the TLAS header is loaded through may be written in another case of a switch
+  // (a path that does not reach the load), but not on the path to it.
+  for (const bool reaches : {false, true}) {
+    std::vector<uint32_t> code {0xbf068005u,                              // s_cmp_eq_u32 s5, 0
+                                EncodeSopp(0x05, reaches ? 1u : 2u),      // s_cbranch_scc1 <load>
+                                0xbe800412u};                             // s_mov_b64 s[0:1], s[18:19]
+    if (!reaches) {
+      // s_branch to the program's end.
+      code.push_back(EncodeSopp(0x02, static_cast<uint32_t>(std::size(kClosestUniformOrigin) - 2)));
+    }
+    code.insert(code.end(), std::begin(kClosestUniformOrigin), std::end(kClosestUniformOrigin));
+    Check(derive(code, patch) == !reaches, reaches ? "a TLAS header loaded through a pair written before was recognized"
+                                                    : "a write of the header's user data pair on another path hid the traversal");
+  }
+}
+
 void TestRayTracingInstructions() {
   TestTrinityBvhInstruction();
   TestTrinityStackInstruction();
   TestRayTracingSiteWaveSizes();
   TestRayTracingClosestLeafCalls();
+  TestRayTracingUniformOrigin();
   namespace D = ShaderRecompiler::Decoder;
   const std::array code{
       0xf1989f01u, 0x00081014u,

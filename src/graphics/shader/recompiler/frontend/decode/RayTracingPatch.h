@@ -28,7 +28,8 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 //
 // Pseudo instructions (Instruction::offset = site):
 //   RT_INIT    image_nsa_addr[0..7] = origin xyz, direction xyz, t max and cull mask VGPRs ([8]
-//              the constant mask without a mask VGPR, src2 the SGPR mask), src0 = SGPR pair of the
+//              the constant mask without a mask VGPR, src2 the SGPR mask; [9..11] the SGPRs of the
+//              origin components without a VGPR, NoRegister), src0 = SGPR pair of the
 //              guest TLAS header address, src1 = alpha test off, src3 = the SGPR (dmask 4) or lane
 //              mask (dmask 8) of the lanes that cull facings. SCC = native traversal.
 //   RT_SELECT  dst = SGPR of the instance node, dst2 = SGPR pair of the lane mask; advances the
@@ -184,7 +185,10 @@ struct RayTracingSite {
 	uint32_t entry_pc = 0;
 	// The loop header (the fallback target).
 	uint32_t loop_pc = 0;
+	// The VGPRs of the ray's origin, or (NoRegister) the SGPR of the component in `origin_sgpr`:
+	// a ray origin the same for every lane, which the loop copies into the box test's VGPRs.
 	uint32_t origin[3] {};
+	uint32_t origin_sgpr[3] {NoRegister, NoRegister, NoRegister};
 	uint32_t direction[3] {};
 	uint32_t t_max     = 0;
 	// The VGPR of the ray's instance mask (NoRegister: the SGPR or, without one, the constant
