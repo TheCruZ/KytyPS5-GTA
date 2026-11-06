@@ -314,6 +314,18 @@ Operand Vgpr(uint32_t reg) {
 	return operand;
 }
 
+// The ray registers of RT_INIT: the origin (VGPRs, or SGPRs in [9..11]) and the direction.
+void SetRay(Instruction& init, const RayTracingSite& site) {
+	for (uint32_t i = 0; i < 3; i++) {
+		init.image_nsa_addr[i]     = site.origin[i];
+		init.image_nsa_addr[3 + i] = site.direction[i];
+		if (site.origin_sgpr[i] != NoRegister) {
+			init.image_nsa_addr[i]     = NoRegister;
+			init.image_nsa_addr[9 + i] = site.origin_sgpr[i];
+		}
+	}
+}
+
 // What the per-lane alpha test reads (see RayTracingAlphaTest).
 void AddAlphaTest(Layout& layout, const RayTracingSite& site, uint32_t index) {
 	const auto& test        = site.alpha;
@@ -342,10 +354,7 @@ void AddClosestTraversal(Layout& layout, const RayTracingSite& site, uint32_t in
 		AddAlphaTest(layout, site, index);
 	}
 	auto& init = layout.AddPseudo(Opcode::RT_INIT, index);
-	for (uint32_t i = 0; i < 3; i++) {
-		init.image_nsa_addr[i]     = site.origin[i];
-		init.image_nsa_addr[3 + i] = site.direction[i];
-	}
+	SetRay(init, site);
 	init.image_nsa_addr[6] = site.t_max;
 	init.image_nsa_addr[7] = site.cull_mask;
 	init.image_nsa_addr[8] = site.cull_mask_constant;
@@ -402,10 +411,7 @@ bool AddNativeTraversal(Layout& layout, const Program& program, const RayTracing
 		AddAlphaTest(layout, site, index);
 	}
 	auto& init = layout.AddPseudo(Opcode::RT_INIT, index);
-	for (uint32_t i = 0; i < 3; i++) {
-		init.image_nsa_addr[i]     = site.origin[i];
-		init.image_nsa_addr[3 + i] = site.direction[i];
-	}
+	SetRay(init, site);
 	init.image_nsa_addr[6] = site.t_max;
 	init.image_nsa_addr[7] = site.cull_mask;
 	init.image_nsa_addr[8] = site.cull_mask_constant;
@@ -817,25 +823,59 @@ private:
 
 	// The box test after `from`: the first IMAGE_BVH_INTERSECT_RAY, its ray registers, and the
 	// TLAS header SGPR pair its T# was built from (before `header`).
-	bool BoxTest(size_t header, size_t box, RayTracingSite& site) const {
+	bool BoxTest(size_t header, size_t back, size_t box, RayTracingSite& site) const {
 		const auto& test = m_inst[box];
 		if (test.src1.kind != OperandKind::Sgpr) {
 			return false;
 		}
 		site.t_max = AddressReg(test, 1);
 		for (uint32_t c = 0; c < 3; c++) {
-			site.origin[c]    = AddressReg(test, 2 + c);
-			site.direction[c] = AddressReg(test, 5 + c);
+			site.origin[c]      = AddressReg(test, 2 + c);
+			site.origin_sgpr[c] = NoRegister;
+			site.direction[c]   = AddressReg(test, 5 + c);
 		}
 		for (size_t i = header; i-- > 0;) {
 			const auto& bfe = m_inst[i];
 			if (bfe.opcode == Opcode::S_BFE_U64 && IsSgpr(bfe.dst, test.src1.reg) &&
 			    bfe.src0.kind == OperandKind::Sgpr && IsConstant(bfe.src1, 0x280008)) {
 				site.header_sgpr = bfe.src0.reg;
+				ScalarOrigin(header, back, box, site);
 				return site.t_max != NoRegister;
 			}
 		}
 		return false;
+	}
+
+	// A ray origin the same for every lane (camera rays): the loop copies it into the box test's
+	// VGPRs with V_MOV_B32 <vgpr>, <sgpr> right before the test (no branch in between, nor into it),
+	// from SGPRs nothing in the loop writes. The origin is then those SGPRs, which hold it from the
+	// loop's entry on.
+	void ScalarOrigin(size_t header, size_t back, size_t box, RayTracingSite& site) const {
+		for (uint32_t c = 0; c < 3; c++) {
+			const auto w = site.origin[c] != NoRegister ? VectorWriter(box, site.origin[c], header) : npos;
+			if (w == npos) {
+				continue;
+			}
+			const auto& move   = m_inst[w];
+			const auto  source = move.src0.kind == OperandKind::Sgpr ? move.src0.reg : NoRegister;
+			if (move.opcode != Opcode::V_MOV_B32 || !Plain(move.dst) || !Plain(move.src0) || source == NoRegister ||
+			    ScalarWriter(back, source, header) != npos) {
+				continue;
+			}
+			bool straight = true;
+			for (size_t j = w + 1; j < box && straight; j++) {
+				straight = !IsDirectBranch(m_inst[j].opcode) && m_inst[j].opcode != Opcode::S_SETPC_B64;
+			}
+			for (const auto& inst: m_inst) {
+				if (IsDirectBranch(inst.opcode) && inst.branch_target > move.pc && inst.branch_target <= m_inst[box].pc) {
+					straight = false;
+				}
+			}
+			if (straight) {
+				site.origin[c]      = NoRegister;
+				site.origin_sgpr[c] = source;
+			}
+		}
 	}
 
 	bool DerivePacket(size_t header, size_t back, RayTracingSite& site) const {
@@ -852,7 +892,7 @@ private:
 		}
 		site.setup_pc = m_inst[le + 1].branch_target;
 		const auto box = Next(le, Opcode::IMAGE_BVH_INTERSECT_RAY, back);
-		if (box == npos || !BoxTest(header, box, site)) {
+		if (box == npos || !BoxTest(header, back, box, site)) {
 			return false;
 		}
 		// The stack pointer.
@@ -1900,15 +1940,14 @@ private:
 				continue;
 			}
 			RayTracingSite probe;
-			if (BoxTest(header, i, probe)) {
+			if (BoxTest(header, back, i, probe)) {
 				box = i;
 				site.t_max       = probe.t_max;
-				site.origin[0]   = probe.origin[0];
-				site.origin[1]   = probe.origin[1];
-				site.origin[2]   = probe.origin[2];
-				site.direction[0] = probe.direction[0];
-				site.direction[1] = probe.direction[1];
-				site.direction[2] = probe.direction[2];
+				for (uint32_t c = 0; c < 3; c++) {
+					site.origin[c]      = probe.origin[c];
+					site.origin_sgpr[c] = probe.origin_sgpr[c];
+					site.direction[c]   = probe.direction[c];
+				}
 				site.header_sgpr = probe.header_sgpr;
 			}
 		}
@@ -2406,17 +2445,57 @@ private:
 			    (load.src1.kind != OperandKind::Unknown && load.src1.kind != OperandKind::Null)) {
 				return false;
 			}
+			// Nothing before writes the pair on a path to the load (the other cases of a switch
+			// may reuse it).
 			const auto base = load.src0.reg;
 			for (size_t j = 0; j < i; j++) {
 				const auto& dst = m_inst[j].dst;
-				if (dst.kind == OperandKind::Sgpr && (dst.reg == base || dst.reg == base + 1 ||
-				                                      (dst.reg + 1 == base && WritesPair(m_inst[j])))) {
+				if (dst.kind == OperandKind::Sgpr &&
+				    (dst.reg == base || dst.reg == base + 1 || (dst.reg + 1 == base && WritesPair(m_inst[j]))) &&
+				    Reaches(j + 1, i)) {
 					return false;
 				}
 			}
 			user_sgpr = base;
 			offset    = static_cast<uint32_t>(load.offset);
 			return true;
+		}
+		return false;
+	}
+
+	// Whether instruction `to` can run after instruction `from` runs (through fall through and
+	// direct branches; an indirect branch can reach any instruction).
+	bool Reaches(size_t from, size_t to) const {
+		std::vector<bool>   seen(m_inst.size());
+		std::vector<size_t> work {from};
+		while (!work.empty()) {
+			const auto i = work.back();
+			work.pop_back();
+			if (i >= m_inst.size() || seen[i]) {
+				continue;
+			}
+			if (i == to) {
+				return true;
+			}
+			seen[i]          = true;
+			const auto& inst = m_inst[i];
+			if (inst.opcode == Opcode::S_SETPC_B64 || inst.opcode == Opcode::S_SWAPPC_B64) {
+				return true;
+			}
+			if (inst.opcode == Opcode::S_ENDPGM) {
+				continue;
+			}
+			if (IsDirectBranch(inst.opcode)) {
+				const auto target = IndexOf(inst.branch_target);
+				if (target == npos) {
+					return true;
+				}
+				work.push_back(target);
+				if (inst.opcode == Opcode::S_BRANCH) {
+					continue;
+				}
+			}
+			work.push_back(i + 1);
 		}
 		return false;
 	}
@@ -2661,7 +2740,14 @@ private:
 		return node != NoRegister;
 	}
 
-	// The affine form of a value of the object space ray: per world component (the VGPRs
+	// The world components of the ray: per component its VGPR, or (a component the same for every
+	// lane) its SGPR in `scalar`.
+	struct Inputs {
+		std::array<uint32_t, 3> vector {};
+		std::array<uint32_t, 3> scalar {NoRegister, NoRegister, NoRegister};
+	};
+
+	// The affine form of a value of the object space ray: per world component (the registers
 	// `inputs`, unchanged since `from`), the record dword it is multiplied by, and the dword
 	// added (NoRegister: none).
 	struct Form {
@@ -2671,19 +2757,21 @@ private:
 		size_t                  load     = npos;
 	};
 
-	bool FormTerm(size_t i, const Operand& a, const Operand& b, size_t from, const std::array<uint32_t, 3>& inputs,
-	              uint32_t& pair, Form& form) const {
+	bool FormTerm(size_t i, const Operand& a, const Operand& b, size_t from, const Inputs& inputs, uint32_t& pair,
+	              Form& form) const {
 		for (const auto& [scalar, vector]: {std::pair {&a, &b}, std::pair {&b, &a}}) {
-			Field field;
-			if (vector->kind != OperandKind::Vgpr || !Plain(*vector) || !OperandField(i, *scalar, from, field)) {
+			Field      field;
+			const bool uniform = vector->kind == OperandKind::Sgpr && std::ranges::find(inputs.scalar, vector->reg) != inputs.scalar.end();
+			if ((vector->kind != OperandKind::Vgpr && !uniform) || !Plain(*vector) || !OperandField(i, *scalar, from, field)) {
 				continue;
 			}
-			const auto input = std::ranges::find(inputs, vector->reg);
-			if (input == inputs.end() || VectorWriter(i, vector->reg, from) != npos ||
-			    (pair != NoRegister && pair != field.pair)) {
+			const auto& regs    = uniform ? inputs.scalar : inputs.vector;
+			const auto  input   = std::ranges::find(regs, vector->reg);
+			const auto  changed = uniform ? ScalarWriter(i, vector->reg, from) : VectorWriter(i, vector->reg, from);
+			if (input == regs.end() || changed != npos || (pair != NoRegister && pair != field.pair)) {
 				return false;
 			}
-			auto& factor = form.factor[input - inputs.begin()];
+			auto& factor = form.factor[input - regs.begin()];
 			if (factor != NoRegister) {
 				return false;
 			}
@@ -2707,7 +2795,7 @@ private:
 		return true;
 	}
 
-	bool LinearForm(size_t i, uint32_t reg, size_t from, const std::array<uint32_t, 3>& inputs, uint32_t& pair, Form& form,
+	bool LinearForm(size_t i, uint32_t reg, size_t from, const Inputs& inputs, uint32_t& pair, Form& form,
 	                uint32_t depth = 0) const {
 		const auto w = VectorWriter(i, reg, from);
 		if (w == npos || depth > 8) {
@@ -2780,8 +2868,9 @@ private:
 			return false;
 		}
 		// The object space ray: origin = M * world origin + t, direction = M * world direction.
-		const std::array<uint32_t, 3> origin {site.origin[0], site.origin[1], site.origin[2]};
-		const std::array<uint32_t, 3> direction {site.direction[0], site.direction[1], site.direction[2]};
+		const Inputs origin {{site.origin[0], site.origin[1], site.origin[2]},
+		                     {site.origin_sgpr[0], site.origin_sgpr[1], site.origin_sgpr[2]}};
+		const Inputs direction {{site.direction[0], site.direction[1], site.direction[2]}};
 		uint32_t                      pair = NoRegister;
 		size_t                        load = npos;
 		for (uint32_t r = 0; r < 3; r++) {
