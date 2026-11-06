@@ -5,11 +5,16 @@
 // 128-byte instance records) from the instance list the game's CPU writes (96-byte records), in
 // one workgroup, straight into guest memory through the BDA page table.
 //
-// Input record (96 B): +0 BLAS address; +8 mask (bits 24-31) and instance flags (bits 0-3);
-// +12, +16 user data; +20 4x4 object-to-world matrix (column-major).
-// Instance record (128 B): +0 world-to-object 3x4 (row-major), +48/+52 BLAS address >> 3 (42
-// bits) with the flags at bits 54-63, +56 BLAS root, +60 mask << 24, +64 object-to-world 3x4,
-// +112 index, +116/+120 user data.
+// Input record (96 B): +0 BLAS address; +8 mask and instance flags (bits 0-3); +12, +16 user
+// data; +20 4x4 object-to-world matrix (column-major).
+// Instance record (128 B) of library generation Base460 (FORMAT_BASE460): +0 world-to-object 3x4
+// (row-major), +48/+52 BLAS address >> 3 (42 bits) with the flags at bits 54-63, +56 BLAS root,
+// +60 mask (bits 24-31 of the input's +8), +64 object-to-world 3x4 (row-major), +112 index,
+// +116/+120 user data; the records at header + [header + 48].
+// Generation Base252 (FORMAT_BASE252, GTA V 01.005): +0 BLAS address, +8 world-to-object 3x4
+// (column-major), +56 BLAS root, +60 the input's +8 with the flags in its low byte, +64
+// object-to-world 3x4 (column-major), +112 index, +116/+120 user data; the records at header +
+// [header + 40].
 // Tree: four children per box32 node, the root at header + 256 (node pointer 0x25), instance
 // leaves = instance index << 3, built bottom up over the instances sorted by Morton code.
 
@@ -24,7 +29,11 @@ layout(push_constant, std430) uniform Push {
 	uint64_t scratch;
 	uint     count;
 	uint     stride;
+	uint     format;
 } pc;
+
+const uint FORMAT_BASE460 = 0u;
+const uint FORMAT_BASE252 = 1u;
 
 const uint kMaxInstances = 4096u;
 // Box nodes of a tree over kMaxInstances leaves (1024 + 256 + 64 + 16 + 4 + 1).
@@ -197,27 +206,47 @@ void main() {
 			atomicMax(s_scene[5], FloatKey(centre.z));
 		}
 
-		// The record. Flags (bits 22-31 of +52): the input's (bits 0, 2, 3), 0x41 when the BLAS
-		// holds only opaque geometry (its header +24 bit 13), 0x80 when it holds alpha tested
-		// geometry (bit 14), and then 0x2 unless the instance forces opaque (input bit 0).
-		const mat3 w2o   = inverse(r.o2w);
-		const vec3 w2o_t = -(w2o * r.o2w_t);
-		const bool opaque = (blas_flags & (1u << 13)) != 0;
-		const bool alpha  = (blas_flags & (1u << 14)) != 0;
-		uint       flags  = (r.flags_mask & 0xdu) | (opaque ? 0x41u : 0u) | (alpha ? 0x80u : 0u);
-		if (alpha && (r.flags_mask & 1u) == 0) {
-			flags |= 0x2u;
+		const mat3     w2o    = inverse(r.o2w);
+		const vec3     w2o_t  = -(w2o * r.o2w_t);
+		const bool     opaque = (blas_flags & (1u << 13)) != 0;
+		const bool     alpha  = (blas_flags & (1u << 14)) != 0;
+		const uint64_t dst    = instances + uint64_t(i) * 128;
+		if (pc.format == FORMAT_BASE252) {
+			// The record. Flags (the low byte of +60): the input's, 0x40 when the BLAS holds only
+			// opaque geometry (its header +24 bit 13), 0x80 when it holds alpha tested geometry
+			// (bit 14), and then 0x1 or 0x2 unless the instance forces either (input bits 0-1).
+			uint flags = r.flags_mask & 0xffu;
+			if (r.blas != 0) {
+				const bool forced = (r.flags_mask & 3u) != 0;
+				flags |= (opaque ? 0x40u : 0u) | (alpha ? 0x80u : 0u) | (opaque && !forced ? 0x1u : 0u) |
+				         (alpha && !forced ? 0x2u : 0u);
+			}
+			// The 3x4 matrices M|t by columns: M[0], M[1], M[2], t.
+			StoreGuestU32x4(dst, uvec4(uint(r.blas), uint(r.blas >> 32), floatBitsToUint(w2o[0].xy)));
+			StoreGuestU32x4(dst + 16, floatBitsToUint(vec4(w2o[0].z, w2o[1])));
+			StoreGuestU32x4(dst + 32, floatBitsToUint(vec4(w2o[2], w2o_t.x)));
+			StoreGuestU32x4(dst + 48, uvec4(floatBitsToUint(w2o_t.yz), kBlasRoot, (r.flags_mask & 0xffffff00u) | flags));
+			StoreGuestU32x4(dst + 64, floatBitsToUint(vec4(r.o2w[0], r.o2w[1].x)));
+			StoreGuestU32x4(dst + 80, floatBitsToUint(vec4(r.o2w[1].yz, r.o2w[2].xy)));
+			StoreGuestU32x4(dst + 96, floatBitsToUint(vec4(r.o2w[2].z, r.o2w_t)));
+		} else {
+			// The record. Flags (bits 22-31 of +52): the input's (bits 0, 2, 3), 0x41 when the BLAS
+			// holds only opaque geometry (its header +24 bit 13), 0x80 when it holds alpha tested
+			// geometry (bit 14), and then 0x2 unless the instance forces opaque (input bit 0).
+			uint flags = (r.flags_mask & 0xdu) | (opaque ? 0x41u : 0u) | (alpha ? 0x80u : 0u);
+			if (alpha && (r.flags_mask & 1u) == 0) {
+				flags |= 0x2u;
+			}
+			const uint64_t shifted = r.blas >> 3;
+			// Row j of a 3x4 matrix M|t: (M[0][j], M[1][j], M[2][j], t[j]) (glsl matrices are columns).
+			for (uint j = 0; j < 3; j++) {
+				StoreGuestU32x4(dst + j * 16, floatBitsToUint(vec4(w2o[0][j], w2o[1][j], w2o[2][j], w2o_t[j])));
+				StoreGuestU32x4(dst + 64 + j * 16,
+				                floatBitsToUint(vec4(r.o2w[0][j], r.o2w[1][j], r.o2w[2][j], r.o2w_t[j])));
+			}
+			StoreGuestU32x4(dst + 48, uvec4(uint(shifted), (uint(shifted >> 32) & 0x3fffffu) | (flags << 22),
+			                                kBlasRoot, r.flags_mask & 0xff000000u));
 		}
-		const uint64_t shifted = r.blas >> 3;
-		const uint64_t dst     = instances + uint64_t(i) * 128;
-		// Row j of a 3x4 matrix M|t: (M[0][j], M[1][j], M[2][j], t[j]) (glsl matrices are columns).
-		for (uint j = 0; j < 3; j++) {
-			StoreGuestU32x4(dst + j * 16, floatBitsToUint(vec4(w2o[0][j], w2o[1][j], w2o[2][j], w2o_t[j])));
-			StoreGuestU32x4(dst + 64 + j * 16,
-			                floatBitsToUint(vec4(r.o2w[0][j], r.o2w[1][j], r.o2w[2][j], r.o2w_t[j])));
-		}
-		StoreGuestU32x4(dst + 48, uvec4(uint(shifted), (uint(shifted >> 32) & 0x3fffffu) | (flags << 22),
-		                                kBlasRoot, r.flags_mask & 0xff000000u));
 		StoreGuestU32x4(dst + 112, uvec4(i, r.user0, r.user1, 0u));
 	}
 	memoryBarrierBuffer();
@@ -341,10 +370,18 @@ void main() {
 	// Header (also written by the host, see HleTlasHeader()).
 	if (lid == 0) {
 		const uint size = instance_offset + count * 128u;
-		StoreGuestU32x4(pc.header_va, uvec4(0x5f525350u, 0x4c485642u, 0x5d1cba8cu, 0u));
-		StoreGuestU32x4(pc.header_va + 16, uvec4(size, 0u, 0x00020024u, 0u));
-		StoreGuestU32x4(pc.header_va + 48, uvec4(instance_offset, 0u, 0u, 0u));
-		StoreGuestU32(pc.header_va + 88, count + 4u);
-		StoreGuestU32(pc.header_va + 112, count);
+		if (pc.format == FORMAT_BASE252) {
+			StoreGuestU32x4(pc.header_va, uvec4(0x5f525350u, 0x4c485642u, 0xbbe6e938u, 0u));
+			StoreGuestU32x4(pc.header_va + 16, uvec4(size, 0u, 0x24u, 0u));
+			StoreGuestU32x4(pc.header_va + 32, uvec4(0u, 0u, instance_offset, 0u));
+			StoreGuestU32(pc.header_va + 80, count + 4u);
+			StoreGuestU32(pc.header_va + 116, count);
+		} else {
+			StoreGuestU32x4(pc.header_va, uvec4(0x5f525350u, 0x4c485642u, 0x5d1cba8cu, 0u));
+			StoreGuestU32x4(pc.header_va + 16, uvec4(size, 0u, 0x00020024u, 0u));
+			StoreGuestU32x4(pc.header_va + 48, uvec4(instance_offset, 0u, 0u, 0u));
+			StoreGuestU32(pc.header_va + 88, count + 4u);
+			StoreGuestU32(pc.header_va + 112, count);
+		}
 	}
 }
