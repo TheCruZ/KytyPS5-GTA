@@ -109,6 +109,7 @@ struct ConfigOptions {
 	bool                   occlusion_queries_enabled   = true;
 	bool                   async_pipelines_enabled     = true;
 	bool                   native_ray_tracing_enabled  = false;
+	bool                   rt_stats_enabled            = false;
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled            = false;
@@ -194,6 +195,9 @@ bool AsyncPipelinesEnabled();
 // tracing hardware (see NativeRayTracing). Off, the device enables no ray tracing feature and no
 // shader is patched.
 bool NativeRayTracingEnabled();
+// With native ray tracing: the patched shaders count on the GPU the rays they send back to the
+// guest traversal, for the "[RT]" summaries (see NativeRayTracing). Costs a ballot per wave.
+bool RayTracingStatsEnabled();
 bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
 bool PlayGoHackEnabled();

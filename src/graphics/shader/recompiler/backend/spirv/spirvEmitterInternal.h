@@ -189,6 +189,10 @@ struct EmitterState {
 	// Decoder::RayTracingAlphaFields::Pack()).
 	std::array<uint32_t, 4>                          ray_query_alpha_format {};
 	const IR::Inst*                                  ray_query_alpha_sample = nullptr;
+	// --rt-stats: the sites count the rays they send back to the guest traversal; per site, the
+	// count of the first emulated half until the last one adds it (see EmitRayQueryInit).
+	bool                                             ray_stats              = false;
+	std::array<uint32_t, 4>                          ray_stats_first_half {};
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
@@ -616,6 +620,9 @@ void DefineGetBdaPointer(EmitterState& state);
 // BufferCache::HACK_MARKS_OFFSET): the instructions, to insert after the program, or emitted.
 std::vector<uint32_t> HackMarkWords(EmitterState& state, HackMark mark);
 void                  EmitHackMark(EmitterState& state, HackMark mark);
+// Marks the entry of the program's shader hash and adds `count` (an id) to its guest rays
+// (BufferCache::HACK_MARK_GUEST_RAYS).
+void                  EmitGuestRayCount(EmitterState& state, uint32_t count);
 void DefineIndirectBufferLoads(ValueEmitContext& ctx);
 void DefineBvhIntersect(EmitterState& state);
 void DefineTrinityBvhIntersect(EmitterState& state);
