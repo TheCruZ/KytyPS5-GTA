@@ -234,6 +234,7 @@ struct PipelineHelpers::Impl {
 	struct Job {
 		uint64_t             ticket = 0;
 		std::vector<uint8_t> module;
+		bool                 urgent = false;
 	};
 	struct Helper {
 		uint32_t                     number    = 0;
@@ -657,10 +658,19 @@ std::unique_ptr<PipelineHelpers> PipelineHelpers::Start(const GraphicContext& gr
 void PipelineHelpers::Queue(uint64_t ticket, std::vector<uint8_t>&& module, bool urgent) {
 	{
 		std::scoped_lock lock(m_impl->mutex);
+		auto&            queue = m_impl->queue;
 		if (urgent) {
-			m_impl->queue.push_front({.ticket = ticket, .module = std::move(module)});
+			queue.push_front({.ticket = ticket, .module = std::move(module), .urgent = true});
 		} else {
-			m_impl->queue.push_back({.ticket = ticket, .module = std::move(module)});
+			// After the urgent jobs, the largest first: the driver's time follows the size of the
+			// SPIR-V closely, from ~1 s to minutes (GTA V's 0b41af19). Started last, a long one keeps
+			// one helper busy alone at the end while the others are done.
+			const auto size  = module.size();
+			const auto first = std::ranges::find_if(queue, [](const Impl::Job& job) { return !job.urgent; });
+			const auto at    = std::upper_bound(first, queue.end(), size, [](size_t value, const Impl::Job& job) {
+                return value > job.module.size();
+            });
+			queue.insert(at, {.ticket = ticket, .module = std::move(module)});
 		}
 		m_impl->queued++;
 		m_impl->logged_done = UINT64_MAX;
