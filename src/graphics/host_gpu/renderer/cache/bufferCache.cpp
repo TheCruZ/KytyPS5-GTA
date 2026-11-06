@@ -153,17 +153,19 @@ void BufferCache::TouchBuffer(const Buffer& buffer) {
 void BufferCache::DeleteBuffer(BufferId id) {
 	Unregister(id);
 	if (m_scheduler.Active()) {
-		m_scheduler.DeferHostOperation([this, id] { m_slot_buffers.erase(id); });
+		m_scheduler.DeferHostOperation([this, id] {
+			WaitReadbackQueueCopies(m_slot_buffers[id].Handle());
+			m_slot_buffers.erase(id);
+		});
 	} else {
 		m_slot_buffers.erase(id);
 	}
 }
 
-template <bool async>
-bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
-	std::vector<vk::BufferCopy> copies;
-	uint64_t                    total_size     = 0;
-	const auto                  buffer_address = buffer.CpuAddress();
+void BufferCache::CollectDownloadCopies(const Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                        std::vector<vk::BufferCopy>& copies,
+                                        uint64_t&                    total_size) {
+	const auto buffer_address = buffer.CpuAddress();
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
@@ -178,10 +180,20 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		    }
 		    ForgetColorMetadataChecks(address, bytes);
 	    });
+	if (!copies.empty()) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
+	}
+}
+
+template <bool async>
+bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	std::vector<vk::BufferCopy> copies;
+	uint64_t                    total_size     = 0;
+	const auto                  buffer_address = buffer.CpuAddress();
+	CollectDownloadCopies(buffer, vaddr, size, copies, total_size);
 	if (copies.empty()) {
 		return false;
 	}
-	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
 
 	if constexpr (!async) {
 		if (DownloadOnReadbackQueue(buffer, copies, total_size)) {
@@ -304,6 +316,14 @@ BufferCache::~BufferCache() {
 		m_graphics.device.destroyFence(m_readback.fence);
 		m_graphics.device.destroyCommandPool(m_readback.pool);
 	}
+	// A slot's fence is signaled while no copy of it is in flight.
+	for (auto& slot: m_readback_slots) {
+		if (slot.queue.pool) {
+			(void)m_graphics.device.waitForFences(1, &slot.queue.fence, VK_TRUE, UINT64_MAX);
+			m_graphics.device.destroyFence(slot.queue.fence);
+			m_graphics.device.destroyCommandPool(slot.queue.pool);
+		}
+	}
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
 	}
@@ -403,11 +423,16 @@ void BufferCache::ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write, 
 	// The execution thread records the download right away (see ReadMemory()) and submits it, then
 	// goes on with its operations while this thread waits for the GPU and the publication: on
 	// hardware only the reading thread waits for the memory, not the GPU front end.
-	auto&    gpu         = m_scheduler.Context().GetGpu();
-	uint64_t tick        = 0;
-	uint64_t read_size   = size;
-	uint64_t pages_begin = 0;
-	uint64_t pages_end   = 0;
+	auto&             gpu         = m_scheduler.Context().GetGpu();
+	uint64_t          tick        = 0;
+	uint64_t          read_size   = size;
+	uint64_t          pages_begin = 0;
+	uint64_t          pages_end   = 0;
+	ReadbackQueueRead queue_read;
+	// The command processor thread's commands run as operations, whose completion the execution
+	// thread reports only now and then: until then that thread could not publish its copy, and the
+	// execution thread can wait for it (an unmap waits for the priority operations).
+	const bool        readback_queue = !GuestGpu::IsCommandProcessorThread();
 	gpu.SendUrgentCommandSync([&] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
@@ -421,7 +446,10 @@ void BufferCache::ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write, 
 		// them submit at once (see NoteWrite()), so the GPU is done sooner next time.
 		NoteReadbackWait(pages_begin, pages_end, false,
 		                 m_write_ticks.Latest(pages_begin, pages_end) >= m_scheduler.CurrentTick());
-		if (DownloadBufferMemory<true>(buffer, vaddr, read_size)) {
+		if (tick == 0 && readback_queue &&
+		    StartReadbackQueueRead(buffer, vaddr, read_size, pages_begin, pages_end, queue_read)) {
+			tick = queue_read.recorded;
+		} else if (DownloadBufferMemory<true>(buffer, vaddr, read_size)) {
 			const auto recorded = m_scheduler.CurrentTick();
 			m_inflight_readbacks.push_back({pages_begin, pages_end, recorded});
 			tick = std::max(tick, recorded);
@@ -431,18 +459,182 @@ void BufferCache::ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write, 
 			ReleaseReadback(vaddr, size, pages_begin, pages_end, 0, is_write);
 			return;
 		}
-		// This thread may only wait for submitted work.
-		if (tick >= m_scheduler.CurrentTick()) {
+		// This thread may only wait for submitted work; a copy on the readback queue waits for
+		// submitted work only.
+		if (queue_read.slot == nullptr && tick >= m_scheduler.CurrentTick()) {
 			m_scheduler.Flush();
 		}
 	});
 	if (tick == 0) {
 		return;
 	}
-	m_scheduler.GetMasterSemaphore().Wait(tick);
-	m_scheduler.WaitPriorityOperations(tick);
-	gpu.SendUrgentCommandSync(
-	    [&] { ReleaseReadback(vaddr, size, pages_begin, pages_end, tick, is_write); });
+	if (queue_read.slot != nullptr) {
+		FinishReadbackQueueRead(queue_read);
+		gpu.SendUrgentCommandSync([&] {
+			// Another thread's readback that waited for the tick took it out already.
+			const auto own = std::find_if(m_inflight_readbacks.begin(), m_inflight_readbacks.end(),
+			                              [&](const InFlightReadback& readback) {
+				                              return readback.begin == pages_begin &&
+				                                     readback.end == pages_end &&
+				                                     readback.tick == queue_read.recorded;
+			                              });
+			if (own != m_inflight_readbacks.end()) {
+				m_inflight_readbacks.erase(own);
+			}
+			ReleaseReadback(vaddr, size, pages_begin, pages_end, 0, is_write);
+		});
+	} else {
+		m_scheduler.GetMasterSemaphore().Wait(tick);
+		m_scheduler.WaitPriorityOperations(tick);
+		gpu.SendUrgentCommandSync(
+		    [&] { ReleaseReadback(vaddr, size, pages_begin, pages_end, tick, is_write); });
+	}
+}
+
+bool BufferCache::StartReadbackQueueRead(const Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                         uint64_t pages_begin, uint64_t pages_end,
+                                         ReadbackQueueRead& read) {
+	if (!m_graphics.readback_queue || m_device_address_pending) {
+		return false;
+	}
+	// As DownloadOnReadbackQueue(): the submissions that last wrote the bytes, and those that
+	// wrote through device addresses (which name no range). Writes of the operation being
+	// recorded have no tick yet. The download takes whole pages.
+	uint64_t needed  = m_device_address_tick;
+	bool     unknown = false;
+	bool     written = false;
+	m_gpu_modified_ranges.ForEachInRange(pages_begin, pages_end - pages_begin, [&](uint64_t start,
+	                                                                              uint64_t end) {
+		const auto latest = m_write_ticks.Latest(start, end);
+		unknown |= latest == UINT64_MAX;
+		needed  = std::max(needed, latest);
+		written = true;
+		for (const auto& [pending, bytes]: m_pending_writes) {
+			unknown |= pending < end && start < pending + bytes;
+		}
+	});
+	// The copy must not be submitted before the submission it waits for (see
+	// DownloadOnReadbackQueue()).
+	if (!written || unknown || needed > m_scheduler.SubmittedTick()) {
+		return false;
+	}
+	ReadbackQueueSlot* slot = nullptr;
+	for (auto& candidate: m_readback_slots) {
+		if (!candidate.busy.load(std::memory_order_acquire)) {
+			slot = &candidate;
+			break;
+		}
+	}
+	if (slot == nullptr) {
+		return false;
+	}
+	read.copies.clear();
+	read.total_size = 0;
+	CollectDownloadCopies(buffer, vaddr, size, read.copies, read.total_size);
+	if (read.copies.empty()) {
+		return false;
+	}
+	slot->source = buffer.Handle();
+	slot->busy.store(true, std::memory_order_release);
+	auto& queue  = slot->queue;
+	auto& device = m_graphics.device;
+	if (!queue.pool) {
+		vk::CommandPoolCreateInfo pool_info {};
+		pool_info.flags            = vk::CommandPoolCreateFlagBits::eResetCommandBuffer |
+		                             vk::CommandPoolCreateFlagBits::eTransient;
+		pool_info.queueFamilyIndex = m_graphics.readback_family;
+		vk::CommandBufferAllocateInfo allocate {};
+		allocate.level              = vk::CommandBufferLevel::ePrimary;
+		allocate.commandBufferCount = 1;
+		vk::FenceCreateInfo fence_info {};
+		fence_info.flags = vk::FenceCreateFlagBits::eSignaled;
+		if (device.createCommandPool(&pool_info, nullptr, &queue.pool) != vk::Result::eSuccess ||
+		    (allocate.commandPool = queue.pool,
+		     device.allocateCommandBuffers(&allocate, &queue.command) != vk::Result::eSuccess) ||
+		    device.createFence(&fence_info, nullptr, &queue.fence) != vk::Result::eSuccess) {
+			EXIT("BufferCache: could not create the readback queue resources\n");
+		}
+	}
+	if (!queue.staging || queue.staging->Size() < read.total_size) {
+		queue.staging = std::make_unique<Buffer>(
+		    m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		    vk::BufferUsageFlagBits::eTransferDst,
+		    std::max<uint64_t>(Common::AlignUp(read.total_size, 1024 * 1024), 1024 * 1024));
+	}
+	const auto command = queue.command;
+	(void)device.resetFences(1, &queue.fence);
+	(void)command.reset({});
+	vk::CommandBufferBeginInfo begin_info {};
+	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	(void)command.begin(&begin_info);
+	command.copyBuffer(buffer.Handle(), queue.staging->Handle(),
+	                   static_cast<uint32_t>(read.copies.size()), read.copies.data());
+	vk::BufferMemoryBarrier after {};
+	after.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+	after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after.buffer              = queue.staging->Handle();
+	after.offset              = 0;
+	after.size                = read.total_size;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+	                        {}, 0, nullptr, 1, &after, 0, nullptr);
+	(void)command.end();
+	// The semaphore wait makes the writes of the needed submissions visible to the copy.
+	const auto                      semaphore  = m_scheduler.GetMasterSemaphore().Handle();
+	const vk::PipelineStageFlags    wait_stage = vk::PipelineStageFlagBits::eTransfer;
+	vk::TimelineSemaphoreSubmitInfo timeline {};
+	timeline.waitSemaphoreValueCount = 1;
+	timeline.pWaitSemaphoreValues    = &needed;
+	vk::SubmitInfo submit {};
+	submit.pNext              = &timeline;
+	submit.waitSemaphoreCount = 1;
+	submit.pWaitSemaphores    = &semaphore;
+	submit.pWaitDstStageMask  = &wait_stage;
+	submit.commandBufferCount = 1;
+	submit.pCommandBuffers    = &command;
+	if (m_graphics.readback_queue.submit(1, &submit, queue.fence) != vk::Result::eSuccess) {
+		EXIT("BufferCache: readback queue submission failed\n");
+	}
+	read.slot           = slot;
+	read.buffer_address = buffer.CpuAddress();
+	read.needed         = needed;
+	read.recorded       = m_scheduler.CurrentTick();
+	read.published      = std::make_shared<std::atomic<bool>>(false);
+	// Other readers of these pages (the execution thread, another guest thread, an unmap) wait
+	// for the downloads in flight over them up to their tick: this one is published by then.
+	m_inflight_readbacks.push_back({pages_begin, pages_end, read.recorded});
+	m_scheduler.DeferPriorityOperation(
+	    [published = read.published] { published->wait(false, std::memory_order_acquire); },
+	    pages_begin, pages_end - pages_begin);
+	return true;
+}
+
+void BufferCache::WaitReadbackQueueCopies(vk::Buffer buffer) {
+	for (auto& slot: m_readback_slots) {
+		if (slot.busy.load(std::memory_order_acquire) && slot.source == buffer) {
+			(void)m_graphics.device.waitForFences(1, &slot.queue.fence, VK_TRUE, UINT64_MAX);
+		}
+	}
+}
+
+void BufferCache::FinishReadbackQueueRead(ReadbackQueueRead& read) {
+	auto& queue = read.slot->queue;
+	if (m_graphics.device.waitForFences(1, &queue.fence, VK_TRUE, UINT64_MAX) !=
+	    vk::Result::eSuccess) {
+		EXIT("BufferCache: readback queue wait failed\n");
+	}
+	// Earlier asynchronous publications of these bytes run first, as in the queued path.
+	m_scheduler.WaitPriorityOperations(read.needed);
+	queue.staging->Invalidate(0, read.total_size);
+	const auto* mapped = queue.staging->Mapped().data();
+	for (const auto& copy: read.copies) {
+		Libs::LibKernel::Memory::WriteBacking(read.buffer_address + copy.srcOffset,
+		                                      mapped + copy.dstOffset, copy.size);
+	}
+	read.slot->busy.store(false, std::memory_order_release);
+	read.published->store(true, std::memory_order_release);
+	read.published->notify_all();
 }
 
 uint64_t BufferCache::InFlightReadbackTick(uint64_t begin, uint64_t end) const {
