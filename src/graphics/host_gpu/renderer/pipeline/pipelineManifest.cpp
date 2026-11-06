@@ -1436,6 +1436,24 @@ struct PipelineCache::ManifestState {
 
 	std::vector<std::jthread> threads;
 	std::jthread              saver;
+
+	// Queues a graphics pipeline whose modules are built, the largest first (by their SPIR-V, which
+	// the driver's time follows): one left for the end would keep a thread busy alone.
+	void QueuePipeline(uint32_t index) {
+		const auto words = [this](uint32_t pipeline) {
+			uint64_t total = 0;
+			for (const auto stage: warm_pipelines[pipeline].stages) {
+				if (stage != ManifestPipeline::NoStage && modules[stage] != nullptr) {
+					total += modules[stage]->spirv_words;
+				}
+			}
+			return total;
+		};
+		const auto size = words(index);
+		pipeline_jobs.insert(std::upper_bound(pipeline_jobs.begin(), pipeline_jobs.end(), size,
+		                                      [&](uint64_t value, uint32_t job) { return value > words(job); }),
+		                     index);
+	}
 };
 
 void PipelineCache::ManifestStateDeleter::operator()(ManifestState* state) const {
@@ -1822,7 +1840,7 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 					state.missing_modules[pipeline] = UINT8_MAX;
 				} else if (state.missing_modules[pipeline] != UINT8_MAX &&
 				           --state.missing_modules[pipeline] == 0) {
-					state.pipeline_jobs.push_back(pipeline);
+					state.QueuePipeline(pipeline);
 				}
 			}
 		}
