@@ -912,6 +912,8 @@ struct InlinedCallBody {
 	uint32_t begin   = 0;
 	uint32_t end     = 0;
 	uint64_t address = 0;
+	// The other targets of the call whose code is the same, which run this body too.
+	std::vector<uint64_t> aliases;
 };
 
 // A direct branch of an expanded program whose target is beyond the reach of its 16-bit offset,
