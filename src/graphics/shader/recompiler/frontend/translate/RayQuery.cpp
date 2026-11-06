@@ -51,6 +51,14 @@ void Translator::EmitRayTracing(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::RT_INIT: {
 			std::array<IR::U32, 8> ray;
 			for (uint32_t i = 0; i < 8; i++) {
+				// An origin component the same for every lane is in an SGPR.
+				if (i < 3 && inst.image_nsa_addr[i] == Decoder::NoRegister) {
+					Decoder::Operand origin;
+					origin.kind = Decoder::OperandKind::Sgpr;
+					origin.reg  = inst.image_nsa_addr[9 + i];
+					ray[i]      = ReadU32(origin);
+					continue;
+				}
 				// A site without a mask VGPR has a wave-wide mask (src2) or a constant one.
 				if (i == 7 && inst.image_nsa_addr[i] == Decoder::NoRegister) {
 					ray[i] = inst.src2.kind == Decoder::OperandKind::Sgpr ? ReadU32(inst.src2)
