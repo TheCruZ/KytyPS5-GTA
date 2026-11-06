@@ -1776,19 +1776,21 @@ void CommandProcessor::EmitHleRefit() {
 			// The vertex buffer reaches the GPU (once per buffer in a row).
 			if (vsharp.Base48() != 0 && vsharp.Base48() != last_vertices && vsharp.GetSize() != 0) {
 				last_vertices = vsharp.Base48();
-				(void)cache.ObtainBuffer(vsharp.Base48(), vsharp.GetSize(), false);
+				cache.PrepareDeviceAddressRead(vsharp.Base48(), vsharp.GetSize());
 			}
 			geometries.push_back(geometry);
 		}
-		// The refit writes the nodes; the header (first 256 bytes) stays.
+		// The refit reads the header (first 256 bytes), which stays, and writes the nodes.
 		for (const auto blas: blases) {
 			uint32_t size = 0;
 			ReadGuestAroundGpuWrites(blas + 16, &size, sizeof(size));
 			if (blas != 0 && size > 256u) {
+				cache.PrepareDeviceAddressRead(blas, 256u);
 				(void)cache.ObtainBuffer(blas + 256u, size - 256u, true);
 			}
 		}
-		// The inputs reached the GPU above (or are GPU written).
+		// The refit reads and writes through device addresses: everything it reaches is in
+		// cached buffers now (PrepareBda() uploads nothing more).
 		context.PrepareBda(true, false);
 		auto& command = context.GetCommandScheduler().Current();
 		command.EndRendering();
@@ -1916,8 +1918,10 @@ bool CommandProcessor::HleTlasDispatch(uint64_t data_addr) {
 
 void CommandProcessor::EmitHleTlas() {
 	EmitHostCommand([this, builds = m_hle_tlas_builds] {
-		auto& context = m_renderer;
-		auto& cache   = context.GetBufferCache();
+		auto&                 context = m_renderer;
+		auto&                 cache   = context.GetBufferCache();
+		std::vector<uint8_t>  list;
+		std::vector<uint64_t> blases;
 		for (const auto& build: builds) {
 			if (build.header == 0 || !build.Native()) {
 				// [HACK] No build: a TLAS without an address, or a list the native build cannot read
@@ -1931,19 +1935,40 @@ void CommandProcessor::EmitHleTlas() {
 				                build.stride, build.input, build.header));
 				continue;
 			}
-			// The list the CPU wrote reaches the GPU. The header depends only on the instance
-			// count: it is written here too, so CPU reads of it need no readback; the rest of the
-			// TLAS becomes GPU written.
+			// The list the CPU wrote reaches the GPU, and so do the header and root node of each
+			// BLAS it references (the build reads their flags and bounds) when the GPU did not
+			// write them (it builds and refits most BLASes; a game may also load them as they are).
+			// The header depends only on the instance count: it is written here too, so CPU reads
+			// of it need no readback; the rest of the TLAS becomes GPU written.
 			if (build.count != 0) {
-				(void)cache.ObtainBuffer(build.input, uint64_t {build.stride} * build.count, false);
+				const auto bytes = uint64_t {build.stride} * build.count;
+				cache.PrepareDeviceAddressRead(build.input, bytes);
+				list.resize(bytes);
+				ReadGuestAroundGpuWrites(build.input, list.data(), bytes);
+				blases.clear();
+				for (uint32_t i = 0; i < build.count; i++) {
+					uint64_t blas = 0;
+					std::memcpy(&blas, list.data() + uint64_t {i} * build.stride, sizeof(blas));
+					if (blas != 0) {
+						blases.push_back(blas);
+					}
+				}
+				std::ranges::sort(blases);
+				blases.erase(std::unique(blases.begin(), blases.end()), blases.end());
+				constexpr uint64_t BlasReadSize = 256 + 64;
+				for (const auto blas: blases) {
+					if (context.IsMapped(blas, BlasReadSize) && !cache.IsRegionGpuModified(blas, BlasReadSize)) {
+						cache.PrepareDeviceAddressRead(blas, BlasReadSize);
+					}
+				}
 			}
 			std::array<uint32_t, 32> header {};
 			const auto size = NativeRayTracing::HleTlasHeader(build.count, build.format, header);
 			Libs::LibKernel::Memory::WriteBacking(build.header, header.data(), sizeof(header));
 			(void)cache.ObtainBuffer(build.header + 256u, size - 256u, true);
 		}
-		// The builds store through device addresses; their inputs reached the GPU above (or are
-		// GPU written).
+		// The builds read and store through device addresses: everything they reach is in cached
+		// buffers now (PrepareBda() uploads nothing more).
 		context.PrepareBda(true, false);
 		auto& command = context.GetCommandScheduler().Current();
 		command.EndRendering();
