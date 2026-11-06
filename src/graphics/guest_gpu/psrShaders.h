@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_GUEST_GPU_PSRSHADERS_H_
 
 #include <cstdint>
+#include <span>
 
 namespace Libs::Graphics::Psr {
 
@@ -11,7 +12,9 @@ namespace Libs::Graphics::Psr {
 // registers each shader by name with the driver (owner "sce::Psr", see
 // sceAgcDriverRegisterResource). The emulator recognizes them by that name, not by the hash of
 // their code, which differs from game to game, and reads their user data with the layout of the
-// library's generation.
+// library's generation. When the library has not registered psr_ names (GTA V 01.005 registers
+// them without the prefix, ASTRO BOT registers none), they are recognized by their code
+// (CodeFingerprint()), for the builds of the library whose shaders the emulator knows.
 //
 // Only the shaders the emulator replaces or watches are listed.
 enum class Shader : uint8_t {
@@ -77,7 +80,7 @@ enum class Shader : uint8_t {
 // The generations of the library whose user data layouts the emulator knows.
 enum class Generation : uint8_t {
 	Unknown,
-	// 460 shaders: GTA V (build J03180688) and Astro Bot (J03093718).
+	// 460 shaders: GTA V 01.010/01.011 (build J03180688), Astro Bot (J03093718) and Nightreign.
 	Base460,
 };
 
@@ -88,6 +91,22 @@ enum class Generation : uint8_t {
 // The Psr shader whose code starts at `code_address`, or None (not a Psr shader, a shader the
 // emulator does not list, or a library of an unknown generation).
 [[nodiscard]] Shader IdentifyShader(uint64_t code_address);
+
+// A fingerprint of a shader's code (`binary`, from its first instruction) that does not depend on
+// where the code is, on the registers the compiler allocated or on the order it scheduled the
+// instructions in: the sorted multiset of its instructions up to S_ENDPGM, each reduced to its
+// opcode, the kinds of its operands, its constants (not those added to the program counter) and
+// its memory offsets and formats. 0 when the code does not end with S_ENDPGM.
+[[nodiscard]] uint64_t CodeFingerprint(std::span<const uint32_t> binary);
+
+// The Psr shader whose code is `binary` (the whole binary, code to footer), recognized by its
+// fingerprint among the shaders of the builds of the library the emulator knows: the generation
+// and the shader (Other for the library's shaders it does not list), or Unknown and None.
+struct CodeMatch {
+	Generation generation = Generation::Unknown;
+	Shader     shader     = Shader::None;
+};
+[[nodiscard]] CodeMatch IdentifyCode(std::span<const uint32_t> binary);
 
 // Whether `shader` belongs to the top level (kBase) build.
 [[nodiscard]] bool IsTopLevelBuildShader(Shader shader);

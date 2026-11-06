@@ -44,6 +44,8 @@ namespace Libs::Graphics {
 struct ShaderMapData: ShaderMappedData {
 	ShaderVertexMetadata vertex;
 	const char*          vertex_error = nullptr;
+	// The size of the whole binary (code, metadata and footer).
+	uint32_t binary_size_bytes = 0;
 };
 
 struct ShaderMapEntry {
@@ -89,7 +91,8 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	const auto*   binary = reinterpret_cast<const uint32_t*>(addr);
 	ShaderMapData mapped {data};
 	// Translation reads the bytes the hash covers.
-	mapped.code_size_bytes = ShaderProgramSize(binary, data.code_size_bytes);
+	mapped.code_size_bytes   = ShaderProgramSize(binary, data.code_size_bytes);
+	mapped.binary_size_bytes = data.code_size_bytes;
 	const auto hash        = XXH3_64bits(binary, mapped.code_size_bytes);
 	mapped.vertex_error =
 	    ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, mapped.vertex);
@@ -117,6 +120,17 @@ void ShaderSetMapListener(ShaderMapListener listener, void* userdata) {
 		         std::span(reinterpret_cast<const uint32_t*>(addr),
 		                   entry.data.code_size_bytes / sizeof(uint32_t)));
 	}
+}
+
+std::span<const uint32_t> ShaderMappedBinary(uint64_t addr) {
+	EXIT_IF(g_shader_map == nullptr);
+
+	std::scoped_lock lock(g_shader_map_mutex);
+	const auto       iter = g_shader_map->find(addr);
+	if (iter == g_shader_map->end()) {
+		return {};
+	}
+	return {reinterpret_cast<const uint32_t*>(addr), iter->second.data.binary_size_bytes / sizeof(uint32_t)};
 }
 
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
