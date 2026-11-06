@@ -339,6 +339,26 @@ private:
 	std::jthread m_thread;
 };
 
+// What a kind of work took lately (seconds), for the estimates of the pipeline precompilation:
+// the mean of the first samples, then a moving average. A few samples are no estimate (the first
+// creations also warm up the driver).
+class PrecompileMean {
+public:
+	void Add(double seconds) {
+		m_samples++;
+		m_mean = m_samples <= Window ? m_mean + (seconds - m_mean) / m_samples
+		                             : m_mean + (seconds - m_mean) / Window;
+	}
+	// 0 until there are enough samples.
+	[[nodiscard]] double Get() const { return m_samples >= MinSamples ? m_mean : 0.0; }
+
+private:
+	static constexpr uint32_t MinSamples = 8;
+	static constexpr uint32_t Window     = 32;
+	double                    m_mean     = 0.0;
+	uint32_t                  m_samples  = 0;
+};
+
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 public:
@@ -551,6 +571,35 @@ private:
 	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_claimed_graphics;
 	std::unordered_set<uint64_t>                                     m_claimed_compute;
 
+	// pipelinePrecompile.cpp: with helpers and a manifest, when the pipelines the driver has to
+	// compile ahead of the game would take long, the game is stopped while they compile (after
+	// asking the player, by --pipeline-precompile). And when the game's GPU work waits long for a
+	// pipeline, a notice says so.
+	std::jthread m_precompile;
+	void         StartPrecompile();
+	void         Precompile(const std::stop_token& stop);
+
+	// The threads that run the game's GPU work and wait for a pipeline: one the driver creates on
+	// them, or one a helper or background thread creates. Not on the path of pipelines found.
+	struct PipelineStall {
+		uint32_t                              threads = 0;
+		// When the first of them began to wait, and when the last one stopped.
+		std::chrono::steady_clock::time_point since;
+		std::chrono::steady_clock::time_point ended;
+	};
+	class StallScope {
+	public:
+		explicit StallScope(PipelineCache& cache);
+		~StallScope();
+		KYTY_CLASS_NO_COPY(StallScope);
+
+	private:
+		PipelineCache& m_cache;
+	};
+	mutable std::mutex m_stall_mutex;
+	PipelineStall      m_stall;
+	[[nodiscard]] PipelineStall GetPipelineStall() const;
+
 	// Compute pipelines compiled by helper processes (see PipelineHelpers), with the manifest:
 	// those of its modules and those of the modules the compile workers add. A job's ticket is
 	// the module id; the helper's pipeline cache data is kept, and written with the driver cache.
@@ -645,6 +694,22 @@ private:
 	    uint32_t push_data_cursor) const;
 	void ManifestProgress(bool force);
 	void SaveManifestRecording();
+	// The manifest's work that is ready to run, for the precompilation's estimates.
+	struct ManifestBacklog {
+		// Modules whose shaders the guest mapped, not built yet, and the compute ones of them.
+		uint32_t modules         = 0;
+		uint32_t compute_modules = 0;
+		// Graphics pipelines whose modules are built, not created yet.
+		uint32_t pipelines       = 0;
+		// Records the threads build or create now.
+		uint32_t running         = 0;
+		uint64_t pipelines_done  = 0;
+		uint32_t threads         = 0;
+		// PrecompileMean of a module build and of a graphics pipeline creation.
+		double   module_seconds   = 0.0;
+		double   pipeline_seconds = 0.0;
+	};
+	[[nodiscard]] ManifestBacklog GetManifestBacklog() const;
 };
 
 // Compute programs compiled with the native ray tracing patching on (see RayTracingPatch.h: the
