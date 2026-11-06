@@ -178,7 +178,10 @@ struct HleTlasPush {
 	uint64_t scratch;
 	uint32_t count;
 	uint32_t stride;
+	uint32_t format;
+	uint32_t padding;
 };
+static_assert(sizeof(HleTlasPush) == 40);
 
 // The instance and node bounds of hle_tlas.comp (32 bytes each).
 constexpr uint64_t HleTlasScratchSize = uint64_t {4096 + 1365} * 32;
@@ -1969,7 +1972,8 @@ void NativeRayTracing::ProcessReadback(Readback& readback) {
 	readback.tick = 0;
 }
 
-uint32_t NativeRayTracing::HleTlasHeader(uint32_t count, std::array<uint32_t, 32>& header) noexcept {
+uint32_t NativeRayTracing::HleTlasHeader(uint32_t count, HleTlasFormat format,
+                                         std::array<uint32_t, 32>& header) noexcept {
 	// Larger lists keep the game's own build (CommandProcessor::HleTlasDispatch()).
 	count          = std::min(count, HleTlasMaxInstances);
 	uint32_t nodes = 0;
@@ -1983,17 +1987,26 @@ uint32_t NativeRayTracing::HleTlasHeader(uint32_t count, std::array<uint32_t, 32
 	header                         = {};
 	header[0]                      = 0x5f525350u; // "PSR_BVHL"
 	header[1]                      = 0x4c485642u;
-	header[2]                      = 0x5d1cba8cu;
 	header[4]                      = instance_offset + count * 128u;
-	header[6]                      = 0x00020024u;
-	header[12]                     = instance_offset;
-	header[22]                     = count + 4u;
-	header[28]                     = count;
+	if (format == HleTlasFormat::Base252) {
+		header[2]  = 0xbbe6e938u;
+		header[6]  = 0x24u;
+		header[10] = instance_offset;
+		header[20] = count + 4u;
+		header[29] = count;
+	} else {
+		header[2]  = 0x5d1cba8cu;
+		header[6]  = 0x00020024u;
+		header[12] = instance_offset;
+		header[22] = count + 4u;
+		header[28] = count;
+	}
 	return header[4];
 }
 
 void NativeRayTracing::RecordHleTlas(const CommandRecorder& command, uint64_t input_va,
-                                     uint32_t count, uint32_t stride, uint64_t header_va) {
+                                     uint32_t count, uint32_t stride, uint64_t header_va,
+                                     HleTlasFormat format) {
 	if (!m_enabled || header_va == 0 || (count != 0 && input_va == 0)) {
 		return;
 	}
@@ -2012,8 +2025,13 @@ void NativeRayTracing::RecordHleTlas(const CommandRecorder& command, uint64_t in
 	write.pBufferInfo     = &page_info;
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_hle_tlas_pipeline);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_hle_tlas_layout, 0, 1, &write);
-	const HleTlasPush push {input_va, header_va, m_hle_tlas_scratch->BufferDeviceAddress(), count,
-	                        stride};
+	const HleTlasPush push {input_va,
+	                        header_va,
+	                        m_hle_tlas_scratch->BufferDeviceAddress(),
+	                        count,
+	                        stride,
+	                        static_cast<uint32_t>(format),
+	                        0};
 	command.pushConstants(m_hle_tlas_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
 	command.dispatch(1, 1, 1);
 	MemoryBarrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,

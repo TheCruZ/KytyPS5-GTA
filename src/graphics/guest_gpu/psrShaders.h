@@ -21,7 +21,8 @@ enum class Shader : uint8_t {
 	None,
 
 	// Top level build (kBase format), in dispatch order. Some of them (scans, sorts) serve other
-	// builds too.
+	// builds too. Generation Base252 has no indirect arguments, valid instance indices or vec2u
+	// scans, and its last pass (CollapseToQbvhSimpleTop) is also the last pass of its BLAS builds.
 	MortonComputeBoundingBoxForInstances,
 	MortonInitializeIndirectArgsTop,
 	SinglePassScanInitializeDescriptors,
