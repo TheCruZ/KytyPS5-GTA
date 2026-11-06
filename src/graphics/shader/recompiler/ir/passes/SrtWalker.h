@@ -16,11 +16,14 @@ inline constexpr uint32_t NoFlatSlot = UINT32_MAX;
 // A load whose value is only one descriptor word with bits the execution thread may refresh
 // (DescriptorRefreshMask()) reports DescriptorSlot(source, word) instead of a flat slot.
 inline constexpr uint32_t DescriptorSlotFlag = 0x80000000u;
+// A load whose value is only a bound tested for zero (`lane < n` with an unknown lane) reports
+// ZeroTestSlot: the resolution depends only on whether the value is 0.
+inline constexpr uint32_t ZeroTestSlot = UINT32_MAX - 1u;
 constexpr uint32_t DescriptorSlot(uint32_t source, uint32_t word) {
 	return DescriptorSlotFlag | (source << 3u) | word;
 }
 constexpr bool IsDescriptorSlot(uint32_t slot) {
-	return slot != NoFlatSlot && (slot & DescriptorSlotFlag) != 0;
+	return slot != NoFlatSlot && slot != ZeroTestSlot && (slot & DescriptorSlotFlag) != 0;
 }
 constexpr uint32_t DescriptorSlotSource(uint32_t slot) {
 	return (slot & ~DescriptorSlotFlag) >> 3u;
