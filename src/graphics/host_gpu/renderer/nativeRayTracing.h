@@ -162,6 +162,9 @@ public:
 	struct GuestBlasBuild {
 		uint64_t                               blas_va = 0;
 		std::vector<std::pair<uint32_t, bool>> geometries;
+		// Where its header holds the fields the layout build reads: 0 in generation Base460, 1 in
+		// Base252 (GTA V 01.005, see rt_blas_walk.comp).
+		uint32_t                               header_layout = 0;
 	};
 	// In operation order after the guest built the BLASes of `builds`: gives each a slot laid out
 	// by primitive (each guest triangle at a position given by its geometry and triangle index, see
@@ -291,6 +294,8 @@ private:
 		// triangle count and opacity (see NoteGuestBlasBuilds()), and its entry in the host table
 		// (UINT32_MAX: none; table_index is then UINT32_MAX too).
 		std::vector<std::array<uint32_t, 4>> layout;
+		// The header layout of the BLAS of the layout (GuestBlasBuild::header_layout).
+		uint32_t                     header_layout    = 0;
 		uint32_t                     host_table_index = UINT32_MAX;
 	};
 

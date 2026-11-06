@@ -236,7 +236,7 @@ struct Job {
 	uint32_t capacity0;
 	uint32_t capacity1;
 	uint32_t result;
-	uint32_t pad;
+	uint32_t header_layout;
 	uint64_t layout;
 	uint32_t layout_count;
 	uint32_t mismatches;
@@ -1309,8 +1309,9 @@ void NativeRayTracing::RecordBuilds(const CommandRecorder& command) {
 			         slot.vertices1.address, slot.entries.address, slot.capacity0,
 			         slot.capacity1, 0, 0, 0, 0, 0};
 			if (!slot.layout.empty()) {
-				job.layout       = m_layouts->BufferDeviceAddress() + uint64_t {layouts.size()} * 16;
-				job.layout_count = static_cast<uint32_t>(slot.layout.size());
+				job.header_layout = slot.header_layout;
+				job.layout        = m_layouts->BufferDeviceAddress() + uint64_t {layouts.size()} * 16;
+				job.layout_count  = static_cast<uint32_t>(slot.layout.size());
 				layouts.insert(layouts.end(), slot.layout.begin(), slot.layout.end());
 			}
 			jobs.push_back(job);
@@ -2082,7 +2083,8 @@ void NativeRayTracing::NoteGuestBlasBuilds(std::span<const GuestBlasBuild> build
 				AllocateSlot(slot, sizes);
 				m_moved_slots.push_back(index);
 			}
-			slot.layout = std::move(layout);
+			slot.layout        = std::move(layout);
+			slot.header_layout = build.header_layout;
 			// Leaves hold one triangle or more: the walk's queue is sized for as many (a walk
 			// that needs more reports it, see RecordBuilds()).
 			slot.leaf_count = static_cast<uint32_t>(totals[0] + totals[1]);
@@ -2097,9 +2099,10 @@ void NativeRayTracing::NoteGuestBlasBuilds(std::span<const GuestBlasBuild> build
 			continue;
 		}
 		if (const auto created = CreateHostSlot(build.blas_va, sizes); created != UINT32_MAX) {
-			auto& slot      = *m_slot_list[created];
-			slot.layout     = std::move(layout);
-			slot.leaf_count = static_cast<uint32_t>(totals[0] + totals[1]);
+			auto& slot         = *m_slot_list[created];
+			slot.layout        = std::move(layout);
+			slot.header_layout = build.header_layout;
+			slot.leaf_count    = static_cast<uint32_t>(totals[0] + totals[1]);
 		}
 	}
 }
