@@ -621,7 +621,9 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 		handoff.src_count = 0;
 	} else {
 		Decoder::DecodeProgram(code, source.decoded);
-		if (options.native_ray_tracing) {
+		source.native_ray_tracing = options.native_ray_tracing;
+		// A program with calls is patched once they are inlined (RefreshShaderSource).
+		if (options.native_ray_tracing && !source.decoded.has_swap_pc) {
 			Decoder::RayTracingPatch patch;
 			if (Decoder::DeriveRayTracingPatch(source.decoded, patch, options.wave_size) &&
 			    Decoder::ApplyRayTracingPatch(patch, source.decoded)) {
@@ -681,6 +683,15 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 		linked.decoded.code = expanded_code;
 		linked.decoded.call_bodies = source.expander->Bodies();
 		linked.decoded.runtime_literals = source.expander->RuntimeLiterals();
+		if (source.native_ray_tracing) {
+			// The traversal's leaf code holds the inlined calls (Gran Turismo 7's any-hit functions).
+			Decoder::RayTracingPatch patch;
+			if (Decoder::DeriveRayTracingPatch(linked.decoded, patch, source.wave_size) &&
+			    Decoder::ApplyRayTracingPatch(patch, linked.decoded)) {
+				LOGF("CS native ray tracing patch of the expanded program: sites=%" PRIu64 "\n",
+				     static_cast<uint64_t>(patch.sites.size()));
+			}
+		}
 		source.linked = std::move(linked);
 		++source.revision;
 		return source.linked->decoded;
