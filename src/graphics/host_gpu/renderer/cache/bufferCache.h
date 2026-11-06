@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <unordered_map>
@@ -299,6 +300,24 @@ private:
 	// queue waits for those submissions only, not for the work queued after them.
 	[[nodiscard]] bool DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::BufferCopy> copies,
 	                                           uint64_t total_size);
+	// The GPU-written ranges of [vaddr, vaddr + size) as copies into a packed staging buffer; they
+	// leave the dirty ranges.
+	void CollectDownloadCopies(const Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                           std::vector<vk::BufferCopy>& copies, uint64_t& total_size);
+	// A guest thread's readback through the readback queue (see StartReadbackQueueRead()).
+	struct ReadbackQueueRead;
+	// Execution thread, for ReadMemoryAsync(): when the last writes of the GPU-written bytes of
+	// [vaddr, vaddr + size) were already submitted, submits their copy on the readback queue,
+	// waiting for those writes only, and returns true. The faulting thread then waits for the copy
+	// in FinishReadbackQueueRead() instead of for everything submitted since.
+	[[nodiscard]] bool StartReadbackQueueRead(const Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                          uint64_t pages_begin, uint64_t pages_end,
+	                                          ReadbackQueueRead& read);
+	// The faulting thread: waits for the copy and publishes the bytes.
+	void FinishReadbackQueueRead(ReadbackQueueRead& read);
+	// Before a buffer is destroyed: its copies on the readback queue are done. The copies wait for
+	// earlier submissions only, so the timeline does not cover them.
+	void WaitReadbackQueueCopies(vk::Buffer buffer);
 	void NoteWrite(uint64_t vaddr, uint64_t size) {
 		// Draws bind the same written ranges again and again.
 		if (m_pending_writes.empty() || m_pending_writes.back() != std::pair {vaddr, size}) {
@@ -402,6 +421,24 @@ private:
 		std::unique_ptr<Buffer> staging;
 	};
 	ReadbackQueue m_readback;
+	// Copies on the readback queue that guest threads wait for (see StartReadbackQueueRead()); a
+	// slot is busy from its submission until its thread published the bytes.
+	struct ReadbackQueueSlot {
+		ReadbackQueue     queue;
+		vk::Buffer        source = nullptr;
+		std::atomic<bool> busy {false};
+	};
+	std::array<ReadbackQueueSlot, 4> m_readback_slots;
+	struct ReadbackQueueRead {
+		ReadbackQueueSlot*                 slot = nullptr;
+		std::vector<vk::BufferCopy>        copies;
+		uint64_t                           buffer_address = 0;
+		uint64_t                           total_size     = 0;
+		// The submission of the bytes' last writes, and the one current when the copy was made.
+		uint64_t                           needed   = 0;
+		uint64_t                           recorded = 0;
+		std::shared_ptr<std::atomic<bool>> published;
+	};
 	// The mirror: each line holds a copy of its bytes in a cached buffer, recorded at the end of
 	// the command buffer `tick` (0: none since the line's last write) into `slot` of a
 	// host-visible buffer. An operation that writes a line clears its tick and queues it for a
