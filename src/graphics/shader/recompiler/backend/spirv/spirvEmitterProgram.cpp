@@ -1099,8 +1099,7 @@ void FinishBdaLoopExits(EmitterState& state) {
 		builder.InsertFunctionWords(exit.insert, words);
 	}
 	// The increment, and the mark of the invocation whose count reaches the limit: its loops end
-	// (FaultManager reports it). The fault path of get_bda_pointer then reaches the merge from the
-	// block after the mark.
+	// (FaultManager reports it).
 	const auto faults  = builder.AllocateId();
 	const auto counted = builder.AllocateId();
 	const auto reached = builder.AllocateId();
@@ -1119,7 +1118,6 @@ void FinishBdaLoopExits(EmitterState& state) {
 	increment.insert(increment.end(), mark.begin(), mark.end());
 	increment.insert(increment.end(), {(2u << spv::WordCountShift) | spv::OpBranch, marked,
 	                                   (2u << spv::WordCountShift) | spv::OpLabel, marked});
-	builder.PatchFunctionWord(state.bda_fault_phi_parent, state.bda_fault_label, marked);
 	builder.InsertFunctionWords(state.bda_fault_count_insert, increment);
 }
 

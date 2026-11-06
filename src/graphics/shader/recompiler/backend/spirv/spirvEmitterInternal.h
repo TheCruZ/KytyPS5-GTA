@@ -127,9 +127,8 @@ struct EmitterState {
 	// once the count reaches BdaFaultedReadsBeforeLoopExit (FinishBdaLoopExits). Whether a loop has
 	// such accesses is known once its body is emitted, so the loop exits are recorded and the
 	// checks, the counter and its increment in get_bda_pointer (at `bda_fault_count_insert`, with
-	// the mark of the invocation that reaches the count; the parent of the fault path in the Phi
-	// of get_bda_pointer is at `bda_fault_phi_parent`) are
-	// inserted after the program: shaders without such a loop keep their SPIR-V.
+	// the mark of the invocation that reaches the count) are inserted after the program: shaders
+	// without such a loop keep their SPIR-V.
 	struct PendingLoopExit {
 		const IR::Block* merge          = nullptr;
 		size_t           insert         = 0; // before the merge instruction of the branch
@@ -139,8 +138,6 @@ struct EmitterState {
 	};
 	static constexpr uint32_t                        BdaFaultedReadsBeforeLoopExit = 4096;
 	size_t                                           bda_fault_count_insert   = SIZE_MAX;
-	size_t                                           bda_fault_phi_parent     = SIZE_MAX;
-	uint32_t                                         bda_fault_label          = 0;
 	std::vector<PendingLoopExit>                     pending_loop_exits;
 	// Loop headers by merge block, and the device-address calls emitted before each block: a loop
 	// has device-address accesses when more were emitted before its merge block than before its
