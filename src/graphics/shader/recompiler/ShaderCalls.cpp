@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
+#include "graphics/shader/recompiler/frontend/decode/RayTracingPatch.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -190,6 +191,15 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 		linked.decoded.code = expanded_code;
 		linked.decoded.call_bodies = source.expander->Bodies();
 		linked.decoded.runtime_literals = source.expander->RuntimeLiterals();
+		if (source.native_ray_tracing) {
+			// The traversal's leaf code holds the inlined calls (Gran Turismo 7's any-hit functions).
+			Decoder::RayTracingPatch patch;
+			if (Decoder::DeriveRayTracingPatch(linked.decoded, patch, source.wave_size) &&
+			    Decoder::ApplyRayTracingPatch(patch, linked.decoded)) {
+				LOGF("CS native ray tracing patch of the expanded program: sites=%" PRIu64 "\n",
+				     static_cast<uint64_t>(patch.sites.size()));
+			}
+		}
 		source.linked = std::move(linked);
 		++source.revision;
 		return source.linked->decoded;

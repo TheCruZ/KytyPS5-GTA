@@ -77,6 +77,8 @@ struct ShaderSource {
 	// `refresh_failed` reports a refresh whose expansion is not possible (with its reason).
 	bool expand_calls = false;
 	uint32_t wave_size = 64;
+	// The native ray tracing patch applies to the expanded program too (see RayTracingPatch.h).
+	bool native_ray_tracing = false;
 	std::shared_ptr<Decoder::ShaderFunctionExpander> expander;
 	bool refresh_failed = false;
 	std::string refresh_failure;

@@ -35,9 +35,10 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 //              queries, picks the candidate of the first lane that has one and sets EXEC (and
 //              the mask) to the lanes with the same candidate. SCC = some lane has a candidate.
 //   RT_LEAF    dst = SGPR of the leaf node, dst2 = SGPR pair that receives EXEC, src0 = SGPR pair
-//              of the lanes entering the leaf.
+//              of the lanes entering the leaf (or EXEC).
 //   RT_RESOLVE src0 = SGPR pair of the lanes still searching after the leaf: the other lanes that
-//              entered it accepted a hit and stop.
+//              entered it accepted a hit and stop. dmask 1: the instance setup culled the lanes;
+//              dmask 2: every lane keeps searching (closest hit sites).
 //   RT_MODE    SCC = the site is traversing natively.
 //   RT_EXIT    EXEC = the lanes that started the traversal; ends the native traversal.
 //   RT_ALPHA   before RT_INIT of a site with a RayTracingAlphaTest: image_nsa_addr[0] = the level
@@ -53,9 +54,18 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 // whose primitive word is not marked opaque (the site has a RayTracingAlphaTest with the Lane
 // layout), the query takes every triangle as a candidate (the guest ignores the instance's
 // opacity flags) and confirms the opaque ones and the alpha tested ones the alpha test accepts.
+//
+// A closest hit site with guest leaf code (RayTracingKind::ClosestLeaf, Gran Turismo 7) is a
+// wave-wide traversal of the BVH library's later generation whose instance code holds a BLAS walk
+// of its own: the leaf code tests one leaf entry, calls the game's any-hit function for the
+// triangles not opaque and keeps the nearest accepted hit in registers. It runs like a Packet
+// site (the instance setup and the leaf code are the guest's, for the alpha tested candidates
+// the hardware reports) except that a lane that accepts a hit keeps searching, and at the exit
+// RT_COMMIT writes the opaque hit the hardware found when it is nearer than the registers' hit.
 enum class RayTracingKind : uint32_t {
 	Packet,        // Wave-wide traversal, the guest leaf code tests the alpha tested triangles.
 	ClosestOpaque, // Closest hit, both facings.
+	ClosestLeaf,   // Closest hit, wave-wide, the guest leaf code tests the alpha tested triangles.
 };
 
 // A register a site does not have.
@@ -217,8 +227,14 @@ struct RayTracingSite {
 	uint32_t saved_exec_sgpr = 0;
 	// The end of the leaf code (the BLAS loop latch), replaced by the end of the iteration.
 	uint32_t tail_pc = 0;
-	// Instructions run after each leaf (copies; 0 = none), e.g. restoring a spilled SGPR.
-	uint32_t after_leaf_pc = 0;
+	// Instructions run after each leaf (copies; 0 = none), e.g. restoring a spilled SGPR: the one at
+	// `after_leaf_pc`, or those up to `after_leaf_end_pc` (ClosestLeaf sites: the V_READLANE_B32s
+	// that restore every SGPR the instance setup spilled).
+	uint32_t after_leaf_pc     = 0;
+	uint32_t after_leaf_end_pc = 0;
+	// ClosestLeaf sites: the end of the BLAS loop (after its backward branch); the leaf code's
+	// branches into the rest of it (the BLAS box code, the pop) end the leaf.
+	uint32_t blas_end_pc = 0;
 	// Where the loop exits to.
 	uint32_t exit_pc = 0;
 	// The alpha test the native traversal runs instead of the leaf code.

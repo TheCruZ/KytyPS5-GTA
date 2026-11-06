@@ -491,7 +491,9 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 		handoff.src_count = 0;
 	} else {
 		Decoder::DecodeProgram(code, source.decoded);
-		if (options.native_ray_tracing) {
+		source.native_ray_tracing = options.native_ray_tracing;
+		// A program with calls is patched once they are inlined (RefreshShaderSource).
+		if (options.native_ray_tracing && !source.decoded.has_swap_pc) {
 			Decoder::RayTracingPatch patch;
 			if (Decoder::DeriveRayTracingPatch(source.decoded, patch, options.wave_size) &&
 			    Decoder::ApplyRayTracingPatch(patch, source.decoded)) {
