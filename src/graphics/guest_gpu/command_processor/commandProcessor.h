@@ -270,10 +270,11 @@ private:
 
 	// The TLAS builds of the current TLAS stage window (see HleTlasDispatch()).
 	struct HleTlasBuild {
-		uint64_t input  = 0;
-		uint64_t header = 0;
-		uint32_t stride = 0;
-		uint32_t count  = 0;
+		uint64_t                        input  = 0;
+		uint64_t                        header = 0;
+		uint32_t                        stride = 0;
+		uint32_t                        count  = 0;
+		NativeRayTracing::HleTlasFormat format = NativeRayTracing::HleTlasFormat::Base460;
 		// The native build can read the list.
 		[[nodiscard]] bool Native() const;
 	};

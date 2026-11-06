@@ -1795,12 +1795,19 @@ void CommandProcessor::EmitHleRefit() {
 // psr_morton_compute_bounding_box_for_instances, written by the game's CPU) is kept with the TLAS
 // address (s[0:1] of psr_collapse_to_qbvh_simple_top, the stage's last shader), user data of
 // generation Base460, and there one host command builds every TLAS. True when the dispatch is
-// dropped. A list the native build cannot read (records shorter than 96 bytes, no list, more than
-// NativeRayTracing::HleTlasMaxInstances instances) is seen at the stage's first dispatch: the game
-// builds that TLAS itself, from that dispatch to its last pass.
+// dropped. A list the native build cannot read (records shorter than 96 bytes or not a multiple of
+// 16 bytes, no list, more than NativeRayTracing::HleTlasMaxInstances instances) is seen at the
+// stage's first dispatch: the game builds that TLAS itself, from that dispatch to its last pass.
+// GTA V 01.005 (generation Base252) builds its three TLASes of a frame with 12 shaders of an older
+// build of the library (no indirect arguments, valid instance indices or vec2u scans; the sort,
+// the scans and the last pass, collapse_to_qbvh_simple, serve its BLAS builds too) into TLASes of
+// another format (header and instance records, see hle_tlas.comp): the list is the V# at s[4:7]
+// with the count at s6 of morton_compute_bounding_box_for_instances, the TLAS s[0:1] of the last
+// pass, and the replacement writes that format.
 bool CommandProcessor::HleTlasBuild::Native() const {
 	// An empty list still makes an empty TLAS.
-	return count == 0 || (input != 0 && stride >= 96 && count <= NativeRayTracing::HleTlasMaxInstances);
+	return count == 0 || (input != 0 && stride >= 96 && stride % 16 == 0 &&
+	                      count <= NativeRayTracing::HleTlasMaxInstances);
 }
 
 bool CommandProcessor::HleTlasDispatch(uint64_t data_addr) {
@@ -1836,9 +1843,13 @@ bool CommandProcessor::HleTlasDispatch(uint64_t data_addr) {
 	}
 	const auto& user = GetShCtx().GetCs().cs_user_sgpr.value;
 	const auto  list = [&] {
-		return HleTlasBuild {.input  = uint64_t {user[6]} | (uint64_t {user[7] & 0xffffu} << 32u),
-		                     .stride = (user[7] >> 16u) & 0x3fffu,
-		                     .count  = user[8]};
+		const bool base252 = Psr::LibraryGeneration() == Psr::Generation::Base252;
+		const auto v       = base252 ? 4u : 6u;
+		return HleTlasBuild {.input  = uint64_t {user[v]} | (uint64_t {user[v + 1] & 0xffffu} << 32u),
+		                     .stride = (user[v + 1] >> 16u) & 0x3fffu,
+		                     .count  = user[v + 2],
+		                     .format = base252 ? NativeRayTracing::HleTlasFormat::Base252
+		                                       : NativeRayTracing::HleTlasFormat::Base460};
 	};
 	if (m_guest_tlas_builds != 0) {
 		// The game's own builds run to their last passes.
@@ -1939,7 +1950,7 @@ void CommandProcessor::EmitHleTlas() {
 				}
 			}
 			std::array<uint32_t, 32> header {};
-			const auto size = NativeRayTracing::HleTlasHeader(build.count, header);
+			const auto size = NativeRayTracing::HleTlasHeader(build.count, build.format, header);
 			Libs::LibKernel::Memory::WriteBacking(build.header, header.data(), sizeof(header));
 			(void)cache.ObtainBuffer(build.header + 256u, size - 256u, true);
 		}
@@ -1952,7 +1963,7 @@ void CommandProcessor::EmitHleTlas() {
 			if (build.header != 0 && build.Native()) {
 				context.GetNativeRayTracing().RecordHleTlas(command.Handle(), build.input,
 				                                            build.count, build.stride,
-				                                            build.header);
+				                                            build.header, build.format);
 			}
 		}
 	});
