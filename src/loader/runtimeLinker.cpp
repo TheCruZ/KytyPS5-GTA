@@ -1355,7 +1355,9 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 			}
 		}
 		Libs::VideoOut::FrameStepHack::PatchMainProgram(main_program->base_vaddr,
-		                                                main_program->base_size, code);
+		                                                main_program->base_size,
+		                                                main_program->mapped_size, code,
+		                                                !game_patch.empty());
 	}
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);
