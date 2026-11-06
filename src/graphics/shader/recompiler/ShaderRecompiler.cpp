@@ -23,7 +23,9 @@
 #include <chrono>
 #include <fmt/format.h>
 #include <map>
+#include <mutex>
 #include <span>
+#include <unordered_set>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler {
@@ -479,6 +481,37 @@ const char* StageName(ShaderType stage) {
 	}
 }
 
+namespace {
+
+std::mutex                                  g_ray_tracing_programs_mutex;
+std::array<std::unordered_set<uint64_t>, 3> g_ray_tracing_programs;
+RayTracingPrograms                          g_ray_tracing_counts;
+
+} // namespace
+
+void NoteRayTracingProgram(RayTracingProgramKind kind, uint64_t shader_hash) {
+	const std::lock_guard lock(g_ray_tracing_programs_mutex);
+	if (!g_ray_tracing_programs[static_cast<size_t>(kind)].insert(shader_hash).second) {
+		return;
+	}
+	switch (kind) {
+		case RayTracingProgramKind::Patched: g_ray_tracing_counts.patched++; break;
+		case RayTracingProgramKind::Unpatched:
+			g_ray_tracing_counts.unpatched++;
+			g_ray_tracing_counts.last_unpatched = shader_hash;
+			break;
+		case RayTracingProgramKind::GuestSites:
+			g_ray_tracing_counts.guest_sites++;
+			g_ray_tracing_counts.last_guest_sites = shader_hash;
+			break;
+	}
+}
+
+RayTracingPrograms GetRayTracingPrograms() {
+	const std::lock_guard lock(g_ray_tracing_programs_mutex);
+	return g_ray_tracing_counts;
+}
+
 ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOptions& options) {
 	EXIT_IF(code.empty());
 	ShaderSource source;
@@ -503,6 +536,14 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 				     static_cast<uint64_t>(patch.sites.size()),
 				     static_cast<uint64_t>(std::ranges::count_if(
 				         patch.sites, [](const auto& site) { return site.alpha.valid; })));
+				NoteRayTracingProgram(RayTracingProgramKind::Patched, options.shader_hash);
+			} else if (std::ranges::any_of(source.decoded.instructions, [](const auto& inst) {
+				           return inst.opcode == Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY;
+			           })) {
+				// It walks a guest BVH the patch does not recognize: on the guest side.
+				LOGF("%s native ray tracing: hash=0x%016" PRIx64 " wave%u walks a guest BVH without a patch\n",
+				     StageName(options.stage), options.shader_hash, options.wave_size);
+				NoteRayTracingProgram(RayTracingProgramKind::Unpatched, options.shader_hash);
 			}
 		}
 	}
@@ -721,7 +762,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " SPIR-V EmitProgram\n", stage,
 	     ir.shader_hash);
 	auto spirv = Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, *options.profile,
-	                                options.emit_debug_info);
+	                                options.emit_debug_info, true, options.ray_stats);
 	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " wave_size=%u elapsed_ms=%" PRIu64 "\n",
 	     stage, ir.shader_hash, static_cast<uint64_t>(spirv.size()), ir.wave_size,
@@ -732,7 +773,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	if (options.plain_mip_stats_variant && Spirv::UsesMipStats(ir)) {
 		result.spirv_plain =
 		    Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, *options.profile,
-		                       options.emit_debug_info, false);
+		                       options.emit_debug_info, false, options.ray_stats);
 	}
 	result.spirv   = std::move(spirv);
 	result.program = std::move(ir);
