@@ -143,10 +143,11 @@ public:
 		std::array<float, 16>    matrix {};
 	};
 	// Records the refits of `blases` in the game's format: the vertices of the triangle nodes of
-	// `geometries`, then the boxes of the box nodes (see hle_blas_refit.comp). Outside a render
+	// `geometries`, then the boxes of the box nodes (see hle_blas_refit.comp). `header_layout` is
+	// the BLAS header of the library: 0 for generation Base460, 1 for Base252. Outside a render
 	// pass.
 	void RecordHleRefit(const CommandRecorder& command, std::span<const uint64_t> blases,
-	                    std::span<const HleRefitGeometry> geometries);
+	                    std::span<const HleRefitGeometry> geometries, uint32_t header_layout);
 
 	// A BLAS the game built with sce::Psr (see CommandProcessor::PsrBlasDispatch()): its address
 	// and, per geometry in the build's order, its triangle count and whether it is opaque, as the

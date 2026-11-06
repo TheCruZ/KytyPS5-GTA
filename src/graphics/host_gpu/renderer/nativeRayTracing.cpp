@@ -190,7 +190,7 @@ struct HleRefitPush {
 	uint32_t mode;
 	uint32_t job_count;
 	uint32_t pool_capacity;
-	uint32_t pad;
+	uint32_t layout;
 };
 
 constexpr uint32_t HleRefitGeometryStride = 96;
@@ -2170,7 +2170,7 @@ void NativeRayTracing::NoteGuestBlasDecompressed(uint64_t blas_va, uint64_t memo
 }
 
 void NativeRayTracing::RecordHleRefit(const CommandRecorder& command, std::span<const uint64_t> blases,
-                                      std::span<const HleRefitGeometry> geometries) {
+                                      std::span<const HleRefitGeometry> geometries, uint32_t header_layout) {
 	if (!m_enabled || blases.empty()) {
 		return;
 	}
@@ -2242,7 +2242,7 @@ void NativeRayTracing::RecordHleRefit(const CommandRecorder& command, std::span<
 		                   0,
 		                   static_cast<uint32_t>(batch_geometries.size()),
 		                   HleRefitPoolCapacity,
-		                   0};
+		                   header_layout};
 		if (!batch_geometries.empty()) {
 			command.pushConstants(m_hle_refit_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
 			command.dispatch(static_cast<uint32_t>(batch_geometries.size()), 1, 1);

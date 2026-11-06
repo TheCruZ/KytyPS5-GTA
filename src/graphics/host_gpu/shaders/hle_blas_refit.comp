@@ -7,9 +7,10 @@
 //
 // BLAS header: +56.. refit bookkeeping (not needed here), +64 u64 offset of the vertex index
 // table (5 u32 per triangle node), +80 u64 offset of the first triangle node of each geometry
-// (u32 per geometry), +108 geometry count, +120 triangle node count, +124 first triangle node
-// (64-byte units from the BLAS). Triangle node: 5 vertices (3 floats each), word 15 the
-// barycentric remap. Box32 node: 4 child pointers, 4 boxes (lo.xyz hi.xyz), 16 bytes of ones.
+// (u32 per geometry), +88 node limit, +108 geometry count, +120 triangle node count, +124 first
+// triangle node (64-byte units from the BLAS). Generation Base252 (GTA V 01.005,
+// Push::header_layout 1) has the same fields at other offsets (kHeaderOffsets). Triangle node: 5
+// vertices (3 floats each), word 15 the barycentric remap. Box32 node: 4 child pointers, 4 boxes (lo.xyz hi.xyz), 16 bytes of ones.
 // Leaves: lists of 8-byte entries at BLAS + 8 * (pointer >> 3): a triangle node pointer
 // (type 0-3 = one of its 4 triangles, 7 = an AABB of the geometry entry pointer >> 3) and a
 // primitive word (bit 31: last entry).
@@ -31,8 +32,14 @@ layout(push_constant, std430) uniform Push {
 	uint     mode;
 	uint     job_count;
 	uint     pool_capacity;
-	uint     pad;
+	// The BLAS header: 0 for generation Base460, 1 for Base252.
+	uint     header_layout;
 } pc;
+
+// The offsets of the BLAS header fields the refit reads, by Push::header_layout: the vertex index table,
+// the first triangle node of each geometry, the geometry count, the triangle node count, the
+// first triangle node and the node limit.
+const uint kHeaderOffsets[2][6] = {{64u, 80u, 108u, 120u, 124u, 88u}, {56u, 72u, 112u, 124u, 128u, 80u}};
 
 const uint MODE_VERTICES = 0u;
 const uint MODE_BOXES    = 1u;
@@ -151,11 +158,12 @@ void VertexJob(uint job_index) {
 	if (blas == 0) {
 		return;
 	}
-	const uint64_t index_table = blas + LoadGuestU64(blas + 64);
-	const uint64_t first_table = blas + LoadGuestU64(blas + 80);
-	const uint     geometries  = LoadGuestU32(blas + 108);
-	const uint     node_count  = LoadGuestU32(blas + 120);
-	const uint     node_first  = LoadGuestU32(blas + 124);
+	const uint     hl          = min(pc.header_layout, 1u);
+	const uint64_t index_table = blas + LoadGuestU64(blas + kHeaderOffsets[hl][0]);
+	const uint64_t first_table = blas + LoadGuestU64(blas + kHeaderOffsets[hl][1]);
+	const uint     geometries  = LoadGuestU32(blas + kHeaderOffsets[hl][2]);
+	const uint     node_count  = LoadGuestU32(blas + kHeaderOffsets[hl][3]);
+	const uint     node_first  = LoadGuestU32(blas + kHeaderOffsets[hl][4]);
 	const uint     g           = job.geometry;
 	if (g >= geometries) {
 		return;
@@ -238,7 +246,7 @@ void BoxJob(uint job_index) {
 		s_overflow = 0;
 		s_tail     = 0;
 		// Box nodes never outnumber the node limit of the BLAS.
-		s_size = min(LoadGuestU32(blas + 88) + 1u, 1u << 20);
+		s_size = min(LoadGuestU32(blas + kHeaderOffsets[min(pc.header_layout, 1u)][5]) + 1u, 1u << 20);
 		s_base = atomicAdd(state.pool_cursor, s_size);
 		if (blas == 0 || s_base + s_size > pc.pool_capacity || s_base + s_size < s_base) {
 			s_overflow = 1;

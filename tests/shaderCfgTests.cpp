@@ -14189,6 +14189,36 @@ static const uint32_t kPsrGta011FanRefitCopyDispatchArgs[] = {
     0x65726162, 0x746f6f66, 0xae341220, 0x00000000, 0x00000001, 0x00000150, 0x00000000, 0x000000ef,
     0xf401e441, 0x6585494c, 0x00000000, 0x00000000,
 };
+// GTA V 01.005 (build J02232310): morton_capture_memory
+static const uint32_t kPsrGta005CaptureMemory[] = {
+    0xbf810000, 0x00000000, 0x00000000, 0x00000000, 0x30306c73, 0x00000073, 0x00000083, 0x00000000,
+    0x00102557, 0x0401a600, 0x0b100a10, 0x40100c10, 0x4c104b40, 0x4e104d10, 0x7a606f10, 0x6e000010,
+    0x0f640000, 0x24102120, 0x00102540, 0x10216500, 0x00004024, 0x24102164, 0x60000040, 0x10295028,
+    0x20610000, 0xb3c02000, 0x4b080202, 0x5b104402, 0x5b005d3d, 0x20605b10, 0x64000a32, 0x68641007,
+    0x156d2f20, 0x01010271, 0xf0076d01, 0x00058b2e, 0x00160952, 0x00000000, 0x00000000, 0x00000000,
+    0x65726162, 0x746f6f66, 0xffd1a152, 0x00000000, 0x00000001, 0x00000004, 0x00000000, 0x00000083,
+    0x7dd3b209, 0xeddd574e, 0x00000000, 0x00000000,
+};
+// GTA V 01.005: qbvh_fan_refit_copy_dispatch_args
+static const uint32_t kPsrGta005FanRefitCopyDispatchArgs[] = {
+    0xbfa00003, 0xd7460001, 0x04010c0b, 0xf4041a80, 0xfa000048, 0xbf8cc07f, 0x8014006a, 0xbe9703ff,
+    0x00016204, 0x8215016b, 0xf4000580, 0xfa000070, 0xbe951d92, 0x4a000281, 0xbf8cc07f, 0xe0302000,
+    0x80050201, 0xbe9703ff, 0x00016204, 0xbe900302, 0xbe910303, 0xbe920304, 0xbe930305, 0xbe840306,
+    0xbe850307, 0xbe860308, 0xbe870309, 0xbe82047e, 0xbf8c3f70, 0x4c040480, 0x7daa000a, 0xbf880004,
+    0xe0302000, 0x80050000, 0xbf8c3f70, 0x4a000500, 0x8afe7e02, 0xbf880004, 0xf4001a80, 0xfa00007c,
+    0xbf8cc07f, 0x4a00046a, 0xbefe0402, 0xd7460007, 0x02050301, 0x7e020281, 0x7e040281, 0xe0382000,
+    0x80040307, 0xbf8c3f70, 0x2c08089f, 0x2c06069f, 0x2c0a0a9f, 0x2c0c0c9f, 0xd76f0003, 0x040d0304,
+    0xd76f0003, 0x040d0505, 0xd76f0003, 0x040d0706, 0xe0782000, 0x80010007, 0xbf810000, 0xbf9f0000,
+    0xbf9f0000, 0xbf9f0000, 0xbf9f0000, 0xbf9f0000, 0xbf9f0000, 0xbf9f0000, 0xbf9f0000, 0x00000000,
+    0x30306c73, 0x000000ba, 0x000000cf, 0x00000000, 0x00102557, 0x10216500, 0x00004024, 0x24102164,
+    0x61000040, 0x00001029, 0x100401a6, 0x100b100a, 0x4040100c, 0x104c104b, 0x104e104d, 0x1079606f,
+    0x0000107a, 0x6400006e, 0x1021200f, 0x10254024, 0x25570000, 0x78507710, 0x45000050, 0x00004024,
+    0x29502860, 0x01000010, 0x00a008e1, 0xe9044f84, 0x2dd2e2c7, 0xfb66d9a9, 0x0c004222, 0x7c230160,
+    0x907e5b01, 0x23008081, 0x1c020181, 0x01870194, 0x8b018752, 0x1c028001, 0x97157c18, 0x157e0801,
+    0x8100019a, 0x01901001, 0x472c019f, 0x01a5000a, 0x01a5100a, 0x442c01ab, 0xb72801b1, 0x01400201,
+    0x0701b101, 0x058b2ef0, 0x80156700, 0x0016608a, 0x65726162, 0x746f6f66, 0x60961246, 0x00000000,
+    0x00000001, 0x0000011c, 0x00000000, 0x000000cf, 0xa1dc51bf, 0xeddd574e, 0x00000000, 0x00000000,
+};
 // ASTRO BOT (build of Base460 J03093718): psr_morton_initialize_indirect_args_top
 static const uint32_t kPsrAstroInitializeIndirectArgsTop[] = {
     0xd7460000, 0x04010c02, 0xbe8303ff, 0x00016204, 0xbe811d92, 0xb0020050, 0x36020087, 0x7d8602f9,
@@ -14228,6 +14258,12 @@ static void TestPsrCodeRecognition() {
         "Psr: a copy of a pass under another name is not taken for that pass");
   Check(is(kPsrGta011FanRefitCopyDispatchArgs, Generation::Base460, Shader::QbvhFanRefitCopyDispatchArgs),
         "Psr: psr_qbvh_fan_refit_copy_dispatch_args of GTA V 01.011 is not recognized");
+  // GTA V 01.005: an older build (generation Base252), same code or not.
+  Check(is(kPsrGta005CaptureMemory, Generation::Base252, Shader::MortonCaptureMemory) &&
+            fingerprint(kPsrGta005CaptureMemory) == fingerprint(kPsrGta011CaptureMemory),
+        "Psr: morton_capture_memory of GTA V 01.005 is not recognized");
+  Check(is(kPsrGta005FanRefitCopyDispatchArgs, Generation::Base252, Shader::QbvhFanRefitCopyDispatchArgs),
+        "Psr: qbvh_fan_refit_copy_dispatch_args of GTA V 01.005 is not recognized");
   // Builds whose replacements are not enabled are not recognized, even with the same code.
   Check(fingerprint(kPsrAstroInitializeIndirectArgsTop) == fingerprint(kPsrGta011InitializeIndirectArgsTop) &&
             is(kPsrAstroInitializeIndirectArgsTop, Generation::Unknown, Shader::None),
