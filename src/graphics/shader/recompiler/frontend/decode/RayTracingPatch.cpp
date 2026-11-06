@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/frontend/decode/RayTracingPatch.h"
 
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/ir/RayQuery.h"
 
 #include <algorithm>
 #include <array>
@@ -640,7 +641,8 @@ public:
 			root          = site_root;
 			sites.push_back(site);
 		}
-		if (sites.empty() || sites.size() > 8 || !layout.valid || !Packable(layout)) {
+		// Each site has its ray query state in the translated program (IR::MaxRayQuerySites).
+		if (sites.empty() || sites.size() > IR::MaxRayQuerySites || !layout.valid || !Packable(layout)) {
 			return false;
 		}
 		patch.sites         = std::move(sites);
