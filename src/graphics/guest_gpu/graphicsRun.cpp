@@ -2487,4 +2487,8 @@ bool GuestGpu::IsGpuThread() noexcept {
 	return g_gpu_thread;
 }
 
+bool GuestGpu::IsCommandProcessorThread() noexcept {
+	return g_cp_thread;
+}
+
 } // namespace Libs::Graphics
