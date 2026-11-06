@@ -82,6 +82,8 @@ enum class Generation : uint8_t {
 	Unknown,
 	// 460 shaders: GTA V 01.010/01.011 (build J03180688), Astro Bot (J03093718) and Nightreign.
 	Base460,
+	// 252 shaders, named without the psr_ prefix: GTA V 01.005 (build J02232310).
+	Base252,
 };
 
 // The generation of the library the game registered (Unknown until it registered its shaders,

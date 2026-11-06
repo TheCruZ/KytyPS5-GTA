@@ -1683,9 +1683,10 @@ static void ReadGuestAroundGpuWrites(uint64_t vaddr, void* data, uint64_t size) 
 // last one) and psr_qbvh_refit_bottom_level (the boxes, bottom up). With native ray tracing they
 // are replaced by NativeRayTracing::RecordHleRefit(): the dispatches are dropped; each BLAS
 // (s[0:1] of the first shader) and each geometry (the geometry table V# at s[0:3], BLAS at s[4:5]
-// and geometry index s8 of the second one, user data of generation Base460) are kept and, with
-// the last box pass, one host command refits every BLAS (with the vertices other work wrote
-// meanwhile). True when the dispatch is dropped.
+// and geometry index s8 of the second one in generation Base460, s6 in Base252) are kept and,
+// with the last box pass, one host command refits every BLAS (with the vertices other work wrote
+// meanwhile). GTA V 01.005 (Base252) runs the same passes on BLASes whose header has the same
+// fields at other offsets. True when the dispatch is dropped.
 bool CommandProcessor::HleBlasDispatch(uint64_t data_addr) {
 	if (data_addr == 0 || !m_renderer.GetNativeRayTracing().Enabled()) {
 		return false;
@@ -1728,7 +1729,7 @@ bool CommandProcessor::HleBlasDispatch(uint64_t data_addr) {
 		m_hle_refit_geometries.push_back(
 		    {.blas     = uint64_t {user[4]} | (uint64_t {user[5] & 0xffffu} << 32u),
 		     .table    = uint64_t {user[0]} | (uint64_t {user[1] & 0xffffu} << 32u),
-		     .geometry = user[8]});
+		     .geometry = Psr::LibraryGeneration() == Psr::Generation::Base252 ? user[6] : user[8]});
 	} else if (shader == Shader::QbvhRefitBottomLevel &&
 	           ++m_hle_refit_finished == m_hle_refit_blases.size()) {
 		m_hle_refit_window = false;
@@ -1738,7 +1739,8 @@ bool CommandProcessor::HleBlasDispatch(uint64_t data_addr) {
 }
 
 void CommandProcessor::EmitHleRefit() {
-	EmitHostCommand([this, blases = m_hle_refit_blases, refs = m_hle_refit_geometries] {
+	const uint32_t header_layout = Psr::LibraryGeneration() == Psr::Generation::Base252 ? 1u : 0u;
+	EmitHostCommand([this, blases = m_hle_refit_blases, refs = m_hle_refit_geometries, header_layout] {
 		auto&                                          context = m_renderer;
 		auto&                                          cache   = context.GetBufferCache();
 		std::vector<NativeRayTracing::HleRefitGeometry> geometries;
@@ -1777,7 +1779,7 @@ void CommandProcessor::EmitHleRefit() {
 		context.PrepareBda(true, false);
 		auto& command = context.GetCommandScheduler().Current();
 		command.EndRendering();
-		context.GetNativeRayTracing().RecordHleRefit(command.Handle(), blases, geometries);
+		context.GetNativeRayTracing().RecordHleRefit(command.Handle(), blases, geometries, header_layout);
 	});
 }
 
@@ -1962,7 +1964,9 @@ void CommandProcessor::PsrBlasDispatch(uint64_t data_addr) {
 	if (shader == Shader::Trinity) {
 		Psr::StopReplacement("the game builds kTrinity BVHs", ShaderRegisteredName(data_addr));
 	}
-	if (!Psr::ReplacementEnabled()) {
+	// The BLAS builds of the older generation Base252 (GTA V 01.005) take other user data: the
+	// walks find those BLASes.
+	if (!Psr::ReplacementEnabled() || Psr::LibraryGeneration() != Psr::Generation::Base460) {
 		m_psr_blas_builds.clear();
 		m_psr_captured.clear();
 		return;
