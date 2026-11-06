@@ -546,7 +546,8 @@ private:
 	Xbyak::Label                                      m_ret;
 	uint32_t m_shader_base = 0, m_reach = 0, m_states = 0, m_states_end = 0;
 	uint32_t m_user_data = 0, m_captures = 0;
-	// By node: the flattened SRT dword that is the only use of its value, else NoFlatSlot.
+	// By node: the flattened SRT dword that is the only use of its value (or ZeroTestSlot), else
+	// NoFlatSlot.
 	std::vector<uint32_t> m_flat_slots;
 	// Loads whose value only decides control flow, such as the bound of a zero test (see
 	// SrtRuntime::gpu_produced).
@@ -737,6 +738,9 @@ void WalkerCompiler::FindFlatOnlyNodes(std::span<const Operand> conditions,
 		m_zero_tested[index] = load && uses[index] != 0 && (uses[index] == zero_uses[index] || control[index]);
 		if (used[index] || !load) {
 			m_flat_slots[index] = NoFlatSlot;
+		}
+		if (load && uses[index] != 0 && uses[index] == zero_uses[index] && m_flat_slots[index] == NoFlatSlot) {
+			m_flat_slots[index] = ZeroTestSlot;
 		}
 		if (load && m_flat_slots[index] == NoFlatSlot && !other_use[index] &&
 		    word_uses[index] == 1 && word_slot[index] != NoFlatSlot && flat_reads[index] <= 1) {
