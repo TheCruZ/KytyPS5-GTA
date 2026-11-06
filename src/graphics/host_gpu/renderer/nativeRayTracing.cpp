@@ -23,6 +23,7 @@
 #include <cstring>
 #include <iterator>
 #include <string>
+#include <utility>
 
 namespace Libs::Graphics {
 
@@ -128,6 +129,8 @@ constexpr uint32_t StateDispatch = offsetof(RtState, dispatch);
 constexpr uint32_t StateVerify   = offsetof(RtState, verify);
 // RtState::overflow: part of the TLAS is in memory the host has not cached (kUnmapped).
 constexpr uint32_t StateUnmapped = 4u;
+// RtState::overflow: the walk's box node queue (1) or the host TLAS (2) was full.
+constexpr uint32_t StateFull = 3u;
 
 // The readback area: the state, the missing BLASes, the build jobs with their results and the
 // slots whose BLAS changed.
@@ -392,6 +395,10 @@ struct RtStats {
 	// they read, and the host caches the rest for the next walks. The last program.
 	RtCounter             walks_uncached;
 	std::atomic<uint64_t> last_uncached {0};
+	// Walks that found more box nodes or instances than the host structures hold (the rest is
+	// left out). The last program.
+	RtCounter             walks_overflow;
+	std::atomic<uint64_t> last_overflow {0};
 	// --rt-stats: rays sent back to the guest traversal.
 	std::atomic<uint64_t>                guest_rays {0};
 	uint64_t                             guest_rays_reported = 0;
@@ -427,6 +434,7 @@ void SummarizeRayTracing() {
 	const auto null_header = stats.walks_null_header.TakeDelta();
 	const auto bad_header  = stats.walks_bad_header.TakeDelta();
 	const auto uncached    = stats.walks_uncached.TakeDelta();
+	const auto overflow    = stats.walks_overflow.TakeDelta();
 	const auto unpublished = null_header + bad_header;
 	const auto rays_total = stats.guest_rays.load(std::memory_order_relaxed);
 	const auto rays       = rays_total - stats.guest_rays_reported;
@@ -436,7 +444,7 @@ void SummarizeRayTracing() {
 	const auto new_guest_sites = programs.guest_sites - stats.programs_reported.guest_sites;
 	stats.programs_reported    = programs;
 	// The first call starts the period; dispatches without a TLAS alone trace nothing.
-	if (next == 0 || unpatched + unpublished + uncached + rays + new_unpatched + new_guest_sites == 0) {
+	if (next == 0 || unpatched + unpublished + uncached + overflow + rays + new_unpatched + new_guest_sites == 0) {
 		return;
 	}
 	const auto log = [](const std::string& line) { ::Log::WriteToConsoleAndLog(line + "\n"); };
@@ -459,6 +467,11 @@ void SummarizeRayTracing() {
 		log(fmt::format("[RT]   {} TLAS walks found TLAS memory not cached yet (last cs {}): their rays missed what "
 		                "it holds, cached for the next walks",
 		                uncached, RtShader(stats.last_uncached.load(std::memory_order_relaxed))));
+	}
+	if (overflow != 0) {
+		log(fmt::format("[RT]   {} TLAS walks found more box nodes or instances than the host structures hold "
+		                "(last cs {}): their rays missed the rest",
+		                overflow, RtShader(stats.last_overflow.load(std::memory_order_relaxed))));
 	}
 	if (rays != 0) {
 		log(fmt::format("[RT]   {} rays went back to the guest traversal (last cs {})", rays,
@@ -506,6 +519,149 @@ bool NativeRayTracing::FindTlasSource(const ShaderRecompiler::IR::ShaderInfo& in
 	source = {info.ray_query_user_sgpr, info.ray_query_header_offset, info.ray_query_root, info.ray_query_layout,
 	          info.ray_query_header_slots};
 	return true;
+}
+
+bool NativeRayTracing::FindGuestTlasSource(const ShaderRecompiler::IR::ShaderInfo& info,
+                                           TlasSource& source) noexcept {
+	if (FindTlasSource(info, source)) {
+		return true;
+	}
+	// A layout is never all zero (Decoder::RayTracingLayout::Pack()).
+	if (!info.bvh || info.ray_query_layout == std::array<uint32_t, 4> {}) {
+		return false;
+	}
+	source = {info.ray_query_user_sgpr, info.ray_query_header_offset, info.ray_query_root, info.ray_query_layout,
+	          {ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot, ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot}};
+	return true;
+}
+
+NativeRayTracing::GuestTlas NativeRayTracing::ReadGuestTlas(
+    uint64_t header, const TlasSource& source, const std::function<bool(uint64_t, uint64_t)>& readable,
+    std::vector<std::pair<uint64_t, uint64_t>>& blases) {
+	// As rt_tlas_walk.comp reads the TLAS (Decoder::RayTracingLayout::Pack() for the layout).
+	if (header == 0 || (header & 255u) != 0) {
+		return {};
+	}
+	for (const auto& [known, tlas]: m_guest_tlases) {
+		if (known == header) {
+			return tlas;
+		}
+	}
+	constexpr uint64_t HeaderSize = 256;
+	// Larger TLASes are not plausible (the walk's queue holds no more box nodes).
+	constexpr uint64_t MaxExtent = uint64_t {64} * 1024 * 1024;
+	if (header > UINT64_MAX - MaxExtent || !readable(header, HeaderSize)) {
+		return {};
+	}
+	const auto load = [](uint64_t address, auto& value) {
+		std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
+	};
+	const auto& layout = source.layout;
+	// The node limit of a BVH header (BlasNodeLimit() in rt_blas_walk.comp).
+	const auto node_limit_at = [&](uint64_t bvh) {
+		uint32_t count = 0;
+		load(bvh + (((layout[3] >> 29u) & 1u) != 0 ? 80 : 88), count);
+		return ((layout[3] >> 29u) & 1u) != 0 ? count - 1u : count;
+	};
+	const uint32_t node_limit = node_limit_at(header);
+	uint64_t       instance_offset = 0;
+	load(header + ((layout[1] >> 16u) & 15u) * 8u, instance_offset);
+	if (node_limit >= QueueCapacity || instance_offset >= MaxExtent) {
+		return {};
+	}
+	const auto nodes_end = header + (uint64_t {node_limit} + 1) * 64;
+	if (!readable(header, nodes_end - header)) {
+		return {};
+	}
+	// The box nodes from the root (no more than the TLAS has) and the instance leaves they reach
+	// (the largest index); inline instances have their record in the header.
+	const bool     inline_layout = ((layout[3] >> 19u) & 1u) != 0;
+	const uint32_t inline_type   = (layout[3] >> 16u) & 7u;
+	std::vector<uint32_t> queue {source.root};
+	std::vector<uint32_t> leaves;
+	bool                  inline_leaf   = false;
+	int64_t               last_instance = -1;
+	uint32_t              instances     = 0;
+	for (size_t i = 0; i < queue.size() && i <= node_limit; i++) {
+		const auto address = header + (uint64_t {queue[i] >> 3u} << 6u);
+		if (address + 16 > nodes_end) {
+			continue;
+		}
+		std::array<uint32_t, 4> children {};
+		load(address, children);
+		for (const auto child: children) {
+			const auto type = child & 7u;
+			if (child == 0xffffffffu) {
+				continue;
+			}
+			if (type == 4u || type == 5u) {
+				queue.push_back(child);
+			} else if (type < 4u || (inline_layout && type == inline_type)) {
+				instances++;
+				if (inline_layout && type == inline_type) {
+					inline_leaf = true;
+				} else {
+					leaves.push_back(child >> 3u);
+					last_instance = std::max<int64_t>(last_instance, child >> 3u);
+				}
+			}
+		}
+	}
+	const auto stride        = uint64_t {128} + ((layout[1] >> 30u) & 3u) * 32u;
+	const auto instances_end = header + instance_offset + static_cast<uint64_t>(last_instance + 1) * stride;
+	const auto inline_end    = inline_layout ? header + (layout[3] & 0xffu) * 8u + 4u + stride : 0;
+	const auto end = std::min(std::max({nodes_end, instances_end, inline_end}), header + MaxExtent);
+
+	// The BLASes of the instances (LoadGuestInstance() in rt_common.inc), when the CPU wrote them as
+	// well (one in ASTRO BOT before Go-Go Archipelago): their nodes, and the table of the geometry
+	// of each triangle node of a Psr BLAS (rt_blas_walk.comp).
+	std::vector<uint64_t> blas_list;
+	const auto            record_blas = [&](uint64_t record) {
+		const auto dword = ((layout[1] >> 20u) & 15u) | (((layout[3] >> 20u) & 3u) << 4u);
+		// Records of 128 bytes are read up to 64 bytes.
+		if ((dword + 2u) * 4u > (stride > 128u ? 160u : 64u) || !readable(record, (dword + 2u) * 4u)) {
+			return;
+		}
+		std::array<uint32_t, 2> words {};
+		load(record + dword * 4u, words);
+		const auto blas = ((layout[1] >> 24u) & 1u) != 0
+		                      ? (uint64_t {words[0]} | (uint64_t {words[1] & 0x3fffffu} << 32u)) << 3u
+		                      : uint64_t {words[0]} | (uint64_t {words[1]} << 32u);
+		if (blas != 0 && (blas & 255u) == 0) {
+			blas_list.push_back(blas);
+		}
+	};
+	for (const auto leaf: leaves) {
+		record_blas(header + instance_offset + uint64_t {leaf} * stride);
+	}
+	if (inline_leaf) {
+		record_blas(header + (layout[3] & 0xffu) * 8u + ((layout[3] >> 28u) & 1u) * 4u);
+	}
+	std::sort(blas_list.begin(), blas_list.end());
+	blas_list.erase(std::unique(blas_list.begin(), blas_list.end()), blas_list.end());
+	for (const auto blas: blas_list) {
+		if (blas > UINT64_MAX - MaxExtent || !readable(blas, HeaderSize)) {
+			continue;
+		}
+		const auto limit = node_limit_at(blas);
+		if (limit >= MaxExtent / 64) {
+			continue;
+		}
+		auto                    blas_end = blas + (uint64_t {limit} + 1) * 64;
+		std::array<uint32_t, 2> magic {};
+		uint32_t                version = 0;
+		uint32_t                table   = 0;
+		load(blas, magic);
+		load(blas + 252, version);
+		load(blas + 40, table);
+		if (magic[0] == 0x5f525350u && magic[1] == 0x4c485642u && version == 9u && table < MaxExtent) {
+			blas_end = std::max(blas_end, blas + table + (uint64_t {limit} + 1) * 4);
+		}
+		blases.emplace_back(blas, std::min(blas_end, blas + MaxExtent));
+	}
+	const GuestTlas tlas {end, instances};
+	m_guest_tlases[m_guest_tlas_next++ % m_guest_tlases.size()] = {header, tlas};
+	return tlas;
 }
 
 NativeRayTracing::Allocation NativeRayTracing::Arena::Allocate(uint64_t size, uint64_t alignment) {
@@ -1468,7 +1624,11 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 			}
 			return false;
 		});
-		const auto last = m_last_instance_counts[source_key];
+		// The count of the last walk of the source, or of the TLAS the CPU read for this dispatch
+		// (NoteTlasInstances()) when larger: the first walks of a new one got a host TLAS of the
+		// size of the source's previous one (ASTRO BOT's island in Go-Go Archipelago: 1024 of its
+		// 4242 instances, in a pass of 64 dispatches in one frame).
+		const auto last = std::max(m_last_instance_counts[source_key], std::exchange(m_next_instances, 0u));
 		tlas_count      = std::min(m_tlas_capacity, std::max(1024u, (last + last / 4 + 255u) &
 		                                                           ~255u));
 	}
@@ -1704,6 +1864,10 @@ void NativeRayTracing::ProcessReadback(Readback& readback) {
 	} else if ((state.overflow & StateUnmapped) != 0) {
 		g_rt_stats.walks_uncached.Add();
 		g_rt_stats.last_uncached.store(readback.shader_hash, std::memory_order_relaxed);
+	}
+	if ((state.overflow & StateFull) != 0) {
+		g_rt_stats.walks_overflow.Add();
+		g_rt_stats.last_overflow.store(readback.shader_hash, std::memory_order_relaxed);
 	}
 	SummarizeRayTracing();
 	for (uint32_t i = 0; i < missing_count; i++) {

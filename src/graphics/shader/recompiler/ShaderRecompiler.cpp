@@ -545,6 +545,19 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 				     StageName(options.stage), options.shader_hash, options.wave_size);
 				NoteRayTracingProgram(RayTracingProgramKind::Unpatched, options.shader_hash);
 			}
+		} else if (std::ranges::any_of(source.decoded.instructions, [](const auto& inst) {
+			           return inst.opcode == Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY;
+		           })) {
+			// The guest walks its BVH itself: the TLAS that the patch would trace is still cached
+			// before the dispatch (see RenderContext::CacheTlasMemory()).
+			Decoder::RayTracingPatch patch;
+			if (Decoder::DeriveRayTracingPatch(source.decoded, patch, options.wave_size)) {
+				source.decoded.ray_tracing_source = {.user_sgpr     = patch.user_sgpr,
+				                                     .header_offset = patch.header_offset,
+				                                     .root          = patch.root,
+				                                     .layout        = patch.layout.Pack(),
+				                                     .valid         = true};
+			}
 		}
 	}
 	if (source.decoded.has_swap_pc) {
