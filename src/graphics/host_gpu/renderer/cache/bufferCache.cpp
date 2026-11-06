@@ -479,7 +479,8 @@ uint64_t BufferCache::ReadAheadSize(const Buffer& buffer, uint64_t vaddr, uint64
 	// follow along when their writes were already submitted, or when the readback drains the GPU
 	// anyway (the faulting bytes were written by work still being recorded).
 	static constexpr uint64_t MaxReadAhead = 256 * 1024;
-	const auto                faulting_end = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	const auto                faulting_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto                faulting_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 	const auto                limit =
 	    std::min(buffer.CpuAddress() + buffer.Size(), faulting_end + MaxReadAhead);
 	const auto latest_write = [&](uint64_t begin, uint64_t end) {
@@ -494,21 +495,29 @@ uint64_t BufferCache::ReadAheadSize(const Buffer& buffer, uint64_t vaddr, uint64
 		});
 		return latest;
 	};
-	const auto needed = latest_write(vaddr, vaddr + size);
+	// The pages decide, not the faulting bytes: GTA V reads the CPU-written fields between the
+	// GPU-written ones of a few hundred pages a frame in order, every page a fault of its own.
+	const auto needed = latest_write(faulting_begin, faulting_end);
 	if (needed == 0) {
 		return size;
 	}
 	const auto current = m_scheduler.CurrentTick();
 	const auto bound   = needed >= current ? UINT64_MAX : current - 1;
-	auto       end     = faulting_end;
-	while (end + TRACKER_PAGE_SIZE <= limit &&
-	       m_gpu_modified_ranges.Intersects(end, TRACKER_PAGE_SIZE) &&
-	       !m_texture_cache.IsRegionGpuModified(end, TRACKER_PAGE_SIZE)) {
-		const auto tick = latest_write(end, end + TRACKER_PAGE_SIZE);
+	// Pages without GPU-written bytes in between have nothing to download: skip them.
+	auto end    = faulting_end;
+	auto cursor = faulting_end;
+	while (cursor + TRACKER_PAGE_SIZE <= limit &&
+	       !m_texture_cache.IsRegionGpuModified(cursor, TRACKER_PAGE_SIZE)) {
+		if (!m_gpu_modified_ranges.Intersects(cursor, TRACKER_PAGE_SIZE)) {
+			cursor += TRACKER_PAGE_SIZE;
+			continue;
+		}
+		const auto tick = latest_write(cursor, cursor + TRACKER_PAGE_SIZE);
 		if (tick == 0 || tick > bound) {
 			break;
 		}
-		end += TRACKER_PAGE_SIZE;
+		cursor += TRACKER_PAGE_SIZE;
+		end = cursor;
 	}
 	return end > faulting_end ? end - vaddr : size;
 }
