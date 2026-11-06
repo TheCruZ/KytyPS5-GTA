@@ -1061,9 +1061,12 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 	// The execution thread takes the pipelines background threads and helpers created from the
 	// m_async_ready maps.
 	m_async_handoff = !m_async_threads.empty() || m_manifest_warm || m_helpers != nullptr;
+	StartPrecompile();
 }
 
 PipelineCache::~PipelineCache() {
+	// It reads the helpers and the manifest, and lets the game go on.
+	m_precompile = {};
 	StopWorkers();
 	CloseManifest();
 	StopHelpers();
@@ -2390,6 +2393,8 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		                        vertex_words <= PipelineSyncUiVsWords;
 		allow_async = spirv_words > PipelineSyncWords && !layer_draw;
 	}
+	// Set while this draw waits for its pipeline, not while it may still be skipped.
+	std::optional<StallScope> stall;
 	if (m_async_handoff) {
 		// Without background threads for them, draws wait for their pipelines.
 		allow_async = allow_async && !m_async_threads.empty();
@@ -2439,6 +2444,9 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 				ClaimPipeline(key);
 				break;
 			}
+			if (!stall) {
+				stall.emplace(*this);
+			}
 			lock.unlock();
 			std::this_thread::yield();
 			lock.lock();
@@ -2458,6 +2466,9 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		if (!stall) {
+			stall.emplace(*this);
+		}
 		CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
 	}
 	StorePipeline(key);
@@ -2476,6 +2487,7 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 	if (const auto found = m_compute_pipelines.find(module.id); found != m_compute_pipelines.end()) {
 		return found->second;
 	}
+	std::optional<StallScope> stall;
 	if (m_async_handoff) {
 		// Dispatches always run: take the pipeline a background thread created, create it here
 		// while it is still queued, or wait for the thread creating it.
@@ -2510,6 +2522,9 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 				}
 				in_helper = true;
 			}
+			if (!stall) {
+				stall.emplace(*this);
+			}
 			lock.unlock();
 			if (in_helper) {
 				std::this_thread::sleep_for(HelperPoll);
@@ -2530,6 +2545,9 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		if (!stall) {
+			stall.emplace(*this);
+		}
 		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
 	}
 	NoteCreatedPipeline(started);
