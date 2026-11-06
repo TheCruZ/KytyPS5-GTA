@@ -8,8 +8,10 @@ namespace Libs::VideoOut::FrameStepHack {
 
 // [HACK] ASTRO BOT (PPSA21559, PPSA21564, PPSA21567, PPSA21568) advances its simulation by one
 // frame of its frame rate for each frame, whatever the time between frames. Below that rate, down
-// to half of it, the game's frame time follows the presented frames instead. No effect on other
-// titles, or on executables where the patched code and data are not found.
+// to a third of it, the game's frame time follows the presented frames instead, and the physics code
+// that is not stable with longer steps is changed (down to half of the rate where that code is not
+// found). No effect on other titles, or on executables where the patched code and data are not
+// found.
 
 // Offsets from the load address of an executable segment.
 struct CodeRange {
@@ -17,8 +19,10 @@ struct CodeRange {
 	uint64_t end   = 0;
 };
 
-// Called once with the main executable, after relocation and before the game runs.
-void PatchMainProgram(uint64_t base_vaddr, uint64_t size, std::span<const CodeRange> code) noexcept;
+// Called once with the main executable, after relocation (and the cheat file, if any) and before the
+// game runs. `mapped_size` is the size of its mapping, past which the physics fixes get their code.
+void PatchMainProgram(uint64_t base_vaddr, uint64_t size, uint64_t mapped_size,
+                      std::span<const CodeRange> code, bool cheat_file) noexcept;
 
 // Called on the presentation thread for each presented main-bus guest flip.
 void OnPresentedFrame() noexcept;
