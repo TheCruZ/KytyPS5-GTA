@@ -1419,7 +1419,7 @@ void RenderExecutor::IndexTableSlots(TableBindingState& state) {
 	}
 }
 
-bool RenderExecutor::PatchTableSlots(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+void RenderExecutor::PatchTableSlots(const ShaderRecompiler::IR::CompiledShaderInfo& program,
                                      const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
                                      TableBindingState& state, uint64_t stamp) {
 	auto& texture_cache = m_context.GetTextureCache();
@@ -1474,13 +1474,65 @@ bool RenderExecutor::PatchTableSlots(const ShaderRecompiler::IR::CompiledShaderI
 	}
 	MergeTableSpans(state, sorted_spans);
 	IndexTableSlots(state);
-	// Elements no slot names any more keep their images pinned: once there are many, the
-	// tables are resolved slot by slot again.
+	// Elements no slot names any more keep their images pinned: once there are many, they are
+	// dropped.
 	size_t unused = 0;
 	for (size_t element = 0; element < state.elements.size(); element++) {
 		unused += state.element_slot_begin[element + 1] == state.element_slot_begin[element] ? 1 : 0;
 	}
-	return unused <= std::max<size_t>(64, state.elements.size() / 16);
+	if (unused > std::max<size_t>(64, state.elements.size() / 16)) {
+		DropUnusedTableElements(state);
+	}
+}
+
+void RenderExecutor::DropUnusedTableElements(TableBindingState& state) {
+	// Keeps the order of the elements that slots still name; IndexTableSlots() is current.
+	auto&      texture_cache = m_context.GetTextureCache();
+	const auto count         = static_cast<uint32_t>(state.elements.size());
+	auto&      remap         = m_table_remap;
+	remap.assign(count, UINT32_MAX);
+	uint32_t kept = 0;
+	for (uint32_t element = 0; element < count; element++) {
+		auto& entry = state.elements[element];
+		if (state.element_slot_begin[element + 1] == state.element_slot_begin[element]) {
+			if (entry.pinned) {
+				texture_cache.UnpinImage(entry.pinned);
+			}
+			state.element_index.erase(entry.resolution);
+			continue;
+		}
+		remap[element] = kept;
+		if (kept != element) {
+			state.elements[kept]                                 = std::move(entry);
+			state.infos[kept]                                    = state.infos[element];
+			state.marks[kept]                                    = state.marks[element];
+			state.checked[kept]                                  = state.checked[element];
+			state.element_index[state.elements[kept].resolution] = kept;
+		}
+		kept++;
+	}
+	state.elements.resize(kept);
+	state.infos.resize(kept);
+	state.marks.resize(kept);
+	state.checked.resize(kept);
+	for (auto& slot: state.slots) {
+		slot = remap[slot];
+	}
+	const auto renumber = [&](std::vector<uint32_t>& elements) {
+		std::erase_if(elements, [&](uint32_t element) { return remap[element] == UINT32_MAX; });
+		for (auto& element: elements) {
+			element = remap[element];
+		}
+	};
+	renumber(state.always);
+	renumber(state.unchecked_backing);
+	// Marked by this binding: a dropped element needs no visit.
+	renumber(m_table_marked);
+	std::erase_if(state.spans, [&](const auto& span) { return remap[span.element] == UINT32_MAX; });
+	for (auto& span: state.spans) {
+		span.element = remap[span.element];
+	}
+	IndexTableSlots(state);
 }
 
 void RenderExecutor::FinishTableBindings(TableBindingState& state,
@@ -1536,9 +1588,10 @@ bool RenderExecutor::ReuseTableBindings(const ShaderRecompiler::IR::CompiledShad
 	size_t                                      range_index = 0;
 	size_t                                      slot_index  = 0;
 	bool                                        same        = true;
-	// A few slots may name other T#s now (GTA V adds the textures it streams in to its bindless
-	// tables: null slots name them now): those slots are bound again, the rest is reused.
-	const size_t max_changes = std::max<size_t>(256, state.values.size() / 8);
+	// Slots may name other T#s now (GTA V adds the textures it streams in to its bindless tables,
+	// and in places moves thousands of T#s between the ~15 000 slots it fills, at times most of
+	// them): those slots are bound again, the rest is reused. Binding a changed slot costs less
+	// than resolving a slot again, however many change.
 	m_table_changed_slots.clear();
 	ForEachImageTable(program.info.images, [&](uint32_t root_index, auto /*kind*/) {
 		if (!same) {
@@ -1564,16 +1617,12 @@ bool RenderExecutor::ReuseTableBindings(const ShaderRecompiler::IR::CompiledShad
 			return;
 		}
 		cached.slots_id = table.slots_id;
-		for (uint32_t slot = 0; slot < root.table_capacity && same; slot++) {
+		for (uint32_t slot = 0; slot < root.table_capacity; slot++) {
 			const auto& value =
 			    slot != 0u && slot < table.slots.size() ? table.slots[slot] : null_value;
 			if (!(state.values[slot_index] == value)) {
-				if (m_table_changed_slots.size() == max_changes) {
-					same = false;
-				} else {
-					m_table_changed_slots.push_back(
-					    {static_cast<uint32_t>(slot_index), static_cast<uint32_t>(range_index - 1), slot});
-				}
+				m_table_changed_slots.push_back(
+				    {static_cast<uint32_t>(slot_index), static_cast<uint32_t>(range_index - 1), slot});
 			}
 			slot_index++;
 		}
@@ -1586,8 +1635,8 @@ bool RenderExecutor::ReuseTableBindings(const ShaderRecompiler::IR::CompiledShad
 	}
 	state.mark_stamp++;
 	m_table_marked.clear();
-	if (!m_table_changed_slots.empty() && !PatchTableSlots(program, snapshot, state, stamp)) {
-		return false;
+	if (!m_table_changed_slots.empty()) {
+		PatchTableSlots(program, snapshot, state, stamp);
 	}
 	for (const auto element: state.always) {
 		MarkTableElement(state, element);

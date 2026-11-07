@@ -454,12 +454,14 @@ private:
 	void MergeTableSpans(TableBindingState& state, size_t sorted);
 	// The slots of each element (element_slot_begin / element_slots) from `slots`.
 	static void IndexTableSlots(TableBindingState& state);
-	// ReuseTableBindings() of tables whose T#s changed in a few slots: binds those slots to the
-	// elements of their new T#s (new elements join the state). False when the state should be
-	// resolved slot by slot again.
-	[[nodiscard]] bool PatchTableSlots(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+	// ReuseTableBindings() of tables whose T#s changed in some slots: binds those slots to the
+	// elements of their new T#s (new elements join the state).
+	void PatchTableSlots(const ShaderRecompiler::IR::CompiledShaderInfo& program,
 	                     const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
 	                     TableBindingState& state, uint64_t stamp);
+	// Drops the elements no slot names any more (and unpins their images); the binding's marks
+	// follow the elements it keeps.
+	void DropUnusedTableElements(TableBindingState& state);
 	// After CommitBindings() bound the tables: records the descriptors and pins the images.
 	void FinishTableBindings(TableBindingState& state, const PreparedBindings& prepared);
 	void UnpinTableBindings(TableBindingState& state);
@@ -584,6 +586,8 @@ private:
 	std::vector<uint32_t>                              m_table_marked;
 	// MergeTableSpans(): the merged spans (swapped with the state's).
 	std::vector<TableBindingState::PageSpan>           m_table_spans;
+	// DropUnusedTableElements(): the new index of every element (UINT32_MAX: dropped).
+	std::vector<uint32_t>                              m_table_remap;
 	// ReuseTableBindings(): the slots whose T# changed (slot, range, slot in its range).
 	struct ChangedTableSlot {
 		uint32_t slot  = 0;
