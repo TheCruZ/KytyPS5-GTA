@@ -55,6 +55,7 @@ constexpr uint32_t CommittedIntersection = 1; // RayQueryCommittedIntersectionKH
 constexpr uint32_t RayFlagOpaque              = 0x1;
 constexpr uint32_t RayFlagNoOpaque            = 0x2;
 constexpr uint32_t RayFlagCullBackFacing      = 0x10;
+constexpr uint32_t RayFlagCullFrontFacing     = 0x20;
 
 struct LaneVariables {
 	uint32_t query   = 0;
@@ -486,7 +487,7 @@ uint32_t AlphaRecordCheck(EmitterState& s, std::span<const uint32_t> words) {
 // triangle with the same material buffers takes them from there. A record the host cleared (a
 // slot built again), half written by another lane or of other buffers fails the check.
 uint32_t AlphaTest(ValueEmitContext& ctx, const LaneVariables& lane, const GuestEntry& candidate, bool lane_layout,
-                   uint32_t format) {
+                   bool factor_reference, uint32_t format) {
 	auto&      s = ctx.state;
 	const auto u = TypeU32(s), f = TypeF32(s), wide = TypeU64(s), b = TypeBool(s);
 	const auto shr = [&](uint32_t value, uint32_t bits) {
@@ -675,7 +676,7 @@ uint32_t AlphaTest(ValueEmitContext& ctx, const LaneVariables& lane, const Guest
 	    EmitImageTableSampleLod(ctx, *s.ray_query_alpha_sample, shr(m2, 4), coord(0), coord(1), level);
 	const auto alpha = s.builder.AllocateId();
 	s.builder.AddFunction(spv::OpCompositeExtract, u, alpha, texel, 3u);
-	if (lane_layout) {
+	if (lane_layout && !factor_reference) {
 		return Binary(s, spv::OpFOrdGreaterThan, b, as_f32(alpha), AlphaF32(s, lane, AlphaArgument::Threshold));
 	}
 	const auto factor = Select(s, f, BitSet(s, m0, 1u), AlphaF32(s, lane, AlphaArgument::Factor),
@@ -693,6 +694,7 @@ void Refill(ValueEmitContext& ctx, uint32_t site) {
 	const auto u = TypeU32(s), b = TypeBool(s), wide = TypeU64(s), f = TypeF32(s);
 	const bool alpha_test = s.ray_query_alpha_sites[site] && s.ray_query_alpha_sample != nullptr;
 	const bool lane_layout      = s.ray_query_alpha_lane[site];
+	const bool factor_reference = s.ray_query_alpha_factor[site];
 	const bool geometry_opacity = s.ray_query_geometry_opacity[site] && alpha_test;
 	std::array<LaneVariables, 2> lanes {};
 	std::array<uint32_t, 2>      refills {};
@@ -760,7 +762,10 @@ void Refill(ValueEmitContext& ctx, uint32_t site) {
 					EmitIfCondition(s, LogicalNot(s, opaque), [&] {
 						const auto candidate = TriangleEntry(s, lane, CandidateIntersection);
 						EmitIfCondition(s, candidate.valid, [&] {
-							EmitIfCondition(s, AlphaTest(ctx, lane, candidate, lane_layout, s.ray_query_alpha_format[site]), confirm);
+							EmitIfCondition(s,
+							                AlphaTest(ctx, lane, candidate, lane_layout, factor_reference,
+							                          s.ray_query_alpha_format[site]),
+							                confirm);
 						});
 					});
 					return;
@@ -771,7 +776,10 @@ void Refill(ValueEmitContext& ctx, uint32_t site) {
 					if (alpha_test) {
 						// The lane's own alpha test; the hardware keeps the nearest accepted
 						// candidate (or opaque hit) as the committed hit.
-						EmitIfCondition(s, AlphaTest(ctx, lane, candidate, lane_layout, s.ray_query_alpha_format[site]), confirm);
+						EmitIfCondition(s,
+						                AlphaTest(ctx, lane, candidate, lane_layout, factor_reference,
+						                          s.ray_query_alpha_format[site]),
+						                confirm);
 						return;
 					}
 					InsertKey(s, lane, count, InstanceNode(s, lane, CandidateIntersection),
@@ -891,7 +899,9 @@ void DeclareRayQueryVariables(EmitterState& s) {
 			if (inst.GetOpcode() == IR::ValueOpcode::RayQueryAlpha) {
 				const auto site   = IR::RayQuerySite(inst.Flags<uint32_t>()) % IR::MaxRayQuerySites;
 				alpha_sites[site] = true;
-				s.ray_query_alpha_lane[site] = IR::RayQueryVariant(inst.Flags<uint32_t>()) == IR::RayQueryAlphaLane;
+				const auto variant             = IR::RayQueryVariant(inst.Flags<uint32_t>());
+				s.ray_query_alpha_lane[site]   = (variant & IR::RayQueryAlphaLane) != 0;
+				s.ray_query_alpha_factor[site] = (variant & IR::RayQueryAlphaFactor) != 0;
 				s.ray_query_alpha_format[site] = inst.Arg(static_cast<size_t>(AlphaArgument::Count)).U32();
 			} else if (inst.GetOpcode() == IR::ValueOpcode::RayQueryInit) {
 				const auto flags = inst.Flags<uint32_t>();
@@ -973,20 +983,27 @@ uint32_t EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto context     = Load(s, wide, entry);
 	const auto variant     = IR::RayQueryVariant(inst.Flags<uint32_t>());
 	const bool geometry_opacity = (variant & IR::RayQueryInitGeometryOpacity) != 0;
-	// A site whose opacity comes from the geometry has no guest leaf code to run for its alpha
-	// tested candidates: without the per-lane alpha test it keeps the guest traversal.
-	const bool always_guest = geometry_opacity && !(s.ray_query_alpha_sites[site] && s.ray_query_alpha_sample != nullptr);
+	// A site whose opacity comes from the geometry, or without guest leaf code, has no guest leaf
+	// code to run for its alpha tested candidates: without the per-lane alpha test it keeps the
+	// guest traversal.
+	const bool no_leaf      = (variant & IR::RayQueryInitNoLeaf) != 0;
+	const bool always_guest = (geometry_opacity || no_leaf) &&
+	                          !(s.ray_query_alpha_sites[site] && s.ray_query_alpha_sample != nullptr);
 	if (always_guest) {
 		NoteRayTracingProgram(RayTracingProgramKind::GuestSites, s.program.shader_hash);
 	}
 	const auto has_context = always_guest ? ConstantBool(s, false)
 	                                      : Binary(s, spv::OpINotEqual, b, context, ConstantU64(s, 0));
-	const auto native = EmitValueOrDefaultIfCondition(s, has_context, b, ConstantBool(s, false), [&] {
+	const auto host = EmitValueOrDefaultIfCondition(s, has_context, b, ConstantBool(s, false), [&] {
 		const auto valid = Binary(s, spv::OpINotEqual, b,
 		                          LoadAddressU32(s, AddressPlus(s, context, ContextValid)), U32(s, 0));
 		const auto same = Equal(s, LoadAddressU64(s, AddressPlus(s, context, ContextHeader)), header);
 		return LogicalAnd(s, valid, same);
 	});
+	// A site without guest leaf code keeps the guest traversal where its alpha test does not hold
+	// (the same in every lane).
+	const auto& allow  = inst.Arg(14);
+	const auto  native = allow.IsImmediate() && allow.U1() ? host : LogicalAnd(s, host, ctx.Arg(inst, 14));
 	if (s.ray_stats) {
 		// --rt-stats: one ballot per wave, and one lane adds the rays that go back to the guest
 		// traversal (an emulated wave of 64 lanes adds both halves at once).
@@ -1046,15 +1063,21 @@ uint32_t EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst) {
 		// Closest hit sites (RayQueryInitBothFacings) count both facings.
 		// Sites whose opacity comes from the geometry take every triangle as a candidate.
 		// Lanes that do not cull (the guest's own condition) take both facings.
+		// A site without guest leaf code may cull the other facing (its guest test accepts the
+		// other sign).
 		const uint32_t facing  = (variant & IR::RayQueryInitBothFacings) != 0 ? 0u : RayFlagCullBackFacing;
 		const uint32_t opacity = geometry_opacity ? RayFlagNoOpaque : 0u;
 		const auto&    cull    = inst.Arg(12);
+		const auto&    flip    = inst.Arg(13);
 		const bool     always  = facing == 0 || (cull.IsImmediate() && cull.U1());
+		const bool     fixed   = facing == 0 || (flip.IsImmediate() && !flip.U1());
+		const auto     culled  = fixed ? U32(s, facing)
+		                               : Select(s, u, ctx.Arg(inst, 13), U32(s, RayFlagCullFrontFacing), U32(s, facing));
 		uint32_t       flags   = 0;
-		if (always) {
+		if (always && fixed) {
 			flags = Select(s, u, alpha_off, U32(s, facing | RayFlagOpaque), U32(s, facing | opacity));
 		} else {
-			const auto lane_facing = Select(s, u, ctx.Arg(inst, 12), U32(s, facing), U32(s, 0));
+			const auto lane_facing = always ? culled : Select(s, u, ctx.Arg(inst, 12), culled, U32(s, 0));
 			flags = Or(s, lane_facing, Select(s, u, alpha_off, U32(s, RayFlagOpaque), U32(s, opacity)));
 		}
 		s.builder.AddFunction(spv::OpRayQueryInitializeKHR, lane.query, structure, flags,

@@ -41,10 +41,16 @@ constexpr uint32_t RayQueryInitBothFacings = 1u;
 // count): every triangle is a candidate, the opaque ones are confirmed and the alpha tested
 // ones the per-lane alpha test accepts.
 constexpr uint32_t RayQueryInitGeometryOpacity = 2u;
+// No guest leaf code (Decoder::RayTracingKind::PacketLane): without the per-lane alpha test the
+// site keeps the guest traversal. The two last arguments flip the facing the lanes cull, and allow
+// the native traversal.
+constexpr uint32_t RayQueryInitNoLeaf = 4u;
 
 // RayQueryAlpha variant: how the alpha test reads its data (Decoder::RayTracingAlphaLayout).
 constexpr uint32_t RayQueryAlphaScalar = 0u;
 constexpr uint32_t RayQueryAlphaLane   = 1u;
+// With the Lane layout: the reference is threshold * (M0 bit 0 ? factor : 1).
+constexpr uint32_t RayQueryAlphaFactor = 2u;
 
 // RayQueryMark: state changes; the argument selects lanes.
 enum class RayQueryMarkKind : uint32_t {
