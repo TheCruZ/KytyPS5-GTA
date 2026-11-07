@@ -76,11 +76,29 @@ void Translator::EmitRayTracing(const Decoder::Instruction& inst) {
 			} else if ((inst.dmask & 8u) != 0) {
 				cull = ReadMask(inst.src3);
 			}
-			const auto native = IR::U1(ir.Emit(
-			    IR::ValueOpcode::RayQueryInit,
-			    {ray[0], ray[1], ray[2], ray[3], ray[4], ray[5], ray[6], ray[7], header[0], header[1], alpha_off,
-			     ir.GetExec(), cull},
-			    flags(inst.dmask & 3u)));
+			// A site without guest leaf code (dmask 16): the SGPR that flips the culled facing and
+			// the one without which the traversal is the guest's (0xffff: none).
+			auto flip = IR::U1(IR::Value(false)), allow = IR::U1(IR::Value(true));
+			if ((inst.dmask & 16u) != 0) {
+				const auto sgpr = [&](uint32_t reg) {
+					Decoder::Operand operand;
+					operand.kind = Decoder::OperandKind::Sgpr;
+					operand.reg  = reg;
+					return ir.INotEqual(ReadU32(operand), IR::U32(IR::Value(0u)));
+				};
+				if (const auto reg = inst.secondary_offset & 0xffffu; reg != 0xffffu) {
+					flip = sgpr(reg);
+				}
+				if (const auto reg = inst.secondary_offset >> 16u; reg != 0xffffu) {
+					allow = sgpr(reg);
+				}
+			}
+			const auto variant = (inst.dmask & 3u) | ((inst.dmask & 16u) != 0 ? IR::RayQueryInitNoLeaf : 0u);
+			const auto native  = IR::U1(ir.Emit(
+			     IR::ValueOpcode::RayQueryInit,
+			     {ray[0], ray[1], ray[2], ray[3], ray[4], ray[5], ray[6], ray[7], header[0], header[1], alpha_off,
+			      ir.GetExec(), cull, flip, allow},
+			     flags(variant)));
 			// The same in every lane: the host has (or not) the TLAS of the header.
 			ir.SetScc(any_lane(native));
 			return;
@@ -174,8 +192,22 @@ void Translator::EmitRayTracing(const Decoder::Instruction& inst) {
 			// material table and of the buffer table, which the guest leaf code loads from user
 			// data, the threshold (the lane's reference when the site has one) and the format of
 			// the guest data (Decoder::RayTracingAlphaFields::Pack()).
-			const auto material = LoadScalarAddressDwords(inst.src2.reg, inst.image_nsa_addr[1], 4, inst.pc);
-			const auto buffers  = LoadScalarAddressDwords(inst.src3.reg, inst.image_nsa_addr[2], 4, inst.pc);
+			// A V# the guest loads before the traversal is in its SGPRs (RayTracingAlphaDirect).
+			const auto vsharp = [&](uint32_t base, uint32_t offset) {
+				if (offset != Decoder::RayTracingAlphaDirect) {
+					return LoadScalarAddressDwords(base, offset, 4, inst.pc);
+				}
+				std::array<IR::U32, 4> dwords;
+				for (uint32_t i = 0; i < 4; i++) {
+					Decoder::Operand operand;
+					operand.kind = Decoder::OperandKind::Sgpr;
+					operand.reg  = base + i;
+					dwords[i]    = ReadU32(operand);
+				}
+				return dwords;
+			};
+			const auto material = vsharp(inst.src2.reg, inst.image_nsa_addr[1]);
+			const auto buffers  = vsharp(inst.src3.reg, inst.image_nsa_addr[2]);
 			const auto factor   = inst.src1.kind == Decoder::OperandKind::Sgpr ? ReadU32(inst.src1)
 			                                                                    : IR::U32(IR::Value(0x3f800000u));
 			const auto threshold = inst.image_nsa_addr[5] != Decoder::NoRegister

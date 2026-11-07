@@ -102,9 +102,10 @@ bool CheckSite(const Program& program, const RayTracingSite& site) {
 		return inst != nullptr && (opcode == Opcode::UNKNOWN || inst->opcode == opcode);
 	};
 	const auto* entry = FindInstruction(program, site.entry_pc);
-	if (site.kind == RayTracingKind::ClosestOpaque) {
+	if (site.kind == RayTracingKind::ClosestOpaque || site.kind == RayTracingKind::PacketLane) {
 		return entry != nullptr && EndPc(*entry) == site.loop_pc && !IsDirectBranch(entry->opcode) &&
-		       expect(site.loop_pc, Opcode::UNKNOWN) && expect(site.exit_pc, Opcode::UNKNOWN);
+		       expect(site.loop_pc, Opcode::UNKNOWN) && expect(site.exit_pc, Opcode::UNKNOWN) &&
+		       (site.header_load_pc == 0 || expect(site.header_load_pc, Opcode::S_LOAD_DWORDX2));
 	}
 	if (site.kind == RayTracingKind::ClosestLeaf) {
 		return entry != nullptr && EndPc(*entry) == site.loop_pc && !IsDirectBranch(entry->opcode) &&
@@ -339,26 +340,37 @@ void AddAlphaTest(Layout& layout, const RayTracingSite& site, uint32_t index) {
 	alpha.image_nsa_addr[5] = lane ? test.reference_vgpr : NoRegister;
 	alpha.image_nsa_addr[6] = test.fields.Pack(site.layout);
 	alpha.src0              = test.spread_vector ? Vgpr(test.spread_reg) : Sgpr(test.spread_reg);
-	if (!lane) {
+	// The threshold and its factor (the Lane layout without a reference: dmask 2).
+	const bool factor = !lane || test.reference_vgpr == NoRegister;
+	if (factor) {
 		alpha.src1 = Sgpr(test.factor_sgpr);
 	}
 	alpha.src2  = Sgpr(test.material_user);
 	alpha.src3  = Sgpr(test.buffer_user);
-	alpha.dmask = static_cast<uint32_t>(test.layout);
+	alpha.dmask = static_cast<uint32_t>(test.layout) | (lane && factor ? 2u : 0u);
 }
 
 // The native traversal of a closest hit site: the hardware finds the hit (every triangle opaque,
-// both facings); no guest code runs for it.
-void AddClosestTraversal(Layout& layout, const RayTracingSite& site, uint32_t index) {
+// both facings); no guest code runs for it. A PacketLane site's (the opacity and the facing of
+// the instance flags, any hit) is the same with the alpha test of its leaf code.
+void AddClosestTraversal(Layout& layout, const Program& program, const RayTracingSite& site, uint32_t index) {
+	const bool lane = site.kind == RayTracingKind::PacketLane;
 	if (site.alpha.valid) {
 		AddAlphaTest(layout, site, index);
+	}
+	// The TLAS header address, loaded again into a pair nothing reads before.
+	auto header = Sgpr(site.header_sgpr);
+	if (site.header_load_pc != 0) {
+		header    = Sgpr(site.header_load_sgpr);
+		auto& load = layout.AddCopy(*FindInstruction(program, site.header_load_pc));
+		load.dst   = header;
 	}
 	auto& init = layout.AddPseudo(Opcode::RT_INIT, index);
 	SetRay(init, site);
 	init.image_nsa_addr[6] = site.t_max;
 	init.image_nsa_addr[7] = site.cull_mask;
 	init.image_nsa_addr[8] = site.cull_mask_constant;
-	init.src0              = Sgpr(site.header_sgpr);
+	init.src0              = header;
 	if (site.cull_mask_sgpr != NoRegister) {
 		init.src2 = Sgpr(site.cull_mask_sgpr);
 	}
@@ -366,6 +378,14 @@ void AddClosestTraversal(Layout& layout, const RayTracingSite& site, uint32_t in
 	init.src1  = Constant(site.alpha.valid ? 0 : 1);
 	// Both facings, or the facing of the instance flags (and opacity from the geometry).
 	init.dmask = (site.both_facings ? 1u : 0u) | (site.alpha.valid ? 2u : 0u);
+	if (lane) {
+		// The opacity of the instance flags, which the alpha test switch overrides; the facing
+		// flip and the condition of the alpha test's level of detail.
+		init.src1 = site.alpha_off_sgpr != NoAlphaOff ? Sgpr(site.alpha_off_sgpr) : Constant(0);
+		init.dmask = 16u;
+		const auto reg = [](uint32_t sgpr) { return sgpr != NoRegister ? sgpr : 0xffffu; };
+		init.secondary_offset = reg(site.flip_sgpr) | reg(site.alpha.level_sgpr) << 16u;
+	}
 	if (site.facing_sgpr != NoRegister) {
 		init.src3 = Sgpr(site.facing_sgpr);
 		init.dmask |= 4u;
@@ -394,7 +414,8 @@ void AddClosestTraversal(Layout& layout, const RayTracingSite& site, uint32_t in
 	commit.image_nsa_addr[4] = site.result_u;
 	commit.image_nsa_addr[5] = site.result_v;
 	commit.image_nsa_addr[6] = site.result_node;
-	commit.dmask             = 1; // Only when nearer than the hit in the registers.
+	// Only when nearer than the hit in the registers (any hit: the registers hold none).
+	commit.dmask = lane ? 0u : 1u;
 	layout.AddPseudo(Opcode::RT_EXIT, index);
 	layout.AddBranch(Opcode::S_BRANCH, Layout::Target::Guest, site.exit_pc);
 }
@@ -403,8 +424,8 @@ void AddClosestTraversal(Layout& layout, const RayTracingSite& site, uint32_t in
 // RT_INIT falls back to the loop header, else the native loop runs and exits after the loop.
 bool AddNativeTraversal(Layout& layout, const Program& program, const RayTracingSite& site,
                         uint32_t index) {
-	if (site.kind == RayTracingKind::ClosestOpaque) {
-		AddClosestTraversal(layout, site, index);
+	if (site.kind == RayTracingKind::ClosestOpaque || site.kind == RayTracingKind::PacketLane) {
+		AddClosestTraversal(layout, program, site, index);
 		return true;
 	}
 	if (site.alpha.valid) {
@@ -610,6 +631,9 @@ class SiteFinder {
 public:
 	SiteFinder(const Program& program, uint32_t wave_size)
 	    : m_inst(program.instructions), m_bodies(program.call_bodies), m_wave32(wave_size == 32) {}
+	// Over other instructions of the program (see LevelBranch).
+	SiteFinder(const std::vector<Instruction>& inst, const std::vector<InlinedCallBody>& bodies, bool wave32)
+	    : m_inst(inst), m_bodies(bodies), m_wave32(wave32) {}
 
 	// The sites of the program and its TLAS source; false when a traversal loop does not match.
 	bool Find(RayTracingPatch& patch) {
@@ -635,11 +659,15 @@ public:
 			}
 			RayTracingSite site;
 			size_t         node_index = npos;
-			if (IsPacketHeader(header)) {
-				if (!DerivePacket(header, back, site)) {
+			if (const auto type = PacketNodeType(header); type != npos) {
+				if (!DerivePacket(header, back, type, site)) {
+					// A header with spills that is not a site keeps its loop, as other loops.
+					if (type != header + 2) {
+						continue;
+					}
 					return false;
 				}
-				node_index = header + 2;
+				node_index = type;
 			} else if (IsClosestHeader(header)) {
 				if (!DeriveClosest(header, back, site)) {
 					return false;
@@ -715,6 +743,7 @@ public:
 private:
 	static constexpr size_t npos = SIZE_MAX;
 	struct Field;
+	struct Condition;
 
 
 	const Instruction& At(size_t i) const { return m_inst[i]; }
@@ -764,22 +793,38 @@ private:
 		return inst.image_nsa_dwords != 0 ? inst.image_nsa_addr[k - 1] : inst.src0.reg + k;
 	}
 
-	// S_AND_B32 vcc_lo, <node>, 7 at `i` followed by S_ADD_I32 vcc_lo, vcc_lo, -4.
-	bool IsNodeType(size_t i) const {
-		if (i + 1 >= m_inst.size()) {
+	// S_AND_B32 vcc_lo, <node>, 7 at `i` followed by S_ADD_I32 vcc_lo, vcc_lo, -4 (with `spills`,
+	// after V_WRITELANE_B32s).
+	bool IsNodeType(size_t i, bool spills = false) const {
+		size_t next = i + 1;
+		while (spills && next < m_inst.size() && m_inst[next].opcode == Opcode::V_WRITELANE_B32) {
+			next++;
+		}
+		if (next >= m_inst.size()) {
 			return false;
 		}
 		const auto& a = m_inst[i];
-		const auto& b = m_inst[i + 1];
+		const auto& b = m_inst[next];
 		return a.opcode == Opcode::S_AND_B32 && IsVccLo(a.dst) && a.src0.kind == OperandKind::Sgpr &&
 		       IsConstant(a.src1, 7) && b.opcode == Opcode::S_ADD_I32 && IsVccLo(b.dst) &&
 		       IsVccLo(b.src0) && b.src1.kind == OperandKind::IntegerInlineConstant && b.src1.signed_val == -4;
 	}
 
-	bool IsPacketHeader(size_t i) const {
-		return !m_wave32 && i + 3 < m_inst.size() && m_inst[i].opcode == Opcode::S_AND_B64 &&
-		       m_inst[i + 1].opcode == Opcode::S_AND_SAVEEXEC_B64 && IsNodeType(i + 2);
+	// A packet loop header at `i`: S_AND_B64, S_AND_SAVEEXEC_B64 and the node type test, or the same
+	// after V_READLANE_B32s (the lane mask kept in VGPR lanes) with V_WRITELANE_B32s in the node
+	// type test (the saved EXEC spilled). The index of the node type's S_AND_B32 (npos: none).
+	size_t PacketNodeType(size_t i) const {
+		size_t first = i;
+		while (first < m_inst.size() && m_inst[first].opcode == Opcode::V_READLANE_B32) {
+			first++;
+		}
+		return !m_wave32 && first + 3 < m_inst.size() && m_inst[first].opcode == Opcode::S_AND_B64 &&
+		               m_inst[first + 1].opcode == Opcode::S_AND_SAVEEXEC_B64 && IsNodeType(first + 2, first != i)
+		           ? first + 2
+		           : npos;
 	}
+
+	bool IsPacketHeader(size_t i) const { return PacketNodeType(i) != npos; }
 
 	// The node type test of a loop header at `i`: S_AND_B32 <t>, <node>, 7, S_ADD_I32 vcc_lo, <t>, -4
 	// and S_CMP_LE_U32 vcc_lo, 2 (box nodes 4 to 6) or 1 (4 and 5), with other instructions between
@@ -878,14 +923,14 @@ private:
 		}
 	}
 
-	bool DerivePacket(size_t header, size_t back, RayTracingSite& site) const {
+	bool DerivePacket(size_t header, size_t back, size_t type, RayTracingSite& site) const {
 		site.kind     = RayTracingKind::Packet;
 		site.entry_pc = m_inst[header - 1].pc;
 		site.loop_pc  = m_inst[header].pc;
-		const auto& node_type = m_inst[header + 2];
+		const auto& node_type = m_inst[type];
 		site.instance_sgpr    = node_type.src0.reg;
 		// The instance setup.
-		const auto le = Next(header + 3, Opcode::S_CMP_LE_U32, back);
+		const auto le = Next(type + 1, Opcode::S_CMP_LE_U32, back);
 		if (le == npos || !IsVccLo(m_inst[le].src0) || !IsConstant(m_inst[le].src1, 2) ||
 		    m_inst[le + 1].opcode != Opcode::S_CBRANCH_SCC0) {
 			return false;
@@ -938,7 +983,8 @@ private:
 			}
 		}
 		if (blas_head == npos) {
-			return false;
+			// Or each lane walks the BLAS.
+			return DerivePacketLane(header, back, type, culled, record, site);
 		}
 		site.blas_head_pc = m_inst[blas_head].pc;
 		const auto saveexec = Next(blas_head, Opcode::S_AND_SAVEEXEC_B64, back);
@@ -1063,6 +1109,602 @@ private:
 		// The instance flags and the facing the triangle test accepts.
 		return LeafFlags(leaf, tail, header, word.src0.reg, record, site.layout) &&
 		       LeafFacing(leaf, tail, header, back, site);
+	}
+
+	// ---- A Packet site with a per lane BLAS walk (RayTracingKind::PacketLane). ----
+	//
+	// After the instance setup (its cull at `culled`), each lane walks the instance's BLAS: one
+	// IMAGE_BVH_INTERSECT_RAY of a VGPR node in a loop closed by S_AND_B64 exec, <x>, <mask>;
+	// S_CBRANCH_EXECNZ, the node starting at the record's root. Box nodes push their children on
+	// a stack of the lane; the triangle nodes' lanes (after S_ANDN2_B64 exec, <s>, exec) run the
+	// leaf code:
+	//   facing    S_AND_SAVEEXEC_B64 of the triangle test's hit and facing (see LaneLeafFacing)
+	//   t         V_MUL_F32 <t>, <first result>, V_RCP_F32 <second result>; V_CMPX_LE_F32 <t>, <t max>
+	//   opacity   the alpha test runs for the lanes that are neither opaque nor switched off, the
+	//             others accept (see LaneLeafOpacity)
+	//   alpha     the per lane alpha test (DeriveLaneAlphaTest) sets the flag V_CMPX_NE_U32 0, <flag>
+	//   accept    V_MOV_B32 <result t>, <t>; <result word>, <word>; <instance pair>, <record pair>;
+	//             S_ANDN2_B64 <mask>, <mask>, exec
+	// The leaf entry (node, word) is a BUFFER_LOAD_DWORDX2 idxen of the walk. The TLAS walk drops
+	// the lanes with a hit (V_CMP_NE_U32 vcc, -1, <result word>; S_ANDN2_B64 <lanes>, <lanes>, vcc).
+	bool DerivePacketLane(size_t header, size_t back, size_t type, size_t culled, const Field& record,
+	                      RayTracingSite& site) const {
+		site.kind = RayTracingKind::PacketLane;
+		// The BLAS walk.
+		const auto test = Next(culled, Opcode::IMAGE_BVH_INTERSECT_RAY, back);
+		if (test == npos || m_inst[test].src0.kind != OperandKind::Vgpr || m_inst[test].dst.kind != OperandKind::Vgpr) {
+			return false;
+		}
+		const auto node   = AddressReg(m_inst[test], 0);
+		const auto result = m_inst[test].dst.reg;
+		size_t     latch  = npos;
+		for (size_t i = test + 1; i < back && latch == npos; i++) {
+			const auto& inst = m_inst[i];
+			if (inst.opcode == Opcode::S_CBRANCH_EXECNZ && inst.branch_target <= m_inst[test].pc &&
+			    inst.branch_target > m_inst[culled].pc) {
+				latch = i;
+			}
+		}
+		const auto walk = latch != npos ? IndexOf(m_inst[latch].branch_target) : npos;
+		if (walk == npos || latch < 1 || !IsBlasPair(header, back, BlasPair(test), NoRegister)) {
+			return false;
+		}
+		const auto& again = m_inst[latch - 1];
+		if (again.opcode != Lane(Opcode::S_AND_B64) || again.dst.kind != OperandKind::ExecLo) {
+			return false;
+		}
+		const auto mask = again.src1.kind == OperandKind::Sgpr ? again.src1.reg
+		                  : again.src0.kind == OperandKind::Sgpr ? again.src0.reg
+		                                                         : NoRegister;
+		if (mask == NoRegister) {
+			return false;
+		}
+		// The root: V_MOV_B32 <node>, <record root dword> before the walk.
+		const auto root = VectorSource(walk, Vgpr(node), Opcode::V_MOV_B32, culled);
+		Field      root_field;
+		if (root == npos || !OperandField(root, m_inst[root].src0, culled, root_field) ||
+		    !SameRecord(root_field, record) || root_field.dword != site.layout.root_dword) {
+			return false;
+		}
+		// The leaf entries: <node, word> of BUFFER_LOAD_DWORDX2 idxen in the walk.
+		bool entries = false;
+		for (size_t i = walk; i < latch && !entries; i++) {
+			const auto& load = m_inst[i];
+			entries = load.opcode == Opcode::BUFFER_LOAD_DWORDX2 && load.idxen && load.dst.kind == OperandKind::Vgpr &&
+			          load.dst.reg == node;
+		}
+		const auto word = node + 1;
+		// The triangle lanes.
+		size_t leaf = npos;
+		for (size_t i = test + 1; i < latch && leaf == npos; i++) {
+			const auto& inst = m_inst[i];
+			if (inst.opcode == Lane(Opcode::S_ANDN2_B64) && inst.dst.kind == OperandKind::ExecLo &&
+			    inst.src1.kind == OperandKind::ExecLo) {
+				leaf = i + 1;
+			}
+		}
+		if (!entries || leaf == npos) {
+			return false;
+		}
+		// The facing: the first S_AND_SAVEEXEC_B64 of the leaf code.
+		const auto facing = Next(leaf, Lane(Opcode::S_AND_SAVEEXEC_B64), latch);
+		if (facing == npos) {
+			return false;
+		}
+		// The distance, within the t max.
+		size_t t_test = npos;
+		for (size_t i = facing + 1; i < latch && t_test == npos; i++) {
+			const auto& cmp = m_inst[i];
+			if (cmp.opcode == Opcode::V_CMPX_LE_F32 && cmp.src0.kind == OperandKind::Vgpr && Plain(cmp.src0) &&
+			    Plain(cmp.src1) && IsVgpr(cmp.src1, site.t_max)) {
+				t_test = i;
+			}
+		}
+		const auto t   = t_test != npos ? VectorSource(t_test, m_inst[t_test].src0, Opcode::V_MUL_F32, leaf) : npos;
+		const auto rcp = t != npos ? VectorSource(t, m_inst[t].src1, Opcode::V_RCP_F32, leaf) : npos;
+		if (rcp == npos || !Plain(m_inst[t].src0) || !Plain(m_inst[t].src1) || !Plain(m_inst[t].dst) ||
+		    !IsVgpr(m_inst[t].src0, result) || ResultWriter(t, result, test) != test || !IsVgpr(m_inst[rcp].src0, result + 1) ||
+		    !Plain(m_inst[rcp].src0) || ResultWriter(rcp, result + 1, test) != test) {
+			return false;
+		}
+		const auto t_vgpr = m_inst[t].dst.reg;
+		// The opacity and the alpha test switch, then the facing (with the flags they read).
+		size_t   alpha_path = npos;
+		uint32_t flag       = NoRegister;
+		if (!LaneLeafOpacity(header, back, leaf, t_test, latch, word, record, site, alpha_path, flag) ||
+		    !LaneLeafFacing(header, back, test, facing, site)) {
+			return false;
+		}
+		// The accepted hit.
+		size_t accept = npos;
+		for (size_t i = alpha_path; i < latch && accept == npos; i++) {
+			const auto& inst = m_inst[i];
+			if (inst.opcode == Lane(Opcode::S_ANDN2_B64) && IsSgpr(inst.dst, mask) && IsSgpr(inst.src0, mask) &&
+			    inst.src1.kind == OperandKind::ExecLo) {
+				accept = i;
+			}
+		}
+		if (accept == npos || accept < alpha_path + 6) {
+			return false;
+		}
+		const auto& t_move    = m_inst[accept - 4];
+		const auto& word_move = m_inst[accept - 3];
+		const auto& low       = m_inst[accept - 2];
+		const auto& high      = m_inst[accept - 1];
+		for (const auto* move: {&t_move, &word_move, &low, &high}) {
+			if (move->opcode != Opcode::V_MOV_B32 || move->dst.kind != OperandKind::Vgpr || !Plain(move->src0) ||
+			    !Plain(move->dst)) {
+				return false;
+			}
+		}
+		if (!IsVgpr(t_move.src0, t_vgpr) || !IsVgpr(word_move.src0, word) || !IsSgpr(low.src0, record.pair) ||
+		    !IsSgpr(high.src0, record.pair + 1) || high.dst.reg != low.dst.reg + 1) {
+			return false;
+		}
+		// The flag: V_CMPX_NE_U32 0, <flag> (then S_CBRANCH_EXECZ) before the moves, after the alpha
+		// test restored EXEC.
+		const auto& flag_test = m_inst[accept - 6];
+		if ((flag_test.opcode != Opcode::V_CMPX_NE_U32 && flag_test.opcode != Opcode::V_CMPX_NE_I32) ||
+		    !IsConstant(flag_test.src0, 0) || !IsVgpr(flag_test.src1, flag) || !Plain(flag_test.src1) ||
+		    m_inst[accept - 5].opcode != Opcode::S_CBRANCH_EXECZ || m_inst[accept - 7].opcode != Lane(Opcode::S_MOV_B64) ||
+		    m_inst[accept - 7].dst.kind != OperandKind::ExecLo ||
+		    !IsSgpr(m_inst[accept - 7].src0, m_inst[alpha_path].dst.reg)) {
+			return false;
+		}
+		site.result_t        = t_move.dst.reg;
+		site.result_word     = word_move.dst.reg;
+		site.result_instance = low.dst.reg;
+		// The TLAS walk drops the lanes with a hit (the SGPRs of its lane mask restored from VGPR lanes
+		// or not), then exits (the last S_CBRANCH_VCCNZ).
+		const auto lanes = ScalarIndex(m_inst[type - 2].src1);
+		bool       drop  = false;
+		for (size_t i = latch + 1; i + 1 < back && !drop; i++) {
+			const auto& cmp = m_inst[i];
+			auto        j   = i + 1;
+			while (j + 1 < back && m_inst[j].opcode == Opcode::V_READLANE_B32) {
+				j++;
+			}
+			const auto& andn = m_inst[j];
+			drop = cmp.opcode == Opcode::V_CMP_NE_U32 && IsVccLo(cmp.dst) && cmp.src0.kind == OperandKind::IntegerInlineConstant &&
+			       cmp.src0.signed_val == -1 && IsVgpr(cmp.src1, site.result_word) && andn.opcode == Lane(Opcode::S_ANDN2_B64) &&
+			       lanes != NoRegister && IsSgpr(andn.dst, lanes) && IsSgpr(andn.src0, lanes) && IsVccLo(andn.src1);
+		}
+		size_t exit = npos;
+		for (size_t i = back; i-- > latch && exit == npos;) {
+			if (m_inst[i].opcode == Opcode::S_CBRANCH_VCCNZ) {
+				exit = i;
+			}
+		}
+		if (!drop || exit == npos) {
+			return false;
+		}
+		site.exit_pc = m_inst[exit].branch_target;
+		// The alpha test, on the path of a wave-wide condition of its level of detail if it has one.
+		size_t sample = npos;
+		for (size_t i = alpha_path; i < accept && sample == npos; i++) {
+			if (m_inst[i].opcode == Opcode::IMAGE_SAMPLE) {
+				sample = i;
+			}
+		}
+		if (sample == npos) {
+			return false;
+		}
+		std::vector<Instruction> linear;
+		uint32_t                 condition = NoRegister;
+		if (!LevelBranch(header, back, alpha_path, sample, linear, condition)) {
+			return false;
+		}
+		const SiteFinder path(linear.empty() ? m_inst : linear, m_bodies, m_wave32);
+		for (size_t i = leaf; i < accept - 6; i++) {
+			const auto opcode = path.m_inst[i].opcode;
+			if (opcode == Opcode::S_BRANCH || ((IsConditionalBranch(opcode) && opcode != Opcode::S_CBRANCH_EXECZ &&
+			                                     opcode != Opcode::S_CBRANCH_EXECNZ))) {
+				return false;
+			}
+		}
+		RayTracingAlphaTest alpha;
+		if (!path.DeriveLaneAlphaTest(header, back, alpha_path, accept - 6, t_vgpr, node, word, flag, record.pair, alpha)) {
+			return false;
+		}
+		alpha.level_sgpr = condition;
+		site.alpha       = alpha;
+		// RT_SELECT's registers: a pair the program does not use. The TLAS header address at the
+		// entry, when loaded again, goes there before RT_SELECT writes it.
+		site.instance_sgpr = UnusedPair();
+		site.mask_sgpr     = site.instance_sgpr;
+		return site.instance_sgpr != NoRegister && HeaderAtEntry(header, site.instance_sgpr, site);
+	}
+
+	// The TLAS header address at the entry of a site that RT_INIT reads (AddClosestTraversal): the
+	// header pair, or the guest's load of it from its user data pointer, unchanged, again into the
+	// SGPR pair `pair` (a pair nothing reads before; the compiler may reuse the header pair before
+	// the loop, as GTA V 01.005's 0x84ed00053b3771da does for the root node).
+	bool HeaderAtEntry(size_t header, uint32_t pair, RayTracingSite& site) const {
+		uint32_t user = NoRegister, offset = 0;
+		size_t   load = npos;
+		if (!FindTlasSource(header, site.header_sgpr, user, offset, &load)) {
+			return false;
+		}
+		site.header_load_pc = 0;
+		if (ScalarWriter(header, site.header_sgpr, 0) != load || ScalarWriter(header, site.header_sgpr + 1, 0) != load) {
+			if (pair == NoRegister || ScalarWriter(header, user, 0) != npos || ScalarWriter(header, user + 1, 0) != npos) {
+				return false;
+			}
+			site.header_load_pc   = m_inst[load].pc;
+			site.header_load_sgpr = pair;
+		}
+		return true;
+	}
+
+	// The last instruction before `i`, from `from`, that writes VGPR `reg` (stores, whose data
+	// WritesVector counts, do not).
+	size_t ResultWriter(size_t i, uint32_t reg, size_t from) const {
+		for (size_t j = i; j-- > from;) {
+			const auto name = magic_enum::enum_name(m_inst[j].opcode);
+			if (WritesVector(m_inst[j], reg) && name.find("_STORE") == std::string_view::npos &&
+			    !name.starts_with("DS_WRITE")) {
+				return j;
+			}
+		}
+		return npos;
+	}
+
+	static Operand Vgpr(uint32_t reg) {
+		Operand operand;
+		operand.kind = OperandKind::Vgpr;
+		operand.reg  = reg;
+		return operand;
+	}
+
+	static bool IsVgpr(const Operand& operand, uint32_t reg) {
+		return operand.kind == OperandKind::Vgpr && operand.reg == reg;
+	}
+
+	// The SGPR pair the T# of an IMAGE_BVH_INTERSECT_RAY was built from (S_BFE_U64 <t#>, <pair>,
+	// 0x280008), or NoRegister.
+	uint32_t BlasPair(size_t test) const {
+		const auto& inst = m_inst[test];
+		const auto  bfe  = inst.src1.kind == OperandKind::Sgpr ? ScalarSource(test, inst.src1, Opcode::S_BFE_U64, 0) : npos;
+		return bfe != npos && IsConstant(m_inst[bfe].src1, 0x280008) && m_inst[bfe].src0.kind == OperandKind::Sgpr
+		           ? m_inst[bfe].src0.reg
+		           : NoRegister;
+	}
+
+	// The opacity of a PacketLane site's leaf code (lanes from `leaf`, after the distance test
+	// `from`): S_AND_SAVEEXEC_B64 <saved>, !(off | (opaque & !alpha tested)) starts the alpha test
+	// (`path`), after V_CNDMASK_B32 <flag>, 0, 1, (off | (opaque & !alpha tested)), where
+	//   opaque        V_CMP_NE_U32 0, V_AND_B32 1, V_OR_B32 <flags>, V_LSHRREV_B32 30, <word>
+	//   alpha tested  S_CSELECT_B64 exec, 0 of S_CMP_LG_U32 0, S_AND_B32 <flags>, 2
+	//   off           S_CSELECT_B64 exec, 0 of S_CMP_LG_U32 0, <SGPR the traversal keeps>
+	// with <flags> a record dword, shifted right or not: the layout's flags (bit 0 opaque, bit 1
+	// alpha tested anyway).
+	bool LaneLeafOpacity(size_t header, size_t back, size_t leaf, size_t from, size_t latch, uint32_t word,
+	                     const Field& record, RayTracingSite& site, size_t& path, uint32_t& flag) const {
+		path = Next(from, Lane(Opcode::S_AND_SAVEEXEC_B64), latch);
+		if (path == npos || ScalarIndex(m_inst[path].src0) == NoRegister || m_inst[path].dst.kind != OperandKind::Sgpr) {
+			return false;
+		}
+		size_t direct = npos;
+		for (size_t i = path; i-- > from && direct == npos;) {
+			const auto& inst = m_inst[i];
+			if (inst.opcode == Opcode::V_CNDMASK_B32 && IsConstant(inst.src0, 0) && IsConstant(inst.src1, 1) &&
+			    inst.dst.kind == OperandKind::Vgpr && Plain(inst.dst) && ScalarIndex(CndmaskMask(inst)) != NoRegister) {
+				direct = i;
+			}
+		}
+		std::array<size_t, 5> atoms {npos, npos, npos, npos, npos};
+		uint32_t              path_table = 0, direct_table = 0;
+		if (direct == npos || !MaskTable(path, m_inst[path].src0, leaf, atoms, path_table) ||
+		    !MaskTable(direct, CndmaskMask(m_inst[direct]), leaf, atoms, direct_table)) {
+			return false;
+		}
+		flag = m_inst[direct].dst.reg;
+		uint32_t opaque = 5, tested = 5, off = 5;
+		auto&    layout = site.layout;
+		for (uint32_t k = 0; k < atoms.size() && atoms[k] != npos; k++) {
+			if (atoms[k] == ExecAtom) {
+				return false;
+			}
+			const auto& atom = m_inst[atoms[k]];
+			if (atom.opcode == Opcode::V_CMP_NE_U32 && opaque == 5) {
+				// opaque: (flags | word >> 30) & 1.
+				const auto* x   = IsConstant(atom.src0, 0) ? &atom.src1 : IsConstant(atom.src1, 0) ? &atom.src0 : nullptr;
+				const auto  bit = x != nullptr ? VectorSource(atoms[k], *x, Opcode::V_AND_B32, leaf) : npos;
+				const auto  any = bit != npos && IsConstant(m_inst[bit].src0, 1) && Plain(*x)
+				                      ? VectorSource(bit, m_inst[bit].src1, Opcode::V_OR_B32, leaf)
+				                      : npos;
+				if (any == npos) {
+					return false;
+				}
+				const auto& either = m_inst[any];
+				const auto* shifted = either.src1.kind == OperandKind::Vgpr ? &either.src1 : &either.src0;
+				const auto* flags   = either.src1.kind == OperandKind::Vgpr ? &either.src0 : &either.src1;
+				const auto  lsr     = VectorSource(any, *shifted, Opcode::V_LSHRREV_B32, leaf);
+				if (lsr == npos || !IsConstant(m_inst[lsr].src0, 30) || !IsVgpr(m_inst[lsr].src1, word) ||
+				    !Plain(*shifted) || !Plain(*flags) || !LaneFlags(any, *flags, header, record, layout)) {
+					return false;
+				}
+				opaque = k;
+				continue;
+			}
+			// S_CSELECT_B64 exec, 0 of S_CMP_LG_U32 0, <x>.
+			uint32_t x = NoRegister;
+			if (!SelectedLanes(atoms[k], leaf, x)) {
+				return false;
+			}
+			const auto w = ScalarWriter(atoms[k], x, header);
+			if (w == npos) {
+				// A value from before the loop: the switch.
+				if (off != 5 || ScalarWriter(header, x, 0) == npos || !Keeps(header, back, x, false)) {
+					return false;
+				}
+				site.alpha_off_sgpr = x;
+				off                 = k;
+				continue;
+			}
+			// flags & 2.
+			const auto& bits = m_inst[w];
+			const auto* f    = IsConstant(bits.src1, 2) ? &bits.src0 : IsConstant(bits.src0, 2) ? &bits.src1 : nullptr;
+			if (tested != 5 || bits.opcode != Opcode::S_AND_B32 || f == nullptr || !LaneFlags(w, *f, header, record, layout)) {
+				return false;
+			}
+			tested = k;
+		}
+		if (opaque == 5 || tested == 5 || off == 5) {
+			return false;
+		}
+		uint32_t expected = 0;
+		for (uint32_t c = 0; c < 32; c++) {
+			const bool o = ((c >> opaque) & 1u) != 0, a = ((c >> tested) & 1u) != 0, z = ((c >> off) & 1u) != 0;
+			expected |= (z || (o && !a)) ? 1u << c : 0u;
+		}
+		return direct_table == expected && path_table == ~expected;
+	}
+
+	// A lane mask S_CSELECT_B64 <m>, exec, 0 at `i` of S_CMP_LG_U32 0, <x> (or <x>, 0): x.
+	bool SelectedLanes(size_t i, size_t from, uint32_t& x) const {
+		const auto& sel = m_inst[i];
+		if (sel.opcode != Lane(Opcode::S_CSELECT_B64) || sel.src0.kind != OperandKind::ExecLo || !IsConstant(sel.src1, 0)) {
+			return false;
+		}
+		size_t cmp = npos;
+		for (size_t j = i; j-- > from && cmp == npos;) {
+			cmp = WritesScc(m_inst[j]) ? j : npos;
+		}
+		if (cmp == npos || m_inst[cmp].opcode != Opcode::S_CMP_LG_U32) {
+			return false;
+		}
+		const auto& inst  = m_inst[cmp];
+		const auto* value = IsConstant(inst.src0, 0) ? &inst.src1 : IsConstant(inst.src1, 0) ? &inst.src0 : nullptr;
+		x                 = value != nullptr ? ScalarIndex(*value) : NoRegister;
+		return x != NoRegister;
+	}
+
+	// The instance flags SGPR operand `flags` of instruction `i`: a record dword, shifted right
+	// (S_LSHR_B32 <dword>, <shift>) or not. Sets the layout's flags, or checks them.
+	bool LaneFlags(size_t i, const Operand& flags, size_t from, const Field& record, RayTracingLayout& layout) const {
+		Field    field;
+		uint32_t shift = 0;
+		if (!OperandField(i, flags, from, field)) {
+			const auto lsr = ScalarSource(i, flags, Opcode::S_LSHR_B32, from);
+			if (lsr == npos || m_inst[lsr].src1.kind != OperandKind::IntegerInlineConstant || m_inst[lsr].src1.value >= 29u ||
+			    !OperandField(lsr, m_inst[lsr].src0, from, field)) {
+				return false;
+			}
+			shift = m_inst[lsr].src1.value;
+		}
+		if (!SameRecord(field, record)) {
+			return false;
+		}
+		if (layout.flags_dword == NoRegister) {
+			layout.flags_dword = field.dword;
+			layout.flags_shift = shift;
+			return true;
+		}
+		return layout.flags_dword == field.dword && layout.flags_shift == shift;
+	}
+
+	// The facing of a PacketLane site's leaf code: S_AND_SAVEEXEC_B64 at `save` of
+	//   hit & (!A | accept A) & (!B | accept B)
+	// with hit and facing the compares of the triangle test `test` (see LeafFacingTable), and A and
+	// B lane masks (S_CSELECT_B64 exec, 0) of "flags bit 2 clear and x == 0" and "... and x != 0"
+	// for a wave-wide value x; one accepts the facing compare, the other its negation. The layout
+	// takes the first's facing; when the second's lanes cull, the site's flip SGPR is not 0.
+	bool LaneLeafFacing(size_t header, size_t back, size_t test, size_t save, RayTracingSite& site) const {
+		std::array<size_t, 5> atoms {npos, npos, npos, npos, npos};
+		uint32_t              table = 0;
+		if (ScalarIndex(m_inst[save].src0) == NoRegister || !MaskTable(save, m_inst[save].src0, header, atoms, table)) {
+			return false;
+		}
+		uint32_t facing = 5, hit = 5;
+		std::array<uint32_t, 2> selector {5, 5};
+		Field    flags;
+		uint32_t bit = 0;
+		bool     ne  = false;
+		for (uint32_t k = 0; k < atoms.size() && atoms[k] != npos; k++) {
+			if (atoms[k] == ExecAtom) {
+				return false;
+			}
+			const auto& c = m_inst[atoms[k]];
+			Field       f;
+			uint32_t    b = 0;
+			bool        n = false;
+			if (facing == 5 && FacingCompare(atoms[k], test, header, f, b, n)) {
+				facing = k, flags = f, bit = b, ne = n;
+				continue;
+			}
+			const bool compare = c.family == Family::VOPC || magic_enum::enum_name(c.opcode).starts_with("V_CMP_");
+			const auto reads   = [&](uint32_t vgpr) { return IsVgpr(c.src0, vgpr) || IsVgpr(c.src1, vgpr); };
+			if (compare && hit == 5 && reads(m_inst[test].dst.reg) && VectorWriter(atoms[k], m_inst[test].dst.reg, header) == test) {
+				hit = k;
+			} else if (c.opcode == Lane(Opcode::S_CSELECT_B64) && (selector[0] == 5 || selector[1] == 5)) {
+				selector[selector[0] == 5 ? 0 : 1] = k;
+			} else {
+				return false;
+			}
+		}
+		if (facing == 5 || hit == 5 || selector[1] == 5) {
+			return false;
+		}
+		// Which selector accepts the compare (`first`).
+		const auto value = [&](uint32_t k, uint32_t c) { return ((c >> k) & 1u) != 0; };
+		uint32_t   first = 2;
+		for (uint32_t order = 0; order < 2; order++) {
+			uint32_t expected = 0;
+			for (uint32_t c = 0; c < 32; c++) {
+				const bool f = value(facing, c), h = value(hit, c);
+				const bool a = value(selector[order], c), b = value(selector[1 - order], c);
+				expected |= h && (!a || f) && (!b || !f) ? 1u << c : 0u;
+			}
+			if (expected == table) {
+				first = order;
+			}
+		}
+		if (first == 2) {
+			return false;
+		}
+		auto& layout = site.layout;
+		if (layout.flags_dword == NoRegister) {
+			layout.flags_dword = flags.dword;
+			layout.flags_shift = bit - 3u;
+		} else if (flags.dword != layout.flags_dword || bit != layout.flags_shift + 3u) {
+			return false;
+		}
+		// The selectors' conditions: cull (flags bit 2 clear) and complementary wave-wide booleans.
+		std::array<Condition, 2> cond;
+		for (uint32_t s = 0; s < 2; s++) {
+			uint32_t x = NoRegister;
+			if (!SelectedLanes(atoms[selector[s]], header, x)) {
+				return false;
+			}
+			Operand operand;
+			operand.kind = OperandKind::Sgpr;
+			operand.reg  = x;
+			if (!SelectBits(atoms[selector[s]], operand, header, layout, back, cond[s], 0) || cond[s].both != -1 ||
+			    cond[s].uniform == NoRegister || cond[s].lanes != NoRegister) {
+				return false;
+			}
+		}
+		if (!Complementary(header, cond[0].uniform, cond[1].uniform)) {
+			return false;
+		}
+		site.facing_sgpr   = NoRegister;
+		site.facing_mask   = NoRegister;
+		site.both_facings  = false;
+		layout.flip_facing = ne;
+		site.flip_sgpr     = cond[1 - first].uniform;
+		return true;
+	}
+
+	// BitsCondition, or also (in the loop) S_CSELECT_B32 <x>, 1, 0 of an SCC condition and the
+	// S_AND_B32 of such values.
+	bool SelectBits(size_t i, const Operand& x, size_t from, const RayTracingLayout& layout, size_t back, Condition& cond,
+	                uint32_t depth) const {
+		if (BitsCondition(i, x, from, layout, back, cond, 0)) {
+			return true;
+		}
+		const auto reg = ScalarIndex(x);
+		const auto w   = reg != NoRegister && depth < 4 ? ScalarWriter(i, reg, from) : npos;
+		if (w == npos || ScalarIndex(m_inst[w].dst) != reg) {
+			return false;
+		}
+		const auto& inst = m_inst[w];
+		if (inst.opcode == Opcode::S_CSELECT_B32 && IsConstant(inst.src0, 1) && IsConstant(inst.src1, 0)) {
+			return SccCondition(w, from, layout, back, cond, 0);
+		}
+		Condition a, b;
+		if (inst.opcode != Opcode::S_AND_B32 || !SelectBits(w, inst.src0, from, layout, back, a, depth + 1) ||
+		    !SelectBits(w, inst.src1, from, layout, back, b, depth + 1) || !Conjoin(a, b)) {
+			return false;
+		}
+		cond = a;
+		return true;
+	}
+
+	// Whether the wave-wide booleans `a` and `b` (S_CSELECT_B32 <r>, 1, 0 before `header`) are
+	// x == 0 and x != 0 (S_CMP_EQ_U32 / S_CMP_LG_U32 with 0) of the same value of an SGPR x.
+	bool Complementary(size_t header, uint32_t a, uint32_t b) const {
+		std::array<size_t, 2>   source {npos, npos};
+		std::array<uint32_t, 2> value {NoRegister, NoRegister};
+		std::array<bool, 2>     equal {};
+		for (uint32_t k = 0; k < 2; k++) {
+			const auto w = ScalarWriter(header, k == 0 ? a : b, 0);
+			if (w == npos || m_inst[w].opcode != Opcode::S_CSELECT_B32 || !IsConstant(m_inst[w].src0, 1) ||
+			    !IsConstant(m_inst[w].src1, 0)) {
+				return false;
+			}
+			size_t cmp = npos;
+			for (size_t j = w; j-- > 0 && cmp == npos;) {
+				cmp = WritesScc(m_inst[j]) ? j : npos;
+			}
+			if (cmp == npos || (m_inst[cmp].opcode != Opcode::S_CMP_EQ_U32 && m_inst[cmp].opcode != Opcode::S_CMP_LG_U32)) {
+				return false;
+			}
+			const auto& inst = m_inst[cmp];
+			const auto* x    = IsConstant(inst.src0, 0) ? &inst.src1 : IsConstant(inst.src1, 0) ? &inst.src0 : nullptr;
+			value[k]         = x != nullptr ? ScalarIndex(*x) : NoRegister;
+			if (value[k] == NoRegister) {
+				return false;
+			}
+			source[k] = ScalarWriter(cmp, value[k], 0);
+			equal[k]  = inst.opcode == Opcode::S_CMP_EQ_U32;
+		}
+		return value[0] == value[1] && source[0] == source[1] && source[0] != npos && equal[0] != equal[1];
+	}
+
+	// The leaf code on the path of a wave-wide condition: [begin, sample) may hold S_CMP_LG_U32 0, <c>
+	// (or <c>, 0), later S_CBRANCH_SCC0 <else> (SCC unchanged), straight code, S_BRANCH <join>, then
+	// <else> up to <join> (at or before the sample). Where c is not 0 the leaf code skips <else>:
+	// `linear` is the program with the two branches and <else> replaced by S_NOP, `condition` c (an
+	// SGPR the traversal keeps; NoRegister and `linear` empty without such a branch).
+	bool LevelBranch(size_t header, size_t back, size_t begin, size_t sample, std::vector<Instruction>& linear,
+	                 uint32_t& condition) const {
+		linear.clear();
+		condition = NoRegister;
+		for (size_t i = begin; i < sample; i++) {
+			if (m_inst[i].opcode != Opcode::S_CBRANCH_SCC0) {
+				continue;
+			}
+			const auto other = IndexOf(m_inst[i].branch_target);
+			if (other == npos || other <= i + 1 || other > sample || m_inst[other - 1].opcode != Opcode::S_BRANCH) {
+				return false;
+			}
+			const auto join = IndexOf(m_inst[other - 1].branch_target);
+			if (join == npos || join < other || join > sample) {
+				return false;
+			}
+			for (size_t j = i + 1; j + 1 < other; j++) {
+				if (IsDirectBranch(m_inst[j].opcode) || IsConditionalBranch(m_inst[j].opcode)) {
+					return false;
+				}
+			}
+			size_t cmp = npos;
+			for (size_t j = i; j-- > begin && cmp == npos;) {
+				cmp = WritesScc(m_inst[j]) ? j : npos;
+			}
+			if (cmp == npos || m_inst[cmp].opcode != Opcode::S_CMP_LG_U32) {
+				return false;
+			}
+			const auto& inst = m_inst[cmp];
+			const auto* c    = IsConstant(inst.src0, 0) ? &inst.src1 : IsConstant(inst.src1, 0) ? &inst.src0 : nullptr;
+			condition        = c != nullptr && c->kind == OperandKind::Sgpr ? c->reg : NoRegister;
+			if (condition == NoRegister || ScalarWriter(header, condition, 0) == npos || !Keeps(header, back, condition, false)) {
+				return false;
+			}
+			linear = m_inst;
+			for (size_t j = i; j < join; j++) {
+				if (j == i || j + 1 >= other) {
+					Instruction nop;
+					nop.pc         = linear[j].pc;
+					nop.word_count = linear[j].word_count;
+					nop.family     = Family::SOPP;
+					nop.opcode     = Opcode::S_NOP;
+					linear[j]      = nop;
+				}
+			}
+			return true;
+		}
+		return true;
 	}
 
 	// ---- The alpha test of GTA V's leaf code (see RayTracingAlphaTest). ----
@@ -1561,6 +2203,30 @@ private:
 		return true;
 	}
 
+	// A V# the traversal reads at the site entry: SGPRs `reg`..`reg` + 3 that one S_LOAD_DWORDX4 (or
+	// wider) before `header` loaded and no instruction in [header, back] writes.
+	bool EntryDescriptor(size_t i, uint32_t reg, size_t header, size_t back, uint32_t& user, uint32_t& offset) const {
+		const auto load = ScalarWriter(i, reg, 0);
+		if (load == npos || load >= header) {
+			return false;
+		}
+		const auto& inst = m_inst[load];
+		if ((inst.opcode != Opcode::S_LOAD_DWORDX4 && inst.opcode != Opcode::S_LOAD_DWORDX8 &&
+		     inst.opcode != Opcode::S_LOAD_DWORDX16) ||
+		    inst.dst.kind != OperandKind::Sgpr || reg < inst.dst.reg || (reg - inst.dst.reg) % 4 != 0 ||
+		    reg + 4 > inst.dst.reg + inst.data_dwords) {
+			return false;
+		}
+		for (uint32_t k = 0; k < 4; k++) {
+			if (ScalarWriter(i, reg + k, 0) != load || !Keeps(header, back, reg + k, false)) {
+				return false;
+			}
+		}
+		user   = reg;
+		offset = RayTracingAlphaDirect;
+		return true;
+	}
+
 	// The BLAS of a closest hit site: the SGPR pair whose S_BFE_U64 <t#>, <pair>, 0x280008 builds
 	// the T# of an IMAGE_BVH_INTERSECT_RAY of the loop other than the TLAS's.
 	bool IsBlasPair(size_t header, size_t back, uint32_t pair, uint32_t tlas_header) const {
@@ -1578,13 +2244,15 @@ private:
 		return false;
 	}
 
-	// ---- The alpha test of GTA V's closest hit leaf code (RayTracingAlphaLayout::Lane). ----
+	// ---- The alpha test of GTA V's per lane leaf code (RayTracingAlphaLayout::Lane). ----
 	//
 	// The test of the packet sites (see DeriveAlphaTest) with vector loads in [begin, end): the
 	// material dwords m * 3 + k with BUFFER_LOAD_DWORD idxen, the V#s and the T# of the tables in
 	// waterfall loops (V_READFIRSTLANE_B32 of the key), the vertices with FLAT loads at the base
-	// address of the vertex V# (BUFFER_LOAD_DWORDX2 idxen of the buffer table). The reference
-	// and the cone spread are VGPRs.
+	// address of the vertex V# (BUFFER_LOAD_DWORDX2 idxen of the buffer table). The cone spread is
+	// a VGPR or an SGPR, the reference a VGPR (closest hit sites) or the leaf code's
+	// threshold * (M0 bit 0 ? factor : 1) (PacketLane sites, whose tables may be loaded before the
+	// traversal).
 	bool DeriveLaneAlphaTest(size_t header, size_t back, size_t begin, size_t end, uint32_t t_vgpr,
 	                         uint32_t node_vgpr, uint32_t word_vgpr, uint32_t flag_vgpr, uint32_t record_sgpr,
 	                         RayTracingAlphaTest& alpha) const {
@@ -1628,7 +2296,7 @@ private:
 		const auto& sampled = m_inst[sample];
 		if (sampled.dmask != 8 || sampled.image_sample_flags != ImageSampleFlagLod ||
 		    sampled.image_dimension != ImageDimension::Dim2D || sampled.src1.kind != OperandKind::Sgpr ||
-		    sampled.dst.kind != OperandKind::Vgpr || sampled.image_nsa_dwords != 0 ||
+		    sampled.dst.kind != OperandKind::Vgpr ||
 		    sampled.src0.kind != OperandKind::Vgpr) {
 			return false;
 		}
@@ -1644,6 +2312,11 @@ private:
 			return false;
 		}
 		alpha.reference_vgpr = m_inst[compare].src1.reg;
+		// Or the leaf code computes the reference: threshold * (M0 bit 0 ? factor : 1) (see below).
+		const auto product = VectorSource(compare, m_inst[compare].src1, Opcode::V_MUL_F32, begin);
+		if (product == npos && VectorWriter(compare, alpha.reference_vgpr, begin) != npos) {
+			return false;
+		}
 		// The material dwords: BUFFER_LOAD_DWORD idxen of one V# at m * 3 + k, with m * 3 from
 		// V_LSHL_ADD_U32 <m3>, <m>, 1, <m> and V_ADD_NC_U32 <i>, k, <m3>.
 		std::array<size_t, 3> material {npos, npos, npos};
@@ -1678,8 +2351,42 @@ private:
 			material_vsharp = load.src1.reg;
 		}
 		if (material[0] == npos || material[1] == npos || material[2] == npos ||
-		    !UserDescriptor(material[0], material_vsharp, header, alpha.material_user, alpha.material_offset)) {
+		    !(UserDescriptor(material[0], material_vsharp, header, alpha.material_user, alpha.material_offset) ||
+		      EntryDescriptor(material[0], material_vsharp, header, back, alpha.material_user, alpha.material_offset))) {
 			return false;
+		}
+		// The computed reference: V_MUL_F32 <reference>, <threshold>, <x> with
+		// V_CNDMASK_B32 <x>, 1.0, <factor SGPR>, (V_CMP_NE_U32 0, V_AND_B32 1, M0).
+		if (product != npos) {
+			const auto& mul       = m_inst[product];
+			const bool  literal   = mul.src0.kind == OperandKind::LiteralConstant;
+			const auto& threshold = literal ? mul.src0 : mul.src1;
+			const auto  choice    = VectorSource(product, literal ? mul.src1 : mul.src0, Opcode::V_CNDMASK_B32, begin);
+			if (threshold.kind != OperandKind::LiteralConstant || !Plain(mul.src0) || !Plain(mul.src1) ||
+			    !Plain(mul.dst) || choice == npos) {
+				return false;
+			}
+			const auto& select = m_inst[choice];
+			const bool  one    = (select.src0.kind == OperandKind::FloatInlineConstant ||
+			                      select.src0.kind == OperandKind::LiteralConstant) &&
+			                     select.src0.value == 0x3f800000u;
+			const auto lanes = ScalarIndex(CndmaskMask(select));
+			const auto set   = lanes != NoRegister ? ScalarWriter(choice, lanes, begin) : npos;
+			if (!one || select.src1.kind != OperandKind::Sgpr || !Plain(select.src0) || !Plain(select.src1) ||
+			    !Plain(select.dst) || set == npos) {
+				return false;
+			}
+			const auto& ne  = m_inst[set];
+			const auto* m0  = IsConstant(ne.src0, 0) ? &ne.src1 : IsConstant(ne.src1, 0) ? &ne.src0 : nullptr;
+			const auto  low = m0 != nullptr && Plain(*m0) ? VectorSource(set, *m0, Opcode::V_AND_B32, begin) : npos;
+			if ((ne.opcode != Opcode::V_CMP_NE_U32 && ne.opcode != Opcode::V_CMP_NE_I32) || ScalarIndex(ne.dst) != lanes ||
+			    low == npos || !IsConstant(m_inst[low].src0, 1) ||
+			    VectorSource(low, m_inst[low].src1, Opcode::BUFFER_LOAD_DWORD, begin) != material[0]) {
+				return false;
+			}
+			alpha.threshold      = threshold.value;
+			alpha.factor_sgpr    = select.src1.reg;
+			alpha.reference_vgpr = NoRegister;
 		}
 		// m = B[B[0x28] + ((N >> 3) - B[0x7c]) * 4] + R[0x78] of the triangle node N.
 		const auto sum = VectorSource(scale3, m_inst[scale3].src0, Opcode::V_ADD_NC_U32, begin);
@@ -1717,7 +2424,8 @@ private:
 		uint32_t   texture_user = 0, texture_offset = 0;
 		if (tsharp == npos || m_inst[tsharp].offset != 0 || m_inst[tsharp].src0.kind != OperandKind::Sgpr ||
 		    waterfall_value(tsharp, m_inst[tsharp].src1, 5, 4, Opcode::BUFFER_LOAD_DWORD) != material[2] ||
-		    !UserDescriptor(tsharp, m_inst[tsharp].src0.reg, header, texture_user, texture_offset)) {
+		    !(UserDescriptor(tsharp, m_inst[tsharp].src0.reg, header, texture_user, texture_offset) ||
+		      EntryDescriptor(tsharp, m_inst[tsharp].src0.reg, header, back, texture_user, texture_offset))) {
 			return false;
 		}
 		// The indices: BUFFER_LOAD_FORMAT_X idxen at p * 3 + k, p = W & 0x3fffffff, through V#
@@ -1758,7 +2466,8 @@ private:
 		const auto primitive = VectorSource(triangle, m_inst[triangle].src0, Opcode::V_AND_B32, begin);
 		if (primitive == npos || !IsConstant(m_inst[primitive].src0, 0x3fffffff) ||
 		    !SameOperand(m_inst[primitive].src1, vgpr(word_vgpr)) ||
-		    !UserDescriptor(triangle, buffer_table, header, alpha.buffer_user, alpha.buffer_offset)) {
+		    !(UserDescriptor(triangle, buffer_table, header, alpha.buffer_user, alpha.buffer_offset) ||
+		      EntryDescriptor(triangle, buffer_table, header, back, alpha.buffer_user, alpha.buffer_offset))) {
 			return false;
 		}
 		// The vertices: the base address of V# M0 >> 8 of the buffer table (BUFFER_LOAD_DWORDX2
@@ -1861,7 +2570,7 @@ private:
 		alpha.fields.vertex_mask  = vertex_mask;
 		alpha.fields.vertex_align = vertex_align;
 		// The level: min(M2 & 15, log2(2 * (spread * t + lod)) + offset).
-		const auto level = VectorSource(sample, vgpr(sampled.src0.reg + 2), Opcode::V_MIN_F32, begin);
+		const auto level = VectorSource(sample, vgpr(AddressReg(sampled, 2)), Opcode::V_MIN_F32, begin);
 		if (level == npos || !Plain(m_inst[level].src0) || !Plain(m_inst[level].src1) || !Plain(m_inst[level].dst)) {
 			return false;
 		}
@@ -1908,7 +2617,8 @@ private:
 		// The registers the native code reads at the site entry keep their value in the traversal.
 		for (size_t i = header; i <= back; i++) {
 			if ((alpha.spread_vector ? WritesVector(m_inst[i], alpha.spread_reg) : WritesScalar(m_inst[i], alpha.spread_reg)) ||
-			    WritesVector(m_inst[i], alpha.lod_vgpr) || WritesVector(m_inst[i], alpha.reference_vgpr)) {
+			    WritesVector(m_inst[i], alpha.lod_vgpr) || WritesVector(m_inst[i], alpha.reference_vgpr) ||
+			    (product != npos && WritesScalar(m_inst[i], alpha.factor_sgpr))) {
 				return false;
 			}
 		}
@@ -2048,7 +2758,9 @@ private:
 		if (!leaf_walk) {
 			site.mask_sgpr = site.instance_sgpr;
 		}
-		return true;
+		// The TLAS header address RT_INIT reads at the entry (ClosestOpaque sites, whose native
+		// traversal can load it again: AddClosestTraversal).
+		return leaf_walk || HeaderAtEntry(header, UnusedPair(), site);
 	}
 
 	// ---- Closest hit walks whose instance code walks the BLAS itself (ClosestLeaf). ----
@@ -2426,7 +3138,8 @@ private:
 
 	// The TLAS header pair: a S_LOAD_DWORDX2 from a pair nothing wrote before (user data), the
 	// value the T# of the TLAS is built from (the pair may hold something else by the loop).
-	bool FindTlasSource(size_t header, uint32_t header_sgpr, uint32_t& user_sgpr, uint32_t& offset) const {
+	bool FindTlasSource(size_t header, uint32_t header_sgpr, uint32_t& user_sgpr, uint32_t& offset,
+	                    size_t* load_index = nullptr) const {
 		size_t start = header;
 		for (size_t i = header; i-- > 0;) {
 			const auto& bfe = m_inst[i];
@@ -2458,6 +3171,9 @@ private:
 			}
 			user_sgpr = base;
 			offset    = static_cast<uint32_t>(load.offset);
+			if (load_index != nullptr) {
+				*load_index = i;
+			}
 			return true;
 		}
 		return false;
