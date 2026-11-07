@@ -103,6 +103,9 @@ public:
 	void               FlushLazyReadback(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
+	// Whether an image on the range holds GPU writes or writes them back to guest memory (lazy
+	// readbacks, downloads after each submission). Other images only hold copies of guest memory.
+	[[nodiscard]] bool HasGpuWrittenImages(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);

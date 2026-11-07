@@ -2742,6 +2742,17 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	return true;
 }
 
+bool TextureCache::HasGpuWrittenImages(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size)) {
+		const auto& image = m_slot_images[id];
+		if (image.IsGpuModified() || image.readback_begin != 0 || m_download_images.contains(id)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	return !FindImagesInRegion(address, size).empty();
