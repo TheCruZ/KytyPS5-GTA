@@ -88,9 +88,13 @@ private:
 // lowers the shared one) and then reads the value, seq_cst; Notify() issues a seq_cst fence and
 // then reads the target. Either the waiter sees a value published before the fence, or Notify()
 // sees the target, takes the registration out and wakes every sleeper; a sleeper whose own
-// target is not reached yet registers it again and sleeps on. atomic::wait() also returns at
-// once when the value already differs from the one the waiter read. Publish() alone is a plain
-// release store: a sleeper it satisfies wakes at the next Notify().
+// target is not reached yet registers it again and sleeps on. Publish() alone is a plain release
+// store: a sleeper it satisfies wakes at the next Notify().
+//
+// Sleepers wait on a count of the wake-ups, which a waiter reads before it registers, and not on
+// the value: the registration it finds may be a lower target, even one already reached that the
+// next Notify() takes out at the value the sleeper read. A sleeper on the value would not see that
+// wake-up and would sleep on with no target registered, and no later Notify() would wake it.
 class ProgressCounter {
 public:
 	ProgressCounter() = default;
@@ -108,7 +112,8 @@ public:
 			// lower target registered meanwhile stays.
 			(void)m_wait_target.compare_exchange_strong(registered, NoTarget,
 			                                            std::memory_order_seq_cst);
-			m_value.notify_all();
+			m_wakeups.fetch_add(1, std::memory_order_seq_cst);
+			m_wakeups.notify_all();
 		}
 	}
 
@@ -130,21 +135,19 @@ public:
 			}
 		}
 		for (;;) {
+			// A Notify() that takes out the registration below from now on changes the count, so
+			// the wait returns and the target is registered again.
+			const auto wakeups = m_wakeups.load(std::memory_order_seq_cst);
 			// Lower the registered target to ours: another thread may sleep on a lower one.
 			auto registered = m_wait_target.load(std::memory_order_seq_cst);
 			while (registered > target &&
 			       !m_wait_target.compare_exchange_weak(registered, target,
 			                                            std::memory_order_seq_cst)) {
 			}
-			const auto value = m_value.load(std::memory_order_seq_cst);
-			if (value >= target) {
+			if (m_value.load(std::memory_order_seq_cst) >= target) {
 				break;
 			}
-			// A Notify() took the registration out since: register again.
-			if (m_wait_target.load(std::memory_order_seq_cst) > target) {
-				continue;
-			}
-			m_value.wait(value, std::memory_order_seq_cst);
+			m_wakeups.wait(wakeups, std::memory_order_seq_cst);
 		}
 	}
 
@@ -153,6 +156,7 @@ private:
 
 	alignas(64) std::atomic_uint64_t m_value {0};
 	alignas(64) std::atomic_uint64_t m_wait_target {NoTarget};
+	std::atomic_uint32_t             m_wakeups {0};
 };
 
 // A bounded lock-free single-producer single-consumer ring. Push() waits while the ring is full
