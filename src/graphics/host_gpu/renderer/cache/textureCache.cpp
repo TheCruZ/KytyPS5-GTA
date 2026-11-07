@@ -787,15 +787,17 @@ void TextureCache::RefreshCopySource(ImageId id) {
 	}
 }
 
-// The color formats VK_KHR_maintenance8 lets vkCmdCopyImage copy to and from a depth or stencil
-// aspect.
+// The color formats VK_KHR_maintenance8 lets vkCmdCopyImage copy to and from the depth aspect of
+// `depth`.
 static bool DepthColorCopyCompatible(vk::Format depth, vk::Format color) {
 	switch (depth) {
 		case vk::Format::eD16Unorm:
+		case vk::Format::eD16UnormS8Uint:
 			return color == vk::Format::eR16Sfloat || color == vk::Format::eR16Unorm ||
 			       color == vk::Format::eR16Snorm || color == vk::Format::eR16Uint ||
 			       color == vk::Format::eR16Sint;
 		case vk::Format::eD32Sfloat:
+		case vk::Format::eD32SfloatS8Uint:
 			return color == vk::Format::eR32Sfloat || color == vk::Format::eR32Uint ||
 			       color == vk::Format::eR32Sint;
 		default: return false;
@@ -803,9 +805,10 @@ static bool DepthColorCopyCompatible(vk::Format depth, vk::Format color) {
 }
 
 bool TextureCache::CopyDepthColor(Image& destination, Image& source) {
+	// Image::CopyImage() copies the depth aspect alone, as a copy through a buffer does: the stencil
+	// aspect of a depth/stencil image keeps its contents.
 	if (!m_graphics.maintenance8_enabled || source.backing.samples != destination.backing.samples ||
-	    source.info.IsDepth() == destination.info.IsDepth() || source.info.HasStencil() ||
-	    destination.info.HasStencil()) {
+	    source.info.IsDepth() == destination.info.IsDepth()) {
 		return false;
 	}
 	const auto& depth = source.info.IsDepth() ? source : destination;
