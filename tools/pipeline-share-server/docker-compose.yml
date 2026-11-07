@@ -1,0 +1,24 @@
+# /servers/kytypipes/docker-compose.yml (next to src/ and data/; .env with SRC=./src).
+# Inside the repository (to test the build) SRC defaults to this folder.
+# The port is not published on the host: nginx (container nginx-nginx-1, network nginx-net)
+# reaches this container as kytypipes-app:8787.
+services:
+  kytypipes-app:
+    build: ${SRC:-.}
+    image: kytypipes-app
+    container_name: kytypipes-app
+    restart: unless-stopped
+    command:
+      - --listen=0.0.0.0:8787
+      - --data-dir=/data
+      - --real-ip-header=X-Real-IP
+      - --quorum=1
+      - --default-release=v19
+    volumes:
+      - ./data:/data
+    networks:
+      - nginx-net
+
+networks:
+  nginx-net:
+    external: true
