@@ -1350,7 +1350,7 @@ void RenderExecutor::RebuildTableSpans(TableBindingState& state) {
 }
 
 void RenderExecutor::AddTableSpans(TableBindingState& state, uint32_t element) {
-	// As RebuildTableSpans() does, keeping the spans sorted.
+	// As RebuildTableSpans() does; MergeTableSpans() puts them in order.
 	constexpr uint32_t PageBits   = TextureCache::ImagePageBits;
 	auto&              entry      = state.elements[element];
 	const auto&        resolution = *entry.resolution;
@@ -1365,11 +1365,31 @@ void RenderExecutor::AddTableSpans(TableBindingState& state, uint32_t element) {
 		                            ? UINT64_MAX
 		                            : range.address + range.size - 1) >>
 		                      PageBits;
-		const auto at =
-		    std::ranges::upper_bound(state.spans, first, {}, &TableBindingState::PageSpan::first);
-		state.spans.insert(at, {first, last, element});
+		state.spans.push_back({first, last, element});
 		state.max_span = std::max(state.max_span, last - first);
 	}
+}
+
+void RenderExecutor::MergeTableSpans(TableBindingState& state, size_t sorted) {
+	// Merges the spans AddTableSpans() appended after the first `sorted` into them, in the order
+	// inserting each one after the spans with its first page would give. Inserting them one by
+	// one moved the spans after each: GTA V's ray tracing tables have ~26 000 elements and take
+	// in hundreds while it streams textures in (up to 9 ms in one binding).
+	auto& spans = state.spans;
+	if (sorted == spans.size()) {
+		return;
+	}
+	const auto middle = spans.begin() + static_cast<std::ptrdiff_t>(sorted);
+	std::stable_sort(middle, spans.end(), [](const auto& a, const auto& b) {
+		return a.first < b.first;
+	});
+	m_table_spans.clear();
+	m_table_spans.reserve(spans.size());
+	std::ranges::merge(std::ranges::subrange(spans.begin(), middle),
+	                   std::ranges::subrange(middle, spans.end()),
+	                   std::back_inserter(m_table_spans), {}, &TableBindingState::PageSpan::first,
+	                   &TableBindingState::PageSpan::first);
+	spans.swap(m_table_spans);
 }
 
 void RenderExecutor::UnpinTableBindings(TableBindingState& state) {
@@ -1408,7 +1428,8 @@ bool RenderExecutor::PatchTableSlots(const ShaderRecompiler::IR::CompiledShaderI
 	std::vector<uint32_t> roots;
 	ForEachImageTable(program.info.images,
 	                  [&](uint32_t root_index, auto /*kind*/) { roots.push_back(root_index); });
-	auto& index_of = state.element_index;
+	auto&        index_of     = state.element_index;
+	const size_t sorted_spans = state.spans.size();
 	for (const auto& changed: m_table_changed_slots) {
 		auto&       range = state.ranges[changed.range];
 		const auto& table = snapshot.image_tables.at(range.table);
@@ -1451,6 +1472,7 @@ bool RenderExecutor::PatchTableSlots(const ShaderRecompiler::IR::CompiledShaderI
 		state.slots[changed.slot]  = index;
 		MarkTableElement(state, index);
 	}
+	MergeTableSpans(state, sorted_spans);
 	IndexTableSlots(state);
 	// Elements no slot names any more keep their images pinned: once there are many, the
 	// tables are resolved slot by slot again.
