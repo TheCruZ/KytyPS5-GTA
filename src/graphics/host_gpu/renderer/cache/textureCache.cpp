@@ -1699,6 +1699,17 @@ bool TextureCache::DepthCopyStale(const Image& image) const {
 	       source->IsCpuDirty() || source->IsBufferModified();
 }
 
+bool TextureCache::DepthCopyCurrent(const Image& image) const {
+	if (!image.is_depth_copy || !image.depth_copy_source || DepthCopyStale(image)) {
+		return false;
+	}
+	// RefreshDepthCopy() refreshes the color image (RefreshImage()), which tracks its pages again
+	// after a CPU write next to them.
+	const auto& source = *m_slot_images.try_get(image.depth_copy_source);
+	return !source.registered || (source.track_addr == source.info.data.address &&
+	                              source.track_addr_end == source.info.data.End());
+}
+
 void TextureCache::RefreshDepthCopy(ImageId copy_id) {
 	const auto source_id = m_slot_images[copy_id].depth_copy_source;
 	if (!source_id) {

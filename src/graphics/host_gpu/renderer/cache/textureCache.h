@@ -74,6 +74,9 @@ public:
 	// Whether the depth copy `image` no longer holds its color image's contents (false for
 	// other images).
 	[[nodiscard]] bool DepthCopyStale(const Image& image) const;
+	// Whether acquiring the depth copy `image` (FindTexture()) would change nothing: it holds its
+	// color image's contents, and the color image is clean and tracked (false for other images).
+	[[nodiscard]] bool DepthCopyCurrent(const Image& image) const;
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
