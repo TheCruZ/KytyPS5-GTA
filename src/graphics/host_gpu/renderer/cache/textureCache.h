@@ -320,8 +320,8 @@ private:
 	void                  WriteBackStencilCopies(ImageId depth_id);
 	void                  ReleaseStencilCopies(ImageId association);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
-	// A copy between a depth and a color image of the same texel size with vkCmdCopyImage
-	// (VK_KHR_maintenance8); false when the device or the formats do not allow it.
+	// A copy between the depth aspect of a depth image and a color image of the same texel size with
+	// vkCmdCopyImage (VK_KHR_maintenance8); false when the device or the formats do not allow it.
 	[[nodiscard]] bool CopyDepthColor(Image& destination, Image& source);
 	void               CopyImage(ImageId destination, ImageId source);
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
