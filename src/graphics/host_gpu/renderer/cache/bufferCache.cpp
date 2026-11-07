@@ -2195,9 +2195,14 @@ void BufferCache::SynchronizeBuffersInRanges(const RangeSet& ranges, bool all) {
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
-	// Only tracking regions with pending CPU writes can have anything to upload.
-	m_memory_tracker.ForEachCpuDirtySpan(vaddr, size, [&](uint64_t span, uint64_t span_size) {
-		const auto end = span + span_size;
+	// Only tracking regions with pending CPU writes can have anything to upload. Synchronizing a
+	// buffer protects the pages it uploads again, and each protection call costs ~2.3 us (with
+	// other threads of the process running, flushing the other processors' TLBs) besides ~0.1 us
+	// per page. Runs a few clean pages apart are synchronized together: the page tracker then
+	// protects them with one call through the clean pages between, which keep their protection.
+	constexpr uint64_t MaxGap = 32 * TRACKER_PAGE_SIZE;
+	m_memory_tracker.ForEachCpuDirtySpan(vaddr, size, MaxGap, [&](uint64_t span, uint64_t bytes) {
+		const auto end = span + bytes;
 		auto       it  = m_buffers.upper_bound(span);
 		if (it != m_buffers.begin()) {
 			--it;
