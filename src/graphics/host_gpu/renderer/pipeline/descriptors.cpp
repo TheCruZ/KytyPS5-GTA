@@ -1172,6 +1172,23 @@ static void CopyGpuFlatLoads(RenderContext& context, const vk::DescriptorBufferI
 
 // Whether binding `texture` (a table element nothing else in the operation binds) leaves its
 // image as it is: CommitBindings() would record no barrier for it.
+// Whether a table element's view, just acquired in `state`, can be kept while the image keeps that
+// state (see TableViewCurrent()). A depth copy has no guest memory to be dirty (see
+// TextureCache::FindDepthCopy()).
+static bool TableViewKeepable(const ImageLookupState& state, const Image& image) {
+	return !state.cpu_dirty && !state.buffer_modified &&
+	       (!image.info.data.Empty() || image.is_depth_copy);
+}
+
+// Whether the view a table element acquired in `view` still holds: acquiring it again would only
+// refresh the image's use. GTA V's ray tracing tables visit ~700 depth copies per frame.
+static bool TableViewCurrent(const TextureCache& texture_cache, const Image& image,
+                             const TextureBinding& texture, const TableViewMemo& view) {
+	return view.valid && texture.image_view &&
+	       ImageLookupState::Of(texture.image_id, image) == view.state &&
+	       (!image.is_depth_copy || texture_cache.DepthCopyCurrent(image));
+}
+
 static bool TableImageReady(const Image& image, const TextureBinding& texture) {
 	if (image.binding.is_bound || image.binding.is_target || image.binding.force_general ||
 	    texture.desc.type == TextureCache::BindingType::Storage) {
@@ -1664,16 +1681,14 @@ void RenderExecutor::RebindReusedTables(PreparedBindings& prepared) {
 				// Bound as a null descriptor: nothing to acquire.
 				view.valid = false;
 			} else if (auto* image = texture_cache.m_slot_images.try_get(texture.image_id);
-			    view.valid && image != nullptr && texture.image_view &&
-			    ImageLookupState::Of(texture.image_id, *image) == view.state) {
+			    image != nullptr && TableViewCurrent(texture_cache, *image, texture, view)) {
 				image->tick_accessed_last = tick;
 				texture_cache.TouchImage(*image);
 			} else {
 				texture.image_view  = texture_cache.FindTexture(texture.image_id, texture.desc);
 				auto& acquired         = texture_cache.GetImage(texture.image_id);
 				view.state             = ImageLookupState::Of(texture.image_id, acquired);
-				view.valid = !view.state.cpu_dirty && !view.state.buffer_modified &&
-				             !acquired.info.data.Empty();
+				view.valid             = TableViewKeepable(view.state, acquired);
 			}
 			if (texture.image_id != element.pinned) {
 				texture_cache.UnpinImage(element.pinned);
@@ -2152,8 +2167,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		// view and refresh the image's use, as the acquisition would. Guest-dirty images are
 		// refreshed by the acquisition.
 		if (auto* image = texture_cache.m_slot_images.try_get(texture.image_id);
-		    view.valid && image != nullptr && texture.image_view &&
-		    ImageLookupState::Of(texture.image_id, *image) == view.state) {
+		    image != nullptr && TableViewCurrent(texture_cache, *image, texture, view)) {
 			image->tick_accessed_last = tick;
 			texture_cache.TouchImage(*image);
 			continue;
@@ -2161,8 +2175,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		texture.image_view = texture_cache.FindTexture(texture.image_id, texture.desc);
 		auto& image        = texture_cache.GetImage(texture.image_id);
 		view.state = ImageLookupState::Of(texture.image_id, image);
-		view.valid = !view.state.cpu_dirty && !view.state.buffer_modified &&
-		             !image.info.data.Empty();
+		view.valid = TableViewKeepable(view.state, image);
 		element_changed(k);
 	}
 	if (prepared.tables_reused) {
