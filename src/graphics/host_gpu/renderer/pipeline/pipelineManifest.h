@@ -37,6 +37,9 @@ struct ManifestModule {
 	// vertex input.
 	std::variant<ShaderVertexInputInfo, ShaderPixelInputInfo, ShaderComputeInputInfo> input;
 	ShaderRecompiler::IR::ResourceSpecialization specialization;
+	// Not saved: the record comes with the emulator (assets/pipelines). Only such records end the
+	// game when they fail with --strict-pipeline-manifest.
+	bool from_assets = false;
 
 	// The program hash of the module's cache key: the code hash, or both hashes' hash for a GS
 	// front and back pair.
@@ -53,6 +56,8 @@ struct ManifestPipeline {
 	bool plain_pixel = false;
 	// The key with zero stage ids.
 	GraphicsPipelineKey key {};
+	// Not saved: see ManifestModule::from_assets.
+	bool from_assets = false;
 };
 
 struct PipelineManifest {

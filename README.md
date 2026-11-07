@@ -1,462 +1,592 @@
-# KytyPS5
+# KytyPS5-GTA
 
-[![Build KytyPS5 (Windows)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28Windows%29&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
-[![Build KytyPS5 (Linux)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28Linux%29&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
-[![Build KytyPS5 (macOS)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28macOS%29&label=Build%20KytyPS5%20%28macOS%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
-[![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20x64%20%7C%20macOS%20x86__64-0078D4.svg)](#system-requirements)
-[![Status](https://img.shields.io/badge/status-active%20development-orange.svg)](#current-status)
-[![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
+A fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5) focused on running
+**Grand Theft Auto V (PS5, PPSA04263 / PPSA04264)**.
 
-**[Weekly updates](https://github.com/KytyPS5/KytyPS5/discussions/862)** — game progress, recent fixes, and ongoing development.
+This fork is always the latest upstream `main` plus a small set of fixes on top, one commit per
+fix.
 
-**[Development on Discord](https://discord.gg/UNrkMqGaBg)** — KytyPS5 development.
+For everything about the emulator itself (features, system requirements, building, usage,
+licensing), read the [**original KytyPS5 README**](https://github.com/KytyPS5/KytyPS5#readme).
 
-KytyPS5 is a free and open-source PlayStation 5 translation layer written in C++ for Windows
-and Linux, with experimental macOS support. It is based on a heavily modified version of
-[Kyty](https://github.com/InoriRus/Kyty). The project is in active development, and behavior
-can change significantly between builds.
+Builds of this fork for Windows, macOS and Linux are published on the
+[**Releases**](https://github.com/TheCruZ/KytyPS5-GTA/releases) page (v1, v2, ...).
 
 > [!IMPORTANT]
-> KytyPS5 is not affiliated with Sony Interactive Entertainment or PlayStation. The project does
-> not distribute games or copyrighted system software. Use only game files that you have obtained
-> legally.
+> KytyPS5 is not affiliated with Sony Interactive Entertainment, PlayStation or Rockstar Games.
+> The project does not distribute games or copyrighted system software. Use only game files that
+> you have obtained legally.
 
-## Current Status
+## Status
 
-Development is currently focused on expanding game compatibility and improving boot reliability.
-External low-level emulation modules are neither required nor planned.
+- GTA V is fully playable.
+- Fidelity runs at 20-30 fps with native ray tracing (v21).
+- Performance RT runs at 35-60 fps with native ray tracing (v23).
+- Performance runs at 60-140 fps (v21).
 
-Windows and Linux are the primary target platforms and receive the most testing.
+It was about 12-13 fps before the GPU optimizations below. All tests were done on an RTX 3090 /
+Ryzen 9 5900X.
 
-macOS support is experimental. The emulator is built for x86-64 and runs on Apple Silicon under
-Rosetta 2, with Vulkan provided by MoltenVK. A small number of titles have been verified in-game
-on Apple Silicon hardware; see [Building on macOS](#building-on-macos).
+## Native ray tracing (experimental)
 
-Community game test results are available in the
-[KytyPS5 Compatibility List](https://kytyps5.github.io/).
+PS5 games trace rays with the GPU's BVH instructions, which the emulator otherwise runs as
+ordinary shader code. Native ray tracing recognizes the ray tracing passes of supported games and
+traces them with the host GPU's ray tracing hardware (Vulkan ray queries), building the
+acceleration structures from the game's own BVHs.
 
-## Bugs and Issues
+It is **off by default** in the emulator. Enable it with **Native ray tracing (experimental)** in
+the launcher's graphics settings, or with `--native-rt` on the command line; the launcher's
+recommended settings, offered when a game is launched, turn it on. It needs a GPU whose Vulkan
+driver supports `VK_KHR_ray_query` and `VK_KHR_acceleration_structure`; without them the emulator
+leaves it off.
 
-Compatibility, stability, and performance can vary between versions. You may encounter crashes
-or graphical glitches, so please include the version you tested when reporting an issue.
+## Shared pipelines
+
+Games stutter the first time they need a shader or a pipeline, because the PC has to compile it.
+This fork ships manifests of the shaders and pipelines recorded while playing (`assets/pipelines`),
+and the emulator compiles them in the background at boot.
+
+This only reduces the stutter; it does not remove it. Some pipelines still have to be compiled in
+the middle of the game, because the game loads their shaders only right before it uses them, so
+they cannot be compiled earlier.
+
+From v19, the launcher asks on the first launch whether to **share pipeline data** (the checkbox
+at the bottom of the launcher window changes it later). When it is on, the launcher exchanges them
+with this fork's server right before the game starts (the launcher waits for the server 8 seconds
+at most, so that the emulator already has what other players recorded when it loads its manifests),
+about every 3 minutes while you play and when the game ends:
+
+- **Sent**: the game ID and version, the emulator version, descriptions of the shaders and
+  pipelines the game used that are not in the manifests yet (hashes and state flags; never game
+  files or game code), each one only once, and a random ID of the installation. The server also
+  sees the IP address, and keeps only a hash of it.
+- **Received**: the ones other players found, which the emulator compiles from the start of the
+  game (or while it runs, those that arrive later).
+
+What the server collects also extends the manifests of the next release. Its source is in
+`tools/pipeline-share-server`.
+
+## Games
+
+GTA V is the anchor, but this fork runs other PS5 games too. Tested on an RTX 3090 / Ryzen 9 5900X
+with this fork's releases; the version under each cell is the release where that status or speed
+was first reached.
+
+| Game | Status | In-game fps |
+|------|--------|-------------|
+| **Grand Theft Auto V**<br><sub>PPSA04263</sub> | <img src="ForkImgs/readme/status-playable.svg" alt="Playable"><br><sub>v6</sub> | <img src="ForkImgs/readme/fps-gtav-performance.svg" alt="Performance: 60-140 fps"><br><img src="ForkImgs/readme/fps-gtav-performance-rt.svg" alt="Performance RT with native RT: 35-60 fps"><br><img src="ForkImgs/readme/fps-gtav-fidelity.svg" alt="Fidelity with native RT: 20-30 fps, 30 fps cap"><br><sub>v23</sub> |
+| **Red Dead Redemption**<br><sub>PPSA30528</sub> | <img src="ForkImgs/readme/status-playable.svg" alt="Playable"><br><sub>v15</sub> | <img src="ForkImgs/readme/fps-rdr.svg" alt="60-80 fps"><br><sub>v17</sub> |
+| **ASTRO BOT**<br><sub>PPSA21564</sub> | <img src="ForkImgs/readme/status-playable.svg" alt="Playable"><br><sub>v21</sub> | <img src="ForkImgs/readme/fps-astrobot.svg" alt="25-60 fps"><br><sub>v21</sub> |
+| **Demon's Souls**<br><sub>PPSA01341</sub> | <img src="ForkImgs/readme/status-in-game.svg" alt="In-game"><br><sub>v13</sub> | <img src="ForkImgs/readme/fps-demons-souls.svg" alt="20-35 fps"><br><sub>v21</sub> |
+| **Silent Hill: The Short Message**<br><sub>PPSA10112</sub> | <img src="ForkImgs/readme/status-in-game.svg" alt="In-game"><br><sub>v23</sub> | <img src="ForkImgs/readme/fps-silent-hill-short-message.svg" alt="40-70 fps"><br><sub>v23</sub> |
+| **Saros**<br><sub>PPSA07631</sub> | <img src="ForkImgs/readme/status-in-game.svg" alt="In-game"><br><sub>v23</sub> | <sub>Not measured yet</sub> |
+| **Marvel's Wolverine**<br><sub>PPSA03671</sub> | <img src="ForkImgs/readme/status-menus.svg" alt="Menus"><br><sub>v16</sub> | <sub>Reaches the main menu after a few minutes</sub> |
+| **Ghost of Yōtei**<br><sub>PPSA26344</sub> | <img src="ForkImgs/readme/status-menus.svg" alt="Menus"><br><sub>v18</sub> | <sub>Reaches the main menu after a few minutes</sub> |
+| **Gran Turismo 7**<br><sub>PPSA01317</sub> | <img src="ForkImgs/readme/status-menus.svg" alt="Menus"><br><sub>v23</sub> | <sub>Reaches the menus</sub> |
+| **Code Violet**<br><sub>PPSA26528</sub> | <img src="ForkImgs/readme/status-no-boot.svg" alt="Doesn't boot"><br><sub>v23</sub> | <sub>Does not boot</sub> |
+
+Workarounds that hide an emulation problem instead of fixing it print a `[HACK]` line to the console and the
+log when they are used, so they can be tracked and replaced.
+
+## Fork status
+
+- 204 commits on top of upstream `main` (synced 2026-11-13, upstream 58ca8d1d).
+- 🎉 21 fixes from this fork (five of them partly) are now part of upstream KytyPS5; 40 more were fixed
+there independently, fifteen of them partly (see [Fixed upstream since the fork started](#fixed-upstream-since-the-fork-started)).
+
+## Fixed bugs and crashes
+
+Each item is one commit on top of upstream `main`.
+
+<details>
+<summary>Show the list</summary>
+
+### Crashes and unsupported shaders
+
+- **Skinning compute shaders**: stores through buffer descriptors (V#) picked from a descriptor
+table on the GPU.
+- **Ray-hit shading shader (Fidelity/RT)**: GPU-indexed texture (T#) tables are bound as
+bindless sampled-image arrays (upstream now looks T#s up in bounded image tables directly,
+one specialized image per T#, which GTA V's ray tracing heaps are too large for). Table
+elements whose image an earlier rebind replaced are rediscovered before their views are
+acquired ("texture requires rediscovery before final acquisition").
+- **ASTRO BOT crashes loading a save, entering a galaxy map and leaving the desert level**: a game
+`read()` of a whole level or texture file sometimes returned 0 bytes and the game parsed stale
+memory. The emulator read files straight into guest memory, and the GPU threads write-protect
+again pages they synchronize (here a texture the title screen had used), so Windows' `ReadFile`
+failed as a whole. Files are now read into a host buffer and copied into guest memory.
+- **ASTRO BOT froze on its start screen with cold caches** (a little after the pipelines began to
+compile, before any button press): the command processor could sleep waiting for the execution
+thread with no wake-up registered, after every queued operation had already run. Waiters now sleep
+on a count of the wake-ups instead of on the progress value, so none is lost.
+- **Demon's Souls crashed in some areas** (Stonefang, Boletaria, Latria; "Not implemented" or
+"unsupported texture mip view changes physical layout"): a pixel shader picks one of eight textures
+with a byte of a vertex attribute, and the emulator prepared all 32 candidates its mask allows, some
+of them leftovers with impossible addresses. Candidates the host cannot view now bind a null image.
+- **ASTRO BOT closed while loading with upstream 27f290e9** ("unsupported texture mip view changes
+physical layout: base=6 last=6 max=5"): it samples a mip past the last one its texture declares, which
+lies in the mip tail the declared mips already hold. Upstream now reads such a view as a mip chain of its
+own; when that does not fit, the view reads the declared mips, as before.
+- **ASTRO BOT freezes while diving into Sky Garden**: the graphics queue wrote a flag a compute
+queue waited on, but the emulator let the waiting queue look again only after the writer finished
+its whole frame, and by then the game had already reset the flag. A queue that writes memory
+another queue waits on now lets it run right after the write, as on hardware.
+- **Freezes of a few seconds every so often** (ASTRO BOT in Sky Garden, more often the longer one
+plays, even standing still; a fault of `main` since 2026-10-30 that also made hitches in GTA V and
+Demon's Souls): game threads handling page faults change page protections while they hold a
+page-tracking lock, and the threads that needed that lock spun on it. Since the GPU stage threads
+got whole cores to themselves, Windows gave most other threads an ideal processor on those cores
+(103 of 132), so a preempted lock holder waited there, ready but without a processor, while a dozen
+game threads and the execution thread spun on its lock: lock waits of up to 5.6 s and a
+`VirtualProtect` of a single page that took 5.5 s, until Windows' anti-starvation boost after about
+four seconds. The other threads now get a hard affinity off the reserved cores, and lock waiters
+sleep after a short spin.
+- **ASTRO BOT stuck in the Sky Garden entry tunnel**: the emulator answered the GPU's mip
+statistics reports with "every texture sampled at its finest mip", so the texture streamer kept
+unloading and reloading textures and the level never started. Pixel shaders now record which mip
+of each texture they sample, as the GPU does (port of Jetsku's GET_LOD_STATS emulation).
+- **ASTRO BOT crashes entering Creamy Canyon and playing in Sky Garden** ("unsupported buffer
+readback from an asynchronous GPU completion"): occlusion counters, the labels released after
+them and mip statistics reports were written into memory the GPU owned from a GPU completion.
+They are now written through the backing store.
+- **ASTRO BOT's Creamy Canyon flickered** (whole surfaces changing colour from frame to frame with
+the camera still): a compute shader of the game reads the occlusion counters of about 4,500 objects
+in the same frame, but the emulator only wrote the counters once the GPU had finished the command
+buffer, so the shader often read the zeros the game had just cleared them to. The GPU now copies
+the query results into the buffer copies that later GPU work reads, right before that work, with
+no CPU wait.
+- **Demon's Souls and Red Dead Redemption run too fast**: they convert time stamp counter ticks
+with the console's 1.6 GHz rate (Demon's Souls also reads the counter with its own RDTSC), so a
+faster host counter sped them up. Upstream's `--guest-tsc` (console-rate counter, guest RDTSC
+rewritten to match) is on by default in this fork; `--no-guest-tsc` turns it off.
+- **Freeze while a shader compiles** (Demon's Souls, ASTRO BOT): the execution thread waited for
+a shader compile while the compile waited for an urgent command only the execution thread runs.
+Urgent commands now run while the execution thread waits for a compile.
+- **Demon's Souls exit when a draw's resources cannot be resolved** (stopgap, marked HACK): the draw
+is skipped instead of exiting; the same exit happens upstream.
+- **Marvel's Wolverine lost the device or exited before its menus**: its shaders find descriptors
+through tables of records (keys, element tables of up to 2M entries, shared bases). Record-table
+candidates now live in the resident image heap with their own slots, element tables are read
+whole, candidates are found through a hash, indirect thread-count dispatches resolve the heap,
+and record rows outside guest memory give no elements.
+- **ASTRO BOT crash at the Serpent Starway boss** ("mesh draw exceeds host workgroup limits"): the
+game draws a mesh shader with more instances than the host allows in one draw (77,054 over
+65,535). Such draws are now split into several host draws.
+- **ASTRO BOT's Tentacle System levels drew placeholder geometry** (black silhouettes, textures of
+other objects): game threads read GPU-written loading state that the emulator had not finished
+reading back. A guest thread that reads GPU-written memory now waits for that readback itself,
+and other readers of the same bytes wait for it to be published.
+- **ASTRO BOT's memory use grew by about 120 MB a minute** (1.4 GB after 15 minutes in Sky
+Garden): the emulator queued every GPU end-of-pipe interrupt the game asked for (about 45,000 a
+second), and the game never reads them. Interrupts of one context the game has not received yet
+are now merged into one, as the console's kernel does.
+- **Crash when the emulator window is captured** (OBS / Windows Graphics Capture, quick
+PrintWindow loops; 0x80000001): a guest descriptor walk read a garbage pointer that fell on the
+guard page of a host thread's stack. That read now returns zero like other unmapped reads.
+- **Crash when a gamepad is remapped** by SDL.
+- **Fidelity and Performance RT exit on AMD GPUs** ("descriptor set does not fit a pool sized for
+it" in `descriptorHeap.cpp`): the emulator asked a descriptor pool for 32 sets of the ray tracing
+texture table at once and fewer after a failure, but AMD's driver keeps the room a failed
+allocation used, so an empty pool could not hold even one set. Pools are now asked only for the
+sets they have room for.
+- **Missing letters in the boot legal notice and other text**: the compute shader that copies
+glyphs into the font atlas reads the CPU-rasterized bitmaps through DMA; memory without a cached
+buffer read as zero, so glyphs on those pages stayed blank. DMA base registers are now cached
+before the shader runs.
+- **Crash at the car dealership (Franklin and Lamar)**: pixel shader `0xf6b18542ea0e938a` builds
+its sampler's border color word from lane data; the untrackable bits are now dropped (border
+color only) instead of failing the shader.
+- **Streaming crash late in the prologue** ("[RAGE] HDD Streamer" in zlib `inflate_fast`): zlib
+keeps locals in the SysV red zone, which Windows overwrites when it delivers the exceptions the
+emulator's memory tracking raises. Red zone protection is now enabled by default.
+- **Intermittent streaming crash** ("[RAGE] HDD Streamer" in zlib `inflate`/`inflate_fast`, about
+once every 100 sessions): the game maps the same direct-memory page again with `MAP_FIXED`
+while the streamer decompresses into it. The emulator replaces a mapping by unmapping and
+mapping it again, so for a moment the page was gone; guest accesses in that window now wait for
+the mapping and are retried.
+- **GTA San Andreas Definitive Edition crash** (`TSet::UnhashElements`, read near address 0x20): the
+game keeps locals below the stack pointer and addresses them through the frame pointer
+(`[rbp+d]`), which red zone protection did not cover, so Windows exception frames overwrote them.
+- **GTA San Andreas Definitive Edition crash leaving CJ's house** ("buffer ADD_TID is only valid for
+compute shaders"): two vertex shaders take a buffer descriptor on only one side of a branch whose
+condition the GPU writes. The emulator walked both sides ahead of time and compiled a program from
+leftovers of other draws; programs of walks that leave such a condition unread are no longer
+compiled ahead.
+- **Demon's Souls random crash** ("Unhandled host exception" in "BPE JobWorkerThread"; stopgap,
+marked HACK): the game stops on its own assert when an audio decode job fails. Some ATRAC9 frames of
+the DualSense vibration sounds cannot be unpacked by LibAtrac9 (17 of about 2,100 streams); they now
+play as silence.
+- **Elden Ring Nightreign crash at boot with shared pipelines** (access violation on a pipeline
+manifest thread): recordings had written pipelines whose modules belong to other stages (a
+tessellation module as the vertex stage), so the ahead-of-time compile read vertex formats that do
+not exist. Recording now keeps the modules in their places, manifests leave out pipelines that no
+draw could create from their modules, and the sharing server rejects them too.
+- **"depth attachment feedback loop is not supported by the host"** (seen on a Radeon RX 9060 XT):
+draws that sample the depth target they also write need two Vulkan extensions that some drivers
+lack. Without them the draw now samples a copy of the depth target taken just before it; GPUs
+with the extensions keep the previous path.
+- **ASTRO BOT crash in Go-Go Archipelago** (a fault reading 0x20 in a "Havok Worker" thread a few
+seconds into the arrival flight, at about 14 fps; stopgap, marked HACK): the frame-time `[HACK]`
+(see [Games](#games)) gave the game steps of up to 1/15 s, and a character controller of the level
+diverged to NaN with them. Steps now go up to 1/30 s, or 1/20 s where the hack also patches the
+Havok queries, tree traversals, solvers and cloth that fail with longer steps.
+- **GTA V froze for good in Fidelity mode** (about one run in six, driving with native ray tracing):
+a game thread faulted about 290,000 times a second on its own instruction. The page held game code
+that a cache watched for writes, and the read-only protection used for that has no execute
+permission, so every fetch of that instruction faulted. Instruction fetches that fault on pages the
+game mapped as executable now get the execute permission back.
+- **Gran Turismo 7: progress towards its first race** (it still exits while loading the Music Rally,
+"its call tables do not expand"): its BVH walks call the any-hit function of each triangle's
+material through a table of 10,614 rows. Call tables whose descriptor is loaded before the walk's
+loops now expand, targets with the same code share one body, and native ray tracing traces these
+walks (programs with more walks than it can patch keep the game's traversal). The table still names more
+distinct functions (352) than the emulator expands (256).
+
+### Shader instruction accuracy
+
+- Float inline constants read by 64-bit operands use their double-precision encoding.
+
+### Rendering
+
+- Stencil and depth-bias dynamic state is set for every draw (Vulkan validation errors).
+- Page faults on pages that cache tracking protects outside the GPU-mapped ranges are resolved
+instead of reported as guest crashes.
+- **Vehicle damage**: cars no longer deform wildly in collisions (wheels pushed outside the body,
+car unable to drive) and snap back later. The CPU reads the damage textures the GPU renders;
+GPU-written linear images are now read back to guest memory by default.
+- **Ray tracing (Fidelity and Performance RT)**: GTA V's ray tracing dispatches run (BVH
+intersections are emulated in shaders on the GPU's regular shader cores) instead of being
+skipped, so ray-traced reflections and shadows are drawn (the scalar reads through GPU-selected
+V#s are now upstream).
+- **Occlusion queries**: the game's occlusion counters come from real Vulkan occlusion queries
+instead of always reading visible (the sun's lens flare showed through trees and light glows
+through walls). Counters reach the game by the next frame, so water reflections (Michael's pool)
+no longer flicker.
+- **Red Dead Redemption water reflections**: the sea in the opening boat cutscene no longer loses its
+reflection in about one frame of three. The game reads the previous frame's occlusion counters as soon
+as the GPU has finished that frame; the counters are now written to its memory at that point instead of
+later.
+- **GTA Trilogy objects flickering** (San Andreas, Vice City and III Definitive Edition): CJ, cars,
+pedestrians, buildings and the radar map no longer vanish for one to three frames while the camera
+moves. Each occlusion query is followed by a label that tells the game its counters are ready; the
+label was written before the GPU had produced the counters, so the game read zero and hid the
+object. The label now lands after the counters, as on the console. This also fixed brief
+flickering of horses in Red Dead Redemption.
+- **Black smoke and particles**: smoke (Michael's cigar in Father/Son) and small particles render
+translucent instead of black. The game clears the particle depth target (R16 float) with a fast
+register clear that was ignored, so depth of field blurred the particles dark (decoding the
+16-bit clear values is now upstream).
+- **Disappearing trees**: the trunks of nearby trees are drawn. GTA V tessellates them up close
+and upstream now translates its tessellation shaders (see below); tessellation is enabled by
+default in this fork (disable it with `--no-tessellation` or the launcher option).
+- **Wrong water level**: the game's water physics saw a flat sea at a fixed level instead of the
+waves: boats and jet skis sank into the waves instead of riding them, and the water level seen from
+the swimming camera was wrong (with black areas on the water). The physics read the origin of the
+GPU-simulated wave grid from a small tiled render target that never reached guest memory. Upstream
+merged the fix (small GPU-written tiled images are written back like linear ones) as c07ad621f, but
+only behind `--readback-tiled-images` (launcher: "Enable tiled readback"). This fork's launcher
+turns it on through its recommended settings.
+- **Native ray tracing in GTA V 01.005 (PPSA04264)**: this version links an older build of the
+game's ray tracing library and does not register its shaders under the names the emulator looked
+for, so its BVH builds and refits still ran as emulated dispatches every frame (about 25 per TLAS,
+three TLASes a frame), and objects that stream in or are rebuilt (characters) cast no shadow for
+one to three frames. The library's shaders are now recognized by their code, and its TLAS builds,
+BLAS builds and BLAS refits are replaced or followed by host builds, as in 01.010/01.011. The host
+builds also cache the small CPU-written lists they read (TLASes of 8 and 14 instances had every
+instance inactive).
+- **ASTRO BOT's broken ray traced shading in Go-Go Archipelago** (arrival flight, native ray
+tracing): the game writes its TLASes, and some BLASes, with the CPU into memory no other GPU work
+reads, so the native walks found no cached buffer there and every dispatch of the level fell back to
+the game's traversal over zeros. That memory is now cached before the dispatch that reads it, and
+the walks cache the pages they read as other device-address reads do. Passes whose rays start at the
+same point in every lane (ASTRO BOT, ASTRO's PLAYROOM) are now traced natively too, and the log
+prints an `[RT]` summary every 10 s of the walks native ray tracing leaves to the game.
+
+### Performance
+
+- **GTA V's Performance RT mode traces its ray traced shadows natively** (`--native-rt`): from
+about 51 to about 64 fps in the city without the 60 fps cap. Its shadow shader walks the TLAS for the
+whole wave but each lane walks its own BLAS and runs the leaf test itself (alpha test and facing), a
+traversal the patch did not recognize, so it ran the game's own BVH walk. It is now recognized by the
+shape of its code and traced with ray queries.
+- **GTA V 01.005 (PPSA04264) traces its ray tracing natively too** (`--native-rt`, Fidelity and
+Performance RT): the same traversals as the later releases, compiled differently, were not
+recognized (the mask test on a shifted constant or on a scalar, the saved EXEC and ray mask in
+vector lanes, a uniform alpha reference, the BLAS address loaded twice), and one closest-hit pass
+reused the TLAS header register pair for the root node, so none of its rays matched the host TLAS.
+The patch now recognizes these forms and loads the TLAS header again.
+- **GTA V's Fidelity mode in the Franklin and Lamar mission** (native ray tracing): from about 19 to
+about 29 fps on foot and from about 16 to about 29 fps driving. The game moves thousands of texture
+descriptors (T#) between the about 15,000 slots of its ray tracing texture table every dispatch, and
+when more than an eighth of the slots changed the whole table was resolved again (about 15 ms per
+dispatch). The table is now patched whatever changes; slots whose T# moved to an element that is
+already bound take its descriptor without a visit, the spans of new elements are merged at once,
+reused table descriptors are copied from a set of their own, the view of a current depth copy stays
+in the table, CPU-dirty runs a few clean pages apart are synchronized together and the strict reads
+of a resolved operation are compared in place.
+- **Demon's Souls in Boletaria**: from about 16 to about 24 fps standing and from about 15-16 to
+about 22 fps walking (menu: 78 to 99 fps). Runs of indirect draws that only step their record are
+drawn as one multi-draw (about 1,300 fewer operations a frame), the loads of a walk read ahead are
+logged in one call, and the replicating buffer fill copies its pattern without a 64-bit division per
+dword.
+- **ASTRO BOT in Go-Go Archipelago**: about +13 % in the arrival flight and +20 % on the beach. Guest
+constants streamed right before an operation that waits for them are copied in place, so the
+execution thread no longer waits for those copies, and finished occlusion counter dumps are
+published in batches (9.1 to 3.4 ms a frame).
+- **GTA V's Fidelity mode while driving** (native ray tracing, Trevor in Sandy Shores): from about 23.5
+to about 29 fps. The ray tracing library's work lists sized by a GPU-written header are reached
+through device addresses with their bounds checked on the GPU instead of waiting for the GPU to read
+the header (about 100 ms per second of waiting); unmaps of streamed textures no longer drain the GPU;
+depth to colour conversions of two 4K depth targets run as shaders (1.5 ms to 0.1 ms each); and the
+stencil those conversions dropped is kept in a copy refreshed on the GPU.
+- **GTA V's Fidelity mode waits less for readbacks** (Trevor on a buggy in Sandy Shores, native ray
+tracing): the game's job threads read back a GPU-written buffer page by page, about 60 times a
+frame, and each read waited for the whole GPU backlog. The read-ahead now skips the pages without
+GPU writes instead of stopping at them, and a readback whose writes were already submitted is
+copied on the readback queue, waiting only for those writes. Standing still: from 20.8 to 26.5 fps;
+driving: from 17.9 to 21.0 fps.
+- **GTA V's Fidelity mode waits less for the GPU on the execution thread** (native ray tracing): the
+walk ahead of execution read stale values (the parameter blocks of the ray tracing library's build
+passes before the command processor had written them, and the previous frame's work-list counts of
+a shadow pass that only tests them for zero), so the execution thread found them changed and read
+them again around the GPU's writes, waiting for the GPU. Walks ahead now see the bytes of pending
+writes, and counts tested for zero are only checked for still being zero. Trevor on the buggy:
+driving from 18.6 to 23.0 fps, standing still from 19.9 to 27.9 fps.
+- **Hitches in GTA V's Fidelity mode in the first session after a build** (native ray tracing): the
+pipeline manifest built the compute programs without the native ray tracing patch, so dispatches did
+not find them and the execution thread translated them and created their pipelines while driving
+(55-80 ms a frame for the shadow pass, a 5 s freeze at the first car crash with a cold driver cache).
+The manifest now builds them as native ray tracing patches them.
+- **Faster first boot with empty caches, and a notice while pipelines compile** (Demon's Souls,
+Marvel's Wolverine): with NVIDIA's driver on Windows, compute pipelines are created in helper
+processes that use all the processors (`KYTY_PIPELINE_HELPERS=<n>`, 0 turns them off). The largest
+pipelines are compiled first, and when what is left would take long the game stops and a notice in the
+bottom right corner shows the progress: Enter/Cross (or no answer) waits, Esc/Circle plays at once
+with the rest compiled in the background (`--pipeline-precompile ask|wait|play`). Demon's Souls with
+empty caches reaches its world after 463 s instead of 821 s, with 9 frames over 100 ms instead of 53.
+- Compute programs translate to smaller SPIR-V (class tests with a constant mask, device-address
+reads without an extra block and Phi), so the driver compiles them faster: a sample of Demon's
+Souls' compute pipelines takes 970 ms each instead of 1059 ms on one thread.
+- Shaders that walk BVHs (GTA V's ray tracing in Fidelity mode) record the pages their
+device-address loads touch with one atomic OR, without reading the page-use bit first.
+- Game threads that read GPU-written memory wait for the readback themselves instead of stalling
+the emulated GPU's execution thread (Demon's Souls, ASTRO BOT).
+- Written buffer ranges nothing touched since the last synchronization are not synchronized again,
+reads around the GPU's writes reuse page lookups and the GPU-written byte mask, and the last
+shared mapping of backing-store accesses is remembered per thread.
+- Demon's Souls' replicating buffer fill runs on the CPU when neither its source nor its
+destination holds GPU-written bytes, so the draws that read the table no longer wait for the GPU.
+- **Shader variants stay the same across boots** (Marvel's Wolverine): table offsets, record
+blocks, sampler arrays and the addresses of expanded calls no longer end up as constants in the
+shader, null images keep the dimension the shader uses, identity-equivalent storage swizzles and
+unused buffer state no longer change it, and the driver pipeline cache is written right after a
+long pipeline creation. The stored shaders and pipelines are now found again on the next boot.
+- Demon's Souls draws whose descriptors the game rewrites after submitting them (flattened SRT
+constants, mip statistics bits) refresh those words instead of resolving the draw again.
+- Checks of GPU-written bytes are answered from a mask per page.
+- Bindless tables: resolved elements are cached between dispatches and only re-resolved when
+their memory changes.
+- Reused bindless tables rebind only the slots that changed, and draws keep the texture
+descriptions of the slots that did not change (about +3 % in Performance mode).
+- Reused bindless tables only check the elements whose slot or image changed since the last
+check, instead of all of them (GTA V Fidelity with native RT: about +7 %).
+- Draws that write memory from the vertex shader (ASTRO BOT's Sky Garden) no longer get a full
+barrier each; the following draws the game does not order after them stay in the same rendering
+instance (ASTRO BOT: about +5 %).
+- GPU-written values that only decide a shader's control flow are no longer read ahead, so the
+execution thread does not wait for them (ASTRO BOT's indirect dispatches).
+- Buffer device address synchronization only visits CPU-dirty pages and is skipped when nothing
+changed (this replaces the queue of changed ranges of upstream's d58aefde).
+- Render-target fast clears whose metadata a compute shader filled no longer read the metadata
+back from the GPU (upstream writes proven uniform fills to guest memory since 4059179e; fills
+that still run on the GPU are remembered here so the clear value needs no readback; for the rest,
+upstream selects the clears on the GPU with conditional rendering since b54057942, and both paths
+work together).
+- The Vulkan pipeline cache is written soon after a pipeline that took long to create (at most
+every 20 s), and the pipelines created last are written without waiting for another creation
+(upstream writes the cache every minute on its shader store thread since 1b7ea368, taken from
+this fork).
+- RELEASE_MEM label writes no longer submit a command buffer each (about 200 submits per frame
+down to about 20).
+- The per-draw render state is reused instead of zeroing 36 KiB per draw.
+- Guest memory reads and range clamps on the GPU thread resolve their mapping without the global
+memory lock (per-thread caches validated by a mapping generation).
+- Buffer device address synchronization only visits tracking regions dirtied since the last one.
+- Shader stage lookup keys are built without per-word vector work.
+- The emulated GPU runs as a pipeline of dedicated threads pinned to their own cores (command
+processor, draw resolution, execution and Vulkan recording) instead of one thread.
+- Shader programs, resource tables and vertex fetch tables are resolved ahead of execution (upstream's
+x86 resource-table walker logs what it reads there, and the execution thread checks it), and the
+shaders of a new area compile on six worker threads.
+- Unmapping memory drains the GPU only when the range holds GPU data or a guest-memory
+completion is pending (it drained about 12 times per frame while streaming).
+- Streaming no longer stalls frames for 80-280 ms: unmaps run ahead of the emulated GPU's
+backlog, and the guest memory map is updated and queried without linear scans or lock
+contention (upstream now also keeps its range list in an ordered map, since f7ae86c9).
+- Per-draw texture, render-target and image lookups are cached; deleted Vulkan images are
+recycled instead of reallocated.
+- Indirect draws and indirect dispatches whose arguments the GPU writes (grass and foliage
+culling, ray tracing) run from those arguments on the host GPU instead of reading them back:
+the scene near the mountain went from about 34 to 60 fps.
+- Reads and command-processor writes next to GPU-written data no longer drain the GPU, and
+GPU-written bytes are read back on a transfer queue that waits only for their last writer.
+- **No more stutter the first time something is drawn**: the driver needs up to half a second
+to compile each new pipeline, and the game used to stop while it did (places seen for the
+first time dropped to about 18 fps). New pipelines are now compiled in the background and the
+draws that need them are skipped meanwhile, so an object may appear a moment late the first
+time it is seen while the game keeps running at 40-60 fps. Draws whose results the game reads
+back (memory writes, occlusion queries, vehicle damage) still wait. Disable it with
+`--no-async-pipelines` or the launcher option.
+- **Less slowdown in long sessions**: cached GPU buffers were only released under memory pressure,
+so they piled up (from ~350 to ~14,000 in 25 minutes) and every frame kept uploading and
+write-protecting memory the game had reused. Buffers that neither the emulator nor any shader
+used for about 30 seconds are now released (shaders mark the pages they reach through device
+addresses). In a fixed scene after 25 minutes: about 46 fps before, about 52 fps after, the same
+as at the start. The game's sequential writes to protected memory take one fault per 64 KB
+instead of one per page.
+- A vertex shader that reads its vertex buffer descriptors from a table made every draw upload
+all the memory the CPU had written (about 16 MB a frame) and protect it again, so the game took
+about 2700 write faults a frame. The emulator now works out which memory a shader can reach
+through such tables and uploads only that.
+- Small per-draw constants reuse the copy made earlier in the same batch of draws, and the lookup
+of guest memory mappings for those copies is cached per 64 KB.
+- Fewer per-draw checks: the buffers a draw writes are collected once, image use is recorded once
+per frame step, and reads of memory the GPU has not written skip the GPU-written checks.
+- **Faster shaders on NVIDIA and other 32-wide GPUs** (five commits by EmK530, from
+[PR #3](https://github.com/TheCruZ/KytyPS5-GTA/pull/3)): packed and scalar F16 arithmetic runs as
+native half-float operations instead of going through F32, buffers that are only read as
+constants at small immediate offsets are read through uniform buffer views (the constant cache),
+and wave64 ballot lane bits project to the lane predicate. Masked selects whose old value is never
+read are dropped (float min/max keep upstream's lowering, which preserves the signed-zero
+selection of RDNA2). The new paths need the `shaderFloat16` and `uniformBufferStandardLayout`
+device features. Each can be turned off with an environment variable to compare or work around
+a problem: `KYTY_NATIVE_F16=0` (native F16) and `KYTY_UNIFORM_BUFFERS=0` (uniform buffer views).
+The PR's split waves (wave64 compute run as two 32-wide host subgroups) are not in this fork: they
+left wrongly coloured squares in GTA V's ray traced reflections.
+
+### Controllers
+
+- Pads that are not DualSenses (Xbox style) no longer vibrate continuously while driving: the game
+sends the vehicle engine through the haptic audio port, meant for the DualSense actuators, and
+upstream turned that audio into rumble. Those pads now rumble only through the game's normal
+vibration requests (crashes, impacts); `--pad-haptic-rumble` restores the rumble derived
+from haptic audio.
+
+</details>
+
+## Fixed upstream since the fork started
+
+These problems no longer need a fork commit: KytyPS5 fixed them in its own `main`.
+
+<details>
+<summary>Show the list</summary>
+
+### Taken from this fork 🎉
+
+Upstream commits co-authored by TheCruZ.
+
+
+| Fix                                                                                                                  | Upstream commit    |
+| -------------------------------------------------------------------------------------------------------------------- | ------------------ |
+| Fidelity mode device loss in the ray-tracing BVH build (the extra threads of a partial dispatch group stay inactive) | e4aca7a6, 0258bd61 |
+| Unsupported `v_bfrev_b32` with an SDWA source (BVH build shaders)                                                    | d890bb19           |
+| Ray-tracing buffers whose record count the shader computes                                                           | 8b05b673           |
+| Single-DWORD and `FORMAT_X` loads through GPU-selected V#s                                                           | a55a2838, 5f01308b |
+| Samplers built with `s_brev_b32` (constant-folded bit reverse)                                                       | 139b564c           |
+| `V_ALIGNBYTE_B32` uses only `S2[1:0]` as the byte offset                                                             | f18679e0           |
+| Scalar reads through GPU-selected V#s (ray tracing)                                                                  | b4d32394           |
+| Written compute descriptors read without an alias proof                                                              | ec3e48cd           |
+| `V_CMP(X)_GT_I64` / `V_CMP(X)_GE_I64`, the last 64-bit integer compares (from PR #1 by At0mC3)                       | d247d3d6           |
+| Deleting a depth image finds its stencil associations without scanning every cached image (long sessions)            | f4692a45           |
+| Partly: bounded material keys for the ray-hit material table                                                         | 843b5778, 1f6be3d5 |
+| Partly: 16-bit color fast-clear values (black cigar smoke in Father/Son)                                             | 57c97ebd           |
+| Partly: dynamic depth bounds, so deferred lights reuse their pipelines                                               | 98401022           |
+| Small GPU-written tiled images are written back to guest memory (water level for boats and jet skis), behind `--readback-tiled-images` (this fork's launcher turns it on in its recommended settings) | c07ad621f          |
+| `V_CVT_PK_U16_U32` / `V_CVT_PK_I16_I32` saturate to 16 bits                                                           | 9210264d           |
+| `V_FRACT_F32` / `V_FRACT_F16` / `V_FRACT_F64` results stay below 1.0 (`V_FRACT_F64` was from PR #1 by At0mC3, for PPSA04264) | e864cb20           |
+| Partly: the Vulkan pipeline cache is written every minute off the GPU thread, so the draws do not stall during the write (this fork still writes it sooner after slow pipeline creations) | 1b7ea368           |
+| Red Dead Redemption's menu flicker: freeing a superseded depth image keeps the HTile clear state its successor at the same address acquired | 2d84e36b           |
+| Demon's Souls "unsupported sampled depth image": the mip-statistics counter id of a depth texture descriptor is not compression metadata | 4fa10abb           |
+| Presentation no longer holds the video-out port locks while presenting, so a slow present does not stop the emulated GPU (0.8-3 s freezes while turning in free fall) | 937b3766           |
+| Partly: runs of indirect draws of consecutive records are drawn as one multi-draw (Demon's Souls; this fork also joins runs that skip records) | b30f2d6c           |
+
+
+### Fixed by other upstream authors
+
+
+| Fix                                                                                            | Upstream commit |
+| ---------------------------------------------------------------------------------------------- | --------------- |
+| Invalid depth upload on shadow cube maps (partial depth views)                                 | 068d7621        |
+| `DS_MIN_F32` / `DS_MAX_F32` operands                                                           | e85279ea        |
+| Formatted stores to SNORM and USCALED/SSCALED                                                  | de9c15fa        |
+| Synchronous CPU readbacks published on the waiting thread                                      | 39e23ac9        |
+| Window title updates made presentation wait for the main thread (part of a performance commit) | 7415febd        |
+| 64-bit integer compares (all but `V_CMP(X)_GT/GE_I64`)                                         | bb98f264        |
+| V# bases selected by a scalar branch in shaders that write memory                              | 488c0aca        |
+| Texel offsets of `IMAGE_SAMPLE*_O` (runtime offsets need VK_KHR_maintenance8)                  | 984cfceb, 460a196f |
+| GPU-selected formatted loads share one load (Fidelity froze minutes compiling RT shaders)      | 9a7c54da        |
+| Partly: dynamic state a draw already set is not recorded again (part of a performance commit)  | 93452b24        |
+| Partly: the Vulkan pipeline cache is checkpointed every 5 minutes, so a crash does not lose it (nmzik, with fxpw) | 959bee47        |
+| Partly: the Vulkan pipeline cache is kept across emulator builds (part of a performance commit; shadowbeat070) | d58aefde        |
+| Partly: guest buffers with device addresses share VMA blocks instead of one dedicated allocation each (part of a performance commit; shadowbeat070) | d58aefde        |
+| Fidelity mode device loss in PPSA04264: GLC `BUFFER_LOAD_DWORDX2` is one 64-bit atomic load in the BVH build prefix sums (nmzik) | d1fe1324        |
+| `V_CVT_PKRTZ_F16_F32` truncates toward zero for every input (nmzik)                            | 9f88043e        |
+| Partly: proven compute buffer fills (DCC metadata) are written to guest memory instead of read back (nmzik) | 4059179e        |
+| GTA V's tessellated tree trunks: LS/HS/TES stride reflection across forward branches and wide LDS writes, HS patch constants and TES patch inputs through predicated addresses (Mr. Big Britches, nmzik) | 4a2961cd, 0957f088, c7158912 |
+| Partly: virtual memory range edits use an ordered map instead of shifting the whole range list (nmzik) | f7ae86c9        |
+| Formatted stores convert to the unsigned 11/10-bit float formats (nmzik)                       | 59d8256b        |
+| The address space lock is taken shared for the temporary protection changes of the page manager (about +3-5 % in Fidelity with native ray tracing; nmzik) | 07f64202        |
+| **Green puddle reflections in the rain**: MSAA targets resolve into the level and layer the texture cache placed them at (GTA V's reflection cube faces all landed in layer 0; nmzik, usa-ratt) | 17a0f53d        |
+| `Inst::AddUse` without the duplicate-use scan (this fork had ported upstream PR #1679 by Nawid3333; nmzik) | 7eb8abb2        |
+| Partly: the hot IR operand accessors are inline (this fork keeps NeySlim's iterative `Resolve` and the remaining accessors; Senaxx) | 6cee2dc0        |
+| Shader programs and pipelines persist across sessions in a per-game shader store (`--shader-cache`, the launcher's "Cache shaders", on by default; this fork's own program and pipeline stores were replaced by it; nmzik) | 18160043, 83f8bfd3 |
+| Fidelity mode exit "scalar resource reads overlap a shader buffer write": the per-draw overlap guard is gone (the fork had accepted the BVH build's reads that precede the dispatch's own writes) | eb3cb472        |
+| ASTRO BOT's startup crash: SRT table reads through a null pointer, on a branch side the shader never takes, read zero (the fork had ported PR #1528 by Mikhail Radziukevich; x86 SRT walker) | d7856753, bdf48dcf |
+| Partly: range-set additions extend a covering range in place instead of reinserting map nodes (part of a performance commit; nmzik) | 9eef2e14        |
+| Partly: storage buffer reads rely on `robustBufferAccess2` for their bounds (the fork had EmK530's version from PR #3, which skipped the bounds branch of dword reads; nmzik) | ee034be4        |
+| `S_MEMREALTIME` counts at the console's 100 MHz (it ran 25 % fast on NVIDIA's 1 ns device clock, so guest timeouts and frame pacers expired early; the fork had Senaxx's earlier version; Senaxx) | b2f40c6c        |
+| APR resolves each file path with one attribute query (Demon's Souls gathers its ~224,000 package paths at boot, which took ~2 minutes; nmzik) | 45437144        |
+| `fsync` succeeds on directories, devices and read-only descriptors, so a game that syncs its save directory after writing a save no longer sees the save fail (the fork had Senaxx's earlier version; Senaxx) | 5ff1085f        |
+| Elden Ring Nightreign crash with tessellation: hull shaders with one output control point keep their outputs apart from the patch constants, and depth textures that keep metadata pipe alignment without compression are sampled (the fork had its own versions; nmzik) | 3b3e2475, 65cfffe8, c1d1003d |
+| The strongly connected components of a CFG are found without recursion (a long Marvel's Wolverine shader overflowed the stack of the thread that translates it; the fork had Senaxx's earlier version; Senaxx) | b6cc1fff        |
+| Partly: repeated GPU interrupts with the same data count in one event (this fork also merges the unread interrupts of a context that is not the newest one, which ASTRO BOT's memory growth needs; superkeka) | c86d31bf        |
+| Partly: null images keep the dimension and cube their instructions declare (this fork falls back to a 2D view when none is declared; nmzik) | 9a29dc62        |
+| Partly: page tracking lock waiters wait on reads before they try the lock again (this fork's waiters also sleep after a short spin; Artyom Zabroda) | b9cb08d3        |
+| Partly: the parts of a Windows file view that survive a partial unmap keep their page protections (this fork also retries the guest accesses made while they are briefly unmapped; nmzik) | 59723ae1        |
+| Partly: fault scans leave the pages past the records an area holds for the next scan, and read only the records they stored (this fork had it for its fault and write bitmaps; nmzik) | fd04c3fa, f314e86b |
+| Partly: page access watchers count their owners, so several caches can keep a page inaccessible at once (this fork had it for its lazy readback of large linear images, which keeps Red Dead Redemption's post-processing from being read back every frame; nmzik, Mr. Big Britches) | 9678c59b        |
+| ASTRO's PLAYROOM lost the GPU on "Continue": BVH traversal shaders read device-address pages without a cached buffer as all ones, so a leaf walk over memory the GPU had not touched finds its end (the fork had a `[HACK]` that ended such loops after 4096 zero reads; nmzik) | 6030fde6        |
+
+</details>
+
+## Known bugs and crashes
+
+- **Sluggish menus (regression between v13 and v16)**: GTA V's menus respond slowly: button
+presses take a while to register and the menu transitions and animations play slowly. It comes
+from upstream KytyPS5, not from this fork's commits, and shows with `--vblank-frequency 180`
+(not at 60).
 
 ## Screenshots
 
-<table align="center">
-  <tr>
-    <td align="center">
-      <strong>Cyberpunk 2077</strong><br>
-      <img src="docs/screenshots/ps5-07.png" width="300" alt="Cyberpunk 2077 running in KytyPS5">
-    </td>
-    <td align="center">
-      <strong>MLB The Show 23</strong><br>
-      <img src="docs/screenshots/ps5-08.png" width="300" alt="MLB The Show 23 running in KytyPS5">
-    </td>
-  </tr>
-  <tr>
-    <td align="center">
-      <strong>Astro Bot</strong><br>
-      <img src="docs/screenshots/ps5-01.png" width="300" alt="Astro Bot running in KytyPS5">
-    </td>
-    <td align="center">
-      <strong>Saros</strong><br>
-      <img src="docs/screenshots/ps5-03.png" width="300" alt="Saros running in KytyPS5">
-    </td>
-  </tr>
-  <tr>
-    <td align="center">
-      <strong>Neptunia ReVerse</strong><br>
-      <img src="docs/screenshots/ps5-04.png" width="300" alt="Neptunia ReVerse running in KytyPS5">
-    </td>
-    <td align="center">
-      <strong>SILENT HILL: The Short Message</strong><br>
-      <img src="docs/screenshots/ps5-05.png" width="300" alt="SILENT HILL: The Short Message running in KytyPS5">
-    </td>
-  </tr>
-  <tr>
-    <td align="center">
-      <strong>Demon's Souls</strong><br>
-      <img src="docs/screenshots/ps5-02.png" width="300" alt="Demon's Souls running in KytyPS5">
-    </td>
-    <td align="center">
-      <strong>UFC 6</strong><br>
-      <img src="docs/screenshots/ps5-06.jpg" width="300" alt="UFC 6 running in KytyPS5">
-    </td>
-  </tr>
-</table>
+![Boot legal notice](ForkImgs/1.png)
 
-<p align="center"><em>And many more...</em></p>
+![Franklin in Los Santos](ForkImgs/2.png)
 
-## Notable Forks
+## New prologue video with pipeline cache **empty** at 60 fps!!
 
-These community forks bring KytyPS5 to other platforms.
+- v6 compiles the shaders in background without freeze the image and show the models when they are ready, the game is running in 2k resolution
 
-- [Cosmo/KytyPS5](https://github.com/Cosmo/KytyPS5) — Xbox Series X: Direct3D 12 renderer, sleek
-  controller-first interface, and local multiplayer for up to four players.
+[![Video](https://img.youtube.com/vi/AXGfUv167Gs/maxresdefault.jpg)](https://youtu.be/AXGfUv167Gs)
 
-## Contributing
+## 30 min gameplay video 60 fps stable at 2k resolution with v9 release
 
-Testing games and submitting detailed bug reports are useful ways to contribute. Search existing
-issues first, then use the **Game Emulation Status Report** template and attach the complete log file.
+[![Video](https://img.youtube.com/vi/ABnoxSQLzBQ/maxresdefault.jpg)](https://youtu.be/ABnoxSQLzBQ)
 
-**Pull requests for general fixes, architectural changes, or refactoring that do not address a concrete bug or launch problem in a specific game will be automatically closed.**
+## Reporting a problem
 
-**Large, unfocused commits or pull requests that bundle unrelated changes without a clear purpose or game-related benefit will also be automatically closed.**
-
-Keep each PR focused. Name the affected game, describe the exact problem, and provide evidence showing what the change fixes.
-
-Windows and Linux are the primary target platforms, so changes to shared code should not
-introduce regressions on either platform. Changes confined to a platform's own code paths
-only need to build on that platform. Because KytyPS5 is still evolving quickly, consider
-opening an issue before starting a large change.
-
-### Formatting
-
-Set up the clang-format hook after cloning.
-
-Install `pre-commit` using the method appropriate for your platform:
-
-- **Arch Linux / CachyOS:** `sudo pacman -S pre-commit`
-- **Other Linux / macOS / Windows:** `python -m pip install pre-commit`
-
-Then install the Git hook:
-
-```bash
-python -m pre_commit install --install-hooks
-```
-
-It formats staged `.cpp`, `.h`, and `.inc` files in `src`.
-
-## Developer Information
-
-The PS5 graphics architecture is based on AMD RDNA 2. Use AMD's
-[RDNA 2 Instruction Set Architecture Reference Guide (document 70648)](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
-as the primary instruction-encoding reference when working on shader decoding and recompilation.
-
-Important areas of the codebase:
-
-- [`src/graphics/shader/recompiler`](src/graphics/shader/recompiler) — instruction decoding,
-  intermediate representation, control flow, resource tracking, and SPIR-V emission
-- [`src/graphics/guest_gpu`](src/graphics/guest_gpu) — PS5 (Prospero) GPU formats and command processing
-- [`src/graphics/host_gpu`](src/graphics/host_gpu) — Vulkan host backend and resource management
-- [`tests`](tests) — focused memory, shader, and resource-tracking regression tests
-
-The renderer targets Vulkan 1.3. Keep shader changes aligned with both the RDNA 2 ISA semantics and
-the Vulkan/SPIR-V validation rules.
-
-## Building
-
-### System requirements
-
-- Windows 10 version 1803, a current Linux distribution, or macOS on Apple Silicon
-- A 64-bit x86 processor (on macOS, an Apple Silicon processor with Rosetta 2)
-- A Vulkan 1.3-capable GPU with current drivers (on macOS, Vulkan is provided by the bundled
-  MoltenVK)
-
-### Build requirements (Windows)
-
-- Git
-- CMake 3.22.1 or newer
-- Ninja
-- Visual Studio 2022 or Build Tools 2022 with the **Desktop development with C++** workload and
-  **C++ Clang tools for Windows** component
-- Qt 6 for MSVC 2022 64-bit, including Concurrent, Network, and Widgets
-- [glslang](https://github.com/KhronosGroup/glslang/releases) (`glslang` or `glslangValidator`) on `PATH`
-- Python 3 on `PATH`; the bundled SPIRV-Tools runs it at configure time
-
-The Microsoft C++ compiler (`cl.exe`) is not supported; use `clang-cl`.
-
-Open an **x64 Native Tools Command Prompt for Visual Studio 2022** (or the equivalent Developer
-PowerShell), change to the repository root, and initialize the dependencies:
-
-```powershell
-git submodule update --init --recursive
-```
-
-Configure the project. Replace the Qt path with the version installed on your system:
-
-```powershell
-cmake -S . -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_PREFIX_PATH="C:/Qt/6.x.x/msvc2022_64"
-```
-
-Build the launcher and stage a runnable installation:
-
-```powershell
-cmake --build _Build/windows --target launcher
-cmake --install _Build/windows --prefix _Build/windows/install
-```
-
-The finished application and its runtime dependencies will be placed in
-`_Build/windows/install`.
-
-### Building on Linux
-
-Install the toolchain and the libraries the bundled SDL3 needs. Without the audio, Wayland, and
-udev development packages, SDL3 quietly configures itself without those backends, and the resulting
-build has no working audio or gamepad hotplug support:
-
-```bash
-sudo apt-get install --no-install-recommends \
-  clang lld ninja-build cmake git glslang-tools python3 pkg-config \
-  libgl1-mesa-dev libx11-dev libxcursor-dev libxext-dev libxfixes-dev \
-  libxi-dev libxrandr-dev libxss-dev libxtst-dev libxkbcommon-dev \
-  libasound2-dev libpulse-dev libudev-dev libdbus-1-dev libwayland-dev wayland-protocols
-```
-
-Qt 6 (Concurrent, Network, and Widgets) is required for the launcher. Use your distribution's
-packages (`qt6-base-dev`) or an official Qt installation.
-
-```bash
-git submodule update --init --recursive
-
-cmake -S . -B _Build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-  -DCMAKE_PREFIX_PATH="$Qt6_DIR"
-
-cmake --build _Build/linux --target launcher --parallel
-cmake --install _Build/linux --prefix _Build/linux/install
-```
-
-The install step copies the Qt libraries and plugins next to the binaries, so
-`_Build/linux/install` runs without a matching system Qt installation. FFmpeg is linked statically
-from the pinned [KytyPS5 FFmpeg core](https://github.com/KytyPS5/ext-ffmpeg-core)
-release, including VP9 and WebM support. System FFmpeg packages are not required.
-
-To build `kyty_emulator` and the `kyty_tests` target without Qt, use a separate build directory:
-
-```bash
-git submodule update --init --recursive
-
-cmake -S . -B _Build/linux-no-qt -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-  -DKYTY_BUILD_LAUNCHER=OFF
-
-cmake --build _Build/linux-no-qt --target kyty_emulator kyty_tests --parallel
-```
-
-As on Windows, the MSVC compiler is not used; Clang is required. `cl.exe` is rejected at configure
-time.
-
-The CMake source root is the repository root.
-
-### Building on NixOS
-
-A development shell provides Clang, CMake, Ninja, Qt 6, the Vulkan headers, and the SDL3 backend
-libraries. Enter it and configure exactly as on other Linux distributions; the shell exports
-`CMAKE_PREFIX_PATH` and `QT_PLUGIN_PATH`, so the `-DCMAKE_PREFIX_PATH="$Qt6_DIR"` argument is not
-needed:
-
-```bash
-nix-shell # or: nix develop
-git submodule update --init --recursive
-
-cmake -S . -B _Build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
-
-cmake --build _Build/linux --target launcher --parallel
-cmake --install _Build/linux --prefix _Build/linux/install
-```
-
-The configure step downloads the FFmpeg prebuilts and the `xbyak`, `zydis`, `zstd`, and ZArchive
-sources, so it needs network access; a fully sandboxed `nix build` would require vendoring those
-inputs. A Vulkan 1.3 driver must be available at runtime (on NixOS,
-`hardware.graphics.enable = true`).
-
-### Building on Fedora and Fedora Atomic (Bazzite, Bluefin, Silverblue)
-
-On regular Fedora, install dependencies on the host. On Fedora Atomic variants such as Bazzite,
-Bluefin and Silverblue, use [Distrobox](https://distrobox.it/) and run the install and build steps
-inside the container. Keep the checkout in your home directory so it is shared with the container.
-Add `--nvidia` to the create command for hosts using the proprietary NVIDIA driver:
-
-```bash
-distrobox create --name kyty-build --image registry.fedoraproject.org/fedora:latest
-distrobox enter kyty-build
-```
-
-Install the toolchain, Qt 6 and SDL3 dependencies:
-
-```bash
-sudo dnf install -y \
-  clang lld ninja-build cmake git glslang python3 pkgconf-pkg-config \
-  mesa-libGL-devel libX11-devel libXcursor-devel libXext-devel libXfixes-devel \
-  libXi-devel libXrandr-devel libXScrnSaver-devel libXtst-devel libxkbcommon-devel \
-  alsa-lib-devel pulseaudio-libs-devel systemd-devel dbus-devel \
-  wayland-devel wayland-protocols-devel qt6-qtbase-devel
-```
-
-From the repository root, follow the launcher configure, build and install steps in
-[Building on Linux](#building-on-linux), omitting `-DCMAKE_PREFIX_PATH="$Qt6_DIR"`; CMake finds
-Fedora's packaged Qt 6 automatically.
-
-Run `./_Build/linux/install/kyty_launcher` on regular Fedora or inside the container. To launch a
-container build from the host, leave the container with `exit`, then run from the repository root:
-
-```bash
-distrobox enter kyty-build -- ./_Build/linux/install/kyty_launcher
-```
-
-Qt libraries and plugins are bundled. You can also launch directly on a Fedora Atomic host
-if its other system libraries are compatible with the container build.
-
-### Building on macOS
-
-macOS builds target x86-64 and run under Rosetta 2 on Apple Silicon, so the PS5's x86-64 game
-code executes through the same translation layer as the emulator itself. Prebuilt archives are
-attached to releases; the steps below are for building from source.
-
-Requirements:
-
-- An Apple Silicon Mac with Rosetta 2 installed (`softwareupdate --install-rosetta`)
-- Xcode (or the Command Line Tools)
-- Homebrew packages: `brew install cmake ninja glslang python`
-- Qt 6 (Concurrent, Network, and Widgets) with x86-64 support. The official Qt installation is
-  universal and works; Homebrew's Qt is arm64-only and will not link
-
-```bash
-git submodule update --init --recursive
-
-cmake -S . -B _Build/macos -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_OSX_ARCHITECTURES=x86_64 \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-  -DCMAKE_PREFIX_PATH="$Qt6_DIR"
-
-cmake --build _Build/macos --target launcher --parallel
-cmake --install _Build/macos --prefix _Build/macos/install
-```
-
-The build re-signs `kyty_emulator` with the JIT entitlements it needs to execute translated
-guest code; no manual signing step is required. When the launcher is built, the installation
-also produces `_Build/macos/install/KytyPS5.app` — double-click to launch the GUI.
-A flat `kyty_emulator` is kept for CLI usage.
-
-Vulkan comes from MoltenVK. Download `MoltenVK-macos.tar` from the
-[MoltenVK releases](https://github.com/KhronosGroup/MoltenVK/releases), then copy
-`MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib` next to the flat `kyty_emulator`
-(and, for the bundle, into `KytyPS5.app/Contents/Frameworks/`) and sign it with an ad hoc signature:
-
-```bash
-codesign --force --sign - _Build/macos/install/libMoltenVK.dylib
-# For the bundle (if present):
-codesign --force --sign - _Build/macos/install/KytyPS5.app/Contents/Frameworks/libMoltenVK.dylib
-codesign --force --sign - _Build/macos/install/KytyPS5.app
-```
-
-Release archives already include a signed `libMoltenVK.dylib` (both flat and inside the bundle).
-
-### Regression tests
-
-Build every regression executable and run the registered tests with:
-
-```powershell
-cmake --build _Build/windows --target kyty_tests
-ctest --test-dir _Build/windows --output-on-failure
-```
-
-Use `_Build/linux` instead of `_Build/windows` for a Linux build.
-
-### Visual Studio Code
-
-A ready-made Visual Studio Code setup is included in [`.vscode`](.vscode). It configures CMake
-Tools to build the project with Ninja and `clang-cl` and provides launch profiles for both
-`kyty_launcher.exe` and `kyty_emulator.exe`. It is Windows-only: VS Code settings cannot select a
-compiler per platform, so on Linux configure from the command line as shown above.
-
-Before using it:
-
-1. Install the **CMake Tools** and **C/C++** extensions in Visual Studio Code.
-2. Update `CMAKE_PREFIX_PATH` in [`.vscode/settings.json`](.vscode/settings.json) to point to your
-   Qt 6 MSVC installation.
-3. Update the `--game` path in [`.vscode/launch.json`](.vscode/launch.json) for the
-   **Debug kyty_emulator** profile.
-4. Open the repository in an x64 Visual Studio developer environment, configure the CMake project,
-   and select a launch profile from **Run and Debug**.
-
-## Running
-
-Update your graphics driver before reporting rendering problems.
-
-To use the graphical launcher:
-
-```powershell
-.\_Build\windows\install\kyty_launcher.exe
-```
-
-```bash
-./_Build/linux/install/kyty_launcher
-```
-
-```bash
-open _Build/macos/install/KytyPS5.app  # or double-click in Finder
-```
-
-On first launch, add one or more game folders in the global settings. The launcher searches those
-folders recursively for game directories containing `eboot.bin` and ZArchive (`.zar`) game dumps
-whose archive root contains `eboot.bin`. Select a detected game and run it from the game list.
-ZArchive dumps are mounted read-only and streamed directly; they do not need to be extracted first.
-
-Official release builds include a built-in updater. Leave **Check for updates on startup** enabled,
-or click **Check for updates**, then choose **Install Update**. The launcher downloads the package
-for your platform from GitHub, checks its SHA-256 checksum, and restarts after installation. Close
-any running games first. Settings, saves, patches, and other files outside the release package are
-preserved; replacement failures restore the previous files. The installation folder must be writable.
-If a package cannot be installed automatically, the updater offers the GitHub release page.
-Source builds and builds from forks do not replace themselves with official releases.
-
-The emulator can also be started directly with a legally obtained game directory, ELF file, or
-ZArchive dump:
-
-```powershell
-.\_Build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame"
-.\_Build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame.zar"
-```
-
-```bash
-./_Build/linux/install/kyty_emulator --game "/games/ExampleGame"
-./_Build/linux/install/kyty_emulator --game "/games/ExampleGame.zar"
-```
-
-On macOS, the adjacent flat or app-bundled `libMoltenVK.dylib` is found automatically; no
-environment variable is required:
-
-```bash
-./_Build/macos/install/kyty_emulator --game "/games/ExampleGame"
-```
-
-To override the Vulkan loader, set `SDL_VULKAN_LIBRARY`:
-
-```bash
-SDL_VULKAN_LIBRARY=/path/to/libMoltenVK.dylib ./kyty_emulator --game "/games/ExampleGame"
-```
-
-Run `kyty_emulator --help` to see the available graphics, logging, validation, profiling, and
-debugging options.
-
-### AI Use
-
-AI tools may be used for research, reverse engineering, and development assistance. Contributors
-must fully understand, review, and test all code they submit and remain responsible for its
-correctness. Repository communication, including pull-request descriptions, code comments, and
-issue comments, must come from the human contributor rather than an autonomous AI agent.
-
-Pull requests that include AI-assisted or AI-generated work should disclose the scope of the AI
-involvement and describe the human review and testing performed before submission. Unverified or
-untested generated changes may be closed without review.
-
-## License
-
-KytyPS5 is licensed under the [GNU General Public License version 2](LICENSE)
-(`GPL-2.0-only`).
-
-This project is based on the original [Kyty](https://github.com/InoriRus/Kyty), which was released
-under the MIT License. Kyty's original copyright and license notice are preserved in
-[`LICENSES/Kyty-MIT.txt`](LICENSES/Kyty-MIT.txt). Third-party components remain subject to the
-licenses included with those components.
-
-## Special Thanks
-
-- [InoriRus/Kyty](https://github.com/InoriRus/Kyty) — KytyPS5 is based on a heavily modified version
-  of the original Kyty project.
-- [shadps4-emu/shadPS4](https://github.com/shadps4-emu/shadPS4) — reference for understanding PS4
-  memory behavior, GPU resource aliasing, cache coherency,
-  and the AVPlayer implementation.
+Open an issue with the crash message, the game mode (Performance, Performance RT or Fidelity) and
+where in the game it happened. Crash reports from the emulator include the faulting thread,
+registers and stack, which are usually enough to locate the problem. The launcher keeps the
+warnings, errors and crash report of the last 20 sessions in the `_Logs` folder next to the
+emulator, one file per session named after the game and the date: attach the one of the session that
+failed.

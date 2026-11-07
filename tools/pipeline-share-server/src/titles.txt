@@ -1,0 +1,27 @@
+# Game names for the home page (a copy of _Tools/pipelines/titles.txt, which kpm_fold.py reads).
+# TITLE=Name, one per line; a title with no name is shown by its title alone.
+PPSA01317=Gran Turismo 7
+PPSA01341=Demon's Souls
+PPSA01473=Ratchet & Clank: Rift Apart
+PPSA03355=Hades
+PPSA03524=GTA: San Andreas - The Definitive Edition
+PPSA03525=GTA: San Andreas - The Definitive Edition
+PPSA03527=GTA III - The Definitive Edition
+PPSA03530=GTA: Vice City - The Definitive Edition
+PPSA03671=Marvel's Wolverine
+PPSA04263=GTA V
+PPSA04264=GTA V
+PPSA12544=Hollow Knight: Silksong
+PPSA21564=ASTRO BOT
+PPSA21567=ASTRO BOT
+PPSA26344=Ghost of Yotei
+PPSA30528=Red Dead Redemption
+PPSA01325=Astro's Playroom
+PPSA01342=Demon's Souls
+PPSA10067=Prince of Persia: The Lost Crown
+PPSA17191=Hi-Fi RUSH
+PPSA17597=Sonic X Shadow Generations
+PPSA25381=Elden Ring Nightreign
+PPSA28180=Days Gone
+PPSA01951=Control Ultimate Edition
+PPSA01556=Resident Evil Village
