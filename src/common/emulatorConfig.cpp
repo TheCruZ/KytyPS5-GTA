@@ -170,6 +170,10 @@ bool PipelineManifestRecord() {
 	return g_config->pipeline_manifest_record;
 }
 
+bool PipelineManifestStrict() {
+	return g_config->pipeline_manifest_strict;
+}
+
 PipelinePrecompile GetPipelinePrecompile() {
 	return g_config->pipeline_precompile;
 }

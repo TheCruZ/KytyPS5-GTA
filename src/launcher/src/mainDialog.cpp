@@ -6,6 +6,7 @@
 #include "configurationListWidget.h"
 #include "controllerPreview.h"
 #include "gameContent.h"
+#include "pipelineSharing.h"
 #include "titleSound.h"
 #include "updateChecker.h"
 
@@ -22,6 +23,7 @@
 #include <QObject>
 #include <QPointer>
 #include <QProcess>
+#include <QPushButton>
 #include <QRadioButton>
 #include <QRegularExpression>
 #include <QSettings>
@@ -31,6 +33,7 @@
 #include <QtCore>
 
 #include <cstdint>
+#include <memory>
 
 #include "ui_main_dialog.h"
 
@@ -100,6 +103,7 @@ private:
 	ControllerPreview m_controller_preview;
 	TitleSound      m_title_sound;
 	QString         m_interpreter;
+	QString         m_emulator_version;
 
 	int m_running_games = 0;
 };
@@ -127,6 +131,8 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	m_ui->check_updates_on_startup->setChecked(g_check_updates_on_startup);
 	m_ui->close_terminal->setChecked(g_close_terminal);
 	m_ui->theme_combo->setCurrentIndex(g_theme);
+	m_ui->share_pipelines->setVisible(PipelineSharing::Available());
+	m_ui->share_pipelines->setChecked(PipelineSharing::Enabled());
 	ApplyTheme(g_theme);
 	m_ui->check_updates_link->setVisible(UpdateChecker::IsSupported());
 	m_ui->check_updates_on_startup->setVisible(UpdateChecker::IsSupported());
@@ -163,6 +169,10 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	});
 	connect(m_ui->close_terminal, &QCheckBox::toggled, this, [this](bool checked) {
 		g_close_terminal = checked;
+		m_ui->widget->WriteSettings();
+	});
+	connect(m_ui->share_pipelines, &QCheckBox::toggled, this, [this](bool checked) {
+		PipelineSharing::SetEnabled(checked);
 		m_ui->widget->WriteSettings();
 	});
 	connect(m_ui->theme_combo, &QComboBox::currentIndexChanged, this, [this](int index) {
@@ -207,6 +217,7 @@ void MainDialogPrivate::FindInterpreter() {
 		auto lines  = output.split(QRegularExpression("[\r\n]"), Qt::SkipEmptyParts);
 
 		if (lines.count() >= 2) {
+			m_emulator_version = lines.at(0).startsWith("exe_name") ? lines.at(1) : lines.at(0);
 			m_ui->label_Version->setText(
 			    tr("Version: ") + (lines.at(0).startsWith("exe_name") ? lines.at(1) : lines.at(0)));
 		} else {
@@ -489,6 +500,7 @@ void MainDialogPrivate::WriteSettings(QSettings& s) {
 	s.setValue(SETTINGS_THEME, g_theme);
 
 	s.endGroup();
+	PipelineSharing::WriteSettings(s);
 }
 
 void MainDialogPrivate::ReadSettings(QSettings& s) {
@@ -503,6 +515,85 @@ void MainDialogPrivate::ReadSettings(QSettings& s) {
 	}
 
 	s.endGroup();
+	PipelineSharing::ReadSettings(s);
+}
+
+// This fork tests every game with these settings. They came from GTA V (PPSA04263, PPSA04264):
+// without red zone protection its streaming thread crashes, without linear image readback cars
+// deform wildly in collisions, without tiled image readback boats and jet skis do not ride the
+// waves, and without tessellation the trunks of nearby trees are not drawn. Native ray tracing
+// is experimental and is turned off by the emulator on GPUs without ray queries. Without the
+// PS5 TSC rate Red Dead Redemption (PPSA30528) and Demon's Souls (PPSA01341) run too fast;
+// configurations saved before it became the default keep it off. PS5 Pro mode stays off: Days
+// Gone (PPSA28180) and Marvel's Wolverine crash with it. The vblank runs at the console's 60 Hz:
+// faster vblanks only help development measurements, and some games pace or time themselves by
+// them. Offers to launch with these settings when the configuration differs in any of them.
+// Returns false to cancel the launch.
+static bool ApplyRecommendedSettings(QWidget* parent, Configuration* info) {
+	QStringList missing;
+#if defined(_WIN32)
+	if (!info->red_zone_protection_enabled) {
+		missing << QObject::tr("Windows SysV red zone crash protection (streaming crashes)");
+	}
+#endif
+	if (!info->readback_linear_images) {
+		missing << QObject::tr("Read back linear images (vehicle damage)");
+	}
+	if (!info->readback_tiled_images) {
+		missing << QObject::tr("Read back small tiled images (water level for boats and jet skis)");
+	}
+	if (!info->tessellation_enabled) {
+		missing << QObject::tr("Tessellation support (trunks of nearby trees)");
+	}
+	if (!info->shader_cache_enabled) {
+		missing << QObject::tr("Cache shaders (shader and pipeline compilation stutter)");
+	}
+	if (!info->native_ray_tracing_enabled) {
+		missing << QObject::tr("Native ray tracing (experimental; faster ray traced shadows and "
+		                       "reflections)");
+	}
+	if (!info->guest_tsc_enabled) {
+		missing << QObject::tr("PS5 TSC rate (games that run too fast, such as Red Dead "
+		                       "Redemption)");
+	}
+	if (info->pro_enabled) {
+		missing << QObject::tr("PS5 Pro mode turned off (Days Gone and Marvel's Wolverine crash "
+		                       "with it)");
+	}
+	if (info->vblank_frequency != 60) {
+		missing << QObject::tr("Vblank frequency of 60 Hz (now %1 Hz; other values are only advisable "
+		                       "during development, as some games may not work correctly)")
+		               .arg(info->vblank_frequency);
+	}
+	if (missing.isEmpty()) {
+		return true;
+	}
+	QMessageBox box(QMessageBox::Warning, QObject::tr("Recommended settings"),
+	                QObject::tr("This fork tests every game with these settings, which this "
+	                            "configuration does not use:\n\n- %1\n\nLaunch with them?")
+	                    .arg(missing.join(QStringLiteral("\n- "))),
+	                QMessageBox::NoButton, parent);
+	auto* recommended = box.addButton(QObject::tr("Launch with recommended settings"),
+	                                  QMessageBox::AcceptRole);
+	auto* as_is = box.addButton(QObject::tr("Launch as configured"), QMessageBox::DestructiveRole);
+	box.addButton(QMessageBox::Cancel);
+	box.setDefaultButton(recommended);
+	box.exec();
+	if (box.clickedButton() == recommended) {
+#if defined(_WIN32)
+		info->red_zone_protection_enabled = true;
+#endif
+		info->readback_linear_images = true;
+		info->readback_tiled_images  = true;
+		info->tessellation_enabled       = true;
+		info->shader_cache_enabled       = true;
+		info->native_ray_tracing_enabled = true;
+		info->guest_tsc_enabled          = true;
+		info->pro_enabled                = false;
+		info->vblank_frequency           = 60;
+		return true;
+	}
+	return box.clickedButton() == as_is;
 }
 
 void MainDialogPrivate::Run() {
@@ -512,6 +603,23 @@ void MainDialogPrivate::Run() {
 	QPointer<ConfigurationItem> item = m_ui->widget->GetSelectedItem();
 	if (item == nullptr) {
 		return;
+	}
+
+	auto info = m_ui->widget->CreateConfiguration(*item);
+	if (!ApplyRecommendedSettings(m_main_dialog, info.get())) {
+		return;
+	}
+
+	// The first launch asks whether to share pipeline data. Sharing needs the emulator to record
+	// its manifest.
+	const bool share = PipelineSharing::EnsureConsent(m_main_dialog);
+	{
+		const QSignalBlocker blocker(m_ui->share_pipelines);
+		m_ui->share_pipelines->setChecked(share);
+	}
+	m_ui->widget->WriteSettings();
+	if (share) {
+		info->pipeline_manifest_record = true;
 	}
 
 	item->SetRunning(true);
@@ -531,8 +639,20 @@ void MainDialogPrivate::Run() {
 			        Update();
 		        }
 	        });
-	auto info = m_ui->widget->CreateConfiguration(*item);
-	m_main_dialog->RunInterpreter(process, *info, g_close_terminal);
+	if (share && !info->title_id.isEmpty()) {
+		// The emulator starts after a round that only fetches, so that it loads the pipelines
+		// other players recorded with its manifests (it waits for the server 8 s at most).
+		std::shared_ptr<Configuration> shared_info = std::move(info);
+		auto* session = new PipelineShareSession(process, shared_info->title_id,
+		                                         shared_info->gameVersion,
+		                                         QFileInfo(m_interpreter).absolutePath(),
+		                                         m_emulator_version, this);
+		session->LaunchAfterFetch([this, process, shared_info] {
+			m_main_dialog->RunInterpreter(process, *shared_info, g_close_terminal);
+		});
+	} else {
+		m_main_dialog->RunInterpreter(process, *info, g_close_terminal);
+	}
 
 	Update();
 }

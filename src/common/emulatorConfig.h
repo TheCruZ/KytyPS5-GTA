@@ -95,6 +95,8 @@ struct ConfigOptions {
 	bool                   shader_cache_enabled        = false;
 	bool                   pipeline_manifest_enabled   = true;
 	bool                   pipeline_manifest_record    = false;
+	// A fatal error while creating a manifest record ends the game instead of dropping the record.
+	bool                   pipeline_manifest_strict    = KYTY_STRICT_PIPELINE_MANIFEST_DEFAULT != 0;
 	PipelinePrecompile     pipeline_precompile         = PipelinePrecompile::Ask;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
@@ -171,6 +173,9 @@ bool                   PipelineManifestEnabled();
 // The programs and pipelines the session creates are added to the title's manifest in
 // _PipelineCache.
 bool                   PipelineManifestRecord();
+// A fatal error while creating a record of the manifest ends the game, as it would in a draw,
+// instead of dropping the record (--strict-pipeline-manifest).
+bool                   PipelineManifestStrict();
 // --pipeline-precompile: see PipelinePrecompile.
 PipelinePrecompile     GetPipelinePrecompile();
 LogDirection           GetShaderLogDirection();

@@ -1,0 +1,8 @@
+# Titles of one game in several regions (the server's built-in table; --regions <file> replaces it).
+# One game per line: its name, a colon and its titles. The partitions of one game share their
+# records: those of the same version always, those of other versions when they have enough shaders
+# in common (see the README). A title that is in no line is a game of its own.
+GTA V: PPSA04263 PPSA04264
+ASTRO BOT: PPSA21559 PPSA21564 PPSA21567 PPSA21568
+Demon's Souls: PPSA01341 PPSA01342
+GTA: San Andreas - The Definitive Edition: PPSA03524 PPSA03525
