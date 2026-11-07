@@ -825,16 +825,9 @@ bool GuestReadLog::StillValid() const {
 			}
 			continue;
 		}
-		// As specialization memory is read on the execution thread: GPU-owned bytes fail. Large
-		// reads (the key arrays of bindless tables) are checked from a scratch buffer.
-		static thread_local std::vector<uint8_t> scratch;
-		uint8_t* bytes = buffer.data();
-		if (entry.size > buffer.size()) {
-			scratch.resize(entry.size);
-			bytes = scratch.data();
-		}
-		if (!Libs::LibKernel::Memory::TryReadGpuCleanBacking(entry.address, bytes, entry.size) ||
-		    std::memcmp(bytes, recorded, entry.size) != 0) {
+		// As specialization memory is read on the execution thread: GPU-owned bytes fail. The
+		// bytes compare in place: large reads are the key arrays of bindless tables.
+		if (!Libs::LibKernel::Memory::GpuCleanBackingEquals(entry.address, recorded, entry.size)) {
 			return false;
 		}
 	}
