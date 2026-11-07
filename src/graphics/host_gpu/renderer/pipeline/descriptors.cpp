@@ -433,18 +433,22 @@ static vk::Format StorageViewFormat(const ShaderRecompiler::IR::ImageResource& r
 	return SrgbUnormViewFormat(pixel_format);
 }
 
-static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
-                                     const ShaderTextureResource& descriptor, vk::Format format,
-                                     const SurfaceFormatInfo& surface_format, bool storage,
-                                     uint32_t view_levels, uint32_t image_layers) {
-	ImageViewInfo view {};
+// False, with the reason in `unsupported`, when the host cannot view the T# this way.
+static bool TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
+                            const ShaderTextureResource& descriptor, vk::Format format,
+                            const SurfaceFormatInfo& surface_format, bool storage,
+                            uint32_t view_levels, uint32_t image_layers, ImageViewInfo& view,
+                            std::string& unsupported) {
+	view             = {};
 	view.format      = format;
 	view.aspect      = vk::ImageAspectFlagBits::eColor;
 	view.base_level  = descriptor.BaseLevel();
 	view.level_count = view_levels;
 	if (descriptor.MinLod() > descriptor.LastLevel() * 256u) {
-		EXIT("texture minimum LOD exceeds last mip level: min_lod=%u last_level=%u\n",
-		     descriptor.MinLod(), descriptor.LastLevel());
+		unsupported =
+		    fmt::format("texture minimum LOD exceeds last mip level: min_lod={} last_level={}",
+		                descriptor.MinLod(), descriptor.LastLevel());
+		return false;
 	}
 	const auto base_lod = view.base_level * 256u;
 	if (descriptor.MinLod() > base_lod) {
@@ -467,7 +471,8 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			view.type       = vk::ImageViewType::e2DArray;
 			view.base_layer = descriptor.BaseArray5();
 			if (view.base_layer >= image_layers) {
-				EXIT("texture array base layer is out of bounds\n");
+				unsupported = "texture array base layer is out of bounds";
+				return false;
 			}
 			view.layer_count = image_layers - view.base_layer;
 			break;
@@ -477,13 +482,14 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			view.type       = vk::ImageViewType::e2D;
 			view.base_layer = descriptor.BaseArray5();
 			if (view.base_layer >= image_layers) {
-				EXIT("texture base layer is out of bounds\n");
+				unsupported = "texture base layer is out of bounds";
+				return false;
 			}
 			view.layer_count = 1;
 			break;
-		default: EXIT("unsupported texture view dimension\n");
+		default: unsupported = "unsupported texture view dimension"; return false;
 	}
-	return view;
+	return true;
 }
 
 static bool MatchTextureMipView(ImageInfo& info, ImageInfo physical, uint32_t physical_levels,
@@ -564,9 +570,15 @@ static bool MatchTextureMipView(ImageInfo& info, ImageInfo physical, uint32_t ph
 }
 
 // What ResolveTexture derives from a T# and the shader's view of it before any texture-cache
-// lookup: a pure function of both (EXITs on unsupported descriptors).
+// lookup: a pure function of both. A descriptor the host cannot view gives only the reason
+// (TextureDescDerivation::unsupported).
 static TextureDescDerivation DeriveTextureDesc(const ShaderRecompiler::IR::ImageResource& resource,
                                                const ShaderTextureResource& descriptor) {
+	const auto unsupported = [](std::string reason) {
+		TextureDescDerivation derived;
+		derived.unsupported = std::move(reason);
+		return derived;
+	};
 	const bool storage = resource.written;
 	const auto address         = descriptor.Base40();
 	const auto width           = static_cast<uint32_t>(descriptor.Width5()) + 1u;
@@ -594,17 +606,18 @@ static TextureDescDerivation DeriveTextureDesc(const ShaderRecompiler::IR::Image
 	     (base_level != 0 || last_level == 0 || last_level > 3 || max_mip != last_level ||
 	      !msaa_tile || (descriptor.MsaaDepth() && !depth_tile) ||
 	      (!msaa_array && (descriptor.Depth() != 0 || descriptor.BaseArray5() != 0))))) {
-		EXIT("unsupported texture mip view: base=%u last=%u levels=%u max=%u type=%u tile=%u "
-		     "class=%u numeric=%u dimension=%u mip_mode=%u read=%d written=%d "
-		     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
-		     base_level, last_level, levels, descriptor.MaxMip(),
-		     static_cast<uint32_t>(descriptor.Type()), static_cast<uint32_t>(tile),
-		     static_cast<uint32_t>(resource.resource_class),
-		     static_cast<uint32_t>(resource.numeric_class),
-		     static_cast<uint32_t>(resource.dimension), static_cast<uint32_t>(resource.mip_mode),
-		     resource.read, resource.written, descriptor.fields[0], descriptor.fields[1],
-		     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
-		     descriptor.fields[6], descriptor.fields[7]);
+		return unsupported(fmt::format(
+		    "unsupported texture mip view: base={} last={} levels={} max={} type={} tile={} "
+		    "class={} numeric={} dimension={} mip_mode={} read={} written={} "
+		    "dwords={:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
+		    base_level, last_level, levels, descriptor.MaxMip(),
+		    static_cast<uint32_t>(descriptor.Type()), static_cast<uint32_t>(tile),
+		    static_cast<uint32_t>(resource.resource_class),
+		    static_cast<uint32_t>(resource.numeric_class),
+		    static_cast<uint32_t>(resource.dimension), static_cast<uint32_t>(resource.mip_mode),
+		    resource.read, resource.written, descriptor.fields[0], descriptor.fields[1],
+		    descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+		    descriptor.fields[6], descriptor.fields[7]));
 	}
 	const auto samples = multisampled ? 1u << last_level : 1u;
 	const auto depth          = static_cast<uint32_t>(descriptor.Depth()) + 1u;
@@ -619,8 +632,10 @@ static TextureDescDerivation DeriveTextureDesc(const ShaderRecompiler::IR::Image
 	                   Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
 	if (!storage && resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
 	    !sampled_numeric_class) {
-		EXIT("sampled image numeric class mismatch: numeric=%u format=%u addr=0x%016" PRIx64 "\n",
-		     static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(format), address);
+		return unsupported(fmt::format("sampled image numeric class mismatch: numeric={} format={} "
+		                               "addr={:#018x}",
+		                               static_cast<uint32_t>(resource.numeric_class),
+		                               static_cast<uint32_t>(format), address));
 	}
 
 	const bool    volume       = type == Prospero::ImageType::kColor3D;
@@ -665,10 +680,11 @@ static TextureDescDerivation DeriveTextureDesc(const ShaderRecompiler::IR::Image
 			// MAX_MIP; dynamic-mip shaders still count mips up to LAST_LEVEL.
 			if (base_level >= physical_levels ||
 			    resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
-				EXIT("unsupported texture mip view changes physical layout: base=%u last=%u "
-				     "max=%u extent=%ux%ux%u tile=%u\n",
-				     base_level, last_level, max_mip, width, height, depth,
-				     static_cast<uint32_t>(tile));
+				return unsupported(fmt::format(
+				    "unsupported texture mip view changes physical layout: base={} last={} max={} "
+				    "extent={}x{}x{} tile={}",
+				    base_level, last_level, max_mip, width, height, depth,
+				    static_cast<uint32_t>(tile)));
 			}
 			view_levels                = physical_levels - base_level;
 			desc.info.resources.levels = physical_levels;
@@ -679,8 +695,15 @@ static TextureDescDerivation DeriveTextureDesc(const ShaderRecompiler::IR::Image
 		desc.info.UpdateSize();
 	}
 	const auto alignment = desc.info.DataAlignment();
-	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0 ||
-	                     (address & (static_cast<uint64_t>(alignment) - 1u)) != 0);
+	if (desc.info.data.size == 0 || alignment == 0 ||
+	    (address & (static_cast<uint64_t>(alignment) - 1u)) != 0) {
+		return unsupported(fmt::format(
+		    "unsupported texture data range: addr={:#018x} size={:#x} alignment={:#x} "
+		    "dwords={:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
+		    address, desc.info.data.size, alignment, descriptor.fields[0], descriptor.fields[1],
+		    descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+		    descriptor.fields[6], descriptor.fields[7]));
+	}
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, desc.info.data.size);
 	}
@@ -692,8 +715,11 @@ static TextureDescDerivation DeriveTextureDesc(const ShaderRecompiler::IR::Image
 		desc.info.metadata.range         = {descriptor.MetaAddr() << 8u, metadata_size.size};
 		desc.info.metadata.dcc_alpha_msb = descriptor.DccAlphaPos();
 	}
-	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
-	                                 view_levels, desc.info.resources.layers);
+	std::string view_unsupported;
+	if (!TextureViewInfo(resource, descriptor, view_format, surface_format, storage, view_levels,
+	                     desc.info.resources.layers, desc.view_info, view_unsupported)) {
+		return unsupported(std::move(view_unsupported));
+	}
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 	desc.heap = resource.heap;
@@ -815,6 +841,39 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		cached = m_texture_descs.emplace(key, std::move(derived)).first;
 	}
 	auto& derived = cached->second;
+	// Candidates of a T# the shader selects at run time (bindless table and image heap elements,
+	// the T#s an indirect descriptor can name) are whatever the host finds where the shader could
+	// read one, also where the game keeps other data: Demon's Souls' pixel shader 3f7b19201073e188
+	// picks one of the eight T#s of a constant block by a byte of a vertex attribute, so the host
+	// reads 32 (one per bit of the lane mask), and past the eighth come the block's sampler and
+	// constants, with leftovers of older T#s. PS5 reads only the ones the shader selects: one the
+	// host cannot view is one it never selects, and binds a null image.
+	const bool candidate =
+	    table_candidate || resource.heap ||
+	    resource.indirect_root != ShaderRecompiler::IR::ImageResource::NoIndirectImage;
+	if (!candidate && !derived.unsupported.empty()) {
+		EXIT("%s\n", derived.unsupported.c_str());
+	}
+	if (candidate) {
+		const auto& info     = derived.desc.info;
+		const char* declined = !derived.unsupported.empty() ? derived.unsupported.c_str()
+		                       : !info.data.Valid()         ? "data range outside guest memory"
+		                       : info.metadata.kind != ImageMetadataKind::None &&
+		                               !GuestRange {info.metadata.range.address,
+		                                            std::max<uint64_t>(info.metadata.range.size, 1)}
+		                                    .Valid()
+		                           ? "metadata range outside guest memory"
+		                           : nullptr;
+		if (declined != nullptr) {
+			static std::atomic_bool reported {false};
+			if (!reported.exchange(true, std::memory_order_relaxed)) {
+				LOGF("Texture: a T# candidate the host cannot view is bound as a null image "
+				     "(shader 0x%016" PRIx64 "): %s\n",
+				     Common::HackNotice::CurrentShaderSlot(), declined);
+			}
+			return {.layout = vk::ImageLayout::eGeneral};
+		}
+	}
 	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples.
 	if (resource.heap &&
 	    !m_context.IsMapped(derived.desc.info.data.address, derived.desc.info.data.size)) {
