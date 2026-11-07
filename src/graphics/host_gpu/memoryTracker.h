@@ -107,9 +107,10 @@ public:
 
 	// Calls func(address, size) for maximal runs of pages that may hold CPU writes not yet
 	// uploaded, after releasing the region locks. Untracked regions count as dirty, as a new
-	// region starts dirty.
+	// region starts dirty. Runs at most max_gap bytes apart come as one, with the clean pages
+	// between them.
 	template <typename Func>
-	void ForEachCpuDirtySpan(uint64_t vaddr, uint64_t size, Func&& func) {
+	void ForEachCpuDirtySpan(uint64_t vaddr, uint64_t size, uint64_t max_gap, Func&& func) {
 		ValidateRange(vaddr, size);
 		const auto                                  end = vaddr + size;
 		std::vector<std::pair<uint64_t, uint64_t>> spans; // [begin, end)
@@ -119,7 +120,7 @@ public:
 			if (begin >= finish) {
 				return;
 			}
-			if (!spans.empty() && spans.back().second == begin) {
+			if (!spans.empty() && begin <= spans.back().second + max_gap) {
 				spans.back().second = finish;
 			} else {
 				spans.emplace_back(begin, finish);
