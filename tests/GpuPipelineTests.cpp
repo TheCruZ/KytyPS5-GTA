@@ -309,6 +309,30 @@ void TestProgressCounter() {
 	lazy.WaitFor(Rounds);
 	publisher.join();
 	Check(lazy.Load() == Rounds, "published final value");
+
+	// A waiter that wakes and finds its target reached leaves it registered until the next
+	// Notify(); its next wait finds that target and does not register its own. A Notify() at the
+	// value the waiter read (the execution thread notifies again at one value when an urgent
+	// command interrupts its wait) takes the registration out: the waiter must still wake when
+	// its own target is reached.
+	Common::ProgressCounter stale;
+	std::atomic_bool        reached {false};
+	stale.Advance(1);
+	std::jthread waiter([&] {
+		stale.WaitFor(2);
+		stale.WaitFor(3);
+		reached = true;
+	});
+	Stall(std::chrono::milliseconds(50));
+	stale.Advance(2);
+	Stall(std::chrono::milliseconds(50));
+	stale.Notify();
+	Stall(std::chrono::milliseconds(50));
+	stale.Advance(3);
+	for (int i = 0; i < 200 && !reached; i++) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+	Check(reached, "a Notify() at the value a waiter read does not lose its wake-up");
 }
 
 // Small callables live in place, large ones on the heap; both move and destroy once.
