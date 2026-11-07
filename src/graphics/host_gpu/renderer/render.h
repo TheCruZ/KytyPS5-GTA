@@ -330,6 +330,8 @@ private:
 	struct TableSlot {
 		std::array<uint32_t, 8> dwords {};
 		TableElementResolution* element = nullptr;
+		// The element's version_slot, read without reading the element.
+		uint32_t                version_slot = UINT32_MAX;
 	};
 	struct TableResolution {
 		ShaderRecompiler::IR::ImageResource root;
@@ -401,8 +403,10 @@ private:
 		// The slots of each element: element_slots[element_slot_begin[e] .. [e + 1]).
 		std::vector<uint32_t>                element_slot_begin;
 		std::vector<uint32_t>                element_slots;
-		// The element of each element resolution.
-		std::unordered_map<const TableElementResolution*, uint32_t> element_index;
+		// The element of each element resolution, by its version_slot (UINT32_MAX: none). The
+		// elements of a state that applies are alive, so their version slots are theirs alone
+		// (see ResetBindings()).
+		std::vector<uint32_t>                element_of_version;
 		// Element spans by first page; `max_span` is the longest (last - first).
 		std::vector<PageSpan>                spans;
 		uint64_t                             max_span = 0;
@@ -455,7 +459,8 @@ private:
 	// The slots of each element (element_slot_begin / element_slots) from `slots`.
 	static void IndexTableSlots(TableBindingState& state);
 	// ReuseTableBindings() of tables whose T#s changed in some slots: binds those slots to the
-	// elements of their new T#s (new elements join the state).
+	// elements of their new T#s. New elements join the state and are marked; a slot that names
+	// an element the state has goes to m_table_moved_slots.
 	void PatchTableSlots(const ShaderRecompiler::IR::CompiledShaderInfo& program,
 	                     const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
 	                     TableBindingState& state, uint64_t stamp);
@@ -595,6 +600,8 @@ private:
 		uint32_t index = 0;
 	};
 	std::vector<ChangedTableSlot>                      m_table_changed_slots;
+	// PatchTableSlots(): the changed slots that name an element the state already had.
+	std::vector<uint32_t>                              m_table_moved_slots;
 	// RebindReusedTables(): the elements whose versions moved, and whether their binding changed
 	// (one byte per element checked).
 	std::vector<uint32_t>                              m_table_checks;

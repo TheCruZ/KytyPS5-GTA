@@ -1428,7 +1428,7 @@ void RenderExecutor::PatchTableSlots(const ShaderRecompiler::IR::CompiledShaderI
 	std::vector<uint32_t> roots;
 	ForEachImageTable(program.info.images,
 	                  [&](uint32_t root_index, auto /*kind*/) { roots.push_back(root_index); });
-	auto&        index_of     = state.element_index;
+	auto&        element_of   = state.element_of_version;
 	const size_t sorted_spans = state.spans.size();
 	for (const auto& changed: m_table_changed_slots) {
 		auto&       range = state.ranges[changed.range];
@@ -1436,40 +1436,61 @@ void RenderExecutor::PatchTableSlots(const ShaderRecompiler::IR::CompiledShaderI
 		const auto& value = changed.index != 0u && changed.index < table.slots.size()
 		                        ? table.slots[changed.index]
 		                        : null_value;
-		// As the slot by slot resolution in PrepareBindings() does.
+		state.values[changed.slot] = value;
+		// The element of the T#, as the slot by slot resolution in PrepareBindings() finds it.
 		auto&                   resolution = *range.resolution;
 		auto&                   memo       = resolution.slots[changed.index];
 		TableElementResolution* element    = nullptr;
+		bool                    resolved   = false;
 		if (memo.element != nullptr && memo.dwords == value.dwords) {
-			element = &ResolveTableElement(resolution, value, stamp, memo.element);
+			element = memo.element;
 		} else {
-			element = &ResolveTableElement(resolution, value, stamp);
-			memo    = {value.dwords, element};
-		}
-		const auto [found, inserted] =
-		    index_of.try_emplace(element, static_cast<uint32_t>(state.elements.size()));
-		const auto index = found->second;
-		if (inserted) {
-			// As FinishTableBindings() records the elements of a slot by slot resolution; the
-			// visit below binds it and writes its descriptor.
-			state.elements.push_back({.resolution = element, .table = &resolution, .source = value,
-			                          .root = roots.at(changed.range)});
-			auto& entry = state.elements.back();
-			if (element->volatile_dcc || DepthTableElement(texture_cache, element->texture)) {
-				state.always.push_back(index);
-			} else if (!element->permanent && !element->backing_checkable) {
-				state.unchecked_backing.push_back(index);
+			if (const auto found = resolution.elements.find(value.dwords);
+			    found != resolution.elements.end()) {
+				element = &found->second;
+			} else {
+				element  = &ResolveTableElement(resolution, value, stamp);
+				resolved = true;
 			}
-			entry.pinned = element->texture.image_id;
-			texture_cache.PinImage(entry.pinned);
-			// Written with the visit (the element has no view yet).
-			state.infos.emplace_back();
-			state.marks.push_back(0);
-			state.checked.emplace_back();
-			AddTableSpans(state, index);
+			memo = {value.dwords, element, element->version_slot};
 		}
-		state.values[changed.slot] = value;
-		state.slots[changed.slot]  = index;
+		const auto version_slot = memo.version_slot;
+		if (version_slot < element_of.size() && element_of[version_slot] != UINT32_MAX) {
+			// GTA V moves thousands of T#s between the slots of its ray tracing tables in a
+			// binding. The element's descriptor holds for this slot as for its others: whatever
+			// may change it marks the element for a visit, which writes all its slots (see
+			// RebindReusedTables()). CommitBindings() writes this slot.
+			state.slots[changed.slot] = element_of[version_slot];
+			m_table_moved_slots.push_back(changed.slot);
+			continue;
+		}
+		if (!resolved) {
+			(void)ResolveTableElement(resolution, value, stamp, element);
+		}
+		// As FinishTableBindings() records the elements of a slot by slot resolution; the visit
+		// binds it and writes its descriptor.
+		const auto index = static_cast<uint32_t>(state.elements.size());
+		state.elements.push_back({.resolution = element, .table = &resolution, .source = value,
+		                          .root = roots.at(changed.range)});
+		auto& entry = state.elements.back();
+		if (element->volatile_dcc || DepthTableElement(texture_cache, element->texture)) {
+			state.always.push_back(index);
+		} else if (!element->permanent && !element->backing_checkable) {
+			state.unchecked_backing.push_back(index);
+		}
+		entry.pinned = element->texture.image_id;
+		texture_cache.PinImage(entry.pinned);
+		// Written with the visit (the element has no view yet).
+		state.infos.emplace_back();
+		state.marks.push_back(0);
+		state.checked.emplace_back();
+		AddTableSpans(state, index);
+		EXIT_IF(version_slot == UINT32_MAX);
+		if (version_slot >= element_of.size()) {
+			element_of.resize(size_t {version_slot} + 1, UINT32_MAX);
+		}
+		element_of[version_slot]  = index;
+		state.slots[changed.slot] = index;
 		MarkTableElement(state, index);
 	}
 	MergeTableSpans(state, sorted_spans);
@@ -1498,16 +1519,16 @@ void RenderExecutor::DropUnusedTableElements(TableBindingState& state) {
 			if (entry.pinned) {
 				texture_cache.UnpinImage(entry.pinned);
 			}
-			state.element_index.erase(entry.resolution);
+			state.element_of_version[entry.resolution->version_slot] = UINT32_MAX;
 			continue;
 		}
 		remap[element] = kept;
 		if (kept != element) {
-			state.elements[kept]                                 = std::move(entry);
-			state.infos[kept]                                    = state.infos[element];
-			state.marks[kept]                                    = state.marks[element];
-			state.checked[kept]                                  = state.checked[element];
-			state.element_index[state.elements[kept].resolution] = kept;
+			state.element_of_version[entry.resolution->version_slot] = kept;
+			state.elements[kept]                                     = std::move(entry);
+			state.infos[kept]                                        = state.infos[element];
+			state.marks[kept]                                        = state.marks[element];
+			state.checked[kept]                                      = state.checked[element];
 		}
 		kept++;
 	}
@@ -1551,10 +1572,15 @@ void RenderExecutor::FinishTableBindings(TableBindingState& state,
 		state.slot_infos[slot] = state.infos[state.slots[slot]];
 	}
 	IndexTableSlots(state);
-	state.element_index.clear();
-	state.element_index.reserve(state.elements.size());
+	auto& element_of = state.element_of_version;
+	std::ranges::fill(element_of, UINT32_MAX);
 	for (uint32_t index = 0; index < state.elements.size(); index++) {
-		state.element_index.emplace(state.elements[index].resolution, index);
+		const auto version_slot = state.elements[index].resolution->version_slot;
+		EXIT_IF(version_slot == UINT32_MAX);
+		if (version_slot >= element_of.size()) {
+			element_of.resize(size_t {version_slot} + 1, UINT32_MAX);
+		}
+		element_of[version_slot] = index;
 	}
 	state.always.clear();
 	state.unchecked_backing.clear();
@@ -1635,6 +1661,7 @@ bool RenderExecutor::ReuseTableBindings(const ShaderRecompiler::IR::CompiledShad
 	}
 	state.mark_stamp++;
 	m_table_marked.clear();
+	m_table_moved_slots.clear();
 	if (!m_table_changed_slots.empty()) {
 		PatchTableSlots(program, snapshot, state, stamp);
 	}
@@ -1646,7 +1673,8 @@ bool RenderExecutor::ReuseTableBindings(const ShaderRecompiler::IR::CompiledShad
 		auto& entry = state.elements[element];
 		(void)ResolveTableElement(*entry.table, entry.source, stamp, entry.resolution);
 	}
-	prepared.table_visits = m_table_marked;
+	prepared.table_visits      = m_table_marked;
+	prepared.table_moved_slots = m_table_moved_slots;
 	return true;
 }
 
@@ -1958,6 +1986,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.table_state   = nullptr;
 	prepared.tables_reused = false;
 	prepared.table_visits.clear();
+	prepared.table_moved_slots.clear();
 	const auto stamp = ++m_table_prepare_stamp;
 	TableBindingState* table_state = nullptr;
 	if (std::ranges::any_of(program.info.images, [](const ShaderRecompiler::IR::ImageResource& image) {
@@ -2019,7 +2048,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 				add(ResolveTableElement(resolution, value, stamp, memo.element), value);
 			} else {
 				auto& element = ResolveTableElement(resolution, value, stamp);
-				memo          = {value.dwords, &element};
+				memo          = {value.dwords, &element, element.version_slot};
 				add(element, value);
 			}
 		}
@@ -2604,34 +2633,39 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				table_state->infos[index] =
 				    MakeImageInfo(table_state->elements[index].resolution->texture, 0u);
 			}
-			// Only the slots of the visited elements change.
+			const auto write_slot = [&](uint32_t slot, const vk::DescriptorImageInfo& info) {
+				auto&      slot_info = table_state->slot_infos[slot];
+				const bool changed   = slot_info.sampler != info.sampler ||
+				                     slot_info.imageView != info.imageView ||
+				                     slot_info.imageLayout != info.imageLayout;
+				if (copy_tables && changed) {
+					const auto table =
+					    std::ranges::find_if(stage_tables, [&](const TableRange& range) {
+						    return slot >= range.first_slot && slot - range.first_slot < range.capacity;
+					    });
+					EXIT_IF(table == stage_tables.end());
+					vk::WriteDescriptorSet write {};
+					write.dstSet          = table_state->slot_set;
+					write.dstBinding      = table->binding;
+					write.dstArrayElement = table->base + (slot - table->first_slot);
+					write.descriptorCount = 1;
+					write.descriptorType  = NativeDescriptorType(table->kind);
+					write.pImageInfo      = &slot_info;
+					m_slot_set_writes.push_back(write);
+				}
+				slot_info = info;
+			};
+			// Only the slots of the visited elements change, and the slots that name another
+			// element of the state now.
 			for (const auto index: descriptors.table_visits) {
 				const auto& info = table_state->infos[index];
 				for (auto k = table_state->element_slot_begin[index];
 				     k < table_state->element_slot_begin[index + 1]; k++) {
-					const auto slot      = table_state->element_slots[k];
-					auto&      slot_info = table_state->slot_infos[slot];
-					const bool changed   = slot_info.sampler != info.sampler ||
-					                     slot_info.imageView != info.imageView ||
-					                     slot_info.imageLayout != info.imageLayout;
-					if (copy_tables && changed) {
-						const auto table =
-						    std::ranges::find_if(stage_tables, [&](const TableRange& range) {
-							    return slot >= range.first_slot &&
-							           slot - range.first_slot < range.capacity;
-						    });
-						EXIT_IF(table == stage_tables.end());
-						vk::WriteDescriptorSet write {};
-						write.dstSet          = table_state->slot_set;
-						write.dstBinding      = table->binding;
-						write.dstArrayElement = table->base + (slot - table->first_slot);
-						write.descriptorCount = 1;
-						write.descriptorType  = NativeDescriptorType(table->kind);
-						write.pImageInfo      = &slot_info;
-						m_slot_set_writes.push_back(write);
-					}
-					slot_info = info;
+					write_slot(table_state->element_slots[k], info);
 				}
+			}
+			for (const auto slot: descriptors.table_moved_slots) {
+				write_slot(slot, table_state->infos[table_state->slots[slot]]);
 			}
 		}
 		ForEachImageTable(program.info.images, [&](uint32_t root_index, BindingKind kind) {
