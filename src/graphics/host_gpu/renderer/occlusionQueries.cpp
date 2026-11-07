@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
 
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -185,8 +186,9 @@ void OcclusionQueries::OnFrame() {
 void OcclusionQueries::PublishCompleted(bool refresh) {
 	auto&           master = m_context.GetCommandScheduler().GetMasterSemaphore();
 	std::lock_guard lock(m_mutex);
-	while (!m_pending.empty()) {
-		if (!master.IsFree(m_pending.front().tick)) {
+	size_t          count = 0;
+	while (count < m_pending.size()) {
+		if (!master.IsFree(m_pending[count].tick)) {
 			if (!refresh) {
 				break;
 			}
@@ -195,9 +197,10 @@ void OcclusionQueries::PublishCompleted(bool refresh) {
 			refresh = false;
 			continue;
 		}
-		Publish(m_pending.front());
-		m_published_seq.store(m_pending.front().seq, std::memory_order_release);
-		m_pending.pop_front();
+		count++;
+	}
+	if (count != 0) {
+		PublishFront(count);
 	}
 	if (!m_holds.empty()) {
 		ReleaseSlots(m_published_slot);
@@ -266,52 +269,69 @@ void OcclusionQueries::ResetSlots(uint64_t first_slot, uint64_t end_slot) {
 	}
 }
 
-uint64_t OcclusionQueries::ReadSamples(uint64_t first_slot, uint64_t end_slot) {
+bool OcclusionQueries::ReadResults(uint64_t first_slot, uint64_t end_slot) {
 	const auto capacity = m_segments.Capacity();
-	uint64_t   samples  = 0;
+	size_t     offset   = 0;
 	while (first_slot < end_slot) {
 		const auto slot  = static_cast<uint32_t>(first_slot % capacity);
 		const auto count = static_cast<uint32_t>(
 		    std::min<uint64_t>(end_slot - first_slot, uint64_t {capacity} - slot));
 		// The command buffers that ended these queries completed: nothing waits here.
 		const auto result = m_device.getQueryPoolResults(
-		    m_pool, slot, count, count * sizeof(uint64_t), m_results.data(), sizeof(uint64_t),
-		    vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+		    m_pool, slot, count, count * sizeof(uint64_t), m_results.data() + offset,
+		    sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
 		if (result != vk::Result::eSuccess) {
 			Log::WriteToConsoleAndLog(fmt::format(
-			    "Occlusion queries: vkGetQueryPoolResults failed ({}); the query reads visible\n",
+			    "Occlusion queries: vkGetQueryPoolResults failed ({}); the queries read visible\n",
 			    vk::to_string(result)));
-			samples += OcclusionCounters::UncountedSamples;
-		} else {
-			for (uint32_t i = 0; i < count; i++) {
-				samples += m_results[i];
-			}
+			return false;
 		}
+		offset += count;
 		first_slot += count;
 	}
-	return samples;
+	return true;
 }
 
-void OcclusionQueries::Publish(const PendingDump& pending) {
-	const auto& dump = pending.dump;
-	m_total += ReadSamples(dump.first_slot, dump.end_slot);
-	if (dump.uncounted) {
-		Common::HackNotice::Report("occlusion segment without a free host query slot reads visible",
-		                           "OcclusionQueries::Publish", 0, 0);
-		m_total += OcclusionCounters::UncountedSamples;
-	}
-	ReleaseSlots(dump.end_slot);
-	if (!pending.write) {
-		return;
-	}
+void OcclusionQueries::WriteCounters(uint64_t address) {
 	// DB 0 last: once its ready bit is visible, the other DBs are too. Dump() read back the
-	// GPU-written bytes under the counters; later GPU work may own the pages again.
-	for (uint32_t db = OcclusionCounters::DbCount; db-- > 0;) {
-		const auto value = OcclusionCounters::DbValue(db, m_total);
-		m_context.WriteFromCompletion(
-		    reinterpret_cast<void*>(dump.address + db * OcclusionCounters::DbStride), &value,
-		    sizeof(value));
+	// GPU-written bytes under the counters; later GPU work may own the pages again. One lookup of
+	// the backing store writes the 16 of them.
+	std::array<uint64_t, OcclusionCounters::DbCount> values {};
+	for (uint32_t db = 0; db < OcclusionCounters::DbCount; db++) {
+		values[db] = OcclusionCounters::DbValue(db, m_total);
 	}
+	m_context.WriteQwordsFromCompletion(reinterpret_cast<void*>(address), values.data(),
+	                                    OcclusionCounters::DbCount, OcclusionCounters::DbStride);
+}
+
+void OcclusionQueries::PublishFront(size_t count) {
+	// The segments of consecutive dumps are consecutive slots: their results come in one call and
+	// their slots are reset in one. ASTRO BOT (PPSA21564) publishes ~13,000 dumps a frame.
+	const auto first_slot = m_pending.front().dump.first_slot;
+	const auto end_slot   = m_pending[count - 1u].dump.end_slot;
+	const bool counted    = ReadResults(first_slot, end_slot);
+	for (size_t i = 0; i < count; i++) {
+		const auto& pending = m_pending[i];
+		const auto& dump    = pending.dump;
+		if (!counted && dump.end_slot > dump.first_slot) {
+			m_total += OcclusionCounters::UncountedSamples;
+		} else {
+			for (auto slot = dump.first_slot; slot < dump.end_slot; slot++) {
+				m_total += m_results[slot - first_slot];
+			}
+		}
+		if (dump.uncounted) {
+			Common::HackNotice::Report("occlusion segment without a free host query slot reads visible",
+			                           "OcclusionQueries::Publish", 0, 0);
+			m_total += OcclusionCounters::UncountedSamples;
+		}
+		if (pending.write) {
+			WriteCounters(dump.address);
+		}
+	}
+	m_published_seq.store(m_pending[count - 1u].seq, std::memory_order_release);
+	ReleaseSlots(end_slot);
+	m_pending.erase(m_pending.begin(), m_pending.begin() + static_cast<ptrdiff_t>(count));
 }
 
 void OcclusionQueries::ReleaseSlots(uint64_t end_slot) {

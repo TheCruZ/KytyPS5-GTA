@@ -271,6 +271,22 @@ public:
 		    [](uint64_t, uint64_t) {});
 	}
 
+	// Writes values[i] to vaddr + i * stride, values[0] last.
+	void WriteBackingQwords(uint64_t vaddr, const uint64_t* values, uint32_t count,
+	                        uint64_t stride) {
+		const auto size = uint64_t {count - 1u} * stride + sizeof(uint64_t);
+		if (TryCachedTransfer(vaddr, size, [&](uint8_t* backing, size_t) {
+			    for (uint32_t i = count; i-- > 0;) {
+				    *reinterpret_cast<volatile uint64_t*>(backing + i * stride) = values[i];
+			    }
+		    })) {
+			return;
+		}
+		for (uint32_t i = count; i-- > 0;) {
+			WriteBacking(vaddr + i * stride, &values[i], sizeof(uint64_t));
+		}
+	}
+
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
@@ -795,6 +811,21 @@ public:
 			return false;
 		}
 		m_backing->WriteBacking(vaddr, data, size);
+		return true;
+	}
+
+	// TryWriteBacking() of `count` qwords `stride` bytes apart (8-byte aligned), values[0] last.
+	bool TryWriteBackingQwords(uint64_t vaddr, const uint64_t* values, uint32_t count,
+	                           uint64_t stride) {
+		const auto size = uint64_t {count - 1u} * stride + sizeof(uint64_t);
+		if (count == 0 || !Owns(vaddr, size)) {
+			return false;
+		}
+		std::shared_lock lock(m_mutex);
+		if (OverlapsPrivateUnlocked(vaddr, size)) {
+			return false;
+		}
+		m_backing->WriteBackingQwords(vaddr, values, count, stride);
 		return true;
 	}
 
