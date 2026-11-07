@@ -145,7 +145,7 @@
             </item>
             <item row="2" column="1">
              <widget class="QSpinBox" name="spinBox_vblank_frequency">
-              <property name="toolTip"><string>Virtual display refresh rate used for frame pacing</string></property>
+              <property name="toolTip"><string>Virtual display refresh rate used for frame pacing. 60 Hz is recommended: other values are only advisable during development, as some games may not work correctly.</string></property>
               <property name="minimum"><number>30</number></property>
               <property name="maximum"><number>360</number></property>
               <property name="value"><number>60</number></property>
@@ -544,7 +544,7 @@
           </item>
           <item row="3" column="1">
            <widget class="QComboBox" name="comboBox_printf_direction">
-            <property name="toolTip"><string>Print logs to file or console window. If enabled may decrease emulator performance</string></property>
+            <property name="toolTip"><string>Print logs to file or console window. If enabled may decrease emulator performance. Whatever this setting, the launcher keeps the warnings, errors and crash report of each session in _Logs next to the emulator (the last 20 sessions)</string></property>
            </widget>
           </item>
           <item row="3" column="2">

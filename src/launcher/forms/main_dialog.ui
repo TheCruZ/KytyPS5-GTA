@@ -120,6 +120,16 @@
         </widget>
        </item>
        <item>
+        <widget class="QCheckBox" name="share_pipelines">
+         <property name="toolTip">
+          <string>Shares which shaders and pipelines the games use with other players, so that they are compiled ahead on every computer. Sends the game ID and version, the emulator version, hashes and state of the shaders and pipelines used, and a random installation ID, about every 3 minutes while playing.</string>
+         </property>
+         <property name="text">
+          <string>Share pipeline data</string>
+         </property>
+        </widget>
+       </item>
+       <item>
         <layout class="QHBoxLayout" name="themeLayout">
          <item>
           <widget class="QLabel" name="label_theme">
