@@ -209,8 +209,13 @@ private:
 		size_t   end_dump       = 0;
 	};
 
-	void                   Publish(const PendingDump& pending);
-	[[nodiscard]] uint64_t ReadSamples(uint64_t first_slot, uint64_t end_slot);
+	// Publishes the first `count` pending dumps, which the GPU finished.
+	void                   PublishFront(size_t count);
+	// The results of the host queries in slots [first_slot, end_slot) into m_results; false
+	// when the driver could not give them.
+	[[nodiscard]] bool     ReadResults(uint64_t first_slot, uint64_t end_slot);
+	// The counters of a dump at `address` with the running total.
+	void                   WriteCounters(uint64_t address);
 	void                   ResetSlots(uint64_t first_slot, uint64_t end_slot);
 	// Resets and frees the slots of published dumps before `end_slot`, except those a command
 	// buffer the GPU has not finished copies the results of.
