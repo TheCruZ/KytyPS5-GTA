@@ -430,6 +430,11 @@ private:
 		uint64_t                             set_epoch  = 0;
 		uint64_t                             backing_epoch = 0;
 		bool                                 valid = false;
+		// The descriptors of the table slots (`slot_infos`) in a set that is never bound
+		// (DescriptorHeap::CommitPersistent()): a binding that reuses the state copies its table
+		// ranges from it and writes only the slots whose descriptors changed into it.
+		vk::DescriptorSet                    slot_set;
+		bool                                 slot_set_current = false;
 	};
 	// Prepares the tables of `prepared` from the program's state when it still applies; false
 	// when the tables must be resolved slot by slot.
@@ -552,6 +557,10 @@ private:
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	// Table ranges copied from the slot sets of the table states (see CommitBindings()), and the
+	// slots written into those sets first.
+	std::vector<vk::CopyDescriptorSet>    m_descriptor_copies;
+	std::vector<vk::WriteDescriptorSet>   m_slot_set_writes;
 	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
 	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
 	vk::Pipeline                          m_pssr_pipeline          = nullptr;

@@ -75,6 +75,9 @@ DescriptorHeap::DescriptorHeap(GraphicContext& graphics, MasterSemaphore& master
 
 DescriptorHeap::~DescriptorHeap() {
 	m_graphics.device.destroyDescriptorPool(m_current_pool.pool, nullptr);
+	for (const auto pool: m_persistent_pools) {
+		m_graphics.device.destroyDescriptorPool(pool, nullptr);
+	}
 	for (const auto& [pool, tick]: m_pending_pools) {
 		m_master_semaphore.Wait(tick);
 		m_graphics.device.destroyDescriptorPool(pool.pool, nullptr);
@@ -125,6 +128,25 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 		EXIT("descriptor set does not fit a pool sized for it:%s\n", counts.c_str());
 	}
 	return large_batch.sets[--large_batch.size];
+}
+
+vk::DescriptorSet DescriptorHeap::CommitPersistent(vk::DescriptorSetLayout layout) {
+	const auto&                  sizes = LayoutSizes(layout);
+	vk::DescriptorPoolCreateInfo create {};
+	create.maxSets       = 1;
+	create.poolSizeCount = static_cast<uint32_t>(sizes.size());
+	create.pPoolSizes    = sizes.data();
+	vk::DescriptorPool pool;
+	EXIT_IF(m_graphics.device.createDescriptorPool(&create, nullptr, &pool) !=
+	        vk::Result::eSuccess);
+	m_persistent_pools.push_back(pool);
+	vk::DescriptorSetAllocateInfo allocate {};
+	allocate.descriptorPool     = pool;
+	allocate.descriptorSetCount = 1;
+	allocate.pSetLayouts        = &layout;
+	vk::DescriptorSet set;
+	EXIT_IF(m_graphics.device.allocateDescriptorSets(&allocate, &set) != vk::Result::eSuccess);
+	return set;
 }
 
 const std::vector<vk::DescriptorPoolSize>&
