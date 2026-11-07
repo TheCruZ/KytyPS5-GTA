@@ -78,6 +78,12 @@ elseif(KYTY_BUILD_ORIGIN STREQUAL "Fork")
 	set(KYTY_FORK_BUILD ON)
 endif()
 
+# KytyPS5-GTA test builds turn it on: a fatal error while creating a record of the pipeline
+# manifests in assets/pipelines ends the game (--strict-pipeline-manifest) instead of dropping the
+# record. Records this computer recorded or other players shared are always dropped. Releases keep
+# it off.
+option(KYTY_STRICT_PIPELINE_MANIFEST_DEFAULT "Make --strict-pipeline-manifest the default" OFF)
+
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)

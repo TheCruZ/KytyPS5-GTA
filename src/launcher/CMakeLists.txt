@@ -1,5 +1,11 @@
 
 find_package(Qt6 6.8 COMPONENTS Concurrent Network Widgets REQUIRED)
+
+# Where the launcher shares which shaders and pipelines games use (the pipeline manifest). Empty
+# leaves the feature out of the launcher; a QSettings value ([PipelineSharing] url) replaces it
+# for tests.
+set(KYTY_PIPELINE_SHARE_URL "https://kytypipes.mhcruz.com" CACHE STRING
+	"Server of the pipeline sharing of the launcher (empty: no sharing)")
 add_subdirectory("${KYTY_SOURCE_DIR}/updater" "${CMAKE_CURRENT_BINARY_DIR}/updater")
 
 set(CMAKE_AUTOUIC_SEARCH_PATHS forms)
@@ -35,6 +41,17 @@ target_compile_options(launcher PRIVATE -frtti)
 target_link_libraries(launcher pthread)
 endif()
 target_include_directories(launcher PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_compile_definitions(launcher PRIVATE KYTY_PIPELINE_SHARE_URL="${KYTY_PIPELINE_SHARE_URL}")
+
+# One round of the pipeline sharing from the command line (for tests and for diagnosing a server):
+#   pipeline_share_cli <url> <emulator folder> <title id> [client id] [--fetch] [--version <v>]
+add_executable(pipeline_share_cli EXCLUDE_FROM_ALL
+	tools/pipelineShareCli.cpp
+	src/pipelineShareSync.cpp
+	include/pipelineShareSync.h)
+target_link_libraries(pipeline_share_cli Qt6::Concurrent Qt6::Network Qt6::Core)
+target_include_directories(pipeline_share_cli PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set_target_properties(pipeline_share_cli PROPERTIES AUTOMOC ON)
 set_target_properties(launcher PROPERTIES AUTOUIC ON AUTOMOC ON AUTORCC ON)
 
 add_executable(launcher_game_views_tests EXCLUDE_FROM_ALL
