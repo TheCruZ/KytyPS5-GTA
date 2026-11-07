@@ -218,6 +218,10 @@ std::filesystem::path GetPrintfOutputFile() {
 	return g_config->printf_output_file;
 }
 
+std::filesystem::path GetSessionLogFile() {
+	return g_config->session_log_file;
+}
+
 bool ProfilerEnabled() {
 	return g_config->profiler_enabled;
 }
