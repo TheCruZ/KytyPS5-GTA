@@ -2277,9 +2277,22 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 	m_descriptor_images.resize(image_descriptor_count);
 	m_descriptor_writes.clear();
+	m_descriptor_copies.clear();
+	m_slot_set_writes.clear();
 	size_t image_cursor = 0;
 	std::array<vk::DescriptorBufferInfo, 2> address_buffers;
 	vk::DescriptorBufferInfo                mip_stats_view;
+	// The table ranges of the stages, in the order of their slots in the table states.
+	struct TableRange {
+		TableBindingState* state;
+		BindingKind        kind;
+		uint32_t           binding;
+		uint32_t           base;
+		uint32_t           capacity;
+		uint32_t           first_slot;
+		bool               copied;
+	};
+	std::vector<TableRange> table_ranges;
 
 	for (auto* prepared: prepared_bindings) {
 		const auto& program     = prepared->runtime->module->info;
@@ -2347,6 +2360,34 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 		}
 
+		// GTA V's ray tracing binds tables of 16 384 slots, about 100 000 descriptors per frame,
+		// which barely change: writing them costs the driver ~5 ns each, copying them from the
+		// state's slot set ~1 ns.
+		const bool copy_tables = !pipeline.uses_push_descriptors && table_state != nullptr &&
+		                         descriptors.tables_reused && table_state->slot_set_current;
+		const auto stage_ranges = table_ranges.size();
+		if (table_state != nullptr) {
+			uint32_t first_slot = 0;
+			ForEachImageTable(program.info.images, [&](uint32_t root_index, BindingKind kind) {
+				const auto& root = program.info.images[root_index];
+				const auto  binding = ShaderRecompiler::IR::NativeBinding(program.stage, kind);
+				table_ranges.push_back({.state      = table_state,
+				                        .kind       = kind,
+				                        .binding    = binding,
+				                        .base       = root.table_descriptor_base,
+				                        .capacity   = root.table_capacity,
+				                        .first_slot = first_slot,
+				                        .copied     = copy_tables});
+				first_slot += root.table_capacity;
+			});
+			if (!copy_tables) {
+				// Until the slot set holds this binding's descriptors (see below).
+				table_state->slot_set_current = false;
+			}
+		}
+		const std::span<const TableRange> stage_tables =
+		    std::span {table_ranges}.subspan(stage_ranges);
+
 		std::array<size_t, ShaderRecompiler::IR::ImageBindingCount> image_starts {};
 		for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
 			const auto index = std::countr_zero(mask);
@@ -2360,6 +2401,49 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			    ShaderRecompiler::IR::ImageResourceClass::None) {
 				image_starts[ShaderRecompiler::IR::ImageBindingIndex(kind)] = image_start;
 				image_cursor += write.descriptorCount;
+				std::array<const TableRange*, 16> tables {};
+				size_t                            table_count = 0;
+				for (const auto& table: stage_tables) {
+					if (copy_tables && table.kind == kind) {
+						EXIT_IF(table_count == tables.size());
+						tables[table_count++] = &table;
+					}
+				}
+				if (table_count != 0) {
+					// The slots around the tables are written, the tables copied.
+					const auto end = tables.begin() + static_cast<std::ptrdiff_t>(table_count);
+					std::sort(tables.begin(), end,
+					          [](const auto* a, const auto* b) { return a->base < b->base; });
+					uint32_t next = 0;
+					for (size_t t = 0; t < table_count; t++) {
+						const auto& table = *tables[t];
+						EXIT_IF(table.base < next ||
+						        table.base + table.capacity > write.descriptorCount);
+						if (table.base > next) {
+							auto gap            = write;
+							gap.dstArrayElement = next;
+							gap.descriptorCount = table.base - next;
+							gap.pImageInfo      = m_descriptor_images.data() + image_start + next;
+							m_descriptor_writes.push_back(gap);
+						}
+						vk::CopyDescriptorSet copy {};
+						copy.srcSet          = table_state->slot_set;
+						copy.srcBinding      = table.binding;
+						copy.srcArrayElement = table.base;
+						copy.dstBinding      = table.binding;
+						copy.dstArrayElement = table.base;
+						copy.descriptorCount = table.capacity;
+						m_descriptor_copies.push_back(copy);
+						next = table.base + table.capacity;
+					}
+					if (next < write.descriptorCount) {
+						write.dstArrayElement = next;
+						write.descriptorCount -= next;
+						write.pImageInfo      = m_descriptor_images.data() + image_start + next;
+						m_descriptor_writes.push_back(write);
+					}
+					continue;
+				}
 			} else {
 				switch (kind) {
 					case BindingKind::Buffers:
@@ -2438,10 +2522,31 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 			// Only the slots of the visited elements change.
 			for (const auto index: descriptors.table_visits) {
+				const auto& info = table_state->infos[index];
 				for (auto k = table_state->element_slot_begin[index];
 				     k < table_state->element_slot_begin[index + 1]; k++) {
-					table_state->slot_infos[table_state->element_slots[k]] =
-					    table_state->infos[index];
+					const auto slot      = table_state->element_slots[k];
+					auto&      slot_info = table_state->slot_infos[slot];
+					const bool changed   = slot_info.sampler != info.sampler ||
+					                     slot_info.imageView != info.imageView ||
+					                     slot_info.imageLayout != info.imageLayout;
+					if (copy_tables && changed) {
+						const auto table =
+						    std::ranges::find_if(stage_tables, [&](const TableRange& range) {
+							    return slot >= range.first_slot &&
+							           slot - range.first_slot < range.capacity;
+						    });
+						EXIT_IF(table == stage_tables.end());
+						vk::WriteDescriptorSet write {};
+						write.dstSet          = table_state->slot_set;
+						write.dstBinding      = table->binding;
+						write.dstArrayElement = table->base + (slot - table->first_slot);
+						write.descriptorCount = 1;
+						write.descriptorType  = NativeDescriptorType(table->kind);
+						write.pImageInfo      = &slot_info;
+						m_slot_set_writes.push_back(write);
+					}
+					slot_info = info;
 				}
 			}
 		}
@@ -2449,6 +2554,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			const auto& root  = program.info.images[root_index];
 			const auto  start = image_starts[ShaderRecompiler::IR::ImageBindingIndex(kind)] +
 			                   root.table_descriptor_base;
+			if (copy_tables) {
+				table_element += root.table_capacity;
+				return;
+			}
 			if (descriptors.tables_reused) {
 				EXIT_IF(table_element + root.table_capacity > table_state->slot_infos.size());
 				std::copy_n(table_state->slot_infos.begin() +
@@ -2492,13 +2601,49 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			                               static_cast<uint32_t>(m_descriptor_writes.size()),
 			                               m_descriptor_writes.data());
 		} else {
-			const auto set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout);
+			auto&      heap   = m_context.GetDescriptorHeap();
+			const auto device = m_context.GetGraphics().device;
+			const auto set    = heap.Commit(pipeline.descriptor_set_layout);
 			for (auto& write: m_descriptor_writes) {
 				write.dstSet = set;
 			}
-			m_context.GetGraphics().device.updateDescriptorSets(
-			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
-			    nullptr);
+			for (auto& copy: m_descriptor_copies) {
+				copy.dstSet = set;
+			}
+			// The slots written into the slot sets go first: the copies read them.
+			m_descriptor_writes.insert(m_descriptor_writes.end(), m_slot_set_writes.begin(),
+			                           m_slot_set_writes.end());
+			device.updateDescriptorSets(static_cast<uint32_t>(m_descriptor_writes.size()),
+			                            m_descriptor_writes.data(),
+			                            static_cast<uint32_t>(m_descriptor_copies.size()),
+			                            m_descriptor_copies.data());
+			// The tables that were written keep their descriptors in their states' slot sets for
+			// the next bindings, while the states stay valid.
+			m_descriptor_copies.clear();
+			for (const auto& table: table_ranges) {
+				auto& state = *table.state;
+				if (table.copied || !state.valid) {
+					continue;
+				}
+				if (!state.slot_set) {
+					state.slot_set = heap.CommitPersistent(pipeline.descriptor_set_layout);
+				}
+				vk::CopyDescriptorSet copy {};
+				copy.srcSet          = set;
+				copy.srcBinding      = table.binding;
+				copy.srcArrayElement = table.base;
+				copy.dstSet          = state.slot_set;
+				copy.dstBinding      = table.binding;
+				copy.dstArrayElement = table.base;
+				copy.descriptorCount = table.capacity;
+				m_descriptor_copies.push_back(copy);
+				state.slot_set_current = true;
+			}
+			if (!m_descriptor_copies.empty()) {
+				device.updateDescriptorSets(0, nullptr,
+				                            static_cast<uint32_t>(m_descriptor_copies.size()),
+				                            m_descriptor_copies.data());
+			}
 			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
 			                             0, nullptr);
 		}
