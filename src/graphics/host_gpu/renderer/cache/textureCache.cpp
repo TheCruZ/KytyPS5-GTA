@@ -1821,22 +1821,28 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
 	// With storage readback, guest accesses to its pages wait until the stored data lands.
+	const WriteBack write_back {range, m_scheduler.CurrentTick()};
 	if (m_readback_storage_images) {
 		{
 			std::scoped_lock write_back_lock {m_write_back_mutex};
-			m_write_backs.push_back({range, m_scheduler.CurrentTick()});
+			m_write_backs.push_back(write_back);
 		}
 		m_page_manager.UpdatePageWatchers<true, true>(range.address, range.size);
 	}
-	m_scheduler.DeferPriorityOperation([this, download = std::move(download), range,
+	m_scheduler.DeferPriorityOperation([this, download = std::move(download), write_back,
 	                                    trapped = m_readback_storage_images] {
-		download.buffer->Invalidate(download.offset, range.size);
-		LibKernel::Memory::WriteBacking(range.address, download.mapped, range.size);
+		download.buffer->Invalidate(download.offset, write_back.range.size);
+		LibKernel::Memory::WriteBacking(write_back.range.address, download.mapped,
+		                                write_back.range.size);
 		if (trapped) {
-			m_page_manager.UpdatePageWatchers<false, true>(range.address, range.size);
-			// Priority operations run in queue order, so this write-back is the oldest.
+			m_page_manager.UpdatePageWatchers<false, true>(write_back.range.address,
+			                                               write_back.range.size);
+			// Not the oldest one: a priority operation queued while the scheduler is not open runs
+			// at once, ahead of the queued ones. A predicate, because the vectorized std::find of
+			// MSVC STL 14.51 rejects 24-byte elements.
 			std::scoped_lock write_back_lock {m_write_back_mutex};
-			m_write_backs.erase(m_write_backs.begin());
+			m_write_backs.erase(std::ranges::find_if(
+			    m_write_backs, [&](const WriteBack& pending) { return pending == write_back; }));
 		}
 	});
 	return true;

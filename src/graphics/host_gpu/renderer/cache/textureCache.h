@@ -109,6 +109,7 @@ private:
 	struct WriteBack {
 		GuestRange range;
 		uint64_t   tick;
+		bool       operator==(const WriteBack&) const = default;
 	};
 
 	// PS5: guest addresses span 44 bits, so an entry keeps the whole image address.
