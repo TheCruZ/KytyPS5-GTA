@@ -49,9 +49,10 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 //              of detail VGPR, [1] = material V# offset, [2] = buffer table V# offset,
 //              [3] = threshold, [4] = level of detail offset, [5] = reference VGPR (NoRegister:
 //              threshold and factor); src0 = spread register, src1 = factor SGPR (none for a
-//              reference VGPR), src2 / src3 = SGPR pairs of the material and buffer table user
-//              pointers (or, with offset RayTracingAlphaDirect, the first SGPR of the V#);
-//              dmask = RayTracingAlphaLayout, | 2 for the Lane layout with threshold and factor.
+//              reference VGPR; with dmask 4 the reference SGPR), src2 / src3 = SGPR pairs of the
+//              material and buffer table user pointers (or, with offset RayTracingAlphaDirect, the
+//              first SGPR of the V#); dmask = RayTracingAlphaLayout, | 2 for the Lane layout with
+//              threshold and factor, | 4 for the Lane layout with a reference SGPR.
 //
 // A closest hit site (RayTracingKind::ClosestOpaque) is a per lane traversal whose leaf code
 // accepts the nearest triangle of either facing: the hardware finds the hit and RT_COMMIT writes
@@ -187,6 +188,9 @@ struct RayTracingAlphaTest {
 	bool     spread_vector  = false;
 	uint32_t factor_sgpr    = 0;
 	uint32_t reference_vgpr = NoRegister;
+	// Lane layout: a reference the same for every lane, in an SGPR the traversal keeps (NoRegister:
+	// none).
+	uint32_t reference_sgpr = NoRegister;
 	// The V#s of the material table and of the vertex and index buffer table: 16 bytes at user
 	// data pointer (SGPR pair) `*_user` + `*_offset` (RayTracingAlphaDirect: SGPRs `*_user`).
 	uint32_t material_user   = 0;
@@ -227,6 +231,12 @@ struct RayTracingSite {
 	uint32_t header_load_sgpr = 0;
 	// SGPR that turns the alpha test off (every triangle opaque) when not 0 (NoAlphaOff: none).
 	uint32_t alpha_off_sgpr = 0;
+	// PacketLane sites: the V_READLANE_B32s that read the alpha test switch and the ray's instance
+	// mask back from the VGPR lanes the program keeps them in through the traversal, run again at
+	// the entry into `alpha_off_sgpr` and `cull_mask_sgpr` (SGPRs the program does not use; 0: the
+	// value is in that SGPR at the entry).
+	uint32_t alpha_off_load_pc = 0;
+	uint32_t cull_mask_load_pc = 0;
 	// The lanes that cull the facing the instance flags select (Packet sites; closest hit sites
 	// take both facings): all of them, those of the SGPR pair `facing_mask`, or none when SGPR
 	// `facing_sgpr` is 0 (NoRegister: not a condition).
