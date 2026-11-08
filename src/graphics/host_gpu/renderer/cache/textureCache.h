@@ -106,6 +106,7 @@ private:
 	struct WriteBack {
 		GuestRange range;
 		uint64_t   tick;
+		bool       operator==(const WriteBack&) const = default;
 	};
 
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
