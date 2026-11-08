@@ -353,7 +353,8 @@ void AddAlphaTest(Layout& layout, const RayTracingSite& site, uint32_t index) {
 	}
 	alpha.src2  = Sgpr(test.material_user);
 	alpha.src3  = Sgpr(test.buffer_user);
-	alpha.dmask = static_cast<uint32_t>(test.layout) | (lane && factor ? 2u : 0u) | (uniform ? 4u : 0u);
+	alpha.dmask = static_cast<uint32_t>(test.layout) | (lane && factor ? 2u : 0u) | (uniform ? 4u : 0u) |
+	              (factor && test.factor_always ? 8u : 0u);
 }
 
 // The native traversal of a closest hit site: the hardware finds the hit (every triangle opaque,
@@ -1801,7 +1802,9 @@ private:
 	bool WritesScalar(const Instruction& inst, uint32_t reg) const {
 		const auto name      = magic_enum::enum_name(inst.opcode);
 		const bool lane_mask = name.starts_with("V_CMP");
-		const bool wide      = lane_mask ? !m_wave32 : name.find("64") != std::string_view::npos;
+		// 64-bit results, but not the 32-bit ones of 64-bit sources (S_FF1_I32_B64, S_BCNT1_I32_B64...).
+		const bool wide      = lane_mask ? !m_wave32
+		                                 : name.find("64") != std::string_view::npos && name.find("_I32_") == std::string_view::npos;
 		const auto count     = inst.family == Family::SMEM ? std::max(inst.data_dwords, 1u) : (wide ? 2u : 1u);
 		const auto covers    = [&](const Operand& dst, uint32_t n) {
 			const auto first = ScalarIndex(dst);
@@ -1994,19 +1997,33 @@ private:
 		                texture_user, texture_offset)) {
 			return false;
 		}
-		// M2: the third dword of the material record.
+		// M2: the third dword of the material record, at offset 8 of the record's offset or at
+		// offset 0 of S_ADD_I32 <record offset>, 8 (GTA V 01.005).
 		const auto m2 = ScalarSource(key, m_inst[key].src0, Opcode::S_BUFFER_LOAD_DWORD, leaf);
-		if (m2 == npos || m_inst[m2].offset != 8 || m_inst[m2].src0.kind != OperandKind::Sgpr) {
+		if (m2 == npos || m_inst[m2].src0.kind != OperandKind::Sgpr) {
 			return false;
 		}
+		size_t         offset_at = m2;
+		const Operand* offset    = &m_inst[m2].src1;
+		if (m_inst[m2].offset != 8) {
+			const auto add = m_inst[m2].offset == 0 ? ScalarSource(m2, m_inst[m2].src1, Opcode::S_ADD_I32, leaf) : npos;
+			offset         = add == npos                       ? nullptr
+			                 : IsConstant(m_inst[add].src1, 8) ? &m_inst[add].src0
+			                 : IsConstant(m_inst[add].src0, 8) ? &m_inst[add].src1
+			                                                   : nullptr;
+			if (offset == nullptr || ScalarIndex(*offset) == NoRegister || !Plain(*offset)) {
+				return false;
+			}
+			offset_at = add;
+		}
 		const auto material_vsharp = m_inst[m2].src0.reg;
-		const auto record_offset   = ScalarIndex(m_inst[m2].src1);
+		const auto record_offset   = ScalarIndex(*offset);
 		if (!UserVsharp(ScalarRangeSource(m2, material_vsharp, 4, Opcode::S_LOAD_DWORDX4, leaf), tail,
 		                alpha.material_user, alpha.material_offset)) {
 			return false;
 		}
 		// Its offset: (geometry word + R[0x78]) * 12.
-		const auto scale4 = ScalarSource(m2, m_inst[m2].src1, Opcode::S_LSHL_B32, leaf);
+		const auto scale4 = ScalarSource(offset_at, *offset, Opcode::S_LSHL_B32, leaf);
 		if (!IsScalarConstantOp(scale4, Opcode::S_LSHL_B32, 2)) {
 			return false;
 		}
@@ -2030,6 +2047,22 @@ private:
 			}
 			return false;
 		};
+		// A pair of the BLAS address at `i`: the pair of the triangle test's T#, or the same record
+		// dwords loaded again (GTA V 01.005 loads them into other pairs in the leaf code).
+		const auto blas_of = [&](size_t i, uint32_t pair) {
+			if (blas_head(pair)) {
+				return pair;
+			}
+			const auto blas = BlasPairOfRecordLoad(i, pair, header, back, record_sgpr);
+			return blas != NoRegister && blas_head(blas) ? blas : NoRegister;
+		};
+		// Whether `operand` of `i` holds a field of the BLAS `blas`.
+		const auto blas_field = [&](size_t i, const Operand& operand, uint32_t blas, uint32_t& dword) {
+			const auto load = ScalarSource(i, operand, Opcode::S_LOAD_DWORD, leaf);
+			return load != npos && m_inst[load].src0.kind == OperandKind::Sgpr &&
+			       blas_of(load, m_inst[load].src0.reg) == blas &&
+			       FieldLoad(i, operand, m_inst[load].src0.reg, leaf, dword) != npos;
+		};
 		bool geometry_ok = false, base_ok = false;
 		for (const auto* operand: {&m_inst[sum].src0, &m_inst[sum].src1}) {
 			if (FieldLoad(sum, *operand, record_sgpr, leaf, alpha.fields.material_dword) != npos) {
@@ -2038,17 +2071,17 @@ private:
 			}
 			// The geometry word: B[B[table] + ((N >> 3) - B[first]) * 4] of the triangle node N.
 			const auto load = ScalarSource(sum, *operand, Opcode::S_LOAD_DWORD, leaf);
-			if (load == npos || m_inst[load].offset != 0 || m_inst[load].src0.kind != OperandKind::Sgpr ||
-			    !blas_head(m_inst[load].src0.reg)) {
+			const auto base = load != npos && m_inst[load].offset == 0 ? ScalarIndex(m_inst[load].src0) : NoRegister;
+			const auto blas = base != NoRegister ? blas_of(load, base) : NoRegister;
+			if (blas == NoRegister) {
 				continue;
 			}
-			const auto blas  = m_inst[load].src0.reg;
 			const auto index = ScalarSource(load, m_inst[load].src1, Opcode::S_LSHL2_ADD_U32, leaf);
-			if (index == npos || FieldLoad(index, m_inst[index].src1, blas, leaf, alpha.fields.table_dword) == npos) {
+			if (index == npos || !blas_field(index, m_inst[index].src1, blas, alpha.fields.table_dword)) {
 				continue;
 			}
 			const auto local = ScalarSource(index, m_inst[index].src0, Opcode::S_SUB_U32, leaf);
-			if (local == npos || FieldLoad(local, m_inst[local].src1, blas, leaf, alpha.fields.first_dword) == npos) {
+			if (local == npos || !blas_field(local, m_inst[local].src1, blas, alpha.fields.first_dword)) {
 				continue;
 			}
 			const auto node = ScalarSource(local, m_inst[local].src0, Opcode::S_LSHR_B32, leaf);
@@ -2091,18 +2124,38 @@ private:
 		const auto is_m1 = [&](size_t i, const Operand& operand) {
 			return ScalarIndex(operand) == m1_sgpr && ScalarWriter(i, m1_sgpr, leaf) == m01;
 		};
-		// The reference: threshold * (M0 bit 0 ? factor : 1.0), compared with the sample.
-		size_t compare = npos;
+		// The reference: threshold * (M0 bit 0 ? factor : 1.0), compared with the sample
+		// (V_CMP_GT_F32 <sampled>, <reference>); or threshold * factor for every material, the same
+		// for every lane: V_CMP_LT_F32 <reference SGPR>, <sampled> of a V_READFIRSTLANE_B32 of it
+		// (GTA V 01.005).
+		size_t         compare = npos;
+		const Operand* ref     = nullptr;
 		for (size_t i = sample + 1; i < tail && compare == npos; i++) {
-			if (m_inst[i].opcode == Opcode::V_CMP_GT_F32 && m_inst[i].src0.kind == OperandKind::Vgpr &&
-			    m_inst[i].src0.reg == sampled.dst.reg && VectorSource(i, m_inst[i].src0, Opcode::IMAGE_SAMPLE, sample) == sample) {
+			const auto& cmp = m_inst[i];
+			if (cmp.opcode == Opcode::V_CMP_GT_F32 && cmp.src0.kind == OperandKind::Vgpr && cmp.src0.reg == sampled.dst.reg &&
+			    VectorSource(i, cmp.src0, Opcode::IMAGE_SAMPLE, sample) == sample) {
 				compare = i;
+				ref     = &cmp.src1;
+			} else if (cmp.opcode == Opcode::V_CMP_LT_F32 && cmp.src0.kind == OperandKind::Sgpr &&
+			           cmp.src1.kind == OperandKind::Vgpr && cmp.src1.reg == sampled.dst.reg && Plain(cmp.src0) &&
+			           Plain(cmp.src1) && VectorSource(i, cmp.src1, Opcode::IMAGE_SAMPLE, sample) == sample) {
+				compare = i;
+				ref     = &cmp.src0;
 			}
 		}
 		if (compare == npos) {
 			return false;
 		}
-		const auto reference = VectorSource(compare, m_inst[compare].src1, Opcode::V_MUL_F32, leaf);
+		size_t compared = compare;
+		alpha.factor_always = ref->kind == OperandKind::Sgpr;
+		if (alpha.factor_always) {
+			compared = ScalarSource(compare, *ref, Opcode::V_READFIRSTLANE_B32, leaf);
+			if (compared == npos || !Plain(m_inst[compared].src0)) {
+				return false;
+			}
+			ref = &m_inst[compared].src0;
+		}
+		const auto reference = VectorSource(compared, *ref, Opcode::V_MUL_F32, leaf);
 		if (reference == npos || !Plain(m_inst[reference].src0) || !Plain(m_inst[reference].src1) ||
 		    !Plain(m_inst[reference].dst)) {
 			return false;
@@ -2111,13 +2164,19 @@ private:
 		for (const auto* operand: {&m_inst[reference].src0, &m_inst[reference].src1}) {
 			const auto j = ScalarWriter(reference, ScalarIndex(*operand), leaf);
 			if (j == npos) {
+				// For every material: the factor in an SGPR from before the loop that the traversal keeps.
+				if (alpha.factor_always && operand->kind == OperandKind::Sgpr &&
+				    ScalarWriter(header, operand->reg, 0) != npos && Keeps(header, back, operand->reg, false)) {
+					alpha.factor_sgpr = operand->reg;
+					factor_ok         = true;
+				}
 				continue;
 			}
 			const auto& inst = m_inst[j];
 			if (inst.opcode == Opcode::S_MOV_B32 && inst.src0.kind == OperandKind::LiteralConstant) {
 				alpha.threshold = inst.src0.value;
 				threshold_ok    = true;
-			} else if (inst.opcode == Opcode::S_CSELECT_B32 && inst.src0.kind == OperandKind::Sgpr &&
+			} else if (!alpha.factor_always && inst.opcode == Opcode::S_CSELECT_B32 && inst.src0.kind == OperandKind::Sgpr &&
 			           inst.src1.kind == OperandKind::FloatInlineConstant && inst.src1.value == One) {
 				// S_BITCMP1_B32 M0, 0 sets SCC.
 				size_t bitcmp = j;
@@ -2191,7 +2250,7 @@ private:
 			vsharp = inst.src0.reg;
 			return true;
 		};
-		uint32_t formatted = 0, uvs = 0, buffer_table = NoRegister;
+		uint32_t formatted = 0, uvs = 0, aligned = 0, buffer_table = NoRegister;
 		size_t   table_load = npos;
 		for (size_t i = leaf; i < sample; i++) {
 			const auto& inst = m_inst[i];
@@ -2214,6 +2273,14 @@ private:
 				}
 				buffer_table = table;
 				uvs++;
+				// Its offset aligned down to 4 bytes: S_AND_B32 <offset>, -4, <x> (GTA V 01.005).
+				const auto align  = ScalarSource(i, inst.src1, Opcode::S_AND_B32, leaf);
+				const auto minus4 = [](const Operand& operand) {
+					return operand.kind == OperandKind::IntegerInlineConstant && operand.signed_val == -4;
+				};
+				if (align != npos && (minus4(m_inst[align].src0) || minus4(m_inst[align].src1))) {
+					aligned++;
+				}
 			}
 		}
 		if (formatted != 3 || uvs != 3 ||
@@ -2221,9 +2288,10 @@ private:
 		                alpha.buffer_user, alpha.buffer_offset)) {
 			return false;
 		}
-		// The primitive index (W & 0x3fffffff) * 3, the vertex stride and uv offset (& 0xfc).
+		// The primitive index (W & 0x3fffffff) * 3, the vertex stride and uv offset (& 0xfc, or & 0xff
+		// with the vertex offsets aligned down to 4 bytes).
 		bool primitive_ok = false;
-		uint32_t strides  = 0;
+		uint32_t strides  = 0, wide_strides = 0;
 		for (size_t i = leaf; i < sample; i++) {
 			const auto& inst = m_inst[i];
 			if (inst.opcode == Opcode::S_ANDN2_B32 && inst.src1.kind == OperandKind::FloatInlineConstant &&
@@ -2236,8 +2304,18 @@ private:
 			if (IsScalarConstantOp(i, Opcode::S_AND_B32, 0xfc) && (is_m0(i, inst.src0) || is_m1(i, inst.src0))) {
 				strides |= is_m0(i, inst.src0) ? 1u : 2u;
 			}
+			if (IsScalarConstantOp(i, Opcode::S_AND_B32, 0xff) && (is_m0(i, inst.src0) || is_m1(i, inst.src0))) {
+				wide_strides |= is_m0(i, inst.src0) ? 1u : 2u;
+			}
 		}
-		if (!primitive_ok || strides != 3) {
+		if (strides != 3) {
+			if (strides != 0 || wide_strides != 3 || aligned != 3) {
+				return false;
+			}
+			alpha.fields.vertex_mask  = 0xffu;
+			alpha.fields.vertex_align = true;
+		}
+		if (!primitive_ok) {
 			return false;
 		}
 		// The registers the native code reads at the site entry keep their value in the traversal.
@@ -4020,13 +4098,31 @@ private:
 
 	// The wave-wide instance mask test of a setup whose ray mask is the same for every lane:
 	// S_CBRANCH_SCC0 <next node> at `i` of S_AND_B32 <s>, <S_LSHR_B32 dword, shift (or the dword)>,
-	// <SGPR mask or constant> (see MaskAnd), the last instruction before it that writes SCC.
+	// <SGPR mask or constant> (see MaskAnd), the last instruction before it that writes SCC; or,
+	// right before the branch, a test of the record dword with the ray's mask in a constant
+	// (S_AND_B32 <s>, <dword>, <bits << shift>, as in GTA V 01.005's 0xa31ec6a25be5e017; see
+	// ConstantMaskTest).
 	bool ScalarMaskTest(size_t i, size_t header, size_t back, const Field& record, RayTracingSite& site) const {
 		size_t test = npos;
 		for (size_t j = i; j-- > header && test == npos;) {
 			test = WritesScc(m_inst[j]) ? j : npos;
 		}
-		return test != npos && m_inst[test].opcode == Opcode::S_AND_B32 && MaskAnd(test, header, back, record, site);
+		if (test == npos) {
+			return false;
+		}
+		if (m_inst[test].opcode == Opcode::S_AND_B32 && MaskAnd(test, header, back, record, site)) {
+			return true;
+		}
+		Field    field;
+		uint32_t shift = 0, bits = 0, width = 0;
+		if (NextReal(test) != i || !ConstantMaskTest(test, header, field, shift, bits, width) || !SameRecord(field, record)) {
+			return false;
+		}
+		site.cull_mask_constant = bits;
+		site.layout.mask_dword  = field.dword;
+		site.layout.mask_shift  = shift;
+		site.layout.mask_width  = width;
+		return true;
 	}
 
 	// S_AND_B32 at `y` of a record dword (S_LSHR_B32 <dword>, shift, or the dword) and of the ray's
@@ -4349,7 +4445,7 @@ private:
 	}
 
 	// SCC at instruction `i`, from the S_CMP that last wrote it: x != 0 or x == 0 of a value
-	// `Bits` takes.
+	// `Bits` takes (the U32 or I32 compares).
 	bool SccCondition(size_t i, size_t from, const RayTracingLayout& layout, size_t back, Condition& cond,
 	                  uint32_t depth) const {
 		size_t cmp = npos;
@@ -4360,8 +4456,8 @@ private:
 			return false;
 		}
 		const auto& inst = m_inst[cmp];
-		const bool  ne   = inst.opcode == Opcode::S_CMP_LG_U32;
-		if (!ne && inst.opcode != Opcode::S_CMP_EQ_U32) {
+		const bool  ne   = inst.opcode == Opcode::S_CMP_LG_U32 || inst.opcode == Opcode::S_CMP_LG_I32;
+		if (!ne && inst.opcode != Opcode::S_CMP_EQ_U32 && inst.opcode != Opcode::S_CMP_EQ_I32) {
 			return false;
 		}
 		const auto* x = IsConstant(inst.src0, 0) ? &inst.src1 : IsConstant(inst.src1, 0) ? &inst.src0 : nullptr;

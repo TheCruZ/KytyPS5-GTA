@@ -52,7 +52,8 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 //              reference VGPR; with dmask 4 the reference SGPR), src2 / src3 = SGPR pairs of the
 //              material and buffer table user pointers (or, with offset RayTracingAlphaDirect, the
 //              first SGPR of the V#); dmask = RayTracingAlphaLayout, | 2 for the Lane layout with
-//              threshold and factor, | 4 for the Lane layout with a reference SGPR.
+//              threshold and factor, | 4 for the Lane layout with a reference SGPR, | 8 for the
+//              reference threshold * factor of every material.
 //
 // A closest hit site (RayTracingKind::ClosestOpaque) is a per lane traversal whose leaf code
 // accepts the nearest triangle of either facing: the hardware finds the hit and RT_COMMIT writes
@@ -187,6 +188,9 @@ struct RayTracingAlphaTest {
 	uint32_t spread_reg     = 0;
 	bool     spread_vector  = false;
 	uint32_t factor_sgpr    = 0;
+	// The reference is threshold * factor for every material, not only those with M0 bit 0 (GTA V
+	// 01.005's Fidelity sites).
+	bool     factor_always  = false;
 	uint32_t reference_vgpr = NoRegister;
 	// Lane layout: a reference the same for every lane, in an SGPR the traversal keeps (NoRegister:
 	// none).

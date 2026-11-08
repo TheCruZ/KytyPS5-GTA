@@ -208,15 +208,24 @@ void Translator::EmitRayTracing(const Decoder::Instruction& inst) {
 			};
 			const auto material = vsharp(inst.src2.reg, inst.image_nsa_addr[1]);
 			const auto buffers  = vsharp(inst.src3.reg, inst.image_nsa_addr[2]);
-			// dmask 4: src1 is a reference the same for every lane (no factor).
+			// dmask 4: src1 is a reference the same for every lane (no factor); dmask 8: the
+			// reference is threshold * factor for every material.
 			const bool uniform  = (inst.dmask & 4u) != 0;
-			const auto factor   = inst.src1.kind == Decoder::OperandKind::Sgpr && !uniform
+			auto       factor   = inst.src1.kind == Decoder::OperandKind::Sgpr && !uniform
 			                          ? ReadU32(inst.src1)
 			                          : IR::U32(IR::Value(0x3f800000u));
-			const auto threshold = uniform ? ReadU32(inst.src1)
+			auto       threshold = uniform ? ReadU32(inst.src1)
 			                       : inst.image_nsa_addr[5] != Decoder::NoRegister
 			                           ? ReadU32(VectorOperand(inst.image_nsa_addr[5]))
 			                           : IR::U32(IR::Value(inst.image_nsa_addr[3]));
+			if ((inst.dmask & 8u) != 0) {
+				const auto as_float = [&](IR::U32 value) {
+					return IR::F32(ir.Emit(IR::ValueOpcode::BitCastF32U32, {value}));
+				};
+				threshold = IR::U32(ir.Emit(IR::ValueOpcode::BitCastU32F32,
+				                            {ir.Emit(IR::ValueOpcode::FPMul32, {as_float(threshold), as_float(factor)})}));
+				factor    = IR::U32(IR::Value(0x3f800000u));
+			}
 			ir.Emit(IR::ValueOpcode::RayQueryAlpha,
 			        {ReadU32(VectorOperand(inst.image_nsa_addr[0])), ReadU32(inst.src0), factor, material[0],
 			         material[1], material[2], material[3], buffers[0], buffers[1], buffers[2], buffers[3], threshold,
