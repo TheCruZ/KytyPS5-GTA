@@ -358,10 +358,10 @@ void AddClosestTraversal(Layout& layout, const Program& program, const RayTracin
 	if (site.alpha.valid) {
 		AddAlphaTest(layout, site, index);
 	}
-	// The TLAS header address, loaded again into RT_SELECT's pair (which nothing reads before).
+	// The TLAS header address, loaded again into a pair nothing reads before.
 	auto header = Sgpr(site.header_sgpr);
-	if (lane && site.header_load_pc != 0) {
-		header    = Sgpr(site.instance_sgpr);
+	if (site.header_load_pc != 0) {
+		header    = Sgpr(site.header_load_sgpr);
 		auto& load = layout.AddCopy(*FindInstruction(program, site.header_load_pc));
 		load.dst   = header;
 	}
@@ -1308,21 +1308,30 @@ private:
 		}
 		alpha.level_sgpr = condition;
 		site.alpha       = alpha;
-		// RT_SELECT's registers: a pair the program does not use.
+		// RT_SELECT's registers: a pair the program does not use. The TLAS header address at the
+		// entry, when loaded again, goes there before RT_SELECT writes it.
 		site.instance_sgpr = UnusedPair();
 		site.mask_sgpr     = site.instance_sgpr;
-		// The TLAS header address at the entry: the header pair, or the guest's load of it again (its
-		// user data pointer unchanged).
+		return site.instance_sgpr != NoRegister && HeaderAtEntry(header, site.instance_sgpr, site);
+	}
+
+	// The TLAS header address at the entry of a site that RT_INIT reads (AddClosestTraversal): the
+	// header pair, or the guest's load of it from its user data pointer, unchanged, again into the
+	// SGPR pair `pair` (a pair nothing reads before; the compiler may reuse the header pair before
+	// the loop, as GTA V 01.005's 0x84ed00053b3771da does for the root node).
+	bool HeaderAtEntry(size_t header, uint32_t pair, RayTracingSite& site) const {
 		uint32_t user = NoRegister, offset = 0;
 		size_t   load = npos;
-		if (site.instance_sgpr == NoRegister || !FindTlasSource(header, site.header_sgpr, user, offset, &load)) {
+		if (!FindTlasSource(header, site.header_sgpr, user, offset, &load)) {
 			return false;
 		}
+		site.header_load_pc = 0;
 		if (ScalarWriter(header, site.header_sgpr, 0) != load || ScalarWriter(header, site.header_sgpr + 1, 0) != load) {
-			if (ScalarWriter(header, user, 0) != npos || ScalarWriter(header, user + 1, 0) != npos) {
+			if (pair == NoRegister || ScalarWriter(header, user, 0) != npos || ScalarWriter(header, user + 1, 0) != npos) {
 				return false;
 			}
-			site.header_load_pc = m_inst[load].pc;
+			site.header_load_pc   = m_inst[load].pc;
+			site.header_load_sgpr = pair;
 		}
 		return true;
 	}
@@ -2749,7 +2758,9 @@ private:
 		if (!leaf_walk) {
 			site.mask_sgpr = site.instance_sgpr;
 		}
-		return true;
+		// The TLAS header address RT_INIT reads at the entry (ClosestOpaque sites, whose native
+		// traversal can load it again: AddClosestTraversal).
+		return leaf_walk || HeaderAtEntry(header, UnusedPair(), site);
 	}
 
 	// ---- Closest hit walks whose instance code walks the BLAS itself (ClosestLeaf). ----

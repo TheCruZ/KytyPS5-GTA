@@ -219,10 +219,12 @@ struct RayTracingSite {
 	uint32_t cull_mask_constant = 0xff;
 	// SGPR pair of the TLAS header address at entry_pc.
 	uint32_t header_sgpr = 0;
-	// PacketLane sites: the guest's load of the TLAS header address (S_LOAD_DWORDX2), run again at
-	// the entry into RT_SELECT's pair when the header pair holds another value there (0: it holds
+	// Closest hit and PacketLane sites: the guest's load of the TLAS header address
+	// (S_LOAD_DWORDX2), run again at the entry into SGPR pair `header_load_sgpr` (one the program
+	// does not use, or RT_SELECT's) when the header pair holds another value there (0: it holds
 	// the address).
-	uint32_t header_load_pc = 0;
+	uint32_t header_load_pc   = 0;
+	uint32_t header_load_sgpr = 0;
 	// SGPR that turns the alpha test off (every triangle opaque) when not 0 (NoAlphaOff: none).
 	uint32_t alpha_off_sgpr = 0;
 	// The lanes that cull the facing the instance flags select (Packet sites; closest hit sites
