@@ -105,7 +105,9 @@ bool CheckSite(const Program& program, const RayTracingSite& site) {
 	if (site.kind == RayTracingKind::ClosestOpaque || site.kind == RayTracingKind::PacketLane) {
 		return entry != nullptr && EndPc(*entry) == site.loop_pc && !IsDirectBranch(entry->opcode) &&
 		       expect(site.loop_pc, Opcode::UNKNOWN) && expect(site.exit_pc, Opcode::UNKNOWN) &&
-		       (site.header_load_pc == 0 || expect(site.header_load_pc, Opcode::S_LOAD_DWORDX2));
+		       (site.header_load_pc == 0 || expect(site.header_load_pc, Opcode::S_LOAD_DWORDX2)) &&
+		       (site.alpha_off_load_pc == 0 || expect(site.alpha_off_load_pc, Opcode::V_READLANE_B32)) &&
+		       (site.cull_mask_load_pc == 0 || expect(site.cull_mask_load_pc, Opcode::V_READLANE_B32));
 	}
 	if (site.kind == RayTracingKind::ClosestLeaf) {
 		return entry != nullptr && EndPc(*entry) == site.loop_pc && !IsDirectBranch(entry->opcode) &&
@@ -340,14 +342,18 @@ void AddAlphaTest(Layout& layout, const RayTracingSite& site, uint32_t index) {
 	alpha.image_nsa_addr[5] = lane ? test.reference_vgpr : NoRegister;
 	alpha.image_nsa_addr[6] = test.fields.Pack(site.layout);
 	alpha.src0              = test.spread_vector ? Vgpr(test.spread_reg) : Sgpr(test.spread_reg);
-	// The threshold and its factor (the Lane layout without a reference: dmask 2).
-	const bool factor = !lane || test.reference_vgpr == NoRegister;
+	// The threshold and its factor (the Lane layout without a reference: dmask 2), or the
+	// reference SGPR (dmask 4).
+	const bool uniform = lane && test.reference_sgpr != NoRegister;
+	const bool factor  = !lane || (test.reference_vgpr == NoRegister && !uniform);
 	if (factor) {
 		alpha.src1 = Sgpr(test.factor_sgpr);
+	} else if (uniform) {
+		alpha.src1 = Sgpr(test.reference_sgpr);
 	}
 	alpha.src2  = Sgpr(test.material_user);
 	alpha.src3  = Sgpr(test.buffer_user);
-	alpha.dmask = static_cast<uint32_t>(test.layout) | (lane && factor ? 2u : 0u);
+	alpha.dmask = static_cast<uint32_t>(test.layout) | (lane && factor ? 2u : 0u) | (uniform ? 4u : 0u);
 }
 
 // The native traversal of a closest hit site: the hardware finds the hit (every triangle opaque,
@@ -364,6 +370,15 @@ void AddClosestTraversal(Layout& layout, const Program& program, const RayTracin
 		header    = Sgpr(site.header_load_sgpr);
 		auto& load = layout.AddCopy(*FindInstruction(program, site.header_load_pc));
 		load.dst   = header;
+	}
+	// The alpha test switch and the instance mask the program keeps in VGPR lanes, read back into
+	// free SGPRs.
+	for (const auto& [pc, sgpr]: {std::pair {site.alpha_off_load_pc, site.alpha_off_sgpr},
+	                              std::pair {site.cull_mask_load_pc, site.cull_mask_sgpr}}) {
+		if (pc != 0) {
+			auto& read = layout.AddCopy(*FindInstruction(program, pc));
+			read.dst   = Sgpr(sgpr);
+		}
 	}
 	auto& init = layout.AddPseudo(Opcode::RT_INIT, index);
 	SetRay(init, site);
@@ -662,7 +677,7 @@ public:
 			if (const auto type = PacketNodeType(header); type != npos) {
 				if (!DerivePacket(header, back, type, site)) {
 					// A header with spills that is not a site keeps its loop, as other loops.
-					if (type != header + 2) {
+					if (HeaderSpills(header, type)) {
 						continue;
 					}
 					return false;
@@ -811,17 +826,24 @@ private:
 	}
 
 	// A packet loop header at `i`: S_AND_B64, S_AND_SAVEEXEC_B64 and the node type test, or the same
-	// after V_READLANE_B32s (the lane mask kept in VGPR lanes) with V_WRITELANE_B32s in the node
-	// type test (the saved EXEC spilled). The index of the node type's S_AND_B32 (npos: none).
+	// after V_READLANE_B32s (the lane mask kept in VGPR lanes) and/or with V_WRITELANE_B32s in the
+	// node type test (the saved EXEC spilled; GTA V 01.005 spills it with the lane mask in SGPRs).
+	// The index of the node type's S_AND_B32 (npos: none).
 	size_t PacketNodeType(size_t i) const {
 		size_t first = i;
 		while (first < m_inst.size() && m_inst[first].opcode == Opcode::V_READLANE_B32) {
 			first++;
 		}
 		return !m_wave32 && first + 3 < m_inst.size() && m_inst[first].opcode == Opcode::S_AND_B64 &&
-		               m_inst[first + 1].opcode == Opcode::S_AND_SAVEEXEC_B64 && IsNodeType(first + 2, first != i)
+		               m_inst[first + 1].opcode == Opcode::S_AND_SAVEEXEC_B64 && IsNodeType(first + 2, true)
 		           ? first + 2
 		           : npos;
+	}
+
+	// Whether the packet loop header at `i` (node type test at `type`) keeps registers in VGPR
+	// lanes: V_READLANE_B32s before it or V_WRITELANE_B32s in its node type test.
+	bool HeaderSpills(size_t i, size_t type) const {
+		return type != i + 2 || m_inst[type + 1].opcode == Opcode::V_WRITELANE_B32;
 	}
 
 	bool IsPacketHeader(size_t i) const { return PacketNodeType(i) != npos; }
@@ -957,15 +979,30 @@ private:
 			return false;
 		}
 		// The instance cull: the setup's first S_CBRANCH_EXECZ, after tests that narrow EXEC, one
-		// of which (V_CMP_NE_U32 or V_CMPX_NE_U32 0, x) tests the instance mask.
-		const auto culled = Next(setup, Opcode::S_CBRANCH_EXECZ, back);
+		// of which (V_CMP_NE_U32 or V_CMPX_NE_U32 0, x) tests the instance mask; or, for a ray mask
+		// the same for every lane, an S_CBRANCH_SCC0 before it of the S_AND_B32 that tests the
+		// mask, to where the node type test sends the wave without lanes (the next node), with no
+		// test before it that narrows EXEC.
+		auto       culled = Next(setup, Opcode::S_CBRANCH_EXECZ, back);
+		const auto none   = Next(type, Opcode::S_CBRANCH_EXECZ, le);
 		if (culled == npos) {
 			return false;
 		}
-		site.cull_exit_pc   = m_inst[culled].branch_target;
-		site.cull_mask      = NoRegister;
-		site.cull_mask_sgpr = NoRegister;
-		bool mask           = false;
+		site.cull_mask         = NoRegister;
+		site.cull_mask_sgpr    = NoRegister;
+		site.cull_mask_load_pc = 0;
+		bool mask              = false;
+		for (size_t i = setup; i < culled && !mask; i++) {
+			if (WritesExec(m_inst[i])) {
+				break;
+			}
+			if (m_inst[i].opcode == Opcode::S_CBRANCH_SCC0 && none != npos &&
+			    m_inst[i].branch_target == m_inst[none].branch_target) {
+				mask   = ScalarMaskTest(i, header, back, record, site);
+				culled = mask ? i : culled;
+				break;
+			}
+		}
 		for (size_t i = setup; i < culled && !mask; i++) {
 			const auto& cmp = m_inst[i];
 			if ((cmp.opcode == Opcode::V_CMPX_NE_U32 || cmp.opcode == Opcode::V_CMP_NE_U32) && IsConstant(cmp.src0, 0)) {
@@ -975,6 +1012,7 @@ private:
 		if (!mask) {
 			return false;
 		}
+		site.cull_exit_pc = m_inst[culled].branch_target;
 		// The BLAS loop head.
 		size_t blas_head = npos;
 		for (size_t i = culled; i < back && blas_head == npos; i++) {
@@ -985,6 +1023,10 @@ private:
 		if (blas_head == npos) {
 			// Or each lane walks the BLAS.
 			return DerivePacketLane(header, back, type, culled, record, site);
+		}
+		// The native traversal of a Packet site reads the ray's mask from its SGPR.
+		if (site.cull_mask_load_pc != 0) {
+			return false;
 		}
 		site.blas_head_pc = m_inst[blas_head].pc;
 		const auto saveexec = Next(blas_head, Opcode::S_AND_SAVEEXEC_B64, back);
@@ -1312,7 +1354,24 @@ private:
 		// entry, when loaded again, goes there before RT_SELECT writes it.
 		site.instance_sgpr = UnusedPair();
 		site.mask_sgpr     = site.instance_sgpr;
-		return site.instance_sgpr != NoRegister && HeaderAtEntry(header, site.instance_sgpr, site);
+		if (site.instance_sgpr == NoRegister || !HeaderAtEntry(header, site.instance_sgpr, site)) {
+			return false;
+		}
+		// The values RT_INIT reads back from VGPR lanes (see LaneLeafOpacity and MaskAnd) go to a
+		// free pair too: RT_SELECT's when the header address is not loaded there, else another one.
+		if (site.alpha_off_load_pc != 0 || site.cull_mask_load_pc != 0) {
+			const auto values = site.header_load_pc == 0 ? site.instance_sgpr : UnusedPair(site.instance_sgpr);
+			if (values == NoRegister) {
+				return false;
+			}
+			if (site.cull_mask_load_pc != 0) {
+				site.cull_mask_sgpr = values;
+			}
+			if (site.alpha_off_load_pc != 0) {
+				site.alpha_off_sgpr = values + 1;
+			}
+		}
+		return true;
 	}
 
 	// The TLAS header address at the entry of a site that RT_INIT reads (AddClosestTraversal): the
@@ -1375,12 +1434,15 @@ private:
 	// (`path`), after V_CNDMASK_B32 <flag>, 0, 1, (off | (opaque & !alpha tested)), where
 	//   opaque        V_CMP_NE_U32 0, V_AND_B32 1, V_OR_B32 <flags>, V_LSHRREV_B32 30, <word>
 	//   alpha tested  S_CSELECT_B64 exec, 0 of S_CMP_LG_U32 0, S_AND_B32 <flags>, 2
-	//   off           S_CSELECT_B64 exec, 0 of S_CMP_LG_U32 0, <SGPR the traversal keeps>
+	//   off           S_CSELECT_B64 exec, 0 of S_CMP_LG_U32 0, <SGPR the traversal keeps, or that it
+	//                 reads back from a VGPR lane it keeps (KeptLane)>
+	// (the compares may be their I32 forms).
 	// with <flags> a record dword, shifted right or not: the layout's flags (bit 0 opaque, bit 1
 	// alpha tested anyway).
 	bool LaneLeafOpacity(size_t header, size_t back, size_t leaf, size_t from, size_t latch, uint32_t word,
 	                     const Field& record, RayTracingSite& site, size_t& path, uint32_t& flag) const {
-		path = Next(from, Lane(Opcode::S_AND_SAVEEXEC_B64), latch);
+		site.alpha_off_load_pc = 0;
+		path                   = Next(from, Lane(Opcode::S_AND_SAVEEXEC_B64), latch);
 		if (path == npos || ScalarIndex(m_inst[path].src0) == NoRegister || m_inst[path].dst.kind != OperandKind::Sgpr) {
 			return false;
 		}
@@ -1406,7 +1468,7 @@ private:
 				return false;
 			}
 			const auto& atom = m_inst[atoms[k]];
-			if (atom.opcode == Opcode::V_CMP_NE_U32 && opaque == 5) {
+			if ((atom.opcode == Opcode::V_CMP_NE_U32 || atom.opcode == Opcode::V_CMP_NE_I32) && opaque == 5) {
 				// opaque: (flags | word >> 30) & 1.
 				const auto* x   = IsConstant(atom.src0, 0) ? &atom.src1 : IsConstant(atom.src1, 0) ? &atom.src0 : nullptr;
 				const auto  bit = x != nullptr ? VectorSource(atoms[k], *x, Opcode::V_AND_B32, leaf) : npos;
@@ -1442,6 +1504,16 @@ private:
 				off                 = k;
 				continue;
 			}
+			if (m_inst[w].opcode == Opcode::V_READLANE_B32 && KeptLane(w, header, back)) {
+				// Or one the program keeps in a VGPR lane (GTA V 01.005): RT_INIT reads it back into
+				// a free SGPR (see DerivePacketLane).
+				if (off != 5) {
+					return false;
+				}
+				site.alpha_off_load_pc = m_inst[w].pc;
+				off                    = k;
+				continue;
+			}
 			// flags & 2.
 			const auto& bits = m_inst[w];
 			const auto* f    = IsConstant(bits.src1, 2) ? &bits.src0 : IsConstant(bits.src0, 2) ? &bits.src1 : nullptr;
@@ -1461,7 +1533,8 @@ private:
 		return direct_table == expected && path_table == ~expected;
 	}
 
-	// A lane mask S_CSELECT_B64 <m>, exec, 0 at `i` of S_CMP_LG_U32 0, <x> (or <x>, 0): x.
+	// A lane mask S_CSELECT_B64 <m>, exec, 0 at `i` of S_CMP_LG_U32 (or S_CMP_LG_I32) 0, <x> (or
+	// <x>, 0): x.
 	bool SelectedLanes(size_t i, size_t from, uint32_t& x) const {
 		const auto& sel = m_inst[i];
 		if (sel.opcode != Lane(Opcode::S_CSELECT_B64) || sel.src0.kind != OperandKind::ExecLo || !IsConstant(sel.src1, 0)) {
@@ -1471,7 +1544,7 @@ private:
 		for (size_t j = i; j-- > from && cmp == npos;) {
 			cmp = WritesScc(m_inst[j]) ? j : npos;
 		}
-		if (cmp == npos || m_inst[cmp].opcode != Opcode::S_CMP_LG_U32) {
+		if (cmp == npos || (m_inst[cmp].opcode != Opcode::S_CMP_LG_U32 && m_inst[cmp].opcode != Opcode::S_CMP_LG_I32)) {
 			return false;
 		}
 		const auto& inst  = m_inst[cmp];
@@ -1737,14 +1810,22 @@ private:
 		return covers(inst.dst, count) || covers(inst.dst2, m_wave32 ? 1u : 2u);
 	}
 
-	// Whether the instruction writes VGPR `reg` (conservatively wide for image results).
+	// Whether the instruction writes EXEC (a destination, V_CMPX_* or S_*_SAVEEXEC_*).
+	static bool WritesExec(const Instruction& inst) {
+		const auto name = magic_enum::enum_name(inst.opcode);
+		return inst.dst.kind == OperandKind::ExecLo || inst.dst.kind == OperandKind::ExecHi || name.starts_with("V_CMPX") ||
+		       name.find("SAVEEXEC") != std::string_view::npos;
+	}
+
+	// Whether the instruction writes VGPR `reg`.
 	static bool WritesVector(const Instruction& inst, uint32_t reg) {
 		if (inst.dst.kind != OperandKind::Vgpr) {
 			return false;
 		}
 		uint32_t count = 1;
 		switch (inst.family) {
-			case Family::MIMG: count = 8; break;
+			// The dwords of the data, and the one that TFE or LWE (bits 16 and 17) add.
+			case Family::MIMG: count = std::max(inst.data_dwords, 1u) + (((inst.raw[0] >> 16u) & 3u) != 0 ? 1u : 0u); break;
 			case Family::MUBUF:
 			case Family::MTBUF:
 			case Family::FLAT: count = std::max(inst.data_dwords, 1u); break;
@@ -2244,15 +2325,56 @@ private:
 		return false;
 	}
 
+	// The pair of a BLAS T# (IsBlasPair) that holds what SGPR pair `pair` holds at `at`: both written
+	// by S_LOAD_DWORDXn of the same dwords of the instance record pair `record`, with the same value
+	// of that pair (NoRegister: none).
+	uint32_t BlasPairOfRecordLoad(size_t at, uint32_t pair, size_t header, size_t back, uint32_t record) const {
+		// The record byte offset that the load writing SGPR pair `reg` at `i` reads into it.
+		const auto source = [&](size_t i, uint32_t reg, size_t& load) -> int64_t {
+			load = ScalarWriter(i, reg, header);
+			if (load == npos || ScalarWriter(i, reg + 1, header) != load) {
+				return -1;
+			}
+			const auto& inst = m_inst[load];
+			const auto  dst  = ScalarIndex(inst.dst);
+			const bool  smem = inst.opcode == Opcode::S_LOAD_DWORDX2 || inst.opcode == Opcode::S_LOAD_DWORDX4 ||
+			                  inst.opcode == Opcode::S_LOAD_DWORDX8 || inst.opcode == Opcode::S_LOAD_DWORDX16;
+			if (!smem || dst == NoRegister || reg < dst || !IsSgpr(inst.src0, record) ||
+			    (inst.src1.kind != OperandKind::Unknown && inst.src1.kind != OperandKind::Null)) {
+				return -1;
+			}
+			return static_cast<int64_t>(inst.offset) + (reg - dst) * 4;
+		};
+		size_t     load   = npos;
+		const auto offset = source(at, pair, load);
+		if (offset < 0) {
+			return NoRegister;
+		}
+		for (size_t i = header; i < back; i++) {
+			const auto blas = m_inst[i].opcode == Opcode::IMAGE_BVH_INTERSECT_RAY ? BlasPair(i) : NoRegister;
+			if (blas == NoRegister || blas == pair) {
+				continue;
+			}
+			const auto bfe   = ScalarSource(i, m_inst[i].src1, Opcode::S_BFE_U64, header);
+			size_t     other = npos;
+			if (bfe != npos && source(bfe, blas, other) == offset &&
+			    ScalarWriter(load, record, header) == ScalarWriter(other, record, header) &&
+			    ScalarWriter(load, record + 1, header) == ScalarWriter(other, record + 1, header)) {
+				return blas;
+			}
+		}
+		return NoRegister;
+	}
+
 	// ---- The alpha test of GTA V's per lane leaf code (RayTracingAlphaLayout::Lane). ----
 	//
 	// The test of the packet sites (see DeriveAlphaTest) with vector loads in [begin, end): the
 	// material dwords m * 3 + k with BUFFER_LOAD_DWORD idxen, the V#s and the T# of the tables in
 	// waterfall loops (V_READFIRSTLANE_B32 of the key), the vertices with FLAT loads at the base
 	// address of the vertex V# (BUFFER_LOAD_DWORDX2 idxen of the buffer table). The cone spread is
-	// a VGPR or an SGPR, the reference a VGPR (closest hit sites) or the leaf code's
+	// a VGPR or an SGPR, the reference a VGPR (closest hit sites), the leaf code's
 	// threshold * (M0 bit 0 ? factor : 1) (PacketLane sites, whose tables may be loaded before the
-	// traversal).
+	// traversal) or an SGPR the traversal keeps (GTA V 01.005's PacketLane sites).
 	bool DeriveLaneAlphaTest(size_t header, size_t back, size_t begin, size_t end, uint32_t t_vgpr,
 	                         uint32_t node_vgpr, uint32_t word_vgpr, uint32_t flag_vgpr, uint32_t record_sgpr,
 	                         RayTracingAlphaTest& alpha) const {
@@ -2300,21 +2422,42 @@ private:
 		    sampled.src0.kind != OperandKind::Vgpr) {
 			return false;
 		}
-		size_t compare = npos;
+		// sampled > reference: V_CMP_GT_F32 <sampled>, <reference> or V_CMP_LT_F32 <reference>, <sampled>.
+		size_t         compare   = npos;
+		const Operand* reference = nullptr;
 		for (size_t i = sample + 1; i < end && compare == npos; i++) {
-			if (m_inst[i].opcode == Opcode::V_CMP_GT_F32 && IsVccLo(m_inst[i].dst) &&
-			    VectorSource(i, m_inst[i].src0, Opcode::IMAGE_SAMPLE, sample) == sample) {
-				compare = i;
+			const auto& cmp = m_inst[i];
+			if (!IsVccLo(cmp.dst)) {
+				continue;
+			}
+			if (cmp.opcode == Opcode::V_CMP_GT_F32 && VectorSource(i, cmp.src0, Opcode::IMAGE_SAMPLE, sample) == sample) {
+				compare   = i;
+				reference = &cmp.src1;
+			} else if (cmp.opcode == Opcode::V_CMP_LT_F32 &&
+			           VectorSource(i, cmp.src1, Opcode::IMAGE_SAMPLE, sample) == sample) {
+				compare   = i;
+				reference = &cmp.src0;
 			}
 		}
-		if (compare == npos || m_inst[compare].src1.kind != OperandKind::Vgpr ||
+		if (compare == npos || !Plain(m_inst[compare].src0) || !Plain(m_inst[compare].src1) ||
+		    (reference->kind != OperandKind::Vgpr && reference->kind != OperandKind::Sgpr) ||
 		    VectorSource(end, vgpr(flag_vgpr), Opcode::V_CNDMASK_B32, compare) == npos) {
 			return false;
 		}
-		alpha.reference_vgpr = m_inst[compare].src1.reg;
+		// A reference the same for every lane: an SGPR from before the loop that the traversal keeps
+		// (GTA V 01.005's performance mode computes threshold * factor there).
+		alpha.reference_sgpr = NoRegister;
+		if (reference->kind == OperandKind::Sgpr) {
+			if (ScalarWriter(header, reference->reg, 0) == npos || !Keeps(header, back, reference->reg, false)) {
+				return false;
+			}
+			alpha.reference_sgpr = reference->reg;
+		}
+		alpha.reference_vgpr = reference->kind == OperandKind::Vgpr ? reference->reg : NoRegister;
 		// Or the leaf code computes the reference: threshold * (M0 bit 0 ? factor : 1) (see below).
-		const auto product = VectorSource(compare, m_inst[compare].src1, Opcode::V_MUL_F32, begin);
-		if (product == npos && VectorWriter(compare, alpha.reference_vgpr, begin) != npos) {
+		const auto product = VectorSource(compare, *reference, Opcode::V_MUL_F32, begin);
+		if (reference->kind == OperandKind::Vgpr && product == npos &&
+		    VectorWriter(compare, alpha.reference_vgpr, begin) != npos) {
 			return false;
 		}
 		// The material dwords: BUFFER_LOAD_DWORD idxen of one V# at m * 3 + k, with m * 3 from
@@ -2398,9 +2541,14 @@ private:
 		    m_inst[geometry].src1.kind != OperandKind::Sgpr) {
 			return false;
 		}
-		const auto blas = m_inst[geometry].src1.reg;
+		// The BLAS address: the pair of a BLAS T#, or the same record dwords loaded again (GTA V
+		// 01.005 loads them into another pair in the leaf code).
+		auto blas = m_inst[geometry].src1.reg;
 		if (!IsBlasPair(header, back, blas, NoRegister)) {
-			return false;
+			blas = BlasPairOfRecordLoad(geometry, blas, header, back, record_sgpr);
+			if (blas == NoRegister) {
+				return false;
+			}
 		}
 		const auto table = VectorSource(geometry, m_inst[geometry].src0, Opcode::V_ADD_NC_U32, begin);
 		if (table == npos || FieldLoad(table, m_inst[table].src0, blas, begin, alpha.fields.table_dword) == npos) {
@@ -3867,6 +4015,25 @@ private:
 		if (y == npos || !Plain(x)) {
 			return false;
 		}
+		return MaskAnd(y, header, back, record, site);
+	}
+
+	// The wave-wide instance mask test of a setup whose ray mask is the same for every lane:
+	// S_CBRANCH_SCC0 <next node> at `i` of S_AND_B32 <s>, <S_LSHR_B32 dword, shift (or the dword)>,
+	// <SGPR mask or constant> (see MaskAnd), the last instruction before it that writes SCC.
+	bool ScalarMaskTest(size_t i, size_t header, size_t back, const Field& record, RayTracingSite& site) const {
+		size_t test = npos;
+		for (size_t j = i; j-- > header && test == npos;) {
+			test = WritesScc(m_inst[j]) ? j : npos;
+		}
+		return test != npos && m_inst[test].opcode == Opcode::S_AND_B32 && MaskAnd(test, header, back, record, site);
+	}
+
+	// S_AND_B32 at `y` of a record dword (S_LSHR_B32 <dword>, shift, or the dword) and of the ray's
+	// mask: an SGPR the traversal keeps, a value it reads back from a VGPR lane it keeps (GTA V
+	// 01.005, whose ray mask the compiler spills; see KeptLane) or a constant of 8 bits.
+	bool MaskAnd(size_t y, size_t header, size_t back, const Field& record, RayTracingSite& site) const {
+		auto& layout = site.layout;
 		for (const auto& [a, b]: {std::pair {&m_inst[y].src0, &m_inst[y].src1}, std::pair {&m_inst[y].src1, &m_inst[y].src0}}) {
 			Field    field;
 			uint32_t shift = 0;
@@ -3881,8 +4048,12 @@ private:
 			if (!SameRecord(field, record) || shift > 24) {
 				continue;
 			}
+			const auto read = b->kind == OperandKind::Sgpr && Plain(*b) ? ScalarWriter(y, b->reg, header) : npos;
 			if (b->kind == OperandKind::Sgpr && Plain(*b) && Keeps(header, back, b->reg, false)) {
 				site.cull_mask_sgpr = b->reg;
+			} else if (read != npos && KeptLane(read, header, back) && ByteValue(y, *b, 0)) {
+				// RT_INIT reads it back into a free SGPR (DerivePacketLane).
+				site.cull_mask_load_pc = m_inst[read].pc;
 			} else if ((b->kind == OperandKind::IntegerInlineConstant || b->kind == OperandKind::LiteralConstant) &&
 			           b->value <= 0xffu) {
 				site.cull_mask_constant = b->value;
@@ -3894,6 +4065,49 @@ private:
 			return true;
 		}
 		return false;
+	}
+
+	// Whether the SGPR operand `operand` of instruction `i` holds a value of 8 bits (as the host's
+	// instance masks): a constant, or copies and selections (S_MOV_B32, S_MOVK_I32, S_CSELECT_B32)
+	// of such values, through spills.
+	bool ByteValue(size_t i, const Operand& operand, uint32_t depth) const {
+		if (operand.kind == OperandKind::IntegerInlineConstant || operand.kind == OperandKind::LiteralConstant) {
+			return operand.value <= 0xffu;
+		}
+		const auto reg = ScalarIndex(operand);
+		// The writer of the value (of the SGPR spilled, for a value read back from a lane).
+		const auto w = reg != NoRegister && depth < 4 ? ScalarWriter(i, reg, 0) : npos;
+		if (w == npos) {
+			return false;
+		}
+		const auto& inst = m_inst[w];
+		switch (inst.opcode) {
+			case Opcode::S_MOV_B32:
+			case Opcode::S_MOVK_I32: return ByteValue(w, inst.src0, depth + 1);
+			case Opcode::S_CSELECT_B32: return ByteValue(w, inst.src0, depth + 1) && ByteValue(w, inst.src1, depth + 1);
+			default: return false;
+		}
+	}
+
+	// Whether V_READLANE_B32 `read` (in the loop [header, back]) reads back, from a constant lane, a
+	// value spilled there before the loop that the lane keeps through it: no instruction of the loop
+	// writes that VGPR but V_WRITELANE_B32s of other constant lanes. Run again at the entry, it
+	// reads the same value.
+	bool KeptLane(size_t read, size_t header, size_t back) const {
+		const auto& inst  = m_inst[read];
+		const auto  spill = inst.opcode == Opcode::V_READLANE_B32 ? SpilledFrom(read, 0) : npos;
+		if (spill == npos || spill >= header || read < header || read > back || inst.dst.kind != OperandKind::Sgpr) {
+			return false;
+		}
+		for (size_t i = header; i <= back; i++) {
+			const auto& write = m_inst[i];
+			if (WritesVector(write, inst.src0.reg) &&
+			    (write.opcode != Opcode::V_WRITELANE_B32 || write.dst.reg != inst.src0.reg ||
+			     !IsLaneConstant(write.src1) || write.src1.value == inst.src1.value)) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	// ---- The facing a traversal's leaf code accepts. ----
@@ -4343,8 +4557,8 @@ private:
 		}
 	}
 
-	// An SGPR pair the program never reads or writes (NoRegister: none).
-	uint32_t UnusedPair() const {
+	// An SGPR pair the program never reads or writes, other than `skip` (NoRegister: none).
+	uint32_t UnusedPair(uint32_t skip = NoRegister) const {
 		std::array<bool, 106> used {};
 		const auto mark = [&](const Operand& operand, uint32_t count) {
 			const auto reg = operand.kind == OperandKind::Sgpr ? operand.reg : NoRegister;
@@ -4374,7 +4588,7 @@ private:
 			mark(inst.dst2, 2u);
 		}
 		for (uint32_t pair = 104; pair >= 2; pair -= 2) {
-			if (!used[pair] && !used[pair + 1]) {
+			if (!used[pair] && !used[pair + 1] && pair != skip) {
 				return pair;
 			}
 		}

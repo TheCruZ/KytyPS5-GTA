@@ -208,16 +208,20 @@ void Translator::EmitRayTracing(const Decoder::Instruction& inst) {
 			};
 			const auto material = vsharp(inst.src2.reg, inst.image_nsa_addr[1]);
 			const auto buffers  = vsharp(inst.src3.reg, inst.image_nsa_addr[2]);
-			const auto factor   = inst.src1.kind == Decoder::OperandKind::Sgpr ? ReadU32(inst.src1)
-			                                                                    : IR::U32(IR::Value(0x3f800000u));
-			const auto threshold = inst.image_nsa_addr[5] != Decoder::NoRegister
+			// dmask 4: src1 is a reference the same for every lane (no factor).
+			const bool uniform  = (inst.dmask & 4u) != 0;
+			const auto factor   = inst.src1.kind == Decoder::OperandKind::Sgpr && !uniform
+			                          ? ReadU32(inst.src1)
+			                          : IR::U32(IR::Value(0x3f800000u));
+			const auto threshold = uniform ? ReadU32(inst.src1)
+			                       : inst.image_nsa_addr[5] != Decoder::NoRegister
 			                           ? ReadU32(VectorOperand(inst.image_nsa_addr[5]))
 			                           : IR::U32(IR::Value(inst.image_nsa_addr[3]));
 			ir.Emit(IR::ValueOpcode::RayQueryAlpha,
 			        {ReadU32(VectorOperand(inst.image_nsa_addr[0])), ReadU32(inst.src0), factor, material[0],
 			         material[1], material[2], material[3], buffers[0], buffers[1], buffers[2], buffers[3], threshold,
 			         IR::U32(IR::Value(inst.image_nsa_addr[4])), IR::U32(IR::Value(inst.image_nsa_addr[6]))},
-			        flags(inst.dmask));
+			        flags(inst.dmask & 3u));
 			return;
 		}
 		default: FailMissingTranslation(inst);
