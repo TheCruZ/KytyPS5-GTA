@@ -582,6 +582,11 @@ bool AddNativeTraversal(Layout& layout, const Program& program, const RayTracing
 			if (inst == nullptr) {
 				return false;
 			}
+			// The guest walk's restore of its lanes: here EXEC is the lanes RT_LEAF selected.
+			if (inst->dst.kind == OperandKind::ExecLo || inst->dst.kind == OperandKind::ExecHi) {
+				pc = EndPc(*inst);
+				continue;
+			}
 			layout.AddCopy(*inst);
 			pc = EndPc(*inst);
 		}
@@ -639,7 +644,8 @@ bool AddNativeTraversal(Layout& layout, const Program& program, const RayTracing
 		commit.image_nsa_addr[0] = site.result_t;
 		commit.image_nsa_addr[1] = site.result_word;
 		commit.image_nsa_addr[2] = site.result_instance;
-		commit.image_nsa_addr[3] = site.result_instance + 1;
+		commit.image_nsa_addr[3] =
+		    site.result_instance_hi != NoRegister ? site.result_instance_hi : site.result_instance + 1;
 		commit.image_nsa_addr[4] = closest ? site.result_u : NoRegister;
 		commit.image_nsa_addr[5] = closest ? site.result_v : NoRegister;
 		commit.image_nsa_addr[6] = closest ? site.result_node : NoRegister;
@@ -3422,6 +3428,118 @@ private:
 		return leaf_walk || HeaderAtEntry(header, UnusedPair(), site);
 	}
 
+	// The next leaf list entry of a per lane BLAS walk that loads it into a pair other than the
+	// node VGPR (Resident Evil Village, sce::Psr version 1: be0b848d2e06ec9b, f969c192323c215b):
+	//   V_LSHRREV_B32 <x>, 3, <entry>; BUFFER_LOAD_DWORDX2 <entry>, <x> idxen
+	//   V_ADD_NC_U32 <next>, 1, <x>                 the index of the entry after it
+	//   S_MOV_B64 exec, <lanes>                     (the walk's lanes; not run in the native leaf)
+	//   V_MOV_B32 <node>, <entry>                   the triangle node, last write of the node VGPR
+	// before the walk's backward branch, with no other branch or write of those VGPRs in between.
+	struct LaneEntry {
+		size_t   load  = npos;
+		size_t   move  = npos;
+		uint32_t entry = NoRegister;
+		uint32_t next  = NoRegister;
+	};
+	bool LaneEntryCopy(size_t test, size_t back, uint32_t node, LaneEntry& copy) const {
+		const auto move = VectorWriter(back, node, test + 1);
+		if (move == npos || m_inst[move].opcode != Opcode::V_MOV_B32 || !Plain(m_inst[move].dst) ||
+		    !Plain(m_inst[move].src0) || m_inst[move].src0.kind != OperandKind::Vgpr) {
+			return false;
+		}
+		const auto entry = m_inst[move].src0.reg;
+		const auto load  = VectorWriter(move, entry, test + 1);
+		if (load == npos || m_inst[load].opcode != Opcode::BUFFER_LOAD_DWORDX2 || !IsVgpr(m_inst[load].dst, entry) ||
+		    m_inst[load].src0.kind != OperandKind::Vgpr || entry + 1u == node) {
+			return false;
+		}
+		const auto index = m_inst[load].src0.reg;
+		uint32_t   next  = NoRegister;
+		for (size_t i = load + 1; i < move; i++) {
+			const auto& inst = m_inst[i];
+			if (IsDirectBranch(inst.opcode) || WritesVector(inst, entry) || WritesVector(inst, entry + 1u) ||
+			    WritesVector(inst, node) || WritesVector(inst, index)) {
+				return false;
+			}
+			if (WritesExec(inst)) {
+				// Only a restore of the walk's lanes.
+				if (inst.opcode != Lane(Opcode::S_MOV_B64) || inst.dst.kind != OperandKind::ExecLo ||
+				    inst.src0.kind == OperandKind::Vgpr) {
+					return false;
+				}
+				continue;
+			}
+			if (inst.opcode == Opcode::V_ADD_NC_U32 && inst.dst.kind == OperandKind::Vgpr && Plain(inst.dst) &&
+			    IsConstant(inst.src0, 1) && IsVgpr(inst.src1, index) && next == NoRegister) {
+				next = inst.dst.reg;
+			}
+		}
+		if (next == NoRegister) {
+			return false;
+		}
+		copy = {load, move, entry, next};
+		return true;
+	}
+
+	// The accepted hit of the leaf code of LaneEntryCopy() walks: after V_CMPX_NE_U32 0, <flag>;
+	// S_CBRANCH_EXECZ, a run of V_MOV_B32s of the distance (into t max), the primitive word (the
+	// entry's second DWORD), the index of the next entry and the instance record pair (its SGPRs,
+	// in any VGPRs). It has no barycentrics, and the guest's node result is that index, which the
+	// hardware does not give: the native commit leaves those registers to the leaf code.
+	bool ClosestLaneIndexHit(size_t begin_at, size_t latch, const Field& record, const LaneEntry& copy,
+	                         RayTracingSite& site, size_t& flag_test) const {
+		const auto move = [&](size_t i) {
+			const auto& inst = m_inst[i];
+			return inst.opcode == Opcode::V_MOV_B32 && inst.dst.kind == OperandKind::Vgpr && Plain(inst.dst) &&
+			       Plain(inst.src0) && (inst.src0.kind == OperandKind::Vgpr || inst.src0.kind == OperandKind::Sgpr);
+		};
+		size_t t_move = npos;
+		for (size_t i = begin_at; i < latch && t_move == npos; i++) {
+			if (move(i) && m_inst[i].dst.reg == site.t_max && m_inst[i].src0.kind == OperandKind::Vgpr) {
+				t_move = i;
+			}
+		}
+		if (t_move == npos) {
+			return false;
+		}
+		size_t begin = t_move, end = t_move + 1;
+		while (begin > begin_at && move(begin - 1)) {
+			begin--;
+		}
+		while (end < latch && move(end)) {
+			end++;
+		}
+		if (begin < begin_at + 3 || m_inst[begin - 1].opcode != Opcode::S_CBRANCH_EXECZ) {
+			return false;
+		}
+		flag_test     = begin - 2;
+		uint32_t next = NoRegister;
+		site.result_t = site.result_word = site.result_instance = site.result_instance_hi = NoRegister;
+		site.result_u = site.result_v = site.result_node = NoRegister;
+		for (size_t i = begin; i < end; i++) {
+			const auto& inst = m_inst[i];
+			const auto  dst  = inst.dst.reg;
+			auto*       slot = &next;
+			if (inst.src0.kind == OperandKind::Sgpr) {
+				slot = inst.src0.reg == record.pair       ? &site.result_instance
+				       : inst.src0.reg == record.pair + 1 ? &site.result_instance_hi
+				                                          : nullptr;
+			} else if (i == t_move) {
+				slot = &site.result_t;
+			} else if (inst.src0.reg == copy.entry + 1u) {
+				slot = &site.result_word;
+			} else if (inst.src0.reg != copy.next) {
+				slot = nullptr;
+			}
+			if (slot == nullptr || *slot != NoRegister) {
+				return false;
+			}
+			*slot = dst;
+		}
+		return site.result_t != NoRegister && site.result_word != NoRegister && next != NoRegister &&
+		       site.result_instance != NoRegister && site.result_instance_hi != NoRegister;
+	}
+
 	// ---- Closest hit walks whose instance code has a per lane BLAS walk (ClosestLane). ----
 	//
 	// Marvel's Wolverine: past the loop header's node type test (whose S_CBRANCH_SCC1 goes to the
@@ -3435,6 +3553,8 @@ private:
 	//              and an S_MOV_B32 exec, <saved> that ends it (the tail: the lane's next node)
 	//   load       V_LSHRREV_B32 <x>, 3, <node>; BUFFER_LOAD_DWORDX2 <node>, <x> idxen before the
 	//              backward branch: the lane's next leaf list entry, from its pointer
+	//              (or the form of LaneEntryCopy(), Resident Evil Village: the entry goes to another
+	//              pair, and the accepted hit is that of ClosestLaneIndexHit())
 	// The setup spills no SGPR (V_WRITELANE_B32) that would need restoring.
 	bool ClosestLaneWalk(size_t header, size_t back, const Field& record, RayTracingSite& site) const {
 		size_t tlas_test = npos;
@@ -3477,16 +3597,23 @@ private:
 				load = i;
 			}
 		}
+		LaneEntry  copy;
+		const bool copied = load == npos && LaneEntryCopy(test, blas_back, node, copy);
+		if (copied) {
+			load = copy.load;
+		}
+		// The VGPR of the entry pointer the load reads (and the entry it writes).
+		const auto entry = copied ? copy.entry : node;
 		const auto shift = load != npos && m_inst[load].src0.kind == OperandKind::Vgpr
 		                       ? VectorWriter(load, m_inst[load].src0.reg, test)
 		                       : npos;
 		if (shift == npos || m_inst[shift].opcode != Opcode::V_LSHRREV_B32 || !IsConstant(m_inst[shift].src0, 3) ||
-		    !IsVgpr(m_inst[shift].src1, node)) {
+		    !IsVgpr(m_inst[shift].src1, entry)) {
 			return false;
 		}
 		for (size_t i = shift + 1; i < load; i++) {
 			if (IsDirectBranch(m_inst[i].opcode) || WritesExec(m_inst[i]) ||
-			    WritesVector(m_inst[i], m_inst[load].src0.reg) || WritesVector(m_inst[i], node)) {
+			    WritesVector(m_inst[i], m_inst[load].src0.reg) || WritesVector(m_inst[i], entry)) {
 				return false;
 			}
 		}
@@ -3513,7 +3640,8 @@ private:
 		}
 		// The accepted hit, then the end of the leaf code.
 		size_t flag_test = npos;
-		if (!ClosestLaneHit(test + 1, blas_back, test, NoRegister, node, record, site, flag_test)) {
+		if (copied ? !ClosestLaneIndexHit(test + 1, blas_back, record, copy, site, flag_test)
+		           : !ClosestLaneHit(test + 1, blas_back, test, NoRegister, node, record, site, flag_test)) {
 			return false;
 		}
 		size_t tail = npos;
@@ -3561,9 +3689,9 @@ private:
 		site.leaf_pc           = m_inst[blas].pc;
 		site.tail_pc           = m_inst[tail].pc;
 		site.blas_end_pc       = EndPc(m_inst[blas_back]);
-		site.leaf_vgpr         = node;
+		site.leaf_vgpr         = entry;
 		site.leaf_load_pc      = m_inst[shift].pc;
-		site.leaf_load_end_pc  = EndPc(m_inst[load]);
+		site.leaf_load_end_pc  = EndPc(m_inst[copied ? copy.move : load]);
 		site.leaf_box_pc       = box != npos ? m_inst[box].pc : 0;
 		site.leaf_box_end_pc   = box != npos ? m_inst[box].branch_target : 0;
 		site.leaf_sgpr         = 0;

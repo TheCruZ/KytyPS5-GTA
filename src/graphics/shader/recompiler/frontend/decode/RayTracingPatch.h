@@ -283,6 +283,8 @@ struct RayTracingSite {
 	uint32_t result_t        = 0;
 	uint32_t result_word     = 0;
 	uint32_t result_instance = 0;
+	// The VGPR of the instance record address's high DWORD (NoRegister: result_instance + 1).
+	uint32_t result_instance_hi = NoRegister;
 	// Closest hit sites: the VGPRs of its barycentrics (as the guest leaf code divides them) and
 	// of its guest triangle node.
 	uint32_t result_u    = NoRegister;
@@ -313,6 +315,7 @@ struct RayTracingSite {
 	// ClosestLane sites: the VGPR of the lane's leaf list entry pointer (the BLAS walk's node
 	// VGPR) and the instructions that load the entry from it into that VGPR and the next one
 	// [leaf_load_pc, leaf_load_end_pc), run before the leaf code (NoRegister: not such a site).
+	// Instructions in that range that write EXEC (the guest walk restoring its lanes) are not run.
 	uint32_t leaf_vgpr        = NoRegister;
 	uint32_t leaf_load_pc     = 0;
 	uint32_t leaf_load_end_pc = 0;
