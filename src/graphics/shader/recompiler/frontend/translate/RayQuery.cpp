@@ -93,7 +93,8 @@ void Translator::EmitRayTracing(const Decoder::Instruction& inst) {
 					allow = sgpr(reg);
 				}
 			}
-			const auto variant = (inst.dmask & 3u) | ((inst.dmask & 16u) != 0 ? IR::RayQueryInitNoLeaf : 0u);
+			const auto variant = (inst.dmask & 3u) | ((inst.dmask & 16u) != 0 ? IR::RayQueryInitNoLeaf : 0u) |
+			                     ((inst.dmask & 32u) != 0 ? IR::RayQueryInitAllCandidates : 0u);
 			const auto native  = IR::U1(ir.Emit(
 			     IR::ValueOpcode::RayQueryInit,
 			     {ray[0], ray[1], ray[2], ray[3], ray[4], ray[5], ray[6], ray[7], header[0], header[1], alpha_off,
@@ -104,11 +105,13 @@ void Translator::EmitRayTracing(const Decoder::Instruction& inst) {
 			return;
 		}
 		case Decoder::Opcode::RT_SELECT: {
-			// The wave's smallest (instance, leaf) key: uniform values.
-			const auto next     = ir.Emit(IR::ValueOpcode::RayQueryNext, {}, flags(0u));
+			// The wave's smallest (instance, leaf) key: uniform values (dmask 1: the smallest
+			// instance; each lane takes its own leaf of it).
+			const auto keys     = (inst.dmask & 1u) != 0 ? IR::RayQueryKeyLaneLeaf : 0u;
+			const auto next     = ir.Emit(IR::ValueOpcode::RayQueryNext, {}, flags(keys));
 			const auto instance = IR::U32(ir.CompositeExtract(next, 0));
 			const auto has      = ir.INotEqual(IR::U32(ir.CompositeExtract(next, 2)), IR::U32(IR::Value(0u)));
-			const auto match    = IR::U1(ir.Emit(IR::ValueOpcode::RayQueryMatch, {}, flags(0u)));
+			const auto match    = IR::U1(ir.Emit(IR::ValueOpcode::RayQueryMatch, {}, flags(keys)));
 			WriteOperand(inst.dst, instance);
 			write_mask(inst.dst2, match);
 			write_mask(ExecOperand(), match);
@@ -128,8 +131,9 @@ void Translator::EmitRayTracing(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::RT_LEAF: {
 			// The leaf runs for the lanes with its key that the instance setup kept.
 			const auto lanes = ir.LogicalAnd(flag(Flag::Matched), ReadMask(inst.src0));
+			const auto keys  = (inst.dmask & 1u) != 0 ? IR::RayQueryKeyLaneLeaf : 0u;
 			WriteOperand(inst.dst,
-			             IR::U32(ir.Emit(IR::ValueOpcode::RayQuerySelectedLeaf, {}, flags(0u))));
+			             IR::U32(ir.Emit(IR::ValueOpcode::RayQuerySelectedLeaf, {}, flags(keys))));
 			write_mask(inst.src0, lanes);
 			write_mask(ExecOperand(), lanes);
 			write_mask(inst.dst2, lanes);

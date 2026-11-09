@@ -77,11 +77,21 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 // one candidate at a time, so the native traversal runs only with the per-lane alpha test (else it
 // is the guest's): like a closest hit site, the hardware finds the hit, with the opacity and the
 // facing of the instance flags as for Packet sites, and RT_COMMIT writes it.
+//
+// A closest hit site with a per lane BLAS walk (RayTracingKind::ClosestLane, Marvel's Wolverine,
+// sce::Psr BVH version 10) walks the TLAS wave-wide and runs the guest instance setup, then each
+// lane walks the instance's BLAS on its own and runs the leaf code for its own triangles (the
+// alpha test included), keeping the nearest accepted hit in registers. Its native traversal runs
+// like a ClosestLeaf site's, with every triangle a candidate (both facings, none opaque: the guest
+// leaf code decides): the wave takes the smallest instance any lane has, runs its setup once, and
+// each lane with a candidate of that instance runs the guest leaf code for its own smallest one
+// (its leaf list entry, loaded as the guest walk loads it), until no lane has candidates left.
 enum class RayTracingKind : uint32_t {
 	Packet,        // Wave-wide traversal, the guest leaf code tests the alpha tested triangles.
 	ClosestOpaque, // Closest hit, both facings.
 	ClosestLeaf,   // Closest hit, wave-wide, the guest leaf code tests the alpha tested triangles.
 	PacketLane,    // Wave-wide TLAS, per lane BLAS: no guest code runs in the native traversal.
+	ClosestLane,   // Closest hit, wave-wide TLAS, per lane BLAS: each lane runs the guest leaf code.
 };
 
 // A register a site does not have.
@@ -283,6 +293,17 @@ struct RayTracingSite {
 	// ClosestLeaf sites: the end of the BLAS loop (after its backward branch); the leaf code's
 	// branches into the rest of it (the BLAS box code, the pop) end the leaf.
 	uint32_t blas_end_pc = 0;
+	// ClosestLane sites: the VGPR of the lane's leaf list entry pointer (the BLAS walk's node
+	// VGPR) and the instructions that load the entry from it into that VGPR and the next one
+	// [leaf_load_pc, leaf_load_end_pc), run before the leaf code (NoRegister: not such a site).
+	uint32_t leaf_vgpr        = NoRegister;
+	uint32_t leaf_load_pc     = 0;
+	uint32_t leaf_load_end_pc = 0;
+	// ClosestLane sites: the per lane walk's box code [leaf_box_pc, leaf_box_end_pc), from the
+	// S_CBRANCH_EXECZ that skips it when no lane has a box node, which the copy of the leaf code
+	// leaves out (every lane has a triangle node there; 0: none).
+	uint32_t leaf_box_pc      = 0;
+	uint32_t leaf_box_end_pc  = 0;
 	// Where the loop exits to.
 	uint32_t exit_pc = 0;
 	// The alpha test the native traversal runs instead of the leaf code.
@@ -295,9 +316,12 @@ constexpr uint32_t NoAlphaOff = 0xffffffffu;
 
 struct RayTracingPatch {
 	std::vector<RayTracingSite> sites;
-	// The guest TLAS header: the 64-bit value at user data pointer `user_sgpr` + `header_offset`.
+	// The guest TLAS header: the 64-bit value at user data pointer `user_sgpr` + `header_offset`,
+	// or (`header_vsharp` not NoRegister) at the base of the V# at that pointer + `header_vsharp`,
+	// + `header_offset`.
 	uint32_t                    user_sgpr     = 0;
 	uint32_t                    header_offset = 0;
+	uint32_t                    header_vsharp = NoRegister;
 	uint32_t                    root          = 0;
 	RayTracingLayout            layout;
 };

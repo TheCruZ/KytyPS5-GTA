@@ -681,6 +681,9 @@ struct ShaderInfo {
 	// `ray_query_user_sgpr` + `ray_query_header_offset`, the root node `ray_query_root`.
 	uint32_t                        ray_query_user_sgpr           = 0;
 	uint32_t                        ray_query_header_offset       = 0;
+	// Not NoRayQuerySlot: the header address is at the base of the V# at the user data pointer +
+	// this offset, + `ray_query_header_offset` (Marvel's Wolverine).
+	uint32_t                        ray_query_header_vsharp       = NoRayQuerySlot;
 	uint32_t                        ray_query_root                = 0;
 	// How its instance records are laid out (Decoder::RayTracingLayout::Pack()).
 	std::array<uint32_t, 4>         ray_query_layout {};

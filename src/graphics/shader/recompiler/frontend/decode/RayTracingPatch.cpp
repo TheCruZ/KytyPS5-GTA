@@ -109,7 +109,12 @@ bool CheckSite(const Program& program, const RayTracingSite& site) {
 		       (site.alpha_off_load_pc == 0 || expect(site.alpha_off_load_pc, Opcode::V_READLANE_B32)) &&
 		       (site.cull_mask_load_pc == 0 || expect(site.cull_mask_load_pc, Opcode::V_READLANE_B32));
 	}
-	if (site.kind == RayTracingKind::ClosestLeaf) {
+	if (site.kind == RayTracingKind::ClosestLane &&
+	    (site.leaf_vgpr == NoRegister || !expect(site.leaf_load_pc, Opcode::V_LSHRREV_B32) ||
+	     site.leaf_load_end_pc <= site.leaf_load_pc)) {
+		return false;
+	}
+	if (site.kind == RayTracingKind::ClosestLeaf || site.kind == RayTracingKind::ClosestLane) {
 		return entry != nullptr && EndPc(*entry) == site.loop_pc && !IsDirectBranch(entry->opcode) &&
 		       site.setup_pc == site.loop_pc && expect(site.loop_pc, Opcode::UNKNOWN) &&
 		       expect(site.cull_exit_pc, Opcode::UNKNOWN) && expect(site.blas_head_pc, Opcode::UNKNOWN) &&
@@ -447,12 +452,18 @@ bool AddNativeTraversal(Layout& layout, const Program& program, const RayTracing
 	if (site.alpha.valid) {
 		AddAlphaTest(layout, site, index);
 	}
+	// A closest hit site with a per lane BLAS walk: every triangle is a candidate of the lane's own
+	// leaf code.
+	const bool lane_leaf = site.kind == RayTracingKind::ClosestLane;
 	auto& init = layout.AddPseudo(Opcode::RT_INIT, index);
 	SetRay(init, site);
 	init.image_nsa_addr[6] = site.t_max;
 	init.image_nsa_addr[7] = site.cull_mask;
 	init.image_nsa_addr[8] = site.cull_mask_constant;
 	init.src0              = Sgpr(site.header_sgpr);
+	if (lane_leaf) {
+		init.dmask = 1u | 32u;
+	}
 	init.src1              = site.alpha_off_sgpr != NoAlphaOff ? Sgpr(site.alpha_off_sgpr) : Constant(0);
 	if (site.cull_mask_sgpr != NoRegister) {
 		init.src2 = Sgpr(site.cull_mask_sgpr);
@@ -484,7 +495,7 @@ bool AddNativeTraversal(Layout& layout, const Program& program, const RayTracing
 	};
 	// A closest hit site's leaf code keeps the nearest hit itself: lanes that accept one keep
 	// searching. It has no lane mask of its own (EXEC is the lanes that enter the leaf).
-	const bool closest = site.kind == RayTracingKind::ClosestLeaf;
+	const bool closest = site.kind == RayTracingKind::ClosestLeaf || lane_leaf;
 	const auto mask    = [&] {
 		if (!closest) {
 			return Sgpr(site.mask_sgpr);
@@ -499,6 +510,7 @@ bool AddNativeTraversal(Layout& layout, const Program& program, const RayTracing
 	auto& select = layout.AddPseudo(Opcode::RT_SELECT, index);
 	select.dst   = Sgpr(site.instance_sgpr);
 	select.dst2  = Sgpr(site.mask_sgpr);
+	select.dmask = lane_leaf ? 1u : 0u;
 	layout.AddBranch(Opcode::S_CBRANCH_SCC0, Layout::Target::Label, exit_check_label);
 	// The instance whose setup ran last: its registers still hold the object space ray.
 	layout.AddPseudo(Opcode::RT_REUSE, index);
@@ -520,9 +532,21 @@ bool AddNativeTraversal(Layout& layout, const Program& program, const RayTracing
 	}
 	layout.Bind(leaf_label);
 	auto& leaf = layout.AddPseudo(Opcode::RT_LEAF, index);
-	leaf.dst   = Sgpr(site.leaf_sgpr);
+	leaf.dst   = lane_leaf ? Vgpr(site.leaf_vgpr) : Sgpr(site.leaf_sgpr);
 	leaf.dst2  = Sgpr(site.saved_exec_sgpr);
 	leaf.src0  = mask();
+	leaf.dmask = lane_leaf ? 1u : 0u;
+	// Each lane's own leaf list entry, loaded as the guest walk loads it.
+	if (lane_leaf) {
+		for (auto pc = site.leaf_load_pc; pc < site.leaf_load_end_pc;) {
+			const auto* inst = FindInstruction(program, pc);
+			if (inst == nullptr) {
+				return false;
+			}
+			layout.AddCopy(*inst);
+			pc = EndPc(*inst);
+		}
+	}
 	// The guest leaf code; it ends at the BLAS loop latch. The guest loops over the rest of the
 	// leaf list until an entry marked last; here it tests only the selected entry (the hardware
 	// reports the other triangles as candidates of their own). A selected entry from a list the
@@ -530,15 +554,28 @@ bool AddNativeTraversal(Layout& layout, const Program& program, const RayTracing
 	// zeros and no entry is ever the last one.
 	// A closest hit site's leaf code leaves through the rest of the BLAS loop (its box code and
 	// the pop of its next node).
-	if (!AddRangeCopy(
-	        layout, program, site.leaf_pc, site.tail_pc,
-	        [&](uint32_t target) {
-		        return target == site.tail_pc || (closest && target > site.tail_pc && target < site.blas_end_pc)
-		                   ? tail_label
-		                   : UINT32_MAX;
-	        },
-	        true)) {
+	// A ClosestLane site's copy leaves out the box code of its per lane walk: the box stack is
+	// never pushed (and its stores are not resources of the program).
+	// The code before the box code continues with the code after it.
+	const bool skip_box  = lane_leaf && site.leaf_box_pc != 0;
+	const auto box_label = layout.NewLabel();
+	const auto leaf_end  = [&](uint32_t target) {
+		if (skip_box && target == site.leaf_box_pc) {
+			return box_label;
+		}
+		return target == site.tail_pc || (closest && target > site.tail_pc && target < site.blas_end_pc)
+		           ? tail_label
+		           : UINT32_MAX;
+	};
+	if (!AddRangeCopy(layout, program, site.leaf_pc, skip_box ? site.leaf_box_pc : site.tail_pc, leaf_end,
+	                  !lane_leaf)) {
 		return false;
+	}
+	if (skip_box) {
+		layout.Bind(box_label);
+		if (!AddRangeCopy(layout, program, site.leaf_box_end_pc, site.tail_pc, leaf_end, false)) {
+			return false;
+		}
 	}
 	// The end of an iteration: lanes that accepted a hit in the leaf stop (or, closest hit, keep
 	// searching).
@@ -664,7 +701,7 @@ public:
 			return false;
 		}
 		std::vector<RayTracingSite> sites;
-		uint32_t                    user_sgpr = NoRegister, header_offset = 0, root = 0;
+		uint32_t                    user_sgpr = NoRegister, header_offset = 0, root = 0, header_vsharp = NoRegister;
 		RayTracingLayout            layout;
 		// The end of the last site's loop: loops inside it (its BLAS walk) are part of it.
 		size_t site_end = 0;
@@ -694,13 +731,14 @@ public:
 			}
 			// The TLAS source: the header pair is loaded from a user data pointer, the root is
 			// the node register's first value.
-			uint32_t site_user = NoRegister, site_offset = 0, site_root = 0;
-			if (!FindTlasSource(header, site.header_sgpr, site_user, site_offset) ||
+			uint32_t site_user = NoRegister, site_offset = 0, site_root = 0, site_vsharp = NoRegister;
+			if (!FindTlasSource(header, site.header_sgpr, site_user, site_offset, nullptr,
+			                    site.kind == RayTracingKind::ClosestLane ? &site_vsharp : nullptr) ||
 			    !FindRoot(header, m_inst[node_index].src0, site_root)) {
 				return false;
 			}
-			if (user_sgpr != NoRegister &&
-			    (site_user != user_sgpr || site_offset != header_offset || site_root != root)) {
+			if (user_sgpr != NoRegister && (site_user != user_sgpr || site_offset != header_offset ||
+			                                site_root != root || site_vsharp != header_vsharp)) {
 				return false;
 			}
 			// One layout for the program: the sites read the same records (a site that does not
@@ -741,6 +779,7 @@ public:
 			site_end      = back;
 			user_sgpr     = site_user;
 			header_offset = site_offset;
+			header_vsharp = site_vsharp;
 			root          = site_root;
 			sites.push_back(site);
 		}
@@ -751,6 +790,7 @@ public:
 		patch.sites         = std::move(sites);
 		patch.user_sgpr     = user_sgpr;
 		patch.header_offset = header_offset;
+		patch.header_vsharp = header_vsharp;
 		patch.root          = root;
 		patch.layout        = layout;
 		return true;
@@ -910,6 +950,15 @@ private:
 				ScalarOrigin(header, back, box, site);
 				return site.t_max != NoRegister;
 			}
+		}
+		// Or the T#'s base was kept in VGPR lanes (V_WRITELANE_B32, read back with V_READLANE_B32
+		// before the test; Marvel's Wolverine).
+		const auto writer = ScalarWriter(box, test.src1.reg, 0);
+		if (writer != npos && writer < header && m_inst[writer].opcode == Opcode::S_BFE_U64 &&
+		    m_inst[writer].src0.kind == OperandKind::Sgpr && IsConstant(m_inst[writer].src1, 0x280008)) {
+			site.header_sgpr = m_inst[writer].src0.reg;
+			ScalarOrigin(header, back, box, site);
+			return site.t_max != NoRegister;
 		}
 		return false;
 	}
@@ -1373,6 +1422,88 @@ private:
 			}
 		}
 		return true;
+	}
+
+	// The accepted hit of a closest hit walk's per lane leaf code (DerivePacketLane with `closest`):
+	// after V_CMPX_NE_U32 0, <flag>; S_CBRANCH_EXECZ, a run of V_MOV_B32s of the distance (into t
+	// max), the primitive word and the triangle node (the leaf entry), the instance record pair (its
+	// SGPRs) and the barycentrics (V_MUL_F32s of the triangle test's third and fourth results).
+	// Gives the index of the flag test.
+	bool ClosestLaneHit(size_t begin_at, size_t latch, size_t test, uint32_t t_vgpr, uint32_t node,
+	                    const Field& record, RayTracingSite& site, size_t& flag_test) const {
+		const auto move = [&](size_t i) {
+			const auto& inst = m_inst[i];
+			return inst.opcode == Opcode::V_MOV_B32 && inst.dst.kind == OperandKind::Vgpr && Plain(inst.dst) &&
+			       Plain(inst.src0) && (inst.src0.kind == OperandKind::Vgpr || inst.src0.kind == OperandKind::Sgpr);
+		};
+		size_t t_move = npos;
+		for (size_t i = begin_at; i < latch && t_move == npos; i++) {
+			if (move(i) && m_inst[i].dst.reg == site.t_max && m_inst[i].src0.kind == OperandKind::Vgpr &&
+			    (t_vgpr == NoRegister || IsVgpr(m_inst[i].src0, t_vgpr))) {
+				t_move = i;
+			}
+		}
+		if (t_move == npos) {
+			return false;
+		}
+		size_t begin = t_move, end = t_move + 1;
+		while (begin > begin_at && move(begin - 1)) {
+			begin--;
+		}
+		while (end < latch && move(end)) {
+			end++;
+		}
+		if (begin < begin_at + 3 || m_inst[begin - 1].opcode != Opcode::S_CBRANCH_EXECZ) {
+			return false;
+		}
+		flag_test         = begin - 2;
+		t_vgpr            = m_inst[t_move].src0.reg;
+		const auto result = m_inst[test].dst.reg;
+		uint32_t   high   = NoRegister;
+		site.result_t = site.result_word = site.result_instance = NoRegister;
+		site.result_u = site.result_v = site.result_node = NoRegister;
+		for (size_t i = begin; i < end; i++) {
+			const auto& inst = m_inst[i];
+			const auto  dst  = inst.dst.reg;
+			if (inst.src0.kind == OperandKind::Sgpr) {
+				if (inst.src0.reg == record.pair) {
+					site.result_instance = dst;
+				} else if (inst.src0.reg == record.pair + 1) {
+					high = dst;
+				} else {
+					return false;
+				}
+				continue;
+			}
+			const auto src = inst.src0.reg;
+			if (src == t_vgpr && dst == site.t_max) {
+				site.result_t = dst;
+			} else if (src == node + 1) {
+				site.result_word = dst;
+			} else if (src == node) {
+				site.result_node = dst;
+			} else {
+				// A barycentric: the product of the test's third or fourth result.
+				const auto mul = VectorWriter(i, src, test + 1);
+				if (mul == npos || m_inst[mul].opcode != Opcode::V_MUL_F32) {
+					return false;
+				}
+				// (The walk's box code, for other lanes, may write those VGPRs in between.)
+				const auto reads = [&](uint32_t reg) {
+					const auto& m = m_inst[mul];
+					return IsVgpr(m.src0, reg) || IsVgpr(m.src1, reg);
+				};
+				const bool u = reads(result + 2), v = !u && reads(result + 3);
+				auto&      bary = u ? site.result_u : site.result_v;
+				if ((!u && !v) || bary != NoRegister) {
+					return false;
+				}
+				bary = dst;
+			}
+		}
+		return site.result_t != NoRegister && site.result_word != NoRegister && site.result_node != NoRegister &&
+		       site.result_instance != NoRegister && high == site.result_instance + 1 && site.result_u != NoRegister &&
+		       site.result_v != NoRegister;
 	}
 
 	// The TLAS header address at the entry of a site that RT_INIT reads (AddClosestTraversal): the
@@ -2927,10 +3058,14 @@ private:
 		site.both_facings = true;
 		bool leaf_walk    = false;
 		if (accept == npos) {
-			// A wave-wide walk whose leaf code keeps the nearest hit (ClosestLeafWalk), or whose
-			// leaf code selects it (ClosestSelectHit).
+			// A wave-wide walk whose leaf code keeps the nearest hit (ClosestLeafWalk, or with a
+			// per lane BLAS walk ClosestLaneWalk), or one whose leaf code selects it
+			// (ClosestSelectHit).
 			auto walk = site;
 			if (ClosestLeafWalk(header, back, record, walk)) {
+				site      = walk;
+				leaf_walk = true;
+			} else if (walk = site; ClosestLaneWalk(header, back, record, walk)) {
 				site      = walk;
 				leaf_walk = true;
 			} else {
@@ -2987,6 +3122,161 @@ private:
 		// The TLAS header address RT_INIT reads at the entry (ClosestOpaque sites, whose native
 		// traversal can load it again: AddClosestTraversal).
 		return leaf_walk || HeaderAtEntry(header, UnusedPair(), site);
+	}
+
+	// ---- Closest hit walks whose instance code has a per lane BLAS walk (ClosestLane). ----
+	//
+	// Marvel's Wolverine: past the loop header's node type test (whose S_CBRANCH_SCC1 goes to the
+	// box code) comes the instance setup, then a per lane BLAS walk, a loop of the form
+	//   setup      [loop header, BLAS head): the instance record and its tests, which leave for
+	//              the cull exit; the object space ray, the BLAS T#, the BLAS root in the node VGPR
+	//   BLAS head  the target of the walk's backward S_CBRANCH_EXECNZ; then its only
+	//              IMAGE_BVH_INTERSECT_RAY, with the node VGPR as its first address (src0)
+	//   leaf code  for the lanes whose node is a triangle node: the triangle test's results, the
+	//              lane's alpha test and, for an accepted hit, the V_MOV_B32s of ClosestLaneHit()
+	//              and an S_MOV_B32 exec, <saved> that ends it (the tail: the lane's next node)
+	//   load       V_LSHRREV_B32 <x>, 3, <node>; BUFFER_LOAD_DWORDX2 <node>, <x> idxen before the
+	//              backward branch: the lane's next leaf list entry, from its pointer
+	// The setup spills no SGPR (V_WRITELANE_B32) that would need restoring.
+	bool ClosestLaneWalk(size_t header, size_t back, const Field& record, RayTracingSite& site) const {
+		size_t tlas_test = npos;
+		if (!NodeTypeTest(header + 1, tlas_test) || tlas_test + 2 >= back ||
+		    m_inst[tlas_test + 1].opcode != Opcode::S_CBRANCH_SCC1) {
+			return false;
+		}
+		// The BLAS walk: the backward S_CBRANCH_EXECNZ into the instance code with the earliest
+		// target (the leaf code's own loops are inside it).
+		size_t blas = npos, blas_back = npos;
+		for (size_t i = tlas_test + 2; i < back; i++) {
+			const auto& inst = m_inst[i];
+			if (inst.opcode == Opcode::S_CBRANCH_EXECNZ && inst.branch_target > m_inst[tlas_test + 1].pc &&
+			    inst.branch_target < inst.pc && (blas == npos || inst.branch_target <= m_inst[blas].pc)) {
+				blas      = IndexOf(inst.branch_target);
+				blas_back = i;
+			}
+		}
+		if (blas == npos || blas_back == npos) {
+			return false;
+		}
+		size_t test = npos;
+		for (size_t i = blas; i < blas_back; i++) {
+			if (m_inst[i].opcode == Opcode::IMAGE_BVH_INTERSECT_RAY) {
+				if (test != npos) {
+					return false;
+				}
+				test = i;
+			}
+		}
+		if (test == npos || m_inst[test].src0.kind != OperandKind::Vgpr) {
+			return false;
+		}
+		const auto node = m_inst[test].src0.reg;
+		// The load of the next leaf list entry.
+		size_t load = npos;
+		for (size_t i = blas_back; i-- > test && load == npos;) {
+			const auto& inst = m_inst[i];
+			if (inst.opcode == Opcode::BUFFER_LOAD_DWORDX2 && IsVgpr(inst.dst, node)) {
+				load = i;
+			}
+		}
+		const auto shift = load != npos && m_inst[load].src0.kind == OperandKind::Vgpr
+		                       ? VectorWriter(load, m_inst[load].src0.reg, test)
+		                       : npos;
+		if (shift == npos || m_inst[shift].opcode != Opcode::V_LSHRREV_B32 || !IsConstant(m_inst[shift].src0, 3) ||
+		    !IsVgpr(m_inst[shift].src1, node)) {
+			return false;
+		}
+		for (size_t i = shift + 1; i < load; i++) {
+			if (IsDirectBranch(m_inst[i].opcode) || WritesExec(m_inst[i]) ||
+			    WritesVector(m_inst[i], m_inst[load].src0.reg) || WritesVector(m_inst[i], node)) {
+				return false;
+			}
+		}
+		// The setup: no spills, and its exits other than the walk are the box code (the header's
+		// branch) and the cull exit.
+		size_t cull = npos;
+		for (size_t i = header; i < blas; i++) {
+			const auto& inst = m_inst[i];
+			if (inst.opcode == Opcode::V_WRITELANE_B32 && inst.src0.kind == OperandKind::Sgpr) {
+				return false;
+			}
+			if (!IsDirectBranch(inst.opcode) || i == tlas_test + 1 ||
+			    (inst.branch_target > m_inst[header].pc && inst.branch_target <= m_inst[blas].pc)) {
+				continue;
+			}
+			const auto target = IndexOf(inst.branch_target);
+			if (inst.opcode == Opcode::S_BRANCH || target == npos || (cull != npos && target != cull)) {
+				return false;
+			}
+			cull = target;
+		}
+		if (cull == npos || VectorWriter(blas, node, header) == npos) {
+			return false;
+		}
+		// The accepted hit, then the end of the leaf code.
+		size_t flag_test = npos;
+		if (!ClosestLaneHit(test + 1, blas_back, test, NoRegister, node, record, site, flag_test)) {
+			return false;
+		}
+		size_t tail = npos;
+		for (size_t i = flag_test + 2; i < blas_back && tail == npos; i++) {
+			const auto& inst = m_inst[i];
+			if (inst.opcode == Lane(Opcode::S_MOV_B64) && inst.dst.kind == OperandKind::ExecLo &&
+			    inst.src0.kind == OperandKind::Sgpr) {
+				tail = i + 1;
+			}
+		}
+		if (tail == npos || tail >= shift) {
+			return false;
+		}
+		// The box code: from the first S_CBRANCH_EXECZ after the test that skips forward to
+		// S_ANDN2 exec, <lanes>, exec (the lanes with a triangle node), with no branch before it.
+		size_t box = npos;
+		for (size_t i = test + 1; i < tail && box == npos; i++) {
+			const auto& inst = m_inst[i];
+			if (IsDirectBranch(inst.opcode)) {
+				const auto target = IndexOf(inst.branch_target);
+				if (inst.opcode == Opcode::S_CBRANCH_EXECZ && target != npos && target > i && target < tail &&
+				    m_inst[target].opcode == Lane(Opcode::S_ANDN2_B64) &&
+				    m_inst[target].dst.kind == OperandKind::ExecLo && m_inst[target].src1.kind == OperandKind::ExecLo) {
+					box = i;
+				}
+				break;
+			}
+		}
+		// The leaf code leaves only into the rest of the walk.
+		for (size_t i = blas; i < tail; i++) {
+			const auto& inst = m_inst[i];
+			if (IsDirectBranch(inst.opcode) &&
+			    (inst.branch_target < m_inst[blas].pc || inst.branch_target > m_inst[blas_back].pc)) {
+				return false;
+			}
+		}
+		const auto scratch = UnusedPair();
+		if (scratch == NoRegister) {
+			return false;
+		}
+		site.kind              = RayTracingKind::ClosestLane;
+		site.setup_pc          = m_inst[header].pc;
+		site.cull_exit_pc      = m_inst[cull].pc;
+		site.blas_head_pc      = m_inst[blas].pc;
+		site.leaf_pc           = m_inst[blas].pc;
+		site.tail_pc           = m_inst[tail].pc;
+		site.blas_end_pc       = EndPc(m_inst[blas_back]);
+		site.leaf_vgpr         = node;
+		site.leaf_load_pc      = m_inst[shift].pc;
+		site.leaf_load_end_pc  = EndPc(m_inst[load]);
+		site.leaf_box_pc       = box != npos ? m_inst[box].pc : 0;
+		site.leaf_box_end_pc   = box != npos ? m_inst[box].branch_target : 0;
+		site.leaf_sgpr         = 0;
+		site.instance_sgpr     = m_inst[header + 1].src0.reg;
+		site.mask_sgpr         = scratch;
+		site.saved_exec_sgpr   = scratch;
+		site.alpha_off_sgpr    = NoAlphaOff;
+		site.after_leaf_pc     = 0;
+		site.after_leaf_end_pc = 0;
+		site.both_facings      = true;
+		return true;
 	}
 
 	// ---- Closest hit walks whose instance code walks the BLAS itself (ClosestLeaf). ----
@@ -3364,8 +3654,15 @@ private:
 
 	// The TLAS header pair: a S_LOAD_DWORDX2 from a pair nothing wrote before (user data), the
 	// value the T# of the TLAS is built from (the pair may hold something else by the loop).
+	// With `vsharp` (sce::Psr BVH version 10, Marvel's Wolverine), the header pair may also be an
+	// S_BUFFER_LOAD_DWORDX2 <header>, <V#>, <offset> of a V# the program loads from its user data
+	// pointer (S_LOAD_DWORDX4): then `vsharp` is that V#'s offset from the pointer (else
+	// NoRegister) and the header address is at the V#'s base + `offset`.
 	bool FindTlasSource(size_t header, uint32_t header_sgpr, uint32_t& user_sgpr, uint32_t& offset,
-	                    size_t* load_index = nullptr) const {
+	                    size_t* load_index = nullptr, uint32_t* vsharp = nullptr) const {
+		if (vsharp != nullptr) {
+			*vsharp = NoRegister;
+		}
 		size_t start = header;
 		for (size_t i = header; i-- > 0;) {
 			const auto& bfe = m_inst[i];
@@ -3380,13 +3677,33 @@ private:
 				continue;
 			}
 			// An immediate offset only (no offset register).
-			if (load.opcode != Opcode::S_LOAD_DWORDX2 || load.src0.kind != OperandKind::Sgpr ||
+			if (load.src0.kind != OperandKind::Sgpr ||
 			    (load.src1.kind != OperandKind::Unknown && load.src1.kind != OperandKind::Null)) {
+				return false;
+			}
+			size_t pointer_load = i;
+			if (load.opcode == Opcode::S_BUFFER_LOAD_DWORDX2 && vsharp != nullptr) {
+				// The V#: S_LOAD_DWORDX4 from the user data pointer, unchanged up to the load.
+				const auto v = ScalarWriter(i, load.src0.reg, 0);
+				if (v == npos || m_inst[v].opcode != Opcode::S_LOAD_DWORDX4 || !IsSgpr(m_inst[v].dst, load.src0.reg) ||
+				    m_inst[v].src0.kind != OperandKind::Sgpr ||
+				    (m_inst[v].src1.kind != OperandKind::Unknown && m_inst[v].src1.kind != OperandKind::Null)) {
+					return false;
+				}
+				for (uint32_t k = 1; k < 4; k++) {
+					if (ScalarWriter(i, load.src0.reg + k, 0) != v) {
+						return false;
+					}
+				}
+				pointer_load = v;
+				*vsharp      = static_cast<uint32_t>(m_inst[v].offset);
+			} else if (load.opcode != Opcode::S_LOAD_DWORDX2) {
 				return false;
 			}
 			// Nothing before writes the pair on a path to the load (the other cases of a switch
 			// may reuse it).
-			const auto base = load.src0.reg;
+			const auto base = m_inst[pointer_load].src0.reg;
+			i               = pointer_load;
 			for (size_t j = 0; j < i; j++) {
 				const auto& dst = m_inst[j].dst;
 				if (dst.kind == OperandKind::Sgpr &&
@@ -4911,6 +5228,7 @@ bool ApplyRayTracingPatch(const RayTracingPatch& patch, Program& program) {
 	program.instructions       = std::move(patched);
 	program.ray_tracing_source = {.user_sgpr     = patch.user_sgpr,
 	                              .header_offset = patch.header_offset,
+	                              .header_vsharp = patch.header_vsharp,
 	                              .root          = patch.root,
 	                              .layout        = patch.layout.Pack(),
 	                              .valid         = true};

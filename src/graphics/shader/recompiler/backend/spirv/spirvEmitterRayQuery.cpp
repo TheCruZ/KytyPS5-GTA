@@ -1074,7 +1074,10 @@ uint32_t EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto     culled  = fixed ? U32(s, facing)
 		                               : Select(s, u, ctx.Arg(inst, 13), U32(s, RayFlagCullFrontFacing), U32(s, facing));
 		uint32_t       flags   = 0;
-		if (always && fixed) {
+		if ((variant & IR::RayQueryInitAllCandidates) != 0) {
+			// The guest leaf code tests the facing and the opacity of every triangle.
+			flags = U32(s, RayFlagNoOpaque);
+		} else if (always && fixed) {
 			flags = Select(s, u, alpha_off, U32(s, facing | RayFlagOpaque), U32(s, facing | opacity));
 		} else {
 			const auto lane_facing = always ? culled : Select(s, u, ctx.Arg(inst, 12), culled, U32(s, 0));
@@ -1113,16 +1116,19 @@ uint32_t EmitRayQueryNext(ValueEmitContext& ctx, const IR::Inst& inst) {
 	// Every round retires the selected key in each lane that has it (RayQueryMark Resolve or
 	// CullResolve) and a query reports each alpha tested triangle once: the wave ends after as many
 	// rounds as its lanes have candidates, like the guest's own traversal, which has no limit.
-	const auto instance = GroupMin(s, local_instance);
-	const auto leaf =
-	    GroupMin(s, Select(s, u, Equal(s, local_instance, instance), local_leaf, U32(s, None)));
+	// RayQueryKeyLaneLeaf: the instance only; each lane takes its own leaf of it.
+	const bool lane_leaf = (IR::RayQueryVariant(inst.Flags<uint32_t>()) & IR::RayQueryKeyLaneLeaf) != 0;
+	const auto instance  = GroupMin(s, local_instance);
+	const auto leaf      = lane_leaf ? U32(s, None)
+	                                 : GroupMin(s, Select(s, u, Equal(s, local_instance, instance), local_leaf, U32(s, None)));
 	const auto has   = Binary(s, spv::OpINotEqual, b, instance, U32(s, None));
 	// The last setup can serve this key only if it ran for every lane that has the key (its
 	// object space ray is in the lanes the setup was active in).
 	uint32_t unprepared = U32(s, 0);
 	for (uint32_t half = 0; half < s.lane_count; half++) {
 		const auto lane  = Lane(s, site, half);
-		const auto mine  = LogicalAnd(s, Equal(s, heads[half].first, instance), Equal(s, heads[half].second, leaf));
+		const auto mine  = lane_leaf ? Equal(s, heads[half].first, instance)
+		                             : LogicalAnd(s, Equal(s, heads[half].first, instance), Equal(s, heads[half].second, leaf));
 		const auto ready = BitSet(s, Load(s, u, lane.state), PreparedBit);
 		unprepared = Or(s, unprepared, Select(s, u, LogicalAnd(s, mine, LogicalNot(s, ready)), U32(s, 1), U32(s, 0)));
 	}
@@ -1149,9 +1155,12 @@ uint32_t EmitRayQueryMatch(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto lane = Lane(s, site, ctx.half);
 	const auto u    = TypeU32(s);
 	const auto [instance, leaf] = LaneMinimum(s, lane);
+	// RayQueryKeyLaneLeaf: any leaf of the selected instance (the lane's smallest).
+	const bool lane_leaf = (IR::RayQueryVariant(inst.Flags<uint32_t>()) & IR::RayQueryKeyLaneLeaf) != 0;
+	const auto same_instance = Equal(s, instance, Load(s, u, s.ray_query_selected_instance[site]));
 	const auto matched = LogicalAnd(
-	    s, LogicalAnd(s, Equal(s, instance, Load(s, u, s.ray_query_selected_instance[site])),
-	                  Equal(s, leaf, Load(s, u, s.ray_query_selected_leaf[site]))),
+	    s, lane_leaf ? same_instance
+	                 : LogicalAnd(s, same_instance, Equal(s, leaf, Load(s, u, s.ray_query_selected_leaf[site]))),
 	    Binary(s, spv::OpINotEqual, TypeBool(s), instance, U32(s, None)));
 	const auto state = And(s, Load(s, u, lane.state), ~(MatchedBit | EnteredBit));
 	Store(s, lane.state, Or(s, state, Select(s, u, matched, U32(s, MatchedBit), U32(s, 0))));
@@ -1162,6 +1171,10 @@ uint32_t EmitRayQueryMatch(ValueEmitContext& ctx, const IR::Inst& inst) {
 uint32_t EmitRayQuerySelectedLeaf(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      s    = ctx.state;
 	const auto site = SiteOf(ctx, inst);
+	if ((IR::RayQueryVariant(inst.Flags<uint32_t>()) & IR::RayQueryKeyLaneLeaf) != 0) {
+		// The lane's own smallest leaf (of the selected instance in the lanes it matched).
+		return LaneMinimum(s, Lane(s, site, ctx.half)).second;
+	}
 	return Load(s, TypeU32(s), s.ray_query_selected_leaf[site]);
 }
 

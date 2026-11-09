@@ -95,7 +95,10 @@ static void PrepareNativeRayTracing(RenderContext& context, const CommandRecorde
 	const auto& info   = module.info.info;
 	if (NativeRayTracing::TlasSource source; NativeRayTracing::FindTlasSource(info, source)) {
 		const auto& user    = cs_regs.cs_user_sgpr.value;
-		const auto  pointer = uint64_t {user[source.user_sgpr]} | (uint64_t {user[source.user_sgpr + 1]} << 32u);
+		// Through a V# (Marvel's Wolverine), read from guest memory: the game writes its tables.
+		const auto  pointer = NativeRayTracing::UserPointer(
+		    source, uint64_t {user[source.user_sgpr]} | (uint64_t {user[source.user_sgpr + 1]} << 32u),
+		    [&](uint64_t address, uint64_t size) { return context.IsMapped(address, size); });
 		native_rt.Prepare(command, pointer, source, bindings.flattened_srt, context.GetGpu().GetFrameNum(),
 		                  module.info.shader_hash);
 	} else if (info.bvh) {

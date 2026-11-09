@@ -45,6 +45,13 @@ constexpr uint32_t RayQueryInitGeometryOpacity = 2u;
 // site keeps the guest traversal. The two last arguments flip the facing the lanes cull, and allow
 // the native traversal.
 constexpr uint32_t RayQueryInitNoLeaf = 4u;
+// Every triangle is a candidate of the guest leaf code, which tests its facing and opacity
+// (Decoder::RayTracingKind::ClosestLane).
+constexpr uint32_t RayQueryInitAllCandidates = 8u;
+
+// RayQueryNext, RayQueryMatch and RayQuerySelectedLeaf variant: the wave takes the smallest
+// instance any lane has, and each lane with a key of it its own smallest leaf of it.
+constexpr uint32_t RayQueryKeyLaneLeaf = 1u;
 
 // RayQueryAlpha variant: how the alpha test reads its data (Decoder::RayTracingAlphaLayout).
 constexpr uint32_t RayQueryAlphaScalar = 0u;

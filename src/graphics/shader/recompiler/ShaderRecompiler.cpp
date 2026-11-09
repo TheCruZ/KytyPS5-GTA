@@ -554,6 +554,7 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 			if (Decoder::DeriveRayTracingPatch(source.decoded, patch, options.wave_size)) {
 				source.decoded.ray_tracing_source = {.user_sgpr     = patch.user_sgpr,
 				                                     .header_offset = patch.header_offset,
+				                                     .header_vsharp = patch.header_vsharp,
 				                                     .root          = patch.root,
 				                                     .layout        = patch.layout.Pack(),
 				                                     .valid         = true};
@@ -660,6 +661,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	if (decoded.ray_tracing_source.valid) {
 		ir.info.ray_query_user_sgpr     = decoded.ray_tracing_source.user_sgpr;
 		ir.info.ray_query_header_offset = decoded.ray_tracing_source.header_offset;
+		ir.info.ray_query_header_vsharp = decoded.ray_tracing_source.header_vsharp;
 		ir.info.ray_query_root          = decoded.ray_tracing_source.root;
 		ir.info.ray_query_layout        = decoded.ray_tracing_source.layout;
 	}

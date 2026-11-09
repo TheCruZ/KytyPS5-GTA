@@ -381,8 +381,9 @@ void RenderContext::CacheTlasMemory(const ShaderStageRuntime& runtime) {
 		if (source.user_sgpr < program.user_data_base || index + 1u >= user_data.size()) {
 			return;
 		}
-		const auto pointer = user_data[index] | (uint64_t {user_data[index + 1u]} << 32u);
-		if (pointer > UINT64_MAX - source.header_offset ||
+		const auto pointer = NativeRayTracing::UserPointer(
+		    source, user_data[index] | (uint64_t {user_data[index + 1u]} << 32u), readable);
+		if (pointer == 0 || pointer > UINT64_MAX - source.header_offset ||
 		    !readable(pointer + source.header_offset, sizeof(header))) {
 			return;
 		}

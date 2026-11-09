@@ -949,6 +949,9 @@ struct Program {
 	struct RayTracingSource {
 		uint32_t                user_sgpr     = 0;
 		uint32_t                header_offset = 0;
+		// Not 0xffffffff: the header address is at the base of the V# at the pointer + this offset,
+		// + `header_offset` (see RayTracingPatch::header_vsharp).
+		uint32_t                header_vsharp = 0xffffffffu;
 		uint32_t                root          = 0;
 		// How its instance records are laid out (RayTracingLayout::Pack()).
 		std::array<uint32_t, 4> layout {};

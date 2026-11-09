@@ -517,8 +517,21 @@ bool NativeRayTracing::FindTlasSource(const ShaderRecompiler::IR::ShaderInfo& in
 		return false;
 	}
 	source = {info.ray_query_user_sgpr, info.ray_query_header_offset, info.ray_query_root, info.ray_query_layout,
-	          info.ray_query_header_slots};
+	          info.ray_query_header_slots, info.ray_query_header_vsharp};
 	return true;
+}
+
+uint64_t NativeRayTracing::UserPointer(const TlasSource& source, uint64_t pointer,
+                                       const std::function<bool(uint64_t, uint64_t)>& readable) {
+	if (source.header_vsharp == ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot) {
+		return pointer;
+	}
+	std::array<uint32_t, 2> vsharp {};
+	if (pointer > UINT64_MAX - source.header_vsharp || !readable(pointer + source.header_vsharp, sizeof(vsharp))) {
+		return 0;
+	}
+	std::memcpy(vsharp.data(), reinterpret_cast<const void*>(pointer + source.header_vsharp), sizeof(vsharp));
+	return uint64_t {vsharp[0]} | (uint64_t {vsharp[1] & 0xffffu} << 32u);
 }
 
 bool NativeRayTracing::FindGuestTlasSource(const ShaderRecompiler::IR::ShaderInfo& info,
@@ -531,7 +544,8 @@ bool NativeRayTracing::FindGuestTlasSource(const ShaderRecompiler::IR::ShaderInf
 		return false;
 	}
 	source = {info.ray_query_user_sgpr, info.ray_query_header_offset, info.ray_query_root, info.ray_query_layout,
-	          {ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot, ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot}};
+	          {ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot, ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot},
+	          info.ray_query_header_vsharp};
 	return true;
 }
 

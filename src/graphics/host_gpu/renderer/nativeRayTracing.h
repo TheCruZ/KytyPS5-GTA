@@ -84,14 +84,21 @@ public:
 	// user data pointer (user SGPR pair `user_sgpr`) + `header_offset`; `root` its root node,
 	// `layout` how the shader reads its instance records (Decoder::RayTracingLayout::Pack());
 	// `header_slots` the flattened SRT dwords the shader reads the header's address from, when it
-	// loads it from its user data (ShaderInfo::ray_query_header_slots).
+	// loads it from its user data (ShaderInfo::ray_query_header_slots); `header_vsharp` (not
+	// NoRayQuerySlot) the offset from the user data pointer of a V# whose base takes the place of
+	// the pointer (ShaderInfo::ray_query_header_vsharp, see UserPointer()).
 	struct TlasSource {
 		uint32_t                user_sgpr     = 0;
 		uint32_t                header_offset = 0;
 		uint32_t                root          = 0;
 		std::array<uint32_t, 4> layout {};
 		std::array<uint32_t, 2> header_slots {};
+		uint32_t                header_vsharp = 0xffffffffu;
 	};
+	// The pointer the header address is at `header_offset` from: the user data pointer, or the
+	// base of the V# at it + `header_vsharp` (read with `read`, false when unreadable: 0).
+	[[nodiscard]] static uint64_t UserPointer(const TlasSource& source, uint64_t pointer,
+	                                          const std::function<bool(uint64_t, uint64_t)>& readable);
 	// The source of a program that traces through a guest TLAS (its info), or false.
 	[[nodiscard]] static bool FindTlasSource(const ShaderRecompiler::IR::ShaderInfo& info,
 	                                         TlasSource& source) noexcept;
