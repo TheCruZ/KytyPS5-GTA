@@ -8,6 +8,7 @@
 #include <bit>
 #include <cinttypes>
 #include <cstddef>
+#include <ranges>
 #include <unordered_map>
 #include <vector>
 
@@ -113,6 +114,16 @@ bool CheckSite(const Program& program, const RayTracingSite& site) {
 	    (site.leaf_vgpr == NoRegister || !expect(site.leaf_load_pc, Opcode::V_LSHRREV_B32) ||
 	     site.leaf_load_end_pc <= site.leaf_load_pc)) {
 		return false;
+	}
+	if (site.kind == RayTracingKind::AnyLane) {
+		return entry != nullptr && EndPc(*entry) == site.loop_pc && !IsDirectBranch(entry->opcode) &&
+		       expect(site.loop_pc, Opcode::UNKNOWN) && expect(site.setup_pc, Opcode::UNKNOWN) &&
+		       expect(site.cull_exit_pc, Opcode::UNKNOWN) && expect(site.blas_head_pc, Opcode::UNKNOWN) &&
+		       site.leaf_pc == site.blas_head_pc && expect(site.tail_pc, Opcode::UNKNOWN) &&
+		       site.blas_end_pc > site.tail_pc && expect(site.exit_pc, Opcode::UNKNOWN) &&
+		       site.leaf_vgpr != NoRegister && expect(site.leaf_load_pc, Opcode::V_LSHRREV_B32) &&
+		       site.leaf_load_end_pc > site.leaf_load_pc && expect(site.mask_copy_pc, Opcode::UNKNOWN) &&
+		       (site.after_leaf_pc == 0 || expect(site.after_leaf_pc, Opcode::V_READLANE_B32));
 	}
 	if (site.kind == RayTracingKind::ClosestLeaf || site.kind == RayTracingKind::ClosestLane) {
 		return entry != nullptr && EndPc(*entry) == site.loop_pc && !IsDirectBranch(entry->opcode) &&
@@ -452,12 +463,23 @@ bool AddNativeTraversal(Layout& layout, const Program& program, const RayTracing
 	if (site.alpha.valid) {
 		AddAlphaTest(layout, site, index);
 	}
-	// A closest hit site with a per lane BLAS walk: every triangle is a candidate of the lane's own
-	// leaf code.
-	const bool lane_leaf = site.kind == RayTracingKind::ClosestLane;
+	// A site with a per lane BLAS walk (closest hit, or any hit with lane masks): every triangle is
+	// a candidate of the lane's own leaf code.
+	const bool any_lane  = site.kind == RayTracingKind::AnyLane;
+	const bool lane_leaf = site.kind == RayTracingKind::ClosestLane || any_lane;
 	auto& init = layout.AddPseudo(Opcode::RT_INIT, index);
 	SetRay(init, site);
 	init.image_nsa_addr[6] = site.t_max;
+	for (uint32_t c = 0; c < 3; c++) {
+		if (site.direction_sgpr[c] != NoRegister) {
+			init.image_nsa_addr[3 + c]  = NoRegister;
+			init.image_nsa_addr[12 + c] = site.direction_sgpr[c];
+		}
+	}
+	if (site.t_max_is_constant) {
+		init.image_nsa_addr[6] = NoRegister;
+		init.secondary_offset  = site.t_max_constant;
+	}
 	init.image_nsa_addr[7] = site.cull_mask;
 	init.image_nsa_addr[8] = site.cull_mask_constant;
 	init.src0              = Sgpr(site.header_sgpr);
@@ -504,12 +526,22 @@ bool AddNativeTraversal(Layout& layout, const Program& program, const RayTracing
 		exec.kind = OperandKind::ExecLo;
 		return exec;
 	};
+	// An AnyLane site's leaf starts from the lanes of EXEC; the guest's mask copy (run after it)
+	// is what its leaf code clears.
+	const auto leaf_mask = [&] {
+		if (!any_lane) {
+			return mask();
+		}
+		Operand exec;
+		exec.kind = OperandKind::ExecLo;
+		return exec;
+	};
 
 	// Loop header: the wave's next (instance, leaf), with the lanes that have it, or the exit.
 	layout.Bind(loop_label);
 	auto& select = layout.AddPseudo(Opcode::RT_SELECT, index);
 	select.dst   = Sgpr(site.instance_sgpr);
-	select.dst2  = Sgpr(site.mask_sgpr);
+	select.dst2  = Sgpr(any_lane ? site.saved_exec_sgpr : site.mask_sgpr);
 	select.dmask = lane_leaf ? 1u : 0u;
 	layout.AddBranch(Opcode::S_CBRANCH_SCC0, Layout::Target::Label, exit_check_label);
 	// The instance whose setup ran last: its registers still hold the object space ray.
@@ -534,8 +566,15 @@ bool AddNativeTraversal(Layout& layout, const Program& program, const RayTracing
 	auto& leaf = layout.AddPseudo(Opcode::RT_LEAF, index);
 	leaf.dst   = lane_leaf ? Vgpr(site.leaf_vgpr) : Sgpr(site.leaf_sgpr);
 	leaf.dst2  = Sgpr(site.saved_exec_sgpr);
-	leaf.src0  = mask();
+	leaf.src0  = leaf_mask();
 	leaf.dmask = lane_leaf ? 1u : 0u;
+	if (any_lane) {
+		const auto* copy = FindInstruction(program, site.mask_copy_pc);
+		if (copy == nullptr) {
+			return false;
+		}
+		layout.AddCopy(*copy);
+	}
 	// Each lane's own leaf list entry, loaded as the guest walk loads it.
 	if (lane_leaf) {
 		for (auto pc = site.leaf_load_pc; pc < site.leaf_load_end_pc;) {
@@ -563,7 +602,7 @@ bool AddNativeTraversal(Layout& layout, const Program& program, const RayTracing
 		if (skip_box && target == site.leaf_box_pc) {
 			return box_label;
 		}
-		return target == site.tail_pc || (closest && target > site.tail_pc && target < site.blas_end_pc)
+		return target == site.tail_pc || ((closest || any_lane) && target > site.tail_pc && target < site.blas_end_pc)
 		           ? tail_label
 		           : UINT32_MAX;
 	};
@@ -587,22 +626,25 @@ bool AddNativeTraversal(Layout& layout, const Program& program, const RayTracing
 	// The instance mask culled every selected lane (before the setup spilled anything).
 	layout.Bind(cull_label);
 	auto& skip = layout.AddPseudo(Opcode::RT_RESOLVE, index);
-	skip.src0  = mask();
+	skip.src0  = leaf_mask();
 	skip.dmask = 1;
 	layout.AddBranch(Opcode::S_BRANCH, Layout::Target::Label, loop_label);
 
 	// The exit: opaque hits the hardware found (closest hit: when nearer than the leaf code's),
 	// then undo the last setup's spills.
 	layout.Bind(exit_check_label);
-	auto& commit = layout.AddPseudo(Opcode::RT_COMMIT, index);
-	commit.image_nsa_addr[0] = site.result_t;
-	commit.image_nsa_addr[1] = site.result_word;
-	commit.image_nsa_addr[2] = site.result_instance;
-	commit.image_nsa_addr[3] = site.result_instance + 1;
-	commit.image_nsa_addr[4] = closest ? site.result_u : NoRegister;
-	commit.image_nsa_addr[5] = closest ? site.result_v : NoRegister;
-	commit.image_nsa_addr[6] = closest ? site.result_node : NoRegister;
-	commit.dmask             = closest ? 1u : 0u;
+	// (An AnyLane site has no opaque hits: every triangle is a candidate of the leaf code.)
+	if (!any_lane) {
+		auto& commit = layout.AddPseudo(Opcode::RT_COMMIT, index);
+		commit.image_nsa_addr[0] = site.result_t;
+		commit.image_nsa_addr[1] = site.result_word;
+		commit.image_nsa_addr[2] = site.result_instance;
+		commit.image_nsa_addr[3] = site.result_instance + 1;
+		commit.image_nsa_addr[4] = closest ? site.result_u : NoRegister;
+		commit.image_nsa_addr[5] = closest ? site.result_v : NoRegister;
+		commit.image_nsa_addr[6] = closest ? site.result_node : NoRegister;
+		commit.dmask             = closest ? 1u : 0u;
+	}
 	layout.AddPseudo(Opcode::RT_EXIT_CHECK, index);
 	layout.AddBranch(Opcode::S_CBRANCH_SCC0, Layout::Target::Label, exit_label);
 	restore();
@@ -713,7 +755,13 @@ public:
 			RayTracingSite site;
 			size_t         node_index = npos;
 			if (const auto type = PacketNodeType(header); type != npos) {
-				if (!DerivePacket(header, back, type, site)) {
+				if (m_wave32) {
+					// Waves of 32 lanes: only an AnyLane site (Marvel's Wolverine); other loops of this form
+					// keep the guest's walk, as before.
+					if (!DerivePacket(header, back, type, site) || site.kind != RayTracingKind::AnyLane) {
+						continue;
+					}
+				} else if (!DerivePacket(header, back, type, site)) {
 					// A header with spills that is not a site keeps its loop, as other loops.
 					if (HeaderSpills(header, type)) {
 						continue;
@@ -733,7 +781,7 @@ public:
 			// the node register's first value.
 			uint32_t site_user = NoRegister, site_offset = 0, site_root = 0, site_vsharp = NoRegister;
 			if (!FindTlasSource(header, site.header_sgpr, site_user, site_offset, nullptr,
-			                    site.kind == RayTracingKind::ClosestLane ? &site_vsharp : nullptr) ||
+			                    (site.kind == RayTracingKind::ClosestLane || site.kind == RayTracingKind::AnyLane) ? &site_vsharp : nullptr) ||
 			    !FindRoot(header, m_inst[node_index].src0, site_root)) {
 				return false;
 			}
@@ -745,6 +793,27 @@ public:
 			// read the mask or the flags takes those of one that does).
 			auto merged = site.layout;
 			if (!sites.empty()) {
+				// Sites whose ray masks are constants that select the instance mask's bits from another
+				// shift of the same record dword (Marvel's Wolverine: 0x68000000 and 0x30000000): the
+				// lower shift serves both, with the constants moved up.
+				const auto constant_mask = [](const RayTracingSite& x) {
+					return x.cull_mask == NoRegister && x.cull_mask_sgpr == NoRegister && x.cull_mask_load_pc == 0 &&
+					       x.layout.mask_dword != NoRegister && x.layout.mask_width == 0;
+				};
+				if (layout.mask_dword == merged.mask_dword && layout.mask_dword != NoRegister && layout.mask_shift != merged.mask_shift &&
+				    constant_mask(site) && std::ranges::all_of(sites, constant_mask)) {
+					const auto common = std::min(layout.mask_shift, merged.mask_shift);
+					const auto rebase = [&](RayTracingSite& x) {
+						x.cull_mask_constant <<= x.layout.mask_shift - common;
+						x.layout.mask_shift = common;
+					};
+					rebase(site);
+					for (auto& other_site: sites) {
+						rebase(other_site);
+					}
+					layout.mask_shift = common;
+					merged            = site.layout;
+				}
 				const auto& other = layout;
 				if (merged.flags_dword == NoRegister) {
 					merged.flags_dword = other.flags_dword;
@@ -875,8 +944,8 @@ private:
 		while (first < m_inst.size() && m_inst[first].opcode == Opcode::V_READLANE_B32) {
 			first++;
 		}
-		return !m_wave32 && first + 3 < m_inst.size() && m_inst[first].opcode == Opcode::S_AND_B64 &&
-		               m_inst[first + 1].opcode == Opcode::S_AND_SAVEEXEC_B64 && IsNodeType(first + 2, true)
+		return first + 3 < m_inst.size() && m_inst[first].opcode == Lane(Opcode::S_AND_B64) &&
+		               m_inst[first + 1].opcode == Lane(Opcode::S_AND_SAVEEXEC_B64) && IsNodeType(first + 2, true)
 		           ? first + 2
 		           : npos;
 	}
@@ -1012,6 +1081,24 @@ private:
 		if (box == npos || !BoxTest(header, back, box, site)) {
 			return false;
 		}
+		// Waves of 32 lanes: a direction the loop reads from VGPR lanes each iteration (AnyLane).
+		for (uint32_t c = 0; m_wave32 && c < 3; c++) {
+			const auto w = VectorWriter(box, site.direction[c], header);
+			if (w == npos || m_inst[w].opcode != Opcode::V_MOV_B32 || m_inst[w].src0.kind != OperandKind::Sgpr) {
+				continue;
+			}
+			for (size_t j = w; j-- > header;) {
+				if (!WritesScalar(m_inst[j], m_inst[w].src0.reg)) {
+					continue;
+				}
+				if (m_inst[j].opcode == Opcode::V_READLANE_B32 && m_inst[j].src0.kind == OperandKind::Vgpr &&
+				    IsLaneConstant(m_inst[j].src1)) {
+					site.direction_lane_vgpr[c] = m_inst[j].src0.reg;
+					site.direction_lane[c]      = m_inst[j].src1.value;
+				}
+				break;
+			}
+		}
 		// The stack pointer.
 		const auto cap = Next(box, Opcode::S_MIN_U32, back);
 		if (cap == npos || m_inst[cap].dst.kind != OperandKind::Sgpr || !IsConstant(m_inst[cap].src1, 60)) {
@@ -1071,7 +1158,10 @@ private:
 			}
 		}
 		if (blas_head == npos) {
-			// Or each lane walks the BLAS.
+			// Or each lane walks the BLAS (and, in waves of 32 lanes, runs the guest leaf code).
+			if (m_wave32) {
+				return DeriveAnyLane(header, back, type, le, culled, record, site);
+			}
 			return DerivePacketLane(header, back, type, culled, record, site);
 		}
 		// The native traversal of a Packet site reads the ray's mask from its SGPR.
@@ -1201,6 +1291,214 @@ private:
 		// The instance flags and the facing the triangle test accepts.
 		return LeafFlags(leaf, tail, header, word.src0.reg, record, site.layout) &&
 		       LeafFacing(leaf, tail, header, back, site);
+	}
+
+	// ---- A Packet site whose lanes each walk the BLAS and run the guest leaf code (AnyLane). ----
+	//
+	// Marvel's Wolverine's shadow rays (waves of 32 lanes, sce::Psr BVH version 10): the TLAS loop
+	// keeps a wave-wide stack of (node, lane mask) pairs and the lanes of the mask that find an
+	// accepted hit drop out of it; the instance setup (the instance record's mask test, the object
+	// space ray, the BLAS T#, the root in the node VGPR) is followed by a per lane BLAS walk of the
+	// form of ClosestLaneWalk: the loop's only IMAGE_BVH_INTERSECT_RAY has the lane's node VGPR as
+	// its address, the leaf code runs for the lanes with a triangle node, the lane list entry of
+	// the next triangle is loaded just before the backward S_CBRANCH_EXECNZ, and an accepted hit
+	// moves the primitive word into a VGPR and clears the lane from the lane mask the setup copied
+	// from EXEC (S_ANDN2 <mask>, <mask>, exec, then S_MOV exec, <saved> which ends the leaf code).
+	// The ray's direction is the same for every lane and the loop reads it from VGPR lanes each
+	// iteration (V_READLANE_B32; V_MOV_B32 <direction VGPR>, <s>); its t max is a constant the loop
+	// moves into its VGPR.
+	bool DeriveAnyLane(size_t header, size_t back, size_t type, size_t le, size_t culled, const Field& record,
+	                   RayTracingSite& site) const {
+		(void)record;
+		const auto setup = IndexOf(site.setup_pc);
+		if (setup == npos || culled == npos) {
+			return false;
+		}
+		// The BLAS walk: the backward S_CBRANCH_EXECNZ into the instance code with the earliest target.
+		size_t blas = npos, blas_back = npos;
+		for (size_t i = culled + 1; i < back; i++) {
+			const auto& inst = m_inst[i];
+			if (inst.opcode == Opcode::S_CBRANCH_EXECNZ && inst.branch_target > m_inst[culled].pc &&
+			    inst.branch_target < inst.pc && (blas == npos || inst.branch_target <= m_inst[blas].pc)) {
+				blas      = IndexOf(inst.branch_target);
+				blas_back = i;
+			}
+		}
+		if (blas == npos || blas_back == npos) {
+			return false;
+		}
+		size_t test = npos;
+		for (size_t i = blas; i < blas_back; i++) {
+			if (m_inst[i].opcode == Opcode::IMAGE_BVH_INTERSECT_RAY) {
+				if (test != npos) {
+					return false;
+				}
+				test = i;
+			}
+		}
+		if (test == npos || m_inst[test].src0.kind != OperandKind::Vgpr) {
+			return false;
+		}
+		const auto node = m_inst[test].src0.reg;
+		// The load of the lane's next leaf list entry.
+		size_t load = npos;
+		for (size_t i = blas_back; i-- > test && load == npos;) {
+			const auto& inst = m_inst[i];
+			if (inst.opcode == Opcode::BUFFER_LOAD_DWORDX2 && IsVgpr(inst.dst, node)) {
+				load = i;
+			}
+		}
+		const auto shift = load != npos && m_inst[load].src0.kind == OperandKind::Vgpr
+		                       ? VectorWriter(load, m_inst[load].src0.reg, test)
+		                       : npos;
+		if (shift == npos || m_inst[shift].opcode != Opcode::V_LSHRREV_B32 || !IsConstant(m_inst[shift].src0, 3) ||
+		    !IsVgpr(m_inst[shift].src1, node)) {
+			return false;
+		}
+		for (size_t i = shift + 1; i < load; i++) {
+			if (IsDirectBranch(m_inst[i].opcode) || WritesExec(m_inst[i]) ||
+			    WritesVector(m_inst[i], m_inst[load].src0.reg) || WritesVector(m_inst[i], node)) {
+				return false;
+			}
+		}
+		// The setup: no spills, its branches stay inside it or leave through the cull exit; the
+		// copy of EXEC into the lane mask the leaf code clears.
+		size_t mask_copy = npos;
+		for (size_t i = setup; i < blas; i++) {
+			const auto& inst = m_inst[i];
+			if (inst.opcode == Opcode::V_WRITELANE_B32 && inst.src0.kind == OperandKind::Sgpr) {
+				return false;
+			}
+			if (inst.opcode == Lane(Opcode::S_MOV_B64) && inst.dst.kind == OperandKind::Sgpr &&
+			    inst.src0.kind == OperandKind::ExecLo && mask_copy == npos) {
+				mask_copy = i;
+			}
+			if (!IsDirectBranch(inst.opcode) ||
+			    (inst.branch_target > m_inst[setup].pc && inst.branch_target <= m_inst[blas].pc) ||
+			    inst.branch_target == site.cull_exit_pc) {
+				continue;
+			}
+			return false;
+		}
+		if (mask_copy == npos || VectorWriter(blas, node, setup) == npos) {
+			return false;
+		}
+		const auto mask = m_inst[mask_copy].dst.reg;
+		// The accepted hit: V_MOV_B32 <result word>, <the entry's word (node + 1)>, then the lane
+		// leaves the mask; S_MOV exec, <saved> ends the leaf code.
+		size_t accept = npos;
+		for (size_t i = test + 1; i < shift && accept == npos; i++) {
+			const auto& inst = m_inst[i];
+			if (inst.opcode == Lane(Opcode::S_ANDN2_B64) && IsSgpr(inst.dst, mask) && IsSgpr(inst.src0, mask) &&
+			    inst.src1.kind == OperandKind::ExecLo) {
+				accept = i;
+			}
+		}
+		if (accept == npos || accept < test + 2 || m_inst[accept - 1].opcode != Opcode::V_MOV_B32 ||
+		    m_inst[accept - 1].dst.kind != OperandKind::Vgpr || !IsVgpr(m_inst[accept - 1].src0, node + 1) ||
+		    !Plain(m_inst[accept - 1].src0) || accept + 2 >= shift ||
+		    m_inst[accept + 1].opcode != Lane(Opcode::S_MOV_B64) || m_inst[accept + 1].dst.kind != OperandKind::ExecLo ||
+		    m_inst[accept + 1].src0.kind != OperandKind::Sgpr) {
+			return false;
+		}
+		const auto tail = accept + 2;
+		// The box code: from the first S_CBRANCH_EXECZ after the test that skips forward to the
+		// S_ANDN2 exec, <lanes>, exec of the lanes with a triangle node.
+		size_t box = npos;
+		for (size_t i = test + 1; i < tail && box == npos; i++) {
+			const auto& inst = m_inst[i];
+			if (IsDirectBranch(inst.opcode)) {
+				const auto target = IndexOf(inst.branch_target);
+				if (inst.opcode == Opcode::S_CBRANCH_EXECZ && target != npos && target > i && target < tail &&
+				    m_inst[target].opcode == Lane(Opcode::S_ANDN2_B64) && m_inst[target].dst.kind == OperandKind::ExecLo &&
+				    m_inst[target].src1.kind == OperandKind::ExecLo) {
+					box = i;
+				}
+				break;
+			}
+		}
+		// The leaf code leaves only into the rest of the walk.
+		for (size_t i = blas; i < tail; i++) {
+			const auto& inst = m_inst[i];
+			if (IsDirectBranch(inst.opcode) &&
+			    (inst.branch_target < m_inst[blas].pc || inst.branch_target > m_inst[blas_back].pc)) {
+				return false;
+			}
+		}
+		// The exit of the traversal: the last S_CBRANCH_VCCNZ of the loop.
+		size_t exit = npos;
+		for (size_t i = back; i-- > blas_back && exit == npos;) {
+			if (m_inst[i].opcode == Opcode::S_CBRANCH_VCCNZ) {
+				exit = i;
+			}
+		}
+		if (exit == npos) {
+			return false;
+		}
+		// The ray: the TLAS box test's registers. A direction component the loop reads from a
+		// VGPR lane before the test, and a constant t max, are not in their VGPRs at the entry.
+		const auto box_test = Next(le, Opcode::IMAGE_BVH_INTERSECT_RAY, back);
+		if (box_test == npos) {
+			return false;
+		}
+		const auto free_a = UnusedPair();
+		if (free_a == NoRegister) {
+			return false;
+		}
+		for (uint32_t c = 0; c < 3; c++) {
+			const auto w = VectorWriter(box_test, site.direction[c], header);
+			if (w == npos) {
+				continue;
+			}
+			const auto& move = m_inst[w];
+			size_t      read = npos;
+			if (move.opcode == Opcode::V_MOV_B32 && Plain(move.dst) && Plain(move.src0) &&
+			    move.src0.kind == OperandKind::Sgpr) {
+				for (size_t j = w; j-- > header && read == npos;) {
+					if (WritesScalar(m_inst[j], move.src0.reg)) {
+						read = j;
+					}
+				}
+			}
+			if (read == npos || !KeptLane(read, header, back)) {
+				return false;
+			}
+			// RT_INIT reads the lane itself: 0x80000000 | lane << 8 | VGPR.
+			site.direction_sgpr[c] = 0x80000000u | m_inst[read].src1.value << 8u | m_inst[read].src0.reg;
+		}
+		if (const auto w = VectorWriter(box_test, site.t_max, header); w != npos) {
+			const auto& move = m_inst[w];
+			if (move.opcode != Opcode::V_MOV_B32 || !Plain(move.dst) || move.src0.kind != OperandKind::LiteralConstant) {
+				return false;
+			}
+			site.t_max_is_constant = true;
+			site.t_max_constant    = move.src0.value;
+		}
+		site.kind              = RayTracingKind::AnyLane;
+		site.instance_sgpr     = m_inst[type].src0.reg;
+		site.blas_head_pc      = m_inst[blas].pc;
+		site.leaf_pc           = m_inst[blas].pc;
+		site.tail_pc           = m_inst[tail].pc;
+		site.blas_end_pc       = EndPc(m_inst[blas_back]);
+		site.leaf_vgpr         = node;
+		site.leaf_load_pc      = m_inst[shift].pc;
+		site.leaf_load_end_pc  = EndPc(m_inst[load]);
+		site.leaf_box_pc       = box != npos ? m_inst[box].pc : 0;
+		site.leaf_box_end_pc   = box != npos ? m_inst[box].branch_target : 0;
+		site.leaf_sgpr         = 0;
+		site.mask_sgpr         = mask;
+		site.mask_copy_pc      = m_inst[mask_copy].pc;
+		site.saved_exec_sgpr   = free_a;
+		site.alpha_off_sgpr    = NoAlphaOff;
+		site.after_leaf_pc     = 0;
+		site.after_leaf_end_pc = 0;
+		site.both_facings      = true;
+		site.result_t          = NoRegister;
+		site.result_word       = m_inst[accept - 1].dst.reg;
+		site.result_instance   = NoRegister;
+		site.exit_pc           = m_inst[exit].branch_target;
+		site.alpha             = {};
+		return true;
 	}
 
 	// ---- A Packet site with a per lane BLAS walk (RayTracingKind::PacketLane). ----
@@ -4004,7 +4302,32 @@ private:
 	struct Inputs {
 		std::array<uint32_t, 3> vector {};
 		std::array<uint32_t, 3> scalar {NoRegister, NoRegister, NoRegister};
+		// A component the program reads into an SGPR from a lane of a VGPR it keeps (V_READLANE_B32
+		// <s>, <lane_vgpr>, <lane>) wherever it needs it (NoRegister: none).
+		std::array<uint32_t, 3> lane_vgpr {NoRegister, NoRegister, NoRegister};
+		std::array<uint32_t, 3> lane {};
 	};
+
+	// The component of `inputs` that SGPR `reg` holds at instruction `i`: the last write since `from`
+	// is a V_READLANE_B32 of a lane input (-1: none).
+	int LaneInput(size_t i, uint32_t reg, size_t from, const Inputs& inputs) const {
+		for (size_t j = i; j-- > from;) {
+			if (!WritesScalar(m_inst[j], reg)) {
+				continue;
+			}
+			const auto& read = m_inst[j];
+			if (read.opcode != Opcode::V_READLANE_B32 || read.src0.kind != OperandKind::Vgpr || !IsLaneConstant(read.src1)) {
+				return -1;
+			}
+			for (int c = 0; c < 3; c++) {
+				if (inputs.lane_vgpr[c] == read.src0.reg && inputs.lane[c] == read.src1.value) {
+					return c;
+				}
+			}
+			return -1;
+		}
+		return -1;
+	}
 
 	// The affine form of a value of the object space ray: per world component (the registers
 	// `inputs`, unchanged since `from`), the record dword it is multiplied by, and the dword
@@ -4021,16 +4344,18 @@ private:
 		for (const auto& [scalar, vector]: {std::pair {&a, &b}, std::pair {&b, &a}}) {
 			Field      field;
 			const bool uniform = vector->kind == OperandKind::Sgpr && std::ranges::find(inputs.scalar, vector->reg) != inputs.scalar.end();
-			if ((vector->kind != OperandKind::Vgpr && !uniform) || !Plain(*vector) || !OperandField(i, *scalar, from, field)) {
+			const int  lane    = vector->kind == OperandKind::Sgpr && !uniform ? LaneInput(i, vector->reg, from, inputs) : -1;
+			if ((vector->kind != OperandKind::Vgpr && !uniform && lane < 0) || !Plain(*vector) ||
+			    !OperandField(i, *scalar, from, field)) {
 				continue;
 			}
 			const auto& regs    = uniform ? inputs.scalar : inputs.vector;
 			const auto  input   = std::ranges::find(regs, vector->reg);
-			const auto  changed = uniform ? ScalarWriter(i, vector->reg, from) : VectorWriter(i, vector->reg, from);
-			if (input == regs.end() || changed != npos || (pair != NoRegister && pair != field.pair)) {
+			const auto  changed = lane >= 0 ? npos : uniform ? ScalarWriter(i, vector->reg, from) : VectorWriter(i, vector->reg, from);
+			if ((lane < 0 && input == regs.end()) || changed != npos || (pair != NoRegister && pair != field.pair)) {
 				return false;
 			}
-			auto& factor = form.factor[input - regs.begin()];
+			auto& factor = form.factor[lane >= 0 ? static_cast<size_t>(lane) : static_cast<size_t>(input - regs.begin())];
 			if (factor != NoRegister) {
 				return false;
 			}
@@ -4129,7 +4454,11 @@ private:
 		// The object space ray: origin = M * world origin + t, direction = M * world direction.
 		const Inputs origin {{site.origin[0], site.origin[1], site.origin[2]},
 		                     {site.origin_sgpr[0], site.origin_sgpr[1], site.origin_sgpr[2]}};
-		const Inputs direction {{site.direction[0], site.direction[1], site.direction[2]}};
+		Inputs direction {{site.direction[0], site.direction[1], site.direction[2]}};
+		for (uint32_t c = 0; c < 3; c++) {
+			direction.lane_vgpr[c] = site.direction_lane_vgpr[c];
+			direction.lane[c]      = site.direction_lane[c];
+		}
 		uint32_t                      pair = NoRegister;
 		size_t                        load = npos;
 		for (uint32_t r = 0; r < 3; r++) {

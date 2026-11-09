@@ -825,7 +825,7 @@ enum class ImageDimension : uint32_t {
 };
 
 constexpr uint32_t MaxInstructionRawWords       = 5u;
-constexpr uint32_t MaxImageNsaAddressComponents = 12u;
+constexpr uint32_t MaxImageNsaAddressComponents = 16u;
 
 struct Operand {
 	OperandKind kind       = OperandKind::Unknown;

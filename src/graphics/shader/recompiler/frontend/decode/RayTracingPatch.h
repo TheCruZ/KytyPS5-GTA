@@ -86,12 +86,19 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 // leaf code decides): the wave takes the smallest instance any lane has, runs its setup once, and
 // each lane with a candidate of that instance runs the guest leaf code for its own smallest one
 // (its leaf list entry, loaded as the guest walk loads it), until no lane has candidates left.
+//
+// A packet site whose lanes each walk the BLAS and run the guest leaf code (RayTracingKind::AnyLane,
+// Marvel's Wolverine's shadow rays, waves of 32 lanes) keeps a stack of (node, lane mask) pairs in
+// the TLAS loop; its native traversal is a ClosestLane one (every triangle a candidate, the wave
+// takes the smallest instance, each lane its own leaf) that ends a lane's query when the guest leaf
+// code accepts a hit: it clears the lane from the lane mask the instance setup copied from EXEC.
 enum class RayTracingKind : uint32_t {
 	Packet,        // Wave-wide traversal, the guest leaf code tests the alpha tested triangles.
 	ClosestOpaque, // Closest hit, both facings.
 	ClosestLeaf,   // Closest hit, wave-wide, the guest leaf code tests the alpha tested triangles.
 	PacketLane,    // Wave-wide TLAS, per lane BLAS: no guest code runs in the native traversal.
 	ClosestLane,   // Closest hit, wave-wide TLAS, per lane BLAS: each lane runs the guest leaf code.
+	AnyLane,       // Any hit, wave-wide TLAS with lane masks, per lane BLAS: each lane runs the guest leaf code.
 };
 
 // A register a site does not have.
@@ -229,6 +236,16 @@ struct RayTracingSite {
 	uint32_t origin[3] {};
 	uint32_t origin_sgpr[3] {NoRegister, NoRegister, NoRegister};
 	uint32_t direction[3] {};
+	// AnyLane sites: a direction component the loop reads from a VGPR lane into the box test's VGPR
+	// (the same for every lane): RT_INIT reads that lane (`direction_sgpr`: 0x80000000 | lane << 8 |
+	// VGPR; NoRegister: the component is in its VGPR); and a constant t max (`t_max_constant`, set
+	// when `t_max_is_constant`) the loop moves into its VGPR.
+	uint32_t direction_sgpr[3] {NoRegister, NoRegister, NoRegister};
+	// The VGPR and lane the program reads a direction component from (during the derivation).
+	uint32_t direction_lane_vgpr[3] {NoRegister, NoRegister, NoRegister};
+	uint32_t direction_lane[3] {};
+	bool     t_max_is_constant = false;
+	uint32_t t_max_constant    = 0;
 	uint32_t t_max     = 0;
 	// The VGPR of the ray's instance mask (NoRegister: the SGPR or, without one, the constant
 	// mask below).
@@ -304,6 +321,9 @@ struct RayTracingSite {
 	// leaves out (every lane has a triangle node there; 0: none).
 	uint32_t leaf_box_pc      = 0;
 	uint32_t leaf_box_end_pc  = 0;
+	// AnyLane sites: the setup's S_MOV_B32 <mask>, exec (`mask_copy_pc`), run again after each
+	// RT_LEAF: the guest leaf code clears from the mask the lanes that accept a hit.
+	uint32_t mask_copy_pc = 0;
 	// Where the loop exits to.
 	uint32_t exit_pc = 0;
 	// The alpha test the native traversal runs instead of the leaf code.

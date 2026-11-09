@@ -59,6 +59,26 @@ void Translator::EmitRayTracing(const Decoder::Instruction& inst) {
 					ray[i]      = ReadU32(origin);
 					continue;
 				}
+				// A direction component the same for every lane is in an SGPR (image_nsa_addr[12 + c]).
+				if (i >= 3 && i < 6 && inst.image_nsa_addr[i] == Decoder::NoRegister) {
+					const auto code = inst.image_nsa_addr[9 + i];
+					if ((code & 0x80000000u) != 0) {
+						// A lane of a VGPR the program keeps (V_READLANE_B32).
+						ray[i] = IR::U32(ir.Emit(IR::ValueOpcode::ReadLane,
+						                         {ReadU32(VectorOperand(code & 0xffu)), IR::U32(IR::Value((code >> 8u) & 0x3fu))}));
+						continue;
+					}
+					Decoder::Operand direction;
+					direction.kind = Decoder::OperandKind::Sgpr;
+					direction.reg  = code;
+					ray[i]         = ReadU32(direction);
+					continue;
+				}
+				// A constant t max is in `secondary_offset` (`offset` is the site).
+				if (i == 6 && inst.image_nsa_addr[i] == Decoder::NoRegister) {
+					ray[i] = IR::U32(IR::Value(inst.secondary_offset));
+					continue;
+				}
 				// A site without a mask VGPR has a wave-wide mask (src2) or a constant one.
 				if (i == 7 && inst.image_nsa_addr[i] == Decoder::NoRegister) {
 					ray[i] = inst.src2.kind == Decoder::OperandKind::Sgpr ? ReadU32(inst.src2)
