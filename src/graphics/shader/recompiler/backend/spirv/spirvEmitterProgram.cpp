@@ -217,6 +217,13 @@ std::vector<OutlinedRegion> FindOutlinedRegions(const IR::Program& program) {
 			collect(collect, block->condition);
 			collect(collect, block->indirect_target);
 		}
+		// The values the exit block's Phis take on the region's edges that the region does not
+		// define (live through the call target unchanged).
+		for (const auto& phi: *region.exit) {
+			if (phi.GetOpcode() != IR::ValueOpcode::Phi) break;
+			for (size_t index = 0; index < phi.NumArgs(); index++)
+				if (region.blocks.contains(phi.PhiBlock(index))) collect(collect, phi.Arg(index));
+		}
 		// Outputs: the exit block's Phis on the region's edges, then the values used outside.
 		for (const auto& phi: *region.exit) {
 			if (phi.GetOpcode() != IR::ValueOpcode::Phi) break;
