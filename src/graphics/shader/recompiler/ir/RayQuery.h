@@ -58,6 +58,9 @@ constexpr uint32_t RayQueryAlphaScalar = 0u;
 constexpr uint32_t RayQueryAlphaLane   = 1u;
 // With the Lane layout: the reference is threshold * (M0 bit 0 ? factor : 1).
 constexpr uint32_t RayQueryAlphaFactor = 2u;
+// The Entry layout: a closest hit site without guest leaf code whose alpha test is Resident Evil
+// Village's (the node result of an accepted hit is its leaf list entry's index + 1).
+constexpr uint32_t RayQueryAlphaEntry  = 4u;
 
 // RayQueryMark: state changes; the argument selects lanes.
 enum class RayQueryMarkKind : uint32_t {

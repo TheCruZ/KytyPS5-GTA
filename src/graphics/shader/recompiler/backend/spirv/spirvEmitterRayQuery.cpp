@@ -9,6 +9,7 @@
 #undef far
 
 #include <algorithm>
+#include <bit>
 #include <cinttypes>
 #include <span>
 #include <vector>
@@ -685,6 +686,164 @@ uint32_t AlphaTest(ValueEmitContext& ctx, const LaneVariables& lane, const Guest
 	              fmul(AlphaF32(s, lane, AlphaArgument::Threshold), factor));
 }
 
+// The alpha cache of Resident Evil Village's alpha test (Instance is AlphaCache::Instance's slot,
+// which ClearAlphaCache() empties).
+enum class EntryCache : uint32_t {
+	Instance,       // The guest TLAS leaf of the instance below (None: empty).
+	IndexBase,      // The low address of the index buffer + the stride of the material entry's geometry
+	VertexBase,     // The same for the vertex buffer
+	FirstTexture,   // The material's first texture (None: no transformation of the coordinates)
+	ScaleU,
+	ScaleV,
+	OffsetU,
+	Pair0,          // The scales the first texture's channels select
+	Pair1,
+	OffsetV,
+	SecondTexture,  // The material's alpha texture (None: opaque)
+	FirstX,         // The first texture's channels, and the alpha
+	FirstY,
+	Alpha,
+	Count,
+};
+static_assert(static_cast<uint32_t>(EntryCache::Count) <= static_cast<uint32_t>(AlphaCache::Count));
+
+uint32_t EntryCachePointer(EmitterState& s, const LaneVariables& lane, EntryCache field) {
+	const auto pointer = s.builder.AllocateId();
+	s.builder.AddFunction(spv::OpAccessChain, TypePointer(s, spv::StorageClassFunction, TypeU32(s)), pointer,
+	                      lane.alpha_cache, U32(s, static_cast<uint32_t>(field)));
+	return pointer;
+}
+
+// The dword at any byte address of guest memory (an unaligned FLAT load).
+uint32_t UnalignedGuestDword(ValueEmitContext& ctx, uint32_t address) {
+	auto&      s     = ctx.state;
+	const auto u     = TypeU32(s);
+	const auto shift = Binary(s, spv::OpShiftLeftLogical, u, And(s, Unary(s, spv::OpUConvert, u, address), 3u), U32(s, 3));
+	const auto low   = EmitGuestDwordLoad(ctx, address);
+	// Zero for an aligned address: the combination below then is `low`.
+	const auto high  = EmitValueOrZeroIfCondition(s, Binary(s, spv::OpINotEqual, TypeBool(s), shift, U32(s, 0)),
+	                                              [&] { return EmitGuestDwordLoad(ctx, AddressPlus(s, address, 4)); });
+	return Or(s, Binary(s, spv::OpShiftRightLogical, u, low, shift),
+	          Binary(s, spv::OpShiftLeftLogical, u, high, And(s, Binary(s, spv::OpISub, u, U32(s, 32), shift), 31u)));
+}
+
+// Resident Evil Village's alpha test of a triangle candidate (see DeriveEntryAlphaTest in
+// RayTracingPatch.cpp, which lists what the guest leaf code computes): whether it would accept it.
+// What depends on the instance only is read once and kept in the lane's alpha cache.
+uint32_t AlphaTestEntry(ValueEmitContext& ctx, const LaneVariables& lane, const GuestEntry& candidate,
+                        const IR::Inst& first_sample, const IR::Inst& second_sample, uint32_t format) {
+	auto&      s = ctx.state;
+	const auto u = TypeU32(s), f = TypeF32(s), b = TypeBool(s);
+	const auto shr    = [&](uint32_t value, uint32_t bits) { return Binary(s, spv::OpShiftRightLogical, u, value, U32(s, bits)); };
+	const auto shl    = [&](uint32_t value, uint32_t bits) { return Binary(s, spv::OpShiftLeftLogical, u, value, U32(s, bits)); };
+	const auto mul    = [&](uint32_t x, uint32_t y) { return Binary(s, spv::OpIMul, u, x, y); };
+	const auto add    = [&](uint32_t x, uint32_t y) { return Add(s, x, y); };
+	const auto fmul   = [&](uint32_t x, uint32_t y) { return Binary(s, spv::OpFMul, f, x, y); };
+	const auto fadd   = [&](uint32_t x, uint32_t y) { return Binary(s, spv::OpFAdd, f, x, y); };
+	const auto as_f32 = [&](uint32_t value) { return Unary(s, spv::OpBitcast, f, value); };
+	const auto cache  = [&](EntryCache field) { return Load(s, u, EntryCachePointer(s, lane, field)); };
+	const auto keep   = [&](EntryCache field, uint32_t value) { Store(s, EntryCachePointer(s, lane, field), value); };
+	const auto not_none = [&](uint32_t value) { return Binary(s, spv::OpINotEqual, b, value, U32(s, None)); };
+	std::array<uint32_t, 4> entries {}, buffers {};
+	for (uint32_t i = 0; i < 4; i++) {
+		entries[i] = AlphaU32(s, lane, AlphaArgument::Material, i);
+		buffers[i] = AlphaU32(s, lane, AlphaArgument::Buffers, i);
+	}
+	// S_BUFFER_LOAD_DWORD through the V#s.
+	const auto from_entries = [&](uint32_t offset) { return EmitScalarBufferDwordLoad(ctx, entries, offset); };
+	const auto from_buffers = [&](uint32_t offset) { return EmitScalarBufferDwordLoad(ctx, buffers, offset); };
+	// The instance's record index, its material entry and the buffers and material that selects.
+	const auto node = InstanceNode(s, lane, CandidateIntersection);
+	EmitIfCondition(s, Binary(s, spv::OpINotEqual, b, node, cache(EntryCache::Instance)), [&] {
+		const auto record = EmitGuestObject(ctx, InstanceRecordAddress(s, lane.base, node), 0x80);
+		const auto entry  = shl(EmitGuestObjectDword(ctx, record, (format & 63u) * 4u), 4);
+		const auto e0 = from_entries(entry), e1 = from_entries(add(entry, U32(s, 4))),
+		           e2 = from_entries(add(entry, U32(s, 8))), e3 = from_entries(add(entry, U32(s, 12)));
+		// The strides (bytes 0 and 3 of a dword of the buffers), scaling the signed 24 bits of e2 and e3.
+		const auto strides = from_buffers(shl(add(shr(e1, 4), U32(s, 4)), 4));
+		const auto signed24 = [&](uint32_t value) {
+			const auto result = s.builder.AllocateId();
+			s.builder.AddFunction(spv::OpBitFieldSExtract, u, result, value, U32(s, 0), U32(s, 24));
+			return result;
+		};
+		const auto buffer_record = And(s, e1, ~12u);
+		keep(EntryCache::IndexBase, add(from_buffers(buffer_record), mul(And(s, strides, 0xffu), signed24(e2))));
+		keep(EntryCache::VertexBase, add(from_buffers(add(buffer_record, U32(s, 12))), mul(shr(strides, 24), signed24(e3))));
+		// The material: 8 dwords at m + 16, 2 at m + 0x48, and its other dwords.
+		const auto material = And(s, e0, ~14u);
+		const auto at       = [&](uint32_t offset) { return from_buffers(add(material, U32(s, offset))); };
+		keep(EntryCache::FirstTexture, at(16));
+		keep(EntryCache::ScaleU, at(16 + 5 * 4));
+		keep(EntryCache::ScaleV, at(16 + 6 * 4));
+		keep(EntryCache::OffsetU, at(16 + 7 * 4));
+		keep(EntryCache::Pair0, at(0x48));
+		keep(EntryCache::Pair1, at(0x4c));
+		keep(EntryCache::OffsetV, from_buffers(shl(add(shr(e0, 4), U32(s, 3)), 4)));
+		keep(EntryCache::SecondTexture, from_buffers(add(And(s, e0, ~12u), U32(s, 12))));
+		keep(EntryCache::Instance, node);
+	});
+	// The triangle's three 16 bit indices (the upper half-words for an odd triangle, as the guest
+	// loads 8 bytes from the 4 byte aligned address) and their texture coordinates (half floats).
+	const auto bytes   = mul(And(s, candidate.word, 0x3fffffffu), U32(s, 6));
+	const auto aligned = Equal(s, bytes, And(s, bytes, ~2u));
+	const auto index_address = PackU64(s, add(cache(EntryCache::IndexBase), And(s, bytes, ~2u)), U32(s, 31));
+	const auto first_word    = UnalignedGuestDword(ctx, index_address);
+	const auto second_word   = UnalignedGuestDword(ctx, AddressPlus(s, index_address, 4));
+	const auto low16  = [&](uint32_t value) { return And(s, value, 0xffffu); };
+	const auto high16 = [&](uint32_t value) { return shr(value, 16); };
+	const std::array<uint32_t, 3> indices {Select(s, u, aligned, low16(first_word), high16(first_word)),
+	                                       Select(s, u, aligned, high16(first_word), low16(second_word)),
+	                                       Select(s, u, aligned, low16(second_word), high16(second_word))};
+	std::array<std::array<uint32_t, 2>, 3> uv {};
+	for (uint32_t k = 0; k < 3; k++) {
+		const auto address = PackU64(s, add(cache(EntryCache::VertexBase), shl(indices[k], 2)), U32(s, 31));
+		const auto halves  = s.builder.AllocateId();
+		s.builder.AddFunction(spv::OpExtInst, TypeF32Vector(s, 2), halves, GlslStd450(s), GLSLstd450UnpackHalf2x16,
+		                      UnalignedGuestDword(ctx, address));
+		for (uint32_t c = 0; c < 2; c++) {
+			uv[k][c] = s.builder.AllocateId();
+			s.builder.AddFunction(spv::OpCompositeExtract, f, uv[k][c], halves, c);
+		}
+	}
+	const auto [i, j] = GuestBarycentrics(s, lane, CandidateIntersection, candidate.remap);
+	const auto w0     = Binary(s, spv::OpFSub, f, Binary(s, spv::OpFSub, f, ConstantF32Value(s, 1.0f), i), j);
+	const auto coord  = [&](uint32_t c) { return fadd(fadd(fmul(uv[0][c], w0), fmul(uv[1][c], i)), fmul(uv[2][c], j)); };
+	const auto x = coord(0), y = coord(1);
+	// The first texture's channels select the scales of the coordinates of the second.
+	const auto threshold = AlphaF32(s, lane, AlphaArgument::Threshold);
+	const auto level     = AlphaF32(s, lane, AlphaArgument::LodOffset);
+	const auto key       = [&](uint32_t texture) { return And(s, add(mul(texture, U32(s, 48)), U32(s, 16)), ~3u); };
+	keep(EntryCache::FirstX, U32(s, 0));
+	keep(EntryCache::FirstY, U32(s, 0));
+	EmitIfCondition(s, not_none(cache(EntryCache::FirstTexture)), [&] {
+		const auto texel = EmitImageSampleLodAtKey(ctx, first_sample, key(cache(EntryCache::FirstTexture)), x, y, level);
+		for (uint32_t c = 0; c < 2; c++) {
+			const auto value = s.builder.AllocateId();
+			s.builder.AddFunction(spv::OpCompositeExtract, u, value, texel, c);
+			keep(c == 0 ? EntryCache::FirstX : EntryCache::FirstY, value);
+		}
+	});
+	const auto above = [&](EntryCache field) {
+		return Binary(s, spv::OpFOrdGreaterThan, b, as_f32(cache(field)), threshold);
+	};
+	const auto pair0 = as_f32(cache(EntryCache::Pair0)), pair1 = as_f32(cache(EntryCache::Pair1));
+	const auto select_f32 = [&](uint32_t condition, uint32_t yes, uint32_t no) { return Select(s, f, condition, yes, no); };
+	const auto x_hit = above(EntryCache::FirstX), y_hit = above(EntryCache::FirstY);
+	const auto scale_u = select_f32(y_hit, pair1, select_f32(x_hit, pair0, as_f32(cache(EntryCache::ScaleU))));
+	const auto scale_v = select_f32(y_hit, pair1, select_f32(x_hit, pair0, as_f32(cache(EntryCache::ScaleV))));
+	const auto u2 = fadd(fmul(x, scale_u), as_f32(cache(EntryCache::OffsetU)));
+	const auto v2 = fadd(fmul(y, scale_v), as_f32(cache(EntryCache::OffsetV)));
+	// The alpha texture's channel (1 without one).
+	keep(EntryCache::Alpha, U32(s, std::bit_cast<uint32_t>(1.0f)));
+	EmitIfCondition(s, not_none(cache(EntryCache::SecondTexture)), [&] {
+		const auto texel = EmitImageSampleLodAtKey(ctx, second_sample, key(cache(EntryCache::SecondTexture)), u2, v2, level);
+		const auto value = s.builder.AllocateId();
+		s.builder.AddFunction(spv::OpCompositeExtract, u, value, texel, 0u);
+		keep(EntryCache::Alpha, value);
+	});
+	return above(EntryCache::Alpha);
+}
+
 // Collects the alpha tested triangles the lanes' rays hit (the candidates the hardware reports),
 // for the lanes whose list is empty, until the list is full or the query is done. A query is done
 // at its closest opaque hit, kept as the lane's result. Both halves of an emulated wave64 lane
@@ -692,7 +851,8 @@ uint32_t AlphaTest(ValueEmitContext& ctx, const LaneVariables& lane, const Guest
 void Refill(ValueEmitContext& ctx, uint32_t site) {
 	auto&      s = ctx.state;
 	const auto u = TypeU32(s), b = TypeBool(s), wide = TypeU64(s), f = TypeF32(s);
-	const bool alpha_test = s.ray_query_alpha_sites[site] && s.ray_query_alpha_sample != nullptr;
+	const bool alpha_test = s.ray_query_alpha_sites[site];
+	const bool entry_alpha = alpha_test && s.ray_query_alpha_entry[site];
 	const bool lane_layout      = s.ray_query_alpha_lane[site];
 	const bool factor_reference = s.ray_query_alpha_factor[site];
 	const bool geometry_opacity = s.ray_query_geometry_opacity[site] && alpha_test;
@@ -725,7 +885,10 @@ void Refill(ValueEmitContext& ctx, uint32_t site) {
 				const auto node = InstanceNode(s, lane, CommittedIntersection);
 				Store(s, lane.result_t, Unary(s, spv::OpBitcast, u, t));
 				Store(s, lane.result_word, hit_entry.word);
-				Store(s, lane.result_node, hit_entry.node);
+				// Resident Evil Village's node result is the index of the entry after the hit's.
+				Store(s, lane.result_node,
+				      entry_alpha ? Add(s, Binary(s, spv::OpShiftRightLogical, u, hit_entry.entry, U32(s, 3)), U32(s, 1))
+				                  : hit_entry.node);
 				const auto [bary_u, bary_v] =
 				    GuestBarycentrics(s, lane, CommittedIntersection, hit_entry.remap);
 				Store(s, lane.result_u, Unary(s, spv::OpBitcast, u, bary_u));
@@ -777,8 +940,11 @@ void Refill(ValueEmitContext& ctx, uint32_t site) {
 						// The lane's own alpha test; the hardware keeps the nearest accepted
 						// candidate (or opaque hit) as the committed hit.
 						EmitIfCondition(s,
-						                AlphaTest(ctx, lane, candidate, lane_layout, factor_reference,
-						                          s.ray_query_alpha_format[site]),
+						                entry_alpha ? AlphaTestEntry(ctx, lane, candidate, *s.ray_query_entry_samples[0],
+						                                             *s.ray_query_entry_samples[1],
+						                                             s.ray_query_alpha_format[site])
+						                            : AlphaTest(ctx, lane, candidate, lane_layout, factor_reference,
+						                                        s.ray_query_alpha_format[site]),
 						                confirm);
 						return;
 					}
@@ -894,6 +1060,8 @@ void DeclareRayQueryVariables(EmitterState& s) {
 	// table for every site).
 	std::array<bool, IR::MaxRayQuerySites> alpha_sites {};
 	std::vector<const IR::Inst*>           samples;
+	std::array<const IR::Inst*, 2>         entry_samples {};
+	bool                                   entry_ambiguous = false;
 	for (const auto* block: s.program.blocks) {
 		for (const auto& inst: *block) {
 			if (inst.GetOpcode() == IR::ValueOpcode::RayQueryAlpha) {
@@ -902,6 +1070,7 @@ void DeclareRayQueryVariables(EmitterState& s) {
 				const auto variant             = IR::RayQueryVariant(inst.Flags<uint32_t>());
 				s.ray_query_alpha_lane[site]   = (variant & IR::RayQueryAlphaLane) != 0;
 				s.ray_query_alpha_factor[site] = (variant & IR::RayQueryAlphaFactor) != 0;
+				s.ray_query_alpha_entry[site]  = (variant & IR::RayQueryAlphaEntry) != 0;
 				s.ray_query_alpha_format[site] = inst.Arg(static_cast<size_t>(AlphaArgument::Count)).U32();
 			} else if (inst.GetOpcode() == IR::ValueOpcode::RayQueryInit) {
 				const auto flags = inst.Flags<uint32_t>();
@@ -911,7 +1080,21 @@ void DeclareRayQueryVariables(EmitterState& s) {
 			} else if (IsImageTableSampleLod(s, inst)) {
 				samples.push_back(&inst);
 			}
+			// Resident Evil Village's alpha test stands for the program's two samples of the textures
+			// of a material, the first of their x and y channels and the second of its x channel.
+			if (IsImageKeySampleLod(s, inst)) {
+				const auto dmask = s.program.memory_info.at(inst.Flags<IR::MemoryFlags>().index).dmask;
+				if (dmask == 3u || dmask == 1u) {
+					auto& slot = entry_samples[dmask == 3u ? 0 : 1];
+					entry_ambiguous |= slot != nullptr;
+					slot = &inst;
+				}
+			}
 		}
+	}
+	const bool entry_samples_found = entry_samples[0] != nullptr && entry_samples[1] != nullptr && !entry_ambiguous;
+	if (entry_samples_found) {
+		s.ray_query_entry_samples = entry_samples;
 	}
 	const auto memory = [&](const IR::Inst* inst) -> const IR::MemoryInfo& {
 		return s.program.memory_info.at(inst->Flags<IR::MemoryFlags>().index);
@@ -927,7 +1110,7 @@ void DeclareRayQueryVariables(EmitterState& s) {
 	const auto alpha_type = s.builder.Type(spv::OpTypeArray, u, ConstantU32(s, static_cast<uint32_t>(AlphaArgument::Count)));
 	const auto cache_type = s.builder.Type(spv::OpTypeArray, u, ConstantU32(s, static_cast<uint32_t>(AlphaCache::Count)));
 	for (uint32_t site = 0; site < IR::MaxRayQuerySites; site++) {
-		s.ray_query_alpha_sites[site] = alpha_sites[site] && one_table;
+		s.ray_query_alpha_sites[site] = alpha_sites[site] && (s.ray_query_alpha_entry[site] ? entry_samples_found : one_table);
 		if (!alpha_sites[site]) {
 			continue;
 		}
@@ -938,8 +1121,10 @@ void DeclareRayQueryVariables(EmitterState& s) {
 	}
 	s.ray_query_alpha_sample = one_table ? samples[0] : nullptr;
 	if (std::ranges::any_of(alpha_sites, [](bool site) { return site; })) {
+		const bool per_lane = std::ranges::any_of(alpha_sites, [&](bool site) { return site; }) &&
+		                      (one_table || entry_samples_found);
 		LOGF("ShaderRecompiler hash=0x%016" PRIx64 " native ray tracing alpha test: %s\n", s.program.shader_hash,
-		     one_table ? "per lane" : "guest leaf code (no single bindless table sample)");
+		     per_lane ? "per lane" : "guest leaf code (no single bindless table sample)");
 	}
 }
 
@@ -987,8 +1172,7 @@ uint32_t EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst) {
 	// code to run for its alpha tested candidates: without the per-lane alpha test it keeps the
 	// guest traversal.
 	const bool no_leaf      = (variant & IR::RayQueryInitNoLeaf) != 0;
-	const bool always_guest = (geometry_opacity || no_leaf) &&
-	                          !(s.ray_query_alpha_sites[site] && s.ray_query_alpha_sample != nullptr);
+	const bool always_guest = (geometry_opacity || no_leaf) && !s.ray_query_alpha_sites[site];
 	if (always_guest) {
 		NoteRayTracingProgram(RayTracingProgramKind::GuestSites, s.program.shader_hash);
 	}

@@ -161,6 +161,10 @@ struct EmitterState {
 	// Decoder::RayTracingAlphaFields::Pack()).
 	std::array<uint32_t, 4>                          ray_query_alpha_format {};
 	const IR::Inst*                                  ray_query_alpha_sample = nullptr;
+	// Sites whose alpha test is Resident Evil Village's (RayQueryAlphaEntry), and the program's two
+	// samples it stands for (the first texture's xy and the second one's x; nullptr: not found).
+	std::array<bool, 4>                              ray_query_alpha_entry {};
+	std::array<const IR::Inst*, 2>                   ray_query_entry_samples {};
 	// --rt-stats: the sites count the rays they send back to the guest traversal; per site, the
 	// count of the first emulated half until the last one adds it (see EmitRayQueryInit).
 	bool                                             ray_stats              = false;
@@ -644,6 +648,13 @@ uint32_t EmitScalarBufferObjectDword(ValueEmitContext& ctx, const ScalarBufferOb
 // returns it (U32x4).
 bool     IsImageTableSampleLod(const EmitterState& state, const IR::Inst& inst);
 uint32_t EmitImageTableSampleLod(ValueEmitContext& ctx, const IR::Inst& sample, uint32_t key,
+                                 uint32_t u, uint32_t v, uint32_t lod);
+// Whether `inst` samples a 2D float image of a bindless or indirect T# table at an explicit level
+// (the sample can then be emitted for another key, EmitImageSampleLodAtKey()), and that sample for
+// the T# at key `key` (the value the instruction computes from the T#'s offset in its table),
+// coordinates (u, v) and level `lod` (F32): the texel as the instruction returns it (U32x4).
+bool     IsImageKeySampleLod(const EmitterState& state, const IR::Inst& inst);
+uint32_t EmitImageSampleLodAtKey(ValueEmitContext& ctx, const IR::Inst& sample, uint32_t key,
                                  uint32_t u, uint32_t v, uint32_t lod);
 
 // These templates accept local lambdas from several emitter translation units.

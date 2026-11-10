@@ -357,6 +357,16 @@ void AddAlphaTest(Layout& layout, const RayTracingSite& site, uint32_t index) {
 	alpha.image_nsa_addr[4] = test.lod_offset;
 	alpha.image_nsa_addr[5] = lane ? test.reference_vgpr : NoRegister;
 	alpha.image_nsa_addr[6] = test.fields.Pack(site.layout);
+	if (test.layout == RayTracingAlphaLayout::Entry) {
+		// No level of detail term, spread, factor nor reference; the V#s are SGPRs of the program.
+		alpha.image_nsa_addr[0] = NoRegister;
+		alpha.image_nsa_addr[5] = NoRegister;
+		alpha.src0              = Constant(0);
+		alpha.src2              = Sgpr(test.material_user);
+		alpha.src3              = Sgpr(test.buffer_user);
+		alpha.dmask             = 16u;
+		return;
+	}
 	alpha.src0              = test.spread_vector ? Vgpr(test.spread_reg) : Sgpr(test.spread_reg);
 	// The threshold and its factor (the Lane layout without a reference: dmask 2), or the
 	// reference SGPR (dmask 4).
@@ -378,6 +388,10 @@ void AddAlphaTest(Layout& layout, const RayTracingSite& site, uint32_t index) {
 // the instance flags, any hit) is the same with the alpha test of its leaf code.
 void AddClosestTraversal(Layout& layout, const Program& program, const RayTracingSite& site, uint32_t index) {
 	const bool lane = site.kind == RayTracingKind::PacketLane;
+	// A ClosestLane site with an Entry alpha test runs no guest leaf code either; its facing is
+	// both and its opacity comes from the geometry and the instance flags, as for a PacketLane site
+	// (but a hit is the nearest, not any).
+	const bool entry = site.kind == RayTracingKind::ClosestLane;
 	if (site.alpha.valid) {
 		AddAlphaTest(layout, site, index);
 	}
@@ -417,6 +431,11 @@ void AddClosestTraversal(Layout& layout, const Program& program, const RayTracin
 		init.dmask = 16u;
 		const auto reg = [](uint32_t sgpr) { return sgpr != NoRegister ? sgpr : 0xffffu; };
 		init.secondary_offset = reg(site.flip_sgpr) | reg(site.alpha.level_sgpr) << 16u;
+	} else if (entry) {
+		// Both facings, the opacity of the geometry and the instance flags; no flip, always allowed.
+		init.src1             = Constant(0);
+		init.dmask            = 1u | 16u;
+		init.secondary_offset = 0xffffffffu;
 	}
 	if (site.facing_sgpr != NoRegister) {
 		init.src3 = Sgpr(site.facing_sgpr);
@@ -442,7 +461,9 @@ void AddClosestTraversal(Layout& layout, const Program& program, const RayTracin
 	commit.image_nsa_addr[0] = site.result_t;
 	commit.image_nsa_addr[1] = site.result_word;
 	commit.image_nsa_addr[2] = site.result_instance;
-	commit.image_nsa_addr[3] = site.result_instance != NoRegister ? site.result_instance + 1 : NoRegister;
+	commit.image_nsa_addr[3] = site.result_instance_hi != NoRegister ? site.result_instance_hi
+	                           : site.result_instance != NoRegister  ? site.result_instance + 1
+	                                                                 : NoRegister;
 	commit.image_nsa_addr[4] = site.result_u;
 	commit.image_nsa_addr[5] = site.result_v;
 	commit.image_nsa_addr[6] = site.result_node;
@@ -456,7 +477,9 @@ void AddClosestTraversal(Layout& layout, const Program& program, const RayTracin
 // RT_INIT falls back to the loop header, else the native loop runs and exits after the loop.
 bool AddNativeTraversal(Layout& layout, const Program& program, const RayTracingSite& site,
                         uint32_t index) {
-	if (site.kind == RayTracingKind::ClosestOpaque || site.kind == RayTracingKind::PacketLane) {
+	if (site.kind == RayTracingKind::ClosestOpaque || site.kind == RayTracingKind::PacketLane ||
+	    (site.kind == RayTracingKind::ClosestLane && site.alpha.valid &&
+	     site.alpha.layout == RayTracingAlphaLayout::Entry)) {
 		AddClosestTraversal(layout, program, site, index);
 		return true;
 	}
@@ -3536,8 +3559,122 @@ private:
 			}
 			*slot = dst;
 		}
+		site.result_node = next;
 		return site.result_t != NoRegister && site.result_word != NoRegister && next != NoRegister &&
 		       site.result_instance != NoRegister && site.result_instance_hi != NoRegister;
+	}
+
+	// The alpha test of the leaf code of LaneEntryCopy() walks (Resident Evil Village, sce::Psr
+	// version 1: be0b848d2e06ec9b, f969c192323c215b). The leaf code is the compiler's output for the
+	// library's template, so it is recognized by its machine code: the words of [begin, end) (from
+	// the code that follows the walk's box code, the triangle test, up to the flag test of the
+	// accepted hit) are those of the template. What the template does with an accepted triangle
+	// candidate (primitive word W, instance record R, the barycentrics i and j of the triangle test):
+	//   opaque  = ((W >> 30) | R[0x3c] & 3) & 1, taken when (R[0x3c] & 2) == 0; every other
+	//             candidate is alpha tested (the host's instance flags: bit 0 force opaque, bit 1
+	//             force not opaque)
+	//   entry   = e0..e3, the 16 bytes at R[0x70] * 16 of the V# `entries` (S_BUFFER_LOAD_DWORDX4)
+	//   B       = the V# `buffers` (S_BUFFER_LOAD_*), read with offsets in bytes:
+	//   stride  = B[((e1 >> 4) + 4) * 16]: byte 0 and byte 3 scale e2 and e3 (24 bit signed)
+	//   buffers = B[e1 & ~12 ..] x4: dword 0 and 3 are the low addresses of the index and the vertex
+	//             buffers (their high dword is 31, of the FLAT loads)
+	//   indices = 3 16 bit indices at index buffer + byte0 * e2 + (W & 0x3fffffff) * 6 (aligned
+	//             down to 4 bytes, the odd triangles taking the upper half-words)
+	//   uv_k    = packed half floats at vertex buffer + byte3 * e3 + 4 * index k
+	//   uv      = uv_0 * (1 - i - j) + uv_1 * i + uv_2 * j
+	//   material at m = e0 & ~14 (B[m + 16 ..] x8, B[m + 0x48] x2, B[((e0 >> 4) + 3) * 16], B[(e0 & ~12) + 12]):
+	//     texture 1 index m1 = dword 0, scale (dwords 5 and 6), offset u = dword 7; offset v = the dword
+	//     B[((e0 >> 4) + 3) * 16]; m2 = B[(e0 & ~12) + 12]
+	//     m1 != -1: sample the texture (m1 * 48 + 16 into the heap of T#s) at uv, level 2: its
+	//     x channel > 0.5 selects the first of B[m + 0x48] for both scales, its y channel > 0.5
+	//     the second one (y wins)
+	//     uv' = (u * scale u + offset u, v * scale v + offset v)
+	//     m2 != -1: alpha = x channel of the texture m2 at uv', level 2; else 1
+	//   accepted when alpha > 0.5
+	// The tables are SGPRs of the program, loaded from user data before the traversal.
+	bool DeriveEntryAlphaTest(size_t begin, size_t end, const Field& record, size_t header,
+	                          RayTracingSite& site) const {
+		constexpr uint64_t TemplateHash = 0x4856271b2855201bull;
+		uint64_t           hash         = 1469598103934665603ull;
+		for (size_t i = begin; i < end; i++) {
+			const auto& inst = m_inst[i];
+			for (uint32_t k = 0; k < inst.word_count && k < MaxInstructionRawWords; k++) {
+				hash = (hash ^ inst.raw[k]) * 1099511628211ull;
+			}
+		}
+		if (hash != TemplateHash) {
+			return false;
+		}
+		// The V#s of the entry table (the first S_BUFFER_LOAD_DWORDX4) and of the buffers (the
+		// first S_BUFFER_LOAD_DWORD), loaded from user data and unchanged until the site.
+		uint32_t entries = NoRegister, buffers = NoRegister, flags_reg = NoRegister, tested_reg = NoRegister;
+		bool     material = false;
+		for (size_t i = begin; i < end; i++) {
+			const auto& inst = m_inst[i];
+			if (entries == NoRegister && inst.opcode == Opcode::S_BUFFER_LOAD_DWORDX4 && inst.src0.kind == OperandKind::Sgpr) {
+				entries = inst.src0.reg;
+			} else if (buffers == NoRegister && inst.opcode == Opcode::S_BUFFER_LOAD_DWORD && inst.src0.kind == OperandKind::Sgpr) {
+				buffers = inst.src0.reg;
+			} else if (flags_reg == NoRegister && inst.opcode == Opcode::V_OR_B32 && inst.src0.kind == OperandKind::Sgpr) {
+				flags_reg = inst.src0.reg;
+			} else if (tested_reg == NoRegister && inst.opcode == Opcode::S_CMP_LG_I32 && inst.src1.kind == OperandKind::Sgpr) {
+				tested_reg = inst.src1.reg;
+			} else if (!material && inst.opcode == Opcode::S_LOAD_DWORD && IsSgpr(inst.src0, record.pair) && inst.offset == 0x70) {
+				material = true;
+			}
+		}
+		if (entries == NoRegister || buffers == NoRegister || flags_reg == NoRegister || tested_reg == NoRegister || !material) {
+			return false;
+		}
+		const auto user_vsharp = [&](uint32_t first) {
+			Field base;
+			for (uint32_t k = 0; k < 4; k++) {
+				Field field;
+				if (!RecordField(header, first + k, 0, field) || (k != 0 && (field.pair != base.pair || field.load != base.load ||
+				                                                         field.dword != base.dword + k))) {
+					return false;
+				}
+				if (k == 0) {
+					base = field;
+				}
+			}
+			for (size_t j = 0; j < base.load; j++) {
+				if (WritesScalar(m_inst[j], base.pair) || WritesScalar(m_inst[j], base.pair + 1)) {
+					return false;
+				}
+			}
+			return true;
+		};
+		if (!user_vsharp(entries) || !user_vsharp(buffers)) {
+			return false;
+		}
+		// The instance flags: the registers the template tests are R[0x3c] & 3 and that & 2.
+		Operand flags_operand;
+		flags_operand.kind = OperandKind::Sgpr;
+		flags_operand.reg  = flags_reg;
+		Operand tested_operand = flags_operand;
+		tested_operand.reg     = tested_reg;
+		Field    flags;
+		uint32_t mask = 0;
+		const auto tested = ScalarSource(begin, tested_operand, Opcode::S_AND_B32, header);
+		if (!MaskedField(begin, flags_operand, header, flags, mask) || flags.pair != record.pair || flags.dword != 15 ||
+		    mask != 3 || tested == npos || !IsSgpr(m_inst[tested].src0, flags_reg) || !IsConstant(m_inst[tested].src1, 2)) {
+			return false;
+		}
+		auto& alpha                  = site.alpha;
+		alpha                        = {};
+		alpha.valid                  = true;
+		alpha.layout                 = RayTracingAlphaLayout::Entry;
+		alpha.fields.material_dword  = 0x70 / 4;
+		alpha.material_user          = entries;
+		alpha.material_offset        = RayTracingAlphaDirect;
+		alpha.buffer_user            = buffers;
+		alpha.buffer_offset          = RayTracingAlphaDirect;
+		alpha.threshold              = std::bit_cast<uint32_t>(0.5f);
+		alpha.lod_offset             = std::bit_cast<uint32_t>(2.0f);
+		site.layout.flags_dword      = flags.dword;
+		site.layout.flags_shift      = 0;
+		return true;
 	}
 
 	// ---- Closest hit walks whose instance code has a per lane BLAS walk (ClosestLane). ----
@@ -3681,6 +3818,12 @@ private:
 		const auto scratch = UnusedPair();
 		if (scratch == NoRegister) {
 			return false;
+		}
+		// Resident Evil Village's alpha test: the traversal then runs no guest leaf code.
+		const auto leaf_start = box != npos ? IndexOf(m_inst[box].branch_target) : npos;
+		if (copied && (leaf_start == npos || !DeriveEntryAlphaTest(leaf_start, flag_test, record, header, site))) {
+			site.alpha       = {};
+			site.result_node = NoRegister;
 		}
 		site.kind              = RayTracingKind::ClosestLane;
 		site.setup_pc          = m_inst[header].pc;

@@ -320,15 +320,16 @@ uint32_t ImageTableSlot(EmitterState& state, const IR::ImageResource& image, uin
 	              ConstantU32(state, image.table_descriptor_base));
 }
 
+// `key_override` (not 0): the key to select the entry with instead of the instruction's own.
 uint32_t ImageTableElement(ValueEmitContext& ctx, const IR::Inst& inst,
-                           const IR::ImageResource& image) {
+                           const IR::ImageResource& image, uint32_t key_override = 0u) {
 	auto&       state  = ctx.state;
 	const auto* handle = inst.Arg(0).ResolveInstruction();
 	if (handle == nullptr || handle->NumArgs() == 0u || state.flattened_srt_variable == 0 ||
 	    image.table_descriptor_base == UINT32_MAX) {
 		ctx.Fail(inst, "has no image table runtime mapping");
 	}
-	return ImageTableSlot(state, image, ctx.Def(handle->Arg(0)));
+	return ImageTableSlot(state, image, key_override != 0u ? key_override : ctx.Def(handle->Arg(0)));
 }
 
 uint32_t QueryDimensions(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
@@ -730,13 +731,14 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 	return texel;
 }
 
+// `key_override` (not 0): the key of the T# in its table or heap, instead of the instruction's own.
 template <typename Emit>
 auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t result_type,
-                     const Emit& emit) {
+                     const Emit& emit, uint32_t key_override = 0u) {
 	auto& state = ctx.state;
 	const auto& mem = ctx.Memory(inst);
 	const auto& image = state.program.info.images.at(mem.resource);
-	if (image.table_capacity != 0u) return emit(mem.resource, ImageTableElement(ctx, inst, image));
+	if (image.table_capacity != 0u) return emit(mem.resource, ImageTableElement(ctx, inst, image, key_override));
 	if (image.indirect_root != mem.resource) return emit(mem.resource, 0u);
 	const auto* handle = inst.Arg(0).ResolveInstruction();
 	const auto* source = image.source < state.program.descriptor_sources.size()
@@ -746,7 +748,7 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 	    handle->NumArgs() == 0u) {
 		ctx.Fail(inst, "has invalid indirect image key provenance");
 	}
-	const auto key = ctx.Def(handle->Arg(0));
+	const auto key = key_override != 0u ? key_override : ctx.Def(handle->Arg(0));
 	if (state.flattened_srt_variable == 0 ||
 	    image.indirect_resources.size() < 2u) {
 		ctx.Fail(inst, "has no indirect image runtime mapping");
@@ -836,7 +838,8 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 }
 
 template <typename Emit>
-uint32_t EmitImageResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit& emit) {
+uint32_t EmitImageResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit& emit,
+                         uint32_t key_override = 0u) {
 	auto& state = ctx.state;
 	const auto& mem = ctx.Memory(inst);
 	const auto& image = state.program.info.images[mem.resource];
@@ -871,7 +874,8 @@ uint32_t EmitImageResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit
 	    [&](uint32_t resource, uint32_t array_index) {
 		    const auto native = emit(resource, array_index, native_type(resource));
 		    return mixed ? result_bits(resource, native) : native;
-	    });
+	    },
+	    key_override);
 	return mixed ? value : result_bits(mem.resource, value);
 }
 
@@ -1420,6 +1424,46 @@ uint32_t EmitImageTableSampleLod(ValueEmitContext& ctx, const IR::Inst& sample, 
 	                          ImageVectorType(state, image.numeric_class, 4), texel, sampled, coord,
 	                          spv::ImageOperandsLodMask, lod);
 	return ResultVector(ctx, UnpackImageTexel(ctx, mem, texel), image.numeric_class, false, mem);
+}
+
+bool IsImageKeySampleLod(const EmitterState& state, const IR::Inst& inst) {
+	if (inst.GetOpcode() != IR::ValueOpcode::ImageSampleRaw || state.flattened_srt_variable == 0) {
+		return false;
+	}
+	const auto& mem   = state.program.memory_info.at(inst.Flags<IR::MemoryFlags>().index);
+	const auto& image = state.program.info.images.at(mem.resource);
+	// The T# comes from a table (bindless) or an indirect descriptor (a heap or a list of images)
+	// that a key selects; not from a record table, whose key has two parts.
+	const bool keyed = image.table_capacity != 0u
+	                       ? image.table_descriptor_base != UINT32_MAX
+	                       : image.indirect_root == mem.resource && image.indirect_resources.size() >= 2u &&
+	                             !IsRecordTableSource(state, image.source);
+	return keyed && mem.image_sample_flags == Decoder::ImageSampleFlagLod && mem.data_bits == 32u &&
+	       image.dimension == ImageDimension::Dim2D && !image.cube &&
+	       image.numeric_class == Prospero::TextureNumericClass::Float &&
+	       image.conversion_format == Prospero::BufferFormat::kInvalid;
+}
+
+// As the instruction's own sample (EmitImage), with the key of its T#, the coordinates and the
+// level given.
+uint32_t EmitImageSampleLodAtKey(ValueEmitContext& ctx, const IR::Inst& sample, uint32_t key,
+                                 uint32_t u, uint32_t v, uint32_t lod) {
+	auto&      state    = ctx.state;
+	const auto samplers = LoadImageSamplers(ctx, sample);
+	const auto coord    = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), coord, u, v);
+	return EmitImageResult(
+	    ctx, sample,
+	    [&](uint32_t resource, uint32_t array_index, uint32_t result_type) {
+		    const auto& candidate = state.program.info.images[resource];
+		    const auto  sampler   = samplers[candidate.numeric_class != Prospero::TextureNumericClass::Float];
+		    const auto  sampled   = MakeSampledImage(state, resource, sampler.id, 0u, array_index, sampler.dynamic);
+		    const auto  texel     = state.builder.AllocateId();
+		    state.builder.AddFunction(spv::OpImageSampleExplicitLod, result_type, texel, sampled, coord,
+		                              spv::ImageOperandsLodMask, lod);
+		    return texel;
+	    },
+	    key);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

@@ -250,11 +250,17 @@ void Translator::EmitRayTracing(const Decoder::Instruction& inst) {
 				                            {ir.Emit(IR::ValueOpcode::FPMul32, {as_float(threshold), as_float(factor)})}));
 				factor    = IR::U32(IR::Value(0x3f800000u));
 			}
+			// dmask 16, the Entry layout: no level of detail term nor spread; the level of the samples
+			// is image_nsa_addr[4].
+			const bool entry = (inst.dmask & 16u) != 0;
+			const auto lod   = inst.image_nsa_addr[0] != Decoder::NoRegister
+			                       ? ReadU32(VectorOperand(inst.image_nsa_addr[0]))
+			                       : IR::U32(IR::Value(0u));
 			ir.Emit(IR::ValueOpcode::RayQueryAlpha,
-			        {ReadU32(VectorOperand(inst.image_nsa_addr[0])), ReadU32(inst.src0), factor, material[0],
+			        {lod, entry ? IR::U32(IR::Value(0u)) : ReadU32(inst.src0), factor, material[0],
 			         material[1], material[2], material[3], buffers[0], buffers[1], buffers[2], buffers[3], threshold,
 			         IR::U32(IR::Value(inst.image_nsa_addr[4])), IR::U32(IR::Value(inst.image_nsa_addr[6]))},
-			        flags(inst.dmask & 3u));
+			        flags((inst.dmask & 3u) | (entry ? IR::RayQueryAlphaEntry : 0u)));
 			return;
 		}
 		default: FailMissingTranslation(inst);

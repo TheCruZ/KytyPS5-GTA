@@ -53,7 +53,9 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 //              material and buffer table user pointers (or, with offset RayTracingAlphaDirect, the
 //              first SGPR of the V#); dmask = RayTracingAlphaLayout, | 2 for the Lane layout with
 //              threshold and factor, | 4 for the Lane layout with a reference SGPR, | 8 for the
-//              reference threshold * factor of every material.
+//              reference threshold * factor of every material; 16 for the Entry layout (src2 and
+//              src3 are the first SGPRs of the V#s, [3] the threshold and [4] the level of the
+//              samples; no level of detail VGPR (NoRegister) and no spread).
 //
 // A closest hit site (RayTracingKind::ClosestOpaque) is a per lane traversal whose leaf code
 // accepts the nearest triangle of either facing: the hardware finds the hit and RT_COMMIT writes
@@ -86,6 +88,10 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 // leaf code decides): the wave takes the smallest instance any lane has, runs its setup once, and
 // each lane with a candidate of that instance runs the guest leaf code for its own smallest one
 // (its leaf list entry, loaded as the guest walk loads it), until no lane has candidates left.
+// When the leaf code is Resident Evil Village's (RayTracingAlphaLayout::Entry), the native traversal
+// runs no guest code at all: the hardware finds the nearest hit, the per lane alpha test confirms
+// or drops each non opaque candidate, and RT_COMMIT writes the registers of the accepted hit, like a
+// PacketLane site's.
 //
 // A packet site whose lanes each walk the BLAS and run the guest leaf code (RayTracingKind::AnyLane,
 // Marvel's Wolverine's shadow rays, waves of 32 lanes) keeps a stack of (node, lane mask) pairs in
@@ -128,6 +134,14 @@ enum class RayTracingAlphaLayout : uint32_t {
 	// table as a structured buffer), the reference is a VGPR (or, without one, threshold *
 	// (M0 bit 0 ? factor : 1) as in the Scalar layout).
 	Lane = 1,
+	// A closest hit site of the BVH library's first version (ClosestLane, Resident Evil Village): the
+	// instance record holds the index of its material entry, whose strides and offsets select the
+	// index and texture coordinate buffers and a material with two texture lookups (see
+	// DeriveEntryAlphaTest in RayTracingPatch.cpp and AlphaTestEntry in the SPIR-V emitter). The V#s
+	// of the tables are SGPRs of the program (RayTracingAlphaDirect), `lod_offset` is the level of
+	// its samples and `threshold` the alpha it exceeds (float bits). The instance flags are the
+	// record's dword `flags_dword` of the layout, as for the other sites.
+	Entry = 2,
 };
 
 // A V# offset of RayTracingAlphaTest: the V# is in the four SGPRs from `*_user` at the site entry.
