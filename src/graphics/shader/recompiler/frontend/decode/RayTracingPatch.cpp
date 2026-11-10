@@ -579,7 +579,9 @@ bool AddNativeTraversal(Layout& layout, const Program& program, const RayTracing
 	// A closest hit site's setup starts at the loop header (it copies EXEC there); the header's
 	// branch to the box code is never taken for an instance node.
 	if (!AddRangeCopy(layout, program, site.setup_pc, site.blas_head_pc, [&](uint32_t target) {
-		    return target == site.blas_head_pc            ? leaf_label
+		    return target == site.blas_head_pc ||
+		                   (site.blas_copy_pc != 0 && target >= site.blas_copy_pc && target <= site.blas_copy_end_pc)
+		               ? leaf_label
 		           : target == site.cull_exit_pc || closest ? cull_label
 		                                                   : UINT32_MAX;
 	    })) {
@@ -973,10 +975,22 @@ private:
 		while (first < m_inst.size() && m_inst[first].opcode == Opcode::V_READLANE_B32) {
 			first++;
 		}
-		return first + 3 < m_inst.size() && m_inst[first].opcode == Lane(Opcode::S_AND_B64) &&
-		               m_inst[first + 1].opcode == Lane(Opcode::S_AND_SAVEEXEC_B64) && IsNodeType(first + 2, true)
-		           ? first + 2
-		           : npos;
+		if (first + 3 < m_inst.size() && m_inst[first].opcode == Lane(Opcode::S_AND_B64) &&
+		    m_inst[first + 1].opcode == Lane(Opcode::S_AND_SAVEEXEC_B64) && IsNodeType(first + 2, true)) {
+			return first + 2;
+		}
+		// Waves of 32 lanes: the node type's S_AND_B32 scheduled before the S_AND_SAVEEXEC (Marvel's
+		// Wolverine's 0xb790bfb6f776e13a), with the S_ADD_I32 after it.
+		if (m_wave32 && first + 3 < m_inst.size() && m_inst[first].opcode == Lane(Opcode::S_AND_B64) &&
+		    m_inst[first + 2].opcode == Lane(Opcode::S_AND_SAVEEXEC_B64) &&
+		    m_inst[first + 1].opcode == Opcode::S_AND_B32 && IsVccLo(m_inst[first + 1].dst) &&
+		    m_inst[first + 1].src0.kind == OperandKind::Sgpr && IsConstant(m_inst[first + 1].src1, 7) &&
+		    m_inst[first + 3].opcode == Opcode::S_ADD_I32 && IsVccLo(m_inst[first + 3].dst) &&
+		    IsVccLo(m_inst[first + 3].src0) && m_inst[first + 3].src1.kind == OperandKind::IntegerInlineConstant &&
+		    m_inst[first + 3].src1.signed_val == -4) {
+			return first + 1;
+		}
+		return npos;
 	}
 
 	// Whether the packet loop header at `i` (node type test at `type`) keeps registers in VGPR
@@ -1369,6 +1383,42 @@ private:
 			return false;
 		}
 		const auto node = m_inst[test].src0.reg;
+		// A second copy of the BLAS loop after the first one's exit (the same instructions): the
+		// compiler duplicated it, and the setup jumps to the copy's prologue under one condition.
+		size_t blas_copy = npos;
+		for (size_t i = blas_back + 1; i < back && blas_copy == npos; i++) {
+			const auto& inst = m_inst[i];
+			if (inst.opcode != Opcode::S_CBRANCH_EXECNZ || inst.branch_target >= inst.pc ||
+			    inst.branch_target <= m_inst[blas_back].pc) {
+				continue;
+			}
+			const auto copy_head = IndexOf(inst.branch_target);
+			if (copy_head == npos || i - copy_head != blas_back - blas) {
+				continue;
+			}
+			bool same = true;
+			for (size_t k = 0; k < blas_back - blas && same; k++) {
+				const auto& x = m_inst[blas + k];
+				const auto& y = m_inst[copy_head + k];
+				same = x.opcode == y.opcode && SameOperand(x.dst, y.dst) && SameOperand(x.src0, y.src0) &&
+				       SameOperand(x.src1, y.src1) && SameOperand(x.src2, y.src2) && x.offset == y.offset;
+			}
+			if (same) {
+				blas_copy = copy_head;
+			}
+		}
+		// Its prologue: the instructions before its loop head that the first copy's loop head also
+		// has before it (the setup's jump to the copy runs them instead).
+		size_t blas_copy_entry = blas_copy;
+		while (blas_copy != npos && blas_copy_entry > blas_back + 1 && blas_copy - blas_copy_entry < blas - setup) {
+			const auto& x = m_inst[blas - 1 - (blas_copy - blas_copy_entry)];
+			const auto& y = m_inst[blas_copy_entry - 1];
+			if (IsDirectBranch(y.opcode) || x.opcode != y.opcode || !SameOperand(x.dst, y.dst) ||
+			    !SameOperand(x.src0, y.src0) || !SameOperand(x.src1, y.src1) || x.offset != y.offset) {
+				break;
+			}
+			blas_copy_entry--;
+		}
 		// The load of the lane's next leaf list entry.
 		size_t load = npos;
 		for (size_t i = blas_back; i-- > test && load == npos;) {
@@ -1404,7 +1454,9 @@ private:
 			}
 			if (!IsDirectBranch(inst.opcode) ||
 			    (inst.branch_target > m_inst[setup].pc && inst.branch_target <= m_inst[blas].pc) ||
-			    inst.branch_target == site.cull_exit_pc) {
+			    inst.branch_target == site.cull_exit_pc ||
+			    (blas_copy != npos && inst.branch_target >= m_inst[blas_copy_entry].pc &&
+			     inst.branch_target <= m_inst[blas_copy].pc)) {
 				continue;
 			}
 			return false;
@@ -1427,7 +1479,7 @@ private:
 		    m_inst[accept - 1].dst.kind != OperandKind::Vgpr || !IsVgpr(m_inst[accept - 1].src0, node + 1) ||
 		    !Plain(m_inst[accept - 1].src0) || accept + 2 >= shift ||
 		    m_inst[accept + 1].opcode != Lane(Opcode::S_MOV_B64) || m_inst[accept + 1].dst.kind != OperandKind::ExecLo ||
-		    m_inst[accept + 1].src0.kind != OperandKind::Sgpr) {
+		    (m_inst[accept + 1].src0.kind != OperandKind::Sgpr && !IsVccLo(m_inst[accept + 1].src0))) {
 			return false;
 		}
 		const auto tail = accept + 2;
@@ -1497,11 +1549,17 @@ private:
 		}
 		if (const auto w = VectorWriter(box_test, site.t_max, header); w != npos) {
 			const auto& move = m_inst[w];
-			if (move.opcode != Opcode::V_MOV_B32 || !Plain(move.dst) || move.src0.kind != OperandKind::LiteralConstant) {
+			// The constant is a literal, or an integer converted (V_CVT_F32_I32 64).
+			const bool converted =
+			    move.opcode == Opcode::V_CVT_F32_I32 && move.src0.kind == OperandKind::IntegerInlineConstant;
+			if (!Plain(move.dst) || !Plain(move.src0) ||
+			    ((move.opcode != Opcode::V_MOV_B32 || move.src0.kind != OperandKind::LiteralConstant) && !converted)) {
 				return false;
 			}
 			site.t_max_is_constant = true;
-			site.t_max_constant    = move.src0.value;
+			site.t_max_constant =
+			    converted ? std::bit_cast<uint32_t>(static_cast<float>(static_cast<int32_t>(move.src0.value)))
+			              : move.src0.value;
 		}
 		site.kind              = RayTracingKind::AnyLane;
 		site.instance_sgpr     = m_inst[type].src0.reg;
@@ -1517,6 +1575,8 @@ private:
 		site.leaf_sgpr         = 0;
 		site.mask_sgpr         = mask;
 		site.mask_copy_pc      = m_inst[mask_copy].pc;
+		site.blas_copy_pc      = blas_copy != npos ? m_inst[blas_copy_entry].pc : 0;
+		site.blas_copy_end_pc  = blas_copy != npos ? m_inst[blas_copy].pc : 0;
 		site.saved_exec_sgpr   = free_a;
 		site.alpha_off_sgpr    = NoAlphaOff;
 		site.after_leaf_pc     = 0;
@@ -4612,8 +4672,25 @@ private:
 
 	bool FormTerm(size_t i, const Operand& a, const Operand& b, size_t from, const Inputs& inputs, uint32_t& pair,
 	              Form& form) const {
-		for (const auto& [scalar, vector]: {std::pair {&a, &b}, std::pair {&b, &a}}) {
-			Field      field;
+		for (const auto& [scalar, vector_operand]: {std::pair {&a, &b}, std::pair {&b, &a}}) {
+			Field field;
+			// A negated SGPR that one of the VGPR inputs copies with the negation before the loop
+			// (V_MOV_B32 <v>, -<s>): that input.
+			Operand        alias;
+			const Operand* vector = vector_operand;
+			if (vector_operand->kind == OperandKind::Sgpr && vector_operand->negate && !vector_operand->absolute) {
+				for (const auto input_reg: inputs.vector) {
+					const auto w = input_reg == NoRegister ? npos : VectorWriter(i, input_reg, 0);
+					if (w != npos && m_inst[w].opcode == Opcode::V_MOV_B32 && m_inst[w].src0.kind == OperandKind::Sgpr &&
+					    m_inst[w].src0.reg == vector_operand->reg && m_inst[w].src0.negate) {
+						alias      = Operand {};
+						alias.kind = OperandKind::Vgpr;
+						alias.reg  = input_reg;
+						vector     = &alias;
+						break;
+					}
+				}
+			}
 			const bool uniform = vector->kind == OperandKind::Sgpr && std::ranges::find(inputs.scalar, vector->reg) != inputs.scalar.end();
 			const int  lane    = vector->kind == OperandKind::Sgpr && !uniform ? LaneInput(i, vector->reg, from, inputs) : -1;
 			if ((vector->kind != OperandKind::Vgpr && !uniform && lane < 0) || !Plain(*vector) ||
@@ -4657,8 +4734,14 @@ private:
 			return false;
 		}
 		const auto& inst = m_inst[w];
-		if (inst.dst.kind != OperandKind::Vgpr || inst.dst.reg != reg || !Plain(inst.dst) || !Plain(inst.src0) ||
-		    !Plain(inst.src1)) {
+		// A negated SGPR is a term operand too (FormTerm matches it to the VGPR input that copies it).
+		const auto plain_or_negated = [](const Operand& operand) {
+			return Plain(operand) ||
+			       (operand.kind == OperandKind::Sgpr && operand.negate && !operand.absolute && !operand.clamp &&
+			        operand.omod == 0 && operand.sdwa_sel == 6 && !operand.dpp && !operand.dpp8);
+		};
+		if (inst.dst.kind != OperandKind::Vgpr || inst.dst.reg != reg || !Plain(inst.dst) ||
+		    !plain_or_negated(inst.src0) || !plain_or_negated(inst.src1)) {
 			return false;
 		}
 		const auto add = [&](const Operand& operand) {

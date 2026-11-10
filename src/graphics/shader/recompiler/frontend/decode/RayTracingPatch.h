@@ -341,6 +341,12 @@ struct RayTracingSite {
 	// AnyLane sites: the setup's S_MOV_B32 <mask>, exec (`mask_copy_pc`), run again after each
 	// RT_LEAF: the guest leaf code clears from the mask the lanes that accept a hit.
 	uint32_t mask_copy_pc = 0;
+	// AnyLane sites: a second copy of the BLAS loop that the compiler made and that the setup jumps
+	// to under one condition: [blas_copy_pc, blas_copy_end_pc] from the copy's prologue (the same
+	// instructions as the first copy's) to its loop head (0: none). The native traversal runs the
+	// first copy's leaf code for both.
+	uint32_t blas_copy_pc     = 0;
+	uint32_t blas_copy_end_pc = 0;
 	// Where the loop exits to.
 	uint32_t exit_pc = 0;
 	// The alpha test the native traversal runs instead of the leaf code.
