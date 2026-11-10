@@ -959,16 +959,15 @@ uint32_t MipStatsElement(EmitterState& state, uint32_t index) {
 }
 
 struct MipStatsSample {
-	uint32_t finest  = 0; // subgroup minimum of the absolute mip level
-	uint32_t counted = 0; // 1 when a lane's level is below the field's threshold
+	uint32_t finest  = 0; // the lane's absolute mip level
+	uint32_t counted = 0; // 1 when the lane's level is below the field's threshold
 };
 
 // The finest mip a sample wanted, as an absolute level: floor of the unclamped LOD plus the view's
-// BASE_LEVEL, limited to 0..14, reduced to the subgroup minimum. A lane counts when that level is
-// below the T# MIN_LOD: the resident-level clamp raised the sample.
+// BASE_LEVEL, limited to 0..14. A lane counts when that level is below the T# MIN_LOD: the
+// resident-level clamp raised the sample. No subgroup operations: NVIDIA's shader compiler for
+// GeForce RTX 50 GPUs crashed on pixel shaders that reduced these over the subgroup.
 MipStatsSample EmitMipStatsSample(EmitterState& state, uint32_t field, uint32_t lod) {
-	state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
-	state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
 	const auto base_level = Binary(
 	    state, spv::OpBitwiseAnd, TypeU32(state),
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), field, ConstantU32(state, 8)),
@@ -985,10 +984,7 @@ MipStatsSample EmitMipStatsSample(EmitterState& state, uint32_t field, uint32_t 
 	                          GLSLstd450Floor, clamped);
 	const auto level = Unary(state, spv::OpConvertFToU, TypeU32(state), floored);
 	MipStatsSample sample;
-	sample.finest = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformUMin, TypeU32(state), sample.finest,
-	                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce,
-	                          level);
+	sample.finest = level;
 	// Compared with the clamped level, so that magnification (a LOD below 0) of a texture whose
 	// MIN_LOD is 0 is not a clamp.
 	const auto threshold_fixed = Binary(
@@ -1000,56 +996,45 @@ MipStatsSample EmitMipStatsSample(EmitterState& state, uint32_t field, uint32_t 
 	           Unary(state, spv::OpConvertUToF, TypeF32(state), threshold_fixed),
 	           ConstantF32Value(state, 1.0f / 256.0f));
 	const auto below = Binary(state, spv::OpFOrdLessThan, TypeBool(state), clamped, threshold);
-	const auto below_u32 =
+	sample.counted =
 	    Select(state, TypeU32(state), below, ConstantU32(state, 1), ConstantU32(state, 0));
-	sample.counted = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformUMax, TypeU32(state), sample.counted,
-	                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce,
-	                          below_u32);
 	return sample;
 }
 
-// Recording for an image whose T# has a counter (checked by the caller, uniformly per draw). Per
-// subgroup, one lane
+// Recording for an image whose T# has a counter (checked by the caller, uniformly per draw). Every
+// lane
 //  - issues the finest-level AtomicUMin only when a relaxed atomic load shows a larger value. The
 //    finest words only decrease between resets (UMin is their only shader writer, and the resets
 //    are transfer fills ordered against all shader access), so a skipped UMin would not change
 //    the word;
-//  - adds 1 to the count when a lane counted (the game only tests the count for zero).
+//  - adds 1 to the count when it counted (the game only tests the count for zero).
 void EmitMipStatsRecord(EmitterState& state, uint32_t field, uint32_t lod) {
 	const auto counter =
 	    Binary(state, spv::OpBitwiseAnd, TypeU32(state), field, ConstantU32(state, 0xffu));
-	const auto sample  = EmitMipStatsSample(state, field, lod);
-	const auto elected = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformElect, TypeBool(state), elected,
-	                          ConstantU32(state, spv::ScopeSubgroup));
-	EmitIfCondition(state, elected, [&]() {
-		const auto finest_pointer = MipStatsElement(state, counter);
-		const auto current        = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), current, finest_pointer,
+	const auto sample         = EmitMipStatsSample(state, field, lod);
+	const auto finest_pointer = MipStatsElement(state, counter);
+	const auto current        = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), current, finest_pointer,
+	                          ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone));
+	const auto lower = Binary(state, spv::OpULessThan, TypeBool(state), sample.finest, current);
+	EmitIfCondition(state, lower, [&]() {
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicUMin, TypeU32(state), result, finest_pointer,
 		                          ConstantU32(state, spv::ScopeDevice),
-		                          ConstantU32(state, spv::MemorySemanticsMaskNone));
-		const auto lower =
-		    Binary(state, spv::OpULessThan, TypeBool(state), sample.finest, current);
-		EmitIfCondition(state, lower, [&]() {
-			const auto result = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpAtomicUMin, TypeU32(state), result, finest_pointer,
-			                          ConstantU32(state, spv::ScopeDevice),
-			                          ConstantU32(state, spv::MemorySemanticsMaskNone),
-			                          sample.finest);
-		});
-		const auto any =
-		    Binary(state, spv::OpINotEqual, TypeBool(state), sample.counted, ConstantU32(state, 0));
-		EmitIfCondition(state, any, [&]() {
-			const auto count_index = Binary(state, spv::OpIAdd, TypeU32(state), counter,
-			                                ConstantU32(state, MipStatsEntries));
-			const auto result      = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), result,
-			                          MipStatsElement(state, count_index),
-			                          ConstantU32(state, spv::ScopeDevice),
-			                          ConstantU32(state, spv::MemorySemanticsMaskNone),
-			                          ConstantU32(state, 1));
-		});
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone), sample.finest);
+	});
+	const auto any =
+	    Binary(state, spv::OpINotEqual, TypeBool(state), sample.counted, ConstantU32(state, 0));
+	EmitIfCondition(state, any, [&]() {
+		const auto count_index = Binary(state, spv::OpIAdd, TypeU32(state), counter,
+		                                ConstantU32(state, MipStatsEntries));
+		const auto result      = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), result,
+		                          MipStatsElement(state, count_index),
+		                          ConstantU32(state, spv::ScopeDevice),
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone),
+		                          ConstantU32(state, 1));
 	});
 }
 
