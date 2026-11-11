@@ -66,6 +66,30 @@ struct OutlinedRegion {
 	std::vector<uint32_t>                output_ids; // in main, per output and half
 };
 
+// The indirect call of a compute program with outlined call targets as the expansion of the call
+// table makes it: one level per target, each a test of the first word of the target address (block
+// `a`), of the second (block `b`) and the call of the target (the region), and the next level only
+// when no call was made. Written out, that is a nest of as many levels as targets, each with two
+// merge blocks that give every register of the program a Phi, and the NVIDIA compiler works through
+// all of it for each target (the 20 targets of Wolverine's 0x1a04c58a9fbc2052: a dispatch loop that
+// takes 36 s alone). The tests are about the whole wave (votes) and the first level that matches
+// wins, so it is also one switch on the index of that level, with one merge block and one Phi per
+// register.
+struct CallLadder {
+	struct Level {
+		const IR::Block* a      = nullptr; // false -> m2
+		const IR::Block* b      = nullptr; // false -> m1
+		const IR::Block* m1     = nullptr; // Phis; the exit of the region
+		const IR::Block* m2     = nullptr; // Phis; true -> the next level, false -> fin
+		const IR::Block* fin    = nullptr; // merge of the levels from this one on: Phis, falls into the previous level's
+		OutlinedRegion*  region = nullptr;
+	};
+	std::vector<Level>                   levels;
+	const IR::Block*                     join = nullptr; // after a call: the first level's fin
+	const IR::Block*                     none = nullptr; // after the last level, without a call
+	std::unordered_set<const IR::Block*> skipped; // every block but the first level's a
+};
+
 struct PhiSlot {
 	size_t                arg    = 0;       // the operand, unless region is set
 	const OutlinedRegion* region = nullptr; // one operand for all of a region's edges
@@ -83,6 +107,7 @@ struct StructuredFunctionState {
 	std::unordered_map<const IR::Block*, uint32_t>              block_exit_labels;
 	std::vector<DeferredPhiPatch>                               deferred_phis;
 	std::unordered_map<const IR::Block*, const OutlinedRegion*> region_of; // main only
+	const CallLadder*                                           ladder = nullptr; // main only
 };
 
 bool HasSpirvType(IR::Type type) {
@@ -269,6 +294,12 @@ std::vector<OutlinedRegion> FindOutlinedRegions(const IR::Program& program) {
 
 std::vector<PhiSlot> PhiSlots(const StructuredFunctionState& structured, const IR::Inst& phi) {
 	std::vector<PhiSlot> slots;
+	if (structured.ladder != nullptr && phi.Parent() == structured.ladder->join) {
+		// One operand per level: the value after its call (see PatchLadderPhi).
+		for (size_t level = 0; level < structured.ladder->levels.size(); level++)
+			slots.push_back({level, structured.ladder->levels[level].region, 0});
+		return slots;
+	}
 	for (size_t index = 0; index < phi.NumArgs(); index++) {
 		const auto found = structured.region_of.find(phi.PhiBlock(index));
 		if (found == structured.region_of.end()) {
@@ -523,9 +554,8 @@ void EmitDispatcherInstruction(ValueEmitContext& ctx, const DispatcherFunctionSt
 }
 
 template <typename EmitInstruction>
-void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& emit_instruction) {
+void EmitBlockInstructions(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& emit_instruction) {
 	ctx.state.current_block = block;
-	EmitLabel(ctx.state, block->Definition());
 	bool emitted_non_phi = false;
 	for (const auto& inst: *block) {
 		if (inst.GetOpcode() == IR::ValueOpcode::Phi) {
@@ -549,9 +579,62 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 	}
 }
 
+template <typename EmitInstruction>
+void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& emit_instruction) {
+	ctx.state.current_block = block;
+	EmitLabel(ctx.state, block->Definition());
+	EmitBlockInstructions(ctx, block, emit_instruction);
+}
+
+// The value of `value` where level `k` of a ladder has made its call and reached the join (see
+// CallLadder): the Phis of the merge blocks it passes take the result of the region, the registers
+// the region left alone, and what the levels after it add on the way out.
+uint32_t ResolveLadderValue(ValueEmitContext& lane, const CallLadder& ladder, size_t k, IR::Value value) {
+	value = value.Resolve();
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || inst->GetOpcode() != IR::ValueOpcode::Phi) return lane.Def(value);
+	const auto& level = ladder.levels[k];
+	const auto  incoming = [&](const IR::Block* from) {
+		for (size_t index = 0; index < inst->NumArgs(); index++)
+			if (inst->PhiBlock(index) == from) return inst->Arg(index);
+		lane.Fail(*inst, "has no operand for the call of its level");
+	};
+	for (size_t j = 1; j <= k; j++) {
+		if (inst->Parent() == ladder.levels[j].fin)
+			return ResolveLadderValue(lane, ladder, k,
+			                          incoming(j == k ? ladder.levels[k].m2 : ladder.levels[j + 1].fin));
+	}
+	if (inst->Parent() == level.m2) return ResolveLadderValue(lane, ladder, k, incoming(level.m1));
+	if (inst->Parent() != level.m1) return lane.Def(value);
+	const auto output = std::ranges::find(level.region->outputs, inst) - level.region->outputs.begin();
+	if (output >= static_cast<ptrdiff_t>(level.region->phi_outputs))
+		lane.Fail(*inst, "is not an output of the call of its level");
+	return level.region->output_ids.at(static_cast<size_t>(output) * lane.state.lane_count + lane.half);
+}
+
+void PatchLadderPhi(ValueEmitContext& ctx, const CallLadder& ladder, const DeferredPhiPatch& deferred) {
+	auto& lane = deferred.half == 0 ? ctx : *ctx.other_half;
+	for (size_t level = 0; level < ladder.levels.size(); level++) {
+		const auto& entry = ladder.levels[level];
+		const auto& phi   = *deferred.instruction;
+		// The first level reaches the join from its m2, the others from the fin of the second.
+		const auto* from  = level == 0 ? ladder.levels[0].m2 : ladder.levels[1].fin;
+		size_t      index = 0;
+		while (index < phi.NumArgs() && phi.PhiBlock(index) != from) index++;
+		if (index == phi.NumArgs()) ctx.Fail(phi, "has no operand for a level of its call table");
+		ctx.state.builder.PatchDeferredPhi(deferred.phi, level,
+		                                   ResolveLadderValue(lane, ladder, level, phi.Arg(index)),
+		                                   entry.region->call_label);
+	}
+}
+
 void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structured) {
 	for (const auto& deferred: structured.deferred_phis) {
 		auto& lane = deferred.half == 0 ? ctx : *ctx.other_half;
+		if (structured.ladder != nullptr && deferred.instruction->Parent() == structured.ladder->join) {
+			PatchLadderPhi(ctx, *structured.ladder, deferred);
+			continue;
+		}
 		for (size_t slot = 0; slot < deferred.slots.size(); slot++) {
 			const auto& source = deferred.slots[slot];
 			if (source.region != nullptr) {
@@ -717,7 +800,7 @@ void EmitOutlinedFunction(ValueEmitContext& ctx, OutlinedRegion& region) {
 	}
 }
 
-void EmitOutlinedCall(ValueEmitContext& ctx, OutlinedRegion& region) {
+void EmitOutlinedCall(ValueEmitContext& ctx, OutlinedRegion& region, uint32_t exit_label = 0) {
 	auto& state = ctx.state;
 	const auto lanes = state.lane_count;
 	state.current_block = region.entry;
@@ -750,7 +833,189 @@ void EmitOutlinedCall(ValueEmitContext& ctx, OutlinedRegion& region) {
 		}
 	}
 	region.call_label = state.current_label;
-	state.builder.AddFunction(spv::OpBranch, region.exit->Definition());
+	state.builder.AddFunction(spv::OpBranch, exit_label != 0u ? exit_label : region.exit->Definition());
+}
+
+std::optional<CallLadder> FindCallLadder(const IR::Program& program, std::vector<OutlinedRegion>& regions) {
+	using Op = IR::ValueOpcode;
+	std::unordered_map<const IR::Block*, CallLadder::Level> by_a;
+	// The merge blocks hold their Phis and the references that keep the branch condition alive.
+	const auto only_phis = [](const IR::Block* block) {
+		return std::ranges::all_of(*block, [](const IR::Inst& inst) {
+			return inst.GetOpcode() == Op::Phi || inst.GetOpcode() == Op::Reference ||
+			       inst.GetOpcode() == Op::ReferenceU32;
+		});
+	};
+	// Whatever a level hoists runs for every level, so it only reads.
+	const auto only_reads = [](const IR::Block* block) {
+		return std::ranges::all_of(*block, [](const IR::Inst& inst) {
+			const auto op = inst.GetOpcode();
+			return op != Op::Phi && (!inst.MayHaveSideEffects() || op == Op::Reference ||
+			                         op == Op::ReferenceU32 || op == Op::ConditionRef);
+		});
+	};
+	const auto branches = [](const IR::Block* block, const IR::Block* on_true, const IR::Block* on_false) {
+		const auto& term = block->terminator;
+		return term.kind == CFG::TerminatorKind::ConditionalBranch && term.true_block == on_true &&
+		       term.false_block == on_false && !block->condition.IsEmpty();
+	};
+	const auto negation_of = [](IR::Value value, IR::Value of) {
+		const auto* inst = value.Resolve().TryInstruction();
+		return inst != nullptr && inst->GetOpcode() == Op::LogicalNot && !of.IsEmpty() &&
+		       inst->Arg(0).Resolve().TryInstruction() == of.Resolve().TryInstruction() &&
+		       of.Resolve().TryInstruction() != nullptr;
+	};
+	for (auto& region: regions) {
+		const auto* c = region.entry;
+		if (c->ImmPredecessors().size() != 1u) continue;
+		const auto* b = c->ImmPredecessors()[0];
+		if (b->ImmPredecessors().size() != 1u) continue;
+		const auto* a  = b->ImmPredecessors()[0];
+		const auto* m1 = region.exit;
+		if (m1->terminator.kind != CFG::TerminatorKind::Branch || m1->terminator.true_block == nullptr) continue;
+		const auto* m2 = m1->terminator.true_block;
+		const auto& m2_term = m2->terminator;
+		if (!branches(b, c, m1) || !branches(a, b, m2) || m2_term.kind != CFG::TerminatorKind::ConditionalBranch ||
+		    m2_term.true_block == nullptr || m2_term.false_block == nullptr || m2->condition.IsEmpty() ||
+		    !only_phis(m1) || !only_phis(m2) || !only_reads(b) ||
+		    m2->ImmPredecessors().size() != 2u)
+			continue;
+		bool exits_ok = true;
+		for (const auto* predecessor: m1->ImmPredecessors())
+			exits_ok &= predecessor == b || region.blocks.contains(predecessor);
+		for (const auto* predecessor: m2->ImmPredecessors()) exits_ok &= predecessor == a || predecessor == m1;
+		// Not matched is the negation of the test that failed.
+		const auto* condition = m2->condition.Resolve().TryInstruction();
+		exits_ok &= condition != nullptr && condition->GetOpcode() == Op::Phi && condition->Parent() == m2 &&
+		            condition->NumArgs() == 2u;
+		if (exits_ok) {
+			for (size_t index = 0; index < 2u; index++) {
+				const auto* from = condition->PhiBlock(index);
+				exits_ok &= (from == a && negation_of(condition->Arg(index), a->condition)) ||
+				            (from == m1 && negation_of(condition->Arg(index), b->condition));
+			}
+		}
+		if (!exits_ok) continue;
+		by_a.emplace(a, CallLadder::Level {a, b, m1, m2, nullptr, &region});
+	}
+	if (by_a.size() < 2u) return std::nullopt;
+	std::unordered_set<const IR::Block*> nexts;
+	for (const auto& [a, level]: by_a)
+		if (by_a.contains(level.m2->terminator.true_block)) nexts.insert(level.m2->terminator.true_block);
+	CallLadder ladder;
+	for (const auto& [a, level]: by_a)
+		if (!nexts.contains(a)) {
+			if (!ladder.levels.empty()) return std::nullopt;
+			ladder.levels.push_back(level);
+		}
+	if (ladder.levels.empty()) return std::nullopt;
+	while (by_a.contains(ladder.levels.back().m2->terminator.true_block))
+		ladder.levels.push_back(by_a.at(ladder.levels.back().m2->terminator.true_block));
+	if (ladder.levels.size() != by_a.size()) return std::nullopt;
+	ladder.none = ladder.levels.back().m2->terminator.true_block;
+	if (std::ranges::any_of(*ladder.none, [](const IR::Inst& inst) { return inst.GetOpcode() == Op::Phi; }) ||
+	    ladder.none->ImmPredecessors().size() != 1u)
+		return std::nullopt;
+	std::unordered_set<const IR::Block*> members;
+	// The levels nest: the false edge of a level's m2 leads to its fin, which the fin of the next level
+	// falls into, so the join has two predecessors however many levels there are.
+	for (size_t k = 0; k < ladder.levels.size(); k++) {
+		auto& level = ladder.levels[k];
+		level.fin   = level.m2->terminator.false_block;
+		for (const auto* block: {level.a, level.b, level.m1, level.m2, level.fin}) members.insert(block);
+		const bool last = k + 1u == ladder.levels.size();
+		const auto expected = last ? 1u : 2u;
+		if (level.fin == ladder.none || level.fin->ImmPredecessors().size() != expected ||
+		    std::ranges::find(level.fin->ImmPredecessors(), level.m2) == level.fin->ImmPredecessors().end() ||
+		    (!last && std::ranges::find(level.fin->ImmPredecessors(), ladder.levels[k + 1].m2->terminator.false_block) ==
+		                  level.fin->ImmPredecessors().end()))
+			return std::nullopt;
+		if (k > 0) {
+			if (!only_phis(level.fin) || level.fin->terminator.kind != CFG::TerminatorKind::Branch ||
+			    level.fin->terminator.true_block != ladder.levels[k - 1].fin)
+				return std::nullopt;
+			ladder.skipped.insert(level.fin);
+		}
+		// The first level's block stays where it is (it is the loop's, with whatever the loop does first);
+		// the others are hoisted into it, so they only read.
+		if (k > 0 && !only_reads(level.a)) return std::nullopt;
+		for (const auto* block: {level.b, level.m1, level.m2}) ladder.skipped.insert(block);
+		if (level.a != ladder.levels.front().a) ladder.skipped.insert(level.a);
+	}
+	ladder.join = ladder.levels.front().fin;
+	// The first level is entered from one block, which then falls into the switch.
+	if (ladder.levels.front().a->ImmPredecessors().size() != 1u)
+		return std::nullopt;
+	// What the merge blocks define is read after the calls through the Phis of the join only (which are the
+	// values after the calls, and may be read anywhere).
+	members.erase(ladder.join);
+	for (const auto* block: program.blocks) {
+		if (members.contains(block)) continue;
+		if (std::ranges::any_of(ladder.levels, [&](const auto& level) { return level.region->blocks.contains(block); }))
+			continue;
+		for (const auto& inst: *block) {
+			if (block == ladder.join && inst.GetOpcode() == Op::Phi) continue;
+			for (size_t index = 0; index < inst.NumArgs(); index++) {
+				const auto* arg = inst.Arg(index).Resolve().TryInstruction();
+				if (arg != nullptr && members.contains(arg->Parent()) && arg->GetOpcode() == Op::Phi)
+					return std::nullopt;
+			}
+		}
+		for (const auto& value: {block->condition, block->indirect_target}) {
+			const auto* arg = value.IsEmpty() ? nullptr : value.Resolve().TryInstruction();
+			if (arg != nullptr && members.contains(arg->Parent()) && arg->GetOpcode() == Op::Phi)
+				return std::nullopt;
+		}
+	}
+	return ladder;
+}
+
+// The first level's block through the switch: what every level tests is computed first, then the
+// regions are called from the cases of a switch on the first level that matches.
+void EmitCallLadder(ValueEmitContext& ctx, StructuredFunctionState& structured, const CallLadder& ladder) {
+	auto& state = ctx.state;
+	const auto instructions = [&](const IR::Block* block) {
+		EmitBlockInstructions(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
+			EmitStructuredInstruction(lane, structured, inst);
+		});
+	};
+	EmitLabel(state, ladder.levels.front().a->Definition());
+	for (const auto& level: ladder.levels) {
+		instructions(level.a);
+		instructions(level.b);
+		// Until a level matches, the Phis of the merge blocks are what the level was entered with.
+		for (uint32_t half = 0; half < state.lane_count; half++) {
+			auto& lane = half == 0 ? ctx : *ctx.other_half;
+			for (const auto* merge: {level.m1, level.m2}) {
+				const auto* from = merge == level.m1 ? level.b : level.a;
+				for (const auto& phi: *merge) {
+					if (phi.GetOpcode() != IR::ValueOpcode::Phi) continue;
+					size_t index = 0;
+					while (index < phi.NumArgs() && phi.PhiBlock(index) != from) index++;
+					if (index == phi.NumArgs()) ctx.Fail(phi, "has no operand for a level of its call table");
+					lane.Define(phi, lane.Def(phi.Arg(index)));
+				}
+			}
+		}
+	}
+	uint32_t selected = ConstantU32(state, 0);
+	for (size_t level = ladder.levels.size(); level-- > 0;) {
+		const auto& entry   = ladder.levels[level];
+		const auto  matched = Binary(state, spv::OpLogicalAnd, TypeBool(state), ctx.Def(entry.a->condition),
+		                             ctx.Def(entry.b->condition));
+		selected = Select(state, TypeU32(state), matched, ConstantU32(state, static_cast<uint32_t>(level) + 1u),
+		                  selected);
+	}
+	structured.block_exit_labels.emplace(ladder.levels.front().a, state.current_label);
+	state.current_block = nullptr;
+	state.builder.AddFunction(spv::OpSelectionMerge, ladder.join->Definition(), spv::SelectionControlMaskNone);
+	std::vector<uint32_t> words {spv::OpSwitch, selected, ladder.none->Definition()};
+	for (size_t level = 0; level < ladder.levels.size(); level++) {
+		words.push_back(static_cast<uint32_t>(level) + 1u);
+		words.push_back(ladder.levels[level].region->entry->Definition());
+	}
+	state.builder.AddFunction(words);
+	for (const auto& level: ladder.levels) EmitOutlinedCall(ctx, *level.region, ladder.join->Definition());
 }
 
 void EmitStructuredFunction(ValueEmitContext& ctx, std::vector<OutlinedRegion>& regions) {
@@ -758,12 +1023,25 @@ void EmitStructuredFunction(ValueEmitContext& ctx, std::vector<OutlinedRegion>& 
 	StructuredFunctionState structured;
 	for (const auto& region: regions)
 		for (const auto* block: region.blocks) structured.region_of.emplace(block, &region);
+	const auto ladder = FindCallLadder(program, regions);
+	std::unordered_set<const OutlinedRegion*> ladder_regions;
+	if (ladder) {
+		LOGF("ShaderRecompiler hash=0x%016" PRIx64 " emitted the %" PRIu64 " levels of its call table as one switch\n",
+		     ctx.state.program.shader_hash, static_cast<uint64_t>(ladder->levels.size()));
+		structured.ladder = &*ladder;
+		for (const auto& level: ladder->levels) ladder_regions.insert(level.region);
+	}
 	ctx.state.builder.AddFunction(spv::OpBranch, program.blocks.front()->Definition());
 	for (size_t index = 0; index < program.blocks.size(); index++) {
 		const auto* block = program.blocks[index];
 		if (const auto found = structured.region_of.find(block); found != structured.region_of.end()) {
-			if (found->second->entry == block)
+			if (found->second->entry == block && !ladder_regions.contains(found->second))
 				EmitOutlinedCall(ctx, *const_cast<OutlinedRegion*>(found->second));
+			continue;
+		}
+		if (ladder && ladder->skipped.contains(block)) continue;
+		if (ladder && block == ladder->levels.front().a) {
+			EmitCallLadder(ctx, structured, *ladder);
 			continue;
 		}
 		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {

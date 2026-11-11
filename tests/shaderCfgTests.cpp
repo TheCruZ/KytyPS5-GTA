@@ -2399,16 +2399,18 @@ void TestInlinedCallTargetsBecomeFunctions() {
         "the expanded program's resources did not materialize");
   const auto compiled = CompileProgram(std::move(translated), options, specialization, 0);
   CheckSpirvBinaryValidates(compiled.spirv);
-  uint32_t dont_inline = 0, calls = 0;
+  uint32_t dont_inline = 0, calls = 0, switches = 0;
   for (size_t at = 5; at < compiled.spirv.size();) {
     const auto words = compiled.spirv[at] >> 16u;
     const auto opcode = compiled.spirv[at] & 0xffffu;
     if (opcode == 54u && (compiled.spirv[at + 3] & 2u) != 0u) ++dont_inline; // OpFunction DontInline
     if (opcode == 57u) ++calls;                                          // OpFunctionCall
+    if (opcode == 251u) ++switches;                                      // OpSwitch
     at += words == 0u ? 1u : words;
   }
   Check(dont_inline == Targets, "the inlined call targets did not become DontInline functions");
   Check(calls >= Targets, "main does not call the outlined call targets");
+  Check(switches == 1u, "the levels of the call table did not become one switch");
 }
 void TestReadLaneOfSkippedLaneSpill() {
   // v1 only holds a spilled SGPR. On the path that skips the spill its lane 3 is undefined, so
