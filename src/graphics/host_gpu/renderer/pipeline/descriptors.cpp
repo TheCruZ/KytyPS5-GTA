@@ -1867,7 +1867,7 @@ void RenderExecutor::FlushDeferredDispatchBarrier() {
 	                    vk::PipelineStageFlagBits::eComputeShader);
 }
 
-void RenderExecutor::BeginGuestOperation(uint32_t queue, bool dispatch_direct, bool draw,
+void RenderExecutor::BeginGuestOperation(uint32_t queue, bool dispatch, bool draw,
                                          bool guest_sync) {
 	m_guest_queue = queue;
 	m_context.GetOcclusionQueries().DropReadTargets();
@@ -1878,7 +1878,7 @@ void RenderExecutor::BeginGuestOperation(uint32_t queue, bool dispatch_direct, b
 		m_shader_write_deferred = false;
 		m_context.GetCommandScheduler().EndRendering();
 	}
-	if (m_deferred_barrier && dispatch_direct && !guest_sync && queue == m_deferred_barrier_queue) {
+	if (m_deferred_barrier && dispatch && !guest_sync && queue == m_deferred_barrier_queue) {
 		m_dispatch_chained = true;
 		return;
 	}
