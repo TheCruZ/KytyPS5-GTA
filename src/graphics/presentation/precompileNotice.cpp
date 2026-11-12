@@ -91,7 +91,8 @@ uint64_t PrecompileNoticeRevision() noexcept {
 
 bool ProcessPrecompileNoticeInput(const SDL_Event& event) {
 	const auto state = static_cast<PrecompileNoticeState>(g_state.load(std::memory_order_acquire));
-	if (!g_visible.load(std::memory_order_acquire) || state == PrecompileNoticeState::Waiting) {
+	if (!g_visible.load(std::memory_order_acquire) || state == PrecompileNoticeState::Waiting ||
+	    state == PrecompileNoticeState::Compiling) {
 		return false;
 	}
 	const bool question = state == PrecompileNoticeState::Question;
@@ -196,29 +197,51 @@ void DrawPrecompileNotice(vk::Extent2D extent) {
 				ImGui::TextUnformatted("The pipelines are ready and the game goes on. It pauses again if it "
 				                       "needs more.");
 				break;
+			case State::Compiling:
+				if (notice.waited_pipelines == 0) {
+					ImGui::TextUnformatted("The GPU driver has compiled the pipelines. The game runs as usual.");
+				} else {
+					ImGui::TextUnformatted(
+					    fmt::format("The GPU driver is compiling {} the game uses. The game keeps running, "
+					                "but it may stutter or skip some draws until {} ready.",
+					                notice.waited_pipelines == 1
+					                    ? std::string("a pipeline")
+					                    : fmt::format("{} pipelines", notice.waited_pipelines),
+					                notice.waited_pipelines == 1 ? "it is" : "they are")
+					        .c_str());
+				}
+				break;
 		}
 
-		const float fraction = total != 0 ? static_cast<float>(notice.done) / static_cast<float>(total) : 0.0f;
-		const auto  progress = fmt::format("{} of {} ({} %)", notice.done, total,
-		                                   static_cast<uint32_t>(fraction * 100.0f));
-		ImGui::ProgressBar(fraction, {-1.0f, ImGui::GetTextLineHeight() + 6.0f * unit}, progress.c_str());
-		// No time left: the game maps more shaders as it goes, whose pipelines are not known yet.
-		if (notice.state == State::Waiting) {
-			ImGui::TextUnformatted(TimeWaited(notice.seconds_waited).c_str());
+		if (notice.state == State::Compiling) {
+			// Nothing to count: these pipelines are not on a list.
+			if (notice.waited_pipelines != 0) {
+				ImGui::TextDisabled("compiling for %u s", notice.seconds_waited);
+			}
 		} else {
-			if (notice.shaders != 0) {
-				ImGui::TextDisabled("%u shaders to translate", notice.shaders);
-			}
+			const float fraction =
+			    total != 0 ? static_cast<float>(notice.done) / static_cast<float>(total) : 0.0f;
+			const auto progress = fmt::format("{} of {} ({} %)", notice.done, total,
+			                                  static_cast<uint32_t>(fraction * 100.0f));
+			ImGui::ProgressBar(fraction, {-1.0f, ImGui::GetTextLineHeight() + 6.0f * unit}, progress.c_str());
+			// No time left: the game maps more shaders as it goes, whose pipelines are not known yet.
+			if (notice.state == State::Waiting) {
+				ImGui::TextUnformatted(TimeWaited(notice.seconds_waited).c_str());
+			} else {
+				if (notice.shaders != 0) {
+					ImGui::TextDisabled("%u shaders to translate", notice.shaders);
+				}
 
-			ImGui::Separator();
-			const float icon = ImGui::GetTextLineHeight();
-			if (notice.state == State::Question) {
-				Hint(true, "Enter", "Wait for them to finish", icon);
+				ImGui::Separator();
+				const float icon = ImGui::GetTextLineHeight();
+				if (notice.state == State::Question) {
+					Hint(true, "Enter", "Wait for them to finish", icon);
+				}
+				Hint(false, "Esc",
+				     notice.state == State::Ready ? "Do not pause again (expect stutters)"
+				                                  : "Play now (expect stutters)",
+				     icon);
 			}
-			Hint(false, "Esc",
-			     notice.state == State::Ready ? "Do not pause again (expect stutters)"
-			                                  : "Play now (expect stutters)",
-			     icon);
 		}
 		ImGui::PopTextWrapPos();
 		ImGui::PopFont();

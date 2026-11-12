@@ -23,21 +23,27 @@ namespace {
 // answer), or with --pipeline-precompile wait, it stops for less: it waits already.
 constexpr double AskSeconds  = 30.0;
 constexpr double WaitSeconds = 20.0;
-// After the game goes on, the notice stays this long, and the game stops again under it for less:
-// Demon's Souls maps its shaders in batches while it boots and loads, with up to ~13 s of its intro
-// or loading between two. One notice then shows them all, instead of one popping up after another.
-constexpr auto   GraceTime    = std::chrono::seconds(15);
+// After the game goes on, the notice stays this long, and the game stops again under it for less
+// (Demon's Souls maps its shaders in batches while it boots and loads; one notice then shows the
+// batches that follow each other closely, instead of one popping up after another).
+constexpr auto   GraceTime    = std::chrono::seconds(3);
 constexpr double GraceSeconds = 5.0;
+// The notice is up whenever a pipeline has taken this long to compile, whoever compiles it (the
+// game's threads, background and manifest threads, helper processes), and for NoticeLinger after
+// the last one that did.
+constexpr double SlowSeconds   = 0.5;
+constexpr auto   NoticeLinger  = GraceTime;
 // A helper's pipeline before the helpers compiled a few (NVIDIA's compiler, cold: ~1 s).
 constexpr double DefaultJobSeconds = 1.0;
 // Compute pipelines looked up in the driver cache before the share of them it misses is believed.
 constexpr uint64_t MinLookups = 32;
-constexpr auto     WatchPeriod = std::chrono::milliseconds(250);
+constexpr auto     WatchPeriod = std::chrono::milliseconds(100);
 // While the game is stopped: how often threads that were in the emulator are tried again.
 constexpr auto     PausePeriod = std::chrono::milliseconds(50);
 constexpr auto     LogPeriod   = std::chrono::seconds(10);
-// A notice says the game waits for pipelines once its GPU work waited this long for one, and stays
-// while the waits follow one another closer than StallGap.
+// The game's pipeline stall: it counts as one (and may stop the game too) once its GPU work waited
+// this long for a pipeline, and lasts while the waits follow one another closer than StallGap. The
+// notice says it waits from SlowSeconds on.
 constexpr auto     StallShown  = std::chrono::seconds(3);
 constexpr auto     StallGap    = std::chrono::seconds(1);
 
@@ -59,6 +65,9 @@ struct Estimate {
 	double   driver_seconds = 0.0;
 	double   seconds_left   = 0.0;
 	bool     drained        = false;
+	// The helpers' jobs that have run SlowSeconds or more, and the longest of them.
+	uint32_t helpers_slow    = 0;
+	double   helpers_longest = 0.0;
 };
 
 } // namespace
@@ -96,8 +105,9 @@ void PipelineCache::StartPrecompile() {
 // background; waiting, or no answer, stops the game again for the pipelines it maps later, with
 // the progress alone.
 //
-// Whatever the mode, when the game's GPU work waits long for a pipeline (PipelineStall), a notice
-// says so with the progress alone, until it goes on: the game is stopped then anyway.
+// Whatever the mode, the notice is up too whenever any pipeline has taken SlowSeconds to compile,
+// whoever compiles it (the game's GPU work waiting for it, which says so; background and manifest
+// threads; the helper processes), and for NoticeLinger after the last one that did.
 void PipelineCache::Precompile(const std::stop_token& stop) {
 	KYTY_PROFILER_THREAD("Thread_PipelinePrecompile");
 	using Clock = std::chrono::steady_clock;
@@ -124,6 +134,8 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 		double running = 0.0;
 		double longest = 0.0;
 		for (const double ran: stats.running) {
+			e.helpers_slow += ran >= SlowSeconds ? 1u : 0u;
+			e.helpers_longest = std::max(e.helpers_longest, ran);
 			const double left = std::max(job - ran, ran);
 			running += left;
 			longest = std::max(longest, left);
@@ -161,6 +173,8 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 	Clock::time_point                      paused_at; // the game, this time
 	Clock::time_point                      logged_at;
 	Clock::time_point                      grace_end;
+	// The notice stays until then: SlowSeconds of a compilation, plus NoticeLinger.
+	Clock::time_point                      slow_until;
 	uint64_t                               base       = 0; // finished when the game first stopped
 	uint64_t                               stop_base  = 0; // and when the game stopped this time
 	uint32_t                               stops      = 0;
@@ -174,6 +188,7 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 	// stays until neither keeps it.
 	bool                                   shown       = false;
 	uint64_t                               notice_base = 0;
+	Clock::time_point                      notice_shown_at;
 	const auto seconds = [](Clock::duration duration) { return std::chrono::duration<double>(duration).count(); };
 
 	std::mutex                  sleep_mutex;
@@ -196,6 +211,14 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 		const auto stall = GetPipelineStall();
 		// A pipeline the game waits for may be in no queue: one its GPU thread creates itself.
 		const auto left  = std::max(e.pending, stall.threads);
+		// Any compilation that takes long: the driver's on any thread of this process, the helper
+		// processes', and the waits of the game for a pipeline whoever creates it.
+		const auto creations = GetDriverCreations(SlowSeconds);
+		const bool waits_slow = stall.threads != 0 && now - stall.since >= std::chrono::duration<double>(SlowSeconds);
+		const uint32_t slow = creations.slow + e.helpers_slow;
+		if (slow != 0 || waits_slow) {
+			slow_until = now + NoticeLinger;
+		}
 		if (!stalled && stall.threads != 0 && now - stall.since >= StallShown) {
 			stalled      = true;
 			stall_since  = stall.since;
@@ -218,6 +241,10 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 			// it nothing and gives the helpers the processors. So that notice comes for less, and
 			// first, instead of after one that says the game waits.
 			const double threshold = grace || stalled ? GraceSeconds : wait ? WaitSeconds : AskSeconds;
+			if (grace && (slow != 0 || waits_slow)) {
+				// Another slow compilation while the notice is up: it stays for it.
+				grace_end = std::max(grace_end, slow_until);
+			}
 			if (grace && TakePrecompileAnswer() == PrecompileAnswer::Play) {
 				PrecompileLog("Pipeline precompile: the player plays at once ({} pipelines left, compiled in the "
 				              "background)",
@@ -294,23 +321,34 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 			state = PrecompileNoticeState::Question;
 		} else if (phase == Phase::Wait) {
 			state = PrecompileNoticeState::Paused;
-		} else if (stalled && (stall.threads != 0 || phase != Phase::Grace)) {
+		} else if ((stalled || waits_slow) && (stall.threads != 0 || phase != Phase::Grace)) {
 			// Not once the game goes on after a stop: that notice stays anyway, and saying it waits
 			// for the StallGap would come between "paused" and "ready".
 			state = PrecompileNoticeState::Waiting;
 		} else if (phase == Phase::Grace) {
 			state = PrecompileNoticeState::Ready;
+		} else if (now < slow_until) {
+			// The game runs, and a pipeline takes long (or did a moment ago).
+			state = PrecompileNoticeState::Compiling;
 		}
 		if (!state) {
 			if (shown) {
 				shown = false;
 				HidePrecompileNotice();
+				PrecompileLog("Pipeline notice: hidden after {:.1f} s, {:.1f} s after the last compilation over {:.1f} s",
+				              seconds(now - notice_shown_at), seconds(now - (slow_until - NoticeLinger)), SlowSeconds);
 			}
 			continue;
 		}
 		if (!shown) {
-			shown       = true;
-			notice_base = e.finished;
+			shown           = true;
+			notice_base     = e.finished;
+			notice_shown_at = now;
+			constexpr const char* Names[] = {"question", "paused", "waiting", "ready", "compiling"};
+			PrecompileLog("Pipeline notice: shown, state {} ({} driver creations for {:.1f} s, {} helper jobs "
+			              "for {:.1f} s, {} game threads waiting)",
+			              Names[static_cast<uint32_t>(*state)], creations.running, creations.longest,
+			              e.pending, e.helpers_longest, stall.threads);
 		}
 		const auto done = static_cast<uint32_t>(e.finished - notice_base);
 		ShowPrecompileNotice({.visible          = true,
@@ -318,8 +356,10 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 		                      .done             = done,
 		                      .total            = done + left,
 		                      .shaders          = *state == PrecompileNoticeState::Waiting ? 0u : e.shaders,
-		                      .waited_pipelines = stall.threads,
-		                      .seconds_waited   = static_cast<uint32_t>(seconds(now - stall_since))});
+		                      .waited_pipelines = *state == PrecompileNoticeState::Compiling ? slow : stall.threads,
+		                      .seconds_waited   = *state == PrecompileNoticeState::Compiling
+		                                              ? static_cast<uint32_t>(std::max(creations.longest, e.helpers_longest))
+		                                              : static_cast<uint32_t>(seconds(now - (stall.threads != 0 ? stall.since : stall_since)))});
 	}
 	pause.reset();
 	set_helpers(helpers_running);

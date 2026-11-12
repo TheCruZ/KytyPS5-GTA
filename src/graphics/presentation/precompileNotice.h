@@ -20,6 +20,9 @@ enum class PrecompileNoticeState : uint32_t {
 	// The pipelines are ready and the game goes on; the notice stays a moment, in case it stops
 	// again for more.
 	Ready,
+	// The game runs, and the driver is compiling a pipeline that takes long (or did a moment ago):
+	// nothing to answer, and no progress to show.
+	Compiling,
 };
 
 // The notice in the bottom-right corner of the window while the game waits for the pipelines
@@ -34,6 +37,7 @@ struct PrecompileNotice {
 	// Shaders still to translate, whose pipelines are not counted yet.
 	uint32_t shaders  = 0;
 	// Waiting: the pipelines the game's GPU work waits for, and for how long it has waited.
+	// Compiling: the slow pipelines being compiled now, and the longest of them so far.
 	uint32_t waited_pipelines = 0;
 	uint32_t seconds_waited   = 0;
 };

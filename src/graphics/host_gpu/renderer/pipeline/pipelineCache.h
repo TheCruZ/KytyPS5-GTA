@@ -753,6 +753,15 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 // GraphicContext::pipeline_cache_lookup_enabled); false, with nothing created, otherwise.
 bool FindComputePipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                          const ShaderModule& module, vk::PipelineCache cache);
+// The pipelines the driver is creating now in this process, on whichever thread (not those the
+// helper processes create): how many, how many of them for `slow_seconds` or more, and the time of
+// the longest.
+struct DriverCreations {
+	uint32_t running = 0;
+	uint32_t slow    = 0;
+	double   longest = 0.0;
+};
+[[nodiscard]] DriverCreations GetDriverCreations(double slow_seconds);
 // Appends "pipeline being created by the driver: <stage> 0x<hash> ...\n" when this thread is inside
 // the driver's creation of a guest pipeline, for the report of a host fault in the driver.
 void DescribeDriverPipelineCreation(std::string& report);
