@@ -190,8 +190,16 @@ struct WalkerPageAnswer {
 };
 thread_local std::array<WalkerPageAnswer, 4> t_page_answers;
 
+// The pages a walk found direct or backed (by page number, four slots by its low bits), in the walker's
+// scratch: its loads on those pages need no call (see LoadGuest()). The walker clears it when it starts.
+struct WalkerCachedPage {
+	uint64_t       page    = ~uint64_t {0};
+	const uint8_t* backing = nullptr; // Null: load the page directly.
+};
+constexpr uint32_t WalkerPageCacheSlots = 4;
+
 // Bit 32 set: the low dword is the value at the address; clear: load it directly.
-uint64_t KYTY_SYSV_ABI ProbeGuestLoad(uint64_t address) {
+uint64_t KYTY_SYSV_ABI ProbeGuestLoad(uint64_t address, WalkerCachedPage* cache) {
 	constexpr uint64_t PageSize = 4096;
 	if (address < GuestMemoryStart) {
 		return 0;
@@ -212,6 +220,13 @@ uint64_t KYTY_SYSV_ABI ProbeGuestLoad(uint64_t address) {
 		answer.kind = g_guest_memory.page(address, t_walker_ahead, answer.backing);
 	}
 	uint32_t value = 0;
+	// With writes pending ahead of execution every load asks for them first.
+	if (cache != nullptr && answer.kind != SrtWalkerPage::PerLoad &&
+	    !(t_walker_ahead && t_pending_write != nullptr)) {
+		auto& slot   = cache[(page / PageSize) % WalkerPageCacheSlots];
+		slot.page    = page / PageSize;
+		slot.backing = answer.kind == SrtWalkerPage::Backing ? answer.backing : nullptr;
+	}
 	switch (answer.kind) {
 		case SrtWalkerPage::Direct: return 0;
 		case SrtWalkerPage::Backing:
@@ -229,15 +244,33 @@ uint64_t KYTY_SYSV_ABI ProbeGuestLoad(uint64_t address) {
 // The emulator is asked first: on the pages the GPU owns a direct load faults, and a fault costs
 // microseconds (descriptor tables that share pages with GPU-written data took dozens per walk).
 // The walker keeps its state in rdi, rsi, rdx and r8; rcx, r9 and r11 are free here.
-void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
-	Xbyak::Label direct, done;
+void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, uint32_t cache) {
+	Xbyak::Label direct, done, slow;
 	code.lea(code.r10, code.ptr[address]);
+	// A page the walk already answered for is read without the call. rdx is the walker's scratch.
+	code.mov(code.rax, code.r10);
+	code.shr(code.rax, 12);
+	code.mov(code.r11d, code.eax);
+	code.and_(code.r11d, WalkerPageCacheSlots - 1u);
+	code.shl(code.r11d, 4);
+	code.add(code.r11, code.rdx);
+	code.cmp(code.rax, code.qword[code.r11 + cache]);
+	code.jne(slow, Xbyak::CodeGenerator::T_NEAR);
+	code.mov(code.rcx, code.qword[code.r11 + cache + 8]);
+	code.test(code.rcx, code.rcx);
+	code.jz(direct, Xbyak::CodeGenerator::T_NEAR);
+	code.mov(code.r9d, code.r10d);
+	code.and_(code.r9d, 0xfffu);
+	code.mov(code.eax, code.dword[code.rcx + code.r9]);
+	code.jmp(done);
+	code.L(slow);
 	for (const auto& reg: {code.rdi, code.rsi, code.rdx, code.r8, code.r10, code.rbp}) {
 		code.push(reg);
 	}
 	code.mov(code.rbp, code.rsp);
 	code.and_(code.rsp, -16);
 	code.mov(code.rdi, code.r10);
+	code.lea(code.rsi, code.ptr[code.rdx + cache]);
 	code.mov(code.rax, reinterpret_cast<uint64_t>(&ProbeGuestLoad));
 	code.call(code.rax);
 	code.mov(code.rsp, code.rbp);
@@ -554,7 +587,7 @@ private:
 	std::vector<Value>                                m_outputs;
 	std::vector<std::vector<uint32_t>>                m_output_gates;
 	Xbyak::Label                                      m_ret;
-	uint32_t m_shader_base = 0, m_reach = 0, m_states = 0, m_states_end = 0;
+	uint32_t m_shader_base = 0, m_page_cache = 0, m_reach = 0, m_states = 0, m_states_end = 0;
 	uint32_t m_user_data = 0, m_captures = 0;
 	// By node: the flattened SRT dword that is the only use of its value (or ZeroTestSlot), else
 	// NoFlatSlot.
@@ -946,6 +979,8 @@ void WalkerCompiler::Layout() {
 	uint32_t offset = OutputOffset(m_plan) + static_cast<uint32_t>(m_outputs.size()) * 8u;
 	m_shader_base = offset;
 	offset += 8u;
+	m_page_cache = offset;
+	offset += WalkerPageCacheSlots * static_cast<uint32_t>(sizeof(WalkerCachedPage));
 	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
 		if (!Thunk(index)) continue;
 		m_nodes[index].slot = offset;
@@ -1194,7 +1229,7 @@ void WalkerCompiler::EmitRead(const Node& node, uint32_t index) {
 			c.shr(c.rcx, 48);
 			c.jnz(m_ret, Near);
 			if (index < m_zero_tested.size() && m_zero_tested[index]) SkipZeroTestedLoad(c, c.rax, m_ret);
-			LoadGuest(c, c.rax);
+			LoadGuest(c, c.rax, m_page_cache);
 		} else {
 			Load(c.r11, args[1]);
 			c.shr(c.r11d, 16);
@@ -1227,7 +1262,7 @@ void WalkerCompiler::EmitRead(const Node& node, uint32_t index) {
 			if (index < m_zero_tested.size() && m_zero_tested[index]) {
 				SkipZeroTestedLoad(c, c.rax + c.r9 + static_cast<size_t>(immediate), m_ret);
 			}
-			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate));
+			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate), m_page_cache);
 		}
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
@@ -1487,6 +1522,10 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 
 	Xbyak::Label pass, fail, reset;
 	c.mov(c.qword[c.rdx + m_shader_base], c.rcx);
+	for (uint32_t slot = 0; slot < WalkerPageCacheSlots; ++slot) {
+		c.mov(c.qword[c.rdx + m_page_cache + slot * static_cast<uint32_t>(sizeof(WalkerCachedPage))], -1);
+		c.mov(c.qword[c.rdx + m_page_cache + slot * static_cast<uint32_t>(sizeof(WalkerCachedPage)) + 8u], 0);
+	}
 	Zero(m_reach, m_states_end - m_reach);
 	c.lea(c.r8, c.ptr[c.rdx + m_plan.srt_captures]);
 	if (!resources) {
