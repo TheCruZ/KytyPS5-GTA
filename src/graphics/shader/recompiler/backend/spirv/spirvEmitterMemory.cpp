@@ -170,6 +170,16 @@ uint32_t FaultElementPointer(EmitterState& state, uint32_t index) {
 	return pointer;
 }
 
+// The host address of `address` from its BDA page table entry, which may carry the tag BufferCache::BDA_ACCESSED.
+uint32_t BdaEntryAddress(EmitterState& state, uint32_t entry, uint32_t address) {
+	const auto type   = TypeU64(state);
+	const auto offset = Binary(state, spv::OpBitwiseAnd, type, address,
+	                           ConstantU64(state, BufferCache::CACHING_PAGESIZE - 1));
+	const auto base   = Binary(state, spv::OpBitwiseAnd, type, entry,
+	                           ConstantU64(state, ~BufferCache::BDA_ACCESSED));
+	return Binary(state, spv::OpIAdd, type, base, offset);
+}
+
 // The BufferCache caching page of a guest address: the index of its BDA page table entry and of
 // its bits in the fault buffer.
 uint32_t BdaPageIndex(EmitterState& state, uint32_t address) {
@@ -1819,11 +1829,9 @@ void DefineGetBdaPointerMasked(EmitterState& state) {
 	EmitIfCondition(state, AndCondition(state, active, Unary(state, spv::OpLogicalNot, TypeBool(state), missing)),
 	                [&]() { RecordBdaPageBit(state, page, BufferCache::USE_BITMAP_OFFSET); });
 	EmitIfCondition(state, AndCondition(state, active, missing), [&]() { RecordBdaFault(state, page); });
-	const auto offset = Binary(state, spv::OpBitwiseAnd, type, lane_address,
-	                           ConstantU64(state, BufferCache::CACHING_PAGESIZE - 1));
 	state.builder.AddFunction(spv::OpReturnValue,
 	                          Select(state, type, missing, ConstantU64(state, 0),
-	                                 Binary(state, spv::OpIAdd, type, base, offset)));
+	                                 BdaEntryAddress(state, base, lane_address)));
 	state.builder.AddFunction(spv::OpFunctionEnd);
 }
 
@@ -1874,10 +1882,7 @@ void DefineBdaLoads(EmitterState& state) {
 				RecordBdaFault(state, page);
 				state.builder.AddFunction(spv::OpBranch, merge_label);
 				EmitLabel(state, load_label);
-				const auto offset = Binary(state, spv::OpBitwiseAnd, u64, address,
-				                           ConstantU64(state, BufferCache::CACHING_PAGESIZE - 1));
-				const auto value = EmitBdaPointerLoad(state, Binary(state, spv::OpIAdd, u64, base, offset),
-				                                      coherent != 0u);
+				const auto value = EmitBdaPointerLoad(state, BdaEntryAddress(state, base, address), coherent != 0u);
 				const auto load_exit = state.current_label;
 				state.builder.AddFunction(spv::OpBranch, merge_label);
 				EmitLabel(state, merge_label);
@@ -1935,10 +1940,8 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction(spv::OpBranch, merge_label);
 
 	EmitLabel(state, merge_label);
-	const auto offset = Binary(state, spv::OpBitwiseAnd, type, address,
-	                           ConstantU64(state, BufferCache::CACHING_PAGESIZE - 1));
 	const auto result = Select(state, type, missing, ConstantU64(state, 0),
-	                           Binary(state, spv::OpIAdd, type, base, offset));
+	                           BdaEntryAddress(state, base, address));
 	state.builder.AddFunction(spv::OpReturnValue, result);
 	state.builder.AddFunction(spv::OpFunctionEnd);
 	if (state.converged_calls) {

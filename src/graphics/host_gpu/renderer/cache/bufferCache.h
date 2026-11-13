@@ -49,6 +49,11 @@ public:
 	static constexpr uint64_t NATIVE_RT_CONTEXT_PAGE = CACHING_NUMPAGES;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    (CACHING_NUMPAGES + 1) * sizeof(vk::DeviceAddress);
+	// Bit 0 of the entry of a page that a device-address fault named once its buffer exists (a new registration of the
+	// page leaves it off): upstream's tag of DMA-accessed pages, which the BVH mirror's shader (gpu_bvh_mirror.comp)
+	// takes for "present". The other readers (get_bda_pointer, the native ray tracing passes) take the entry as present
+	// when it is not 0 and clear the tag from it (a buffer's address is not odd).
+	static constexpr uint64_t BDA_ACCESSED = 1;
 	// The fault buffer holds three bitmaps of CACHING_NUMPAGES bits: pages that device-address
 	// accesses found without a cached buffer, pages that V#-table stores wrote, and pages that
 	// device-address accesses found cached (their buffers are in use). Then the hack marks.
@@ -128,6 +133,9 @@ public:
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	// Caches memory a shader reached through a device address the host did not know beforehand.
 	void CacheFaultedMemory(uint64_t vaddr, uint64_t size);
+	// The pages that CacheFaultedMemory() caches get BDA_ACCESSED in their entries from now on (a RayTracing mirror reads
+	// it; the game's shaders do not need it, and it costs a staged write of the entries).
+	void TagFaultedPages() noexcept { m_tag_faulted_pages.store(true, std::memory_order_relaxed); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
@@ -414,6 +422,7 @@ private:
 	std::array<RangeSet, 16>                          m_checked_color_metadata;
 	RangeSet                                          m_released_ranges;
 	bool                                              m_record_released = false;
+	std::atomic<bool>                                 m_tag_faulted_pages {false};
 	// The last buffers CollectStaleBuffers() released ([address, size] pairs, a ring): a device
 	// address fault inside one of them means a shader reached memory the age release dropped.
 	static constexpr size_t                           StaleRingSize = 32;

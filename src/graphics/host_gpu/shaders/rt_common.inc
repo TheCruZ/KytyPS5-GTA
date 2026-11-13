@@ -57,7 +57,8 @@ uint64_t HostAddress(uint64_t va) {
 		RecordFault(uint(page));
 	}
 #endif
-	return base == 0 ? 0 : base + (va & uint64_t(kPageMask));
+	// (Bit 0 of an entry tags a cached page: BufferCache::BDA_ACCESSED.)
+	return base == 0 ? 0 : (base & ~1ul) + (va & uint64_t(kPageMask));
 }
 
 // Guest loads (zero where the memory is not cached). Aligned 16-byte loads never cross a caching

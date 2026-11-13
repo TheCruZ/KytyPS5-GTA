@@ -793,7 +793,20 @@ void BufferCache::CacheFaultedMemory(uint64_t vaddr, uint64_t size) {
 		}
 	}
 	if (const auto id = FindBuffer(vaddr, size)) {
-		m_slot_buffers[id].device_address_pinned = true;
+		auto& buffer                 = m_slot_buffers[id];
+		buffer.device_address_pinned = true;
+		if (!m_tag_faulted_pages.load(std::memory_order_relaxed)) {
+			return;
+		}
+		// Tag the entries of the faulted pages: a page that was faulted on has its buffer now.
+		std::vector<vk::DeviceAddress> entries;
+		const auto                     first = Common::AlignDown(vaddr, CACHING_PAGESIZE);
+		const auto                     last  = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
+		for (auto address = first; address < last; address += CACHING_PAGESIZE) {
+			entries.push_back((buffer.BufferDeviceAddress() + buffer.Offset(address)) | BDA_ACCESSED);
+		}
+		WriteDataBuffer(m_bda_pagetable_buffer, PageIndex(first) * sizeof(vk::DeviceAddress), entries.data(),
+		                entries.size() * sizeof(vk::DeviceAddress));
 	}
 }
 

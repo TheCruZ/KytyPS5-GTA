@@ -170,6 +170,8 @@ vk::AccelerationStructureGeometryKHR InstanceGeometry(vk::DeviceAddress instance
 RayTracing::RayTracing(RenderContext& context)
     : m_graphics(context.GetGraphics()), m_scheduler(context.GetCommandScheduler()),
       m_buffer_cache(context.GetBufferCache()), m_context(context) {
+	// The walks take a page without BDA_ACCESSED in its entry for one the host has not synchronized yet.
+	m_buffer_cache.TagFaultedPages();
 	vk::PhysicalDeviceAccelerationStructurePropertiesKHR limits {};
 	vk::PhysicalDeviceProperties2                        properties {};
 	properties.pNext = &limits;
@@ -380,6 +382,9 @@ void RayTracing::Apply(Area& area) {
 }
 
 vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
+	// The mirror reads the guest's BVH as it is now: every call is a device-address reader that comes after the
+	// guest's writes, so the CPU writes since the last synchronization go up (see RenderContext::NoteOperation()).
+	m_context.NoteOperation(0, true);
 	m_context.PrepareBda(false);
 	Collect();
 	auto& area = m_areas[m_next_area];
